@@ -34,12 +34,24 @@ export type ApiBindings = {
 export function createApiApp(): Hono<ApiBindings> {
 	const api = new Hono<ApiBindings>();
 
-	// Baseline security headers on every response from this app.
+	// Baseline security headers on every response from this app. Responses proxied straight
+	// from a Durable Object (or any fetch()) have immutable headers, so rebuild the response
+	// with a fresh, mutable Headers instead of mutating in place (which would throw). Skip
+	// 1xx/upgrade responses, which cannot be reconstructed via the Response constructor.
 	api.use("*", async (c, next) => {
 		await next();
-		c.res.headers.set("X-Content-Type-Options", "nosniff");
-		c.res.headers.set("X-Frame-Options", "DENY");
-		c.res.headers.set("Referrer-Policy", "no-referrer");
+		if (c.res.status < 200) {
+			return;
+		}
+		const headers = new Headers(c.res.headers);
+		headers.set("X-Content-Type-Options", "nosniff");
+		headers.set("X-Frame-Options", "DENY");
+		headers.set("Referrer-Policy", "no-referrer");
+		c.res = new Response(c.res.body, {
+			status: c.res.status,
+			statusText: c.res.statusText,
+			headers,
+		});
 	});
 
 	// Lightweight CSRF defense for state-changing requests: an Origin header that doesn't
@@ -236,6 +248,11 @@ export function createApiApp(): Hono<ApiBindings> {
 	api.onError((error, c) => {
 		if (error instanceof ZodError) {
 			return c.json({ error: "validation_error", issues: error.flatten() }, 400);
+		}
+		// A malformed JSON body makes c.req.json() throw a SyntaxError; surface it as a 400
+		// client error rather than a generic 500.
+		if (error instanceof SyntaxError) {
+			return c.json({ error: "invalid_json" }, 400);
 		}
 		if (error instanceof AppError) {
 			return c.json({ error: error.code, message: error.message }, error.status as 400);

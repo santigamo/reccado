@@ -67,7 +67,15 @@ export async function parseMimeBytes(rawBytes: Uint8Array): Promise<ParsedEmail>
 
 export function normalizeSubject(subject: string | null): string | null {
 	if (!subject) return null;
-	return subject.replace(/^(re|fwd):\s*/gi, "").trim().toLowerCase() || null;
+	// Strip any chain of leading reply/forward prefixes ("Re:", "Fwd:"), tolerating leading
+	// whitespace before the prefix, so threading collapses "Re: Re: X", "  Fwd: X", etc. to "x".
+	let result = subject.trim();
+	let previous: string;
+	do {
+		previous = result;
+		result = result.replace(/^(?:re|fwd):\s*/i, "").trim();
+	} while (result !== previous);
+	return result.toLowerCase() || null;
 }
 
 export function snippetFromText(text: string | null, html: string | null, max = 200): string {

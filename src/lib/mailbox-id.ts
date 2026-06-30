@@ -8,6 +8,9 @@ export function canonicalPrimaryAddress(email: string): string {
 	}
 	const localPart = trimmed.slice(0, at).trim();
 	const domain = trimmed.slice(at + 1).trim();
+	if (!localPart || !domain) {
+		throw new Error(`Invalid email address: ${email}`);
+	}
 	return `${localPart}@${domain}`;
 }
 

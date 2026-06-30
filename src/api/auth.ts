@@ -106,7 +106,13 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 	const audience = env.ACCESS_JWT_AUDIENCE;
 	if (!audience) {
 		const hostname = new URL(request.url).hostname;
-		if (hostname !== "localhost" && hostname !== "127.0.0.1" && hostname !== "::1") {
+		// URL parsing returns IPv6 hosts in bracketed form ("[::1]"), so accept both spellings.
+		if (
+			hostname !== "localhost" &&
+			hostname !== "127.0.0.1" &&
+			hostname !== "::1" &&
+			hostname !== "[::1]"
+		) {
 			return null;
 		}
 		return { userId: "dev-local", email: "dev@local" };

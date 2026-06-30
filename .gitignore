@@ -12,6 +12,8 @@ dist-ssr
 __unconfig*
 todos.json
 .tmp/
+coverage
+.artifacts
 
 .dev.vars*
 !.dev.vars.example
