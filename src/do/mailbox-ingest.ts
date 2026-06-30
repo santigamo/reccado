@@ -68,6 +68,65 @@ function nextRealtimeSeq(sql: SqlStorage): number {
 	return row?.seq ?? 1;
 }
 
+// The DO SQLite driver doesn't expose a typed error code for constraint violations;
+// it surfaces as a generic Error whose message mentions "UNIQUE"/"constraint". We
+// detect that specifically so a concurrent duplicate insert (same idempotency_key)
+// resolves to a clean duplicate/conflict result instead of throwing a spurious 500.
+function isUniqueConstraintViolation(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return /unique/i.test(message) && /constraint/i.test(message);
+}
+
+// Re-reads the row that won the race so we can answer with the same shape the
+// upfront idempotency pre-check would have returned, had it observed the winner.
+function resolveConcurrentIdempotencyConflict(
+	sql: SqlStorage,
+	message: InboundEmailQueueMessage,
+): MailboxIngestResult {
+	const winner = sql
+		.exec<{
+			message_local_id: string | null;
+			raw_sha256: string;
+		}>("SELECT message_local_id, raw_sha256 FROM ingest_events WHERE idempotency_key = ?", message.idempotencyKey)
+		.toArray()[0];
+
+	if (!winner) {
+		// Constraint violation implies a concurrent writer holds this idempotency_key,
+		// but we couldn't find its row (e.g. a messages.idempotency_key collision from
+		// a different code path). Surface a conflict rather than silently swallowing it.
+		return {
+			status: "conflict",
+			mailboxId: message.mailboxId,
+			messageCount: messageCount(sql),
+			idempotencyKey: message.idempotencyKey,
+			messageLocalId: "",
+			rawR2Key: message.rawR2Key,
+			errorCode: "message_id_conflict",
+		};
+	}
+
+	if (winner.raw_sha256 && winner.raw_sha256 !== message.rawSha256) {
+		return {
+			status: "conflict",
+			mailboxId: message.mailboxId,
+			messageCount: messageCount(sql),
+			idempotencyKey: message.idempotencyKey,
+			messageLocalId: "",
+			rawR2Key: message.rawR2Key,
+			errorCode: "message_id_conflict",
+		};
+	}
+
+	return {
+		status: "duplicate",
+		mailboxId: message.mailboxId,
+		messageCount: messageCount(sql),
+		idempotencyKey: message.idempotencyKey,
+		messageLocalId: winner.message_local_id ?? "",
+		rawR2Key: message.rawR2Key,
+	};
+}
+
 export function recordRealtimeEvent(
 	sql: SqlStorage,
 	eventType: string,
@@ -313,58 +372,74 @@ export async function ingestInboundEmail(
 			realtimeSeq: seq,
 		};
 	} catch (error) {
+		if (isUniqueConstraintViolation(error)) {
+			// A concurrent invocation (for the same idempotency_key) won the race and
+			// committed first. Resolve to the same duplicate/conflict shape the upfront
+			// pre-check would have returned instead of re-inserting or throwing.
+			return resolveConcurrentIdempotencyConflict(ctx.sql, message);
+		}
+
 		parseStatus = "failed";
 		const now = nowIso();
 		const messageLocalId = crypto.randomUUID();
 		const threadId = crypto.randomUUID();
 		const snippet = snippetFromText(null, null);
 
-		ctx.transactionSync(() => {
-			ctx.sql.exec(
-				`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
+		try {
+			ctx.transactionSync(() => {
+				ctx.sql.exec(
+					`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
          VALUES (?, NULL, ?, 1, 1, ?, ?)`,
-				threadId,
-				message.receivedAt,
-				now,
-				now,
-			);
-			ctx.sql.exec(
-				`INSERT INTO messages
+					threadId,
+					message.receivedAt,
+					now,
+					now,
+				);
+				ctx.sql.exec(
+					`INSERT INTO messages
          (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
           from_addr, to_json, cc_json, bcc_json, subject, snippet, date_header, received_at, raw_r2_key,
           raw_sha256, raw_size, body_text, body_html_r2_key, parse_status, has_attachments, is_read, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, '[]', '[]', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'failed', 0, 0, ?, ?)`,
-				messageLocalId,
-				message.idempotencyKey,
-				threadId,
-				message.messageId,
-				inReplyTo,
-				referencesJson,
-				fromAddr,
-				toJson,
-				subject,
-				snippet,
-				message.headers.date,
-				message.receivedAt,
-				message.rawR2Key,
-				message.rawSha256,
-				message.rawSize,
-				now,
-				now,
-			);
-			ctx.sql.exec(
-				`INSERT INTO ingest_events
+					messageLocalId,
+					message.idempotencyKey,
+					threadId,
+					message.messageId,
+					inReplyTo,
+					referencesJson,
+					fromAddr,
+					toJson,
+					subject,
+					snippet,
+					message.headers.date,
+					message.receivedAt,
+					message.rawR2Key,
+					message.rawSha256,
+					message.rawSize,
+					now,
+					now,
+				);
+				ctx.sql.exec(
+					`INSERT INTO ingest_events
          (idempotency_key, raw_r2_key, raw_sha256, status, message_local_id, error_code, error_message, created_at, updated_at)
          VALUES (?, ?, ?, 'processed', ?, 'parse_failed', ?, ?, ?)`,
-				message.idempotencyKey,
-				message.rawR2Key,
-				message.rawSha256,
-				messageLocalId,
-				error instanceof Error ? error.message : String(error),
-				now,
-				now,
-			);
-		});
+					message.idempotencyKey,
+					message.rawR2Key,
+					message.rawSha256,
+					messageLocalId,
+					error instanceof Error ? error.message : String(error),
+					now,
+					now,
+				);
+			});
+		} catch (insertError) {
+			if (isUniqueConstraintViolation(insertError)) {
+				// Same race, but discovered while persisting the parse-failure fallback
+				// row: a concurrent invocation already committed under this idempotency_key.
+				return resolveConcurrentIdempotencyConflict(ctx.sql, message);
+			}
+			throw insertError;
+		}
 
 		return {
 			status: "inserted",

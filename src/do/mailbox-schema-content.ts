@@ -134,6 +134,10 @@ CREATE TABLE IF NOT EXISTS outbound_drafts (
   updated_at TEXT NOT NULL
 );
 
+-- Reserved, currently unused: scaffolding for the planned "mailbox-local DO alarm
+-- jobs" milestone (see docs/IMPLEMENTATION.md). Nothing inserts rows into this
+-- table yet; mailbox-do.ts's runPendingJobs()/alarm() poll it defensively but are
+-- effectively no-ops until a feature starts enqueueing jobs here.
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,

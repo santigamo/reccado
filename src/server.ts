@@ -6,16 +6,39 @@ export { MailboxDurableObject } from "./do/mailbox-do";
 
 const api = createApiApp();
 
-function phase0DebugAuthorized(request: Request, env: Env): boolean {
-	const token = env.PHASE0_DEBUG_TOKEN;
-	if (!token) {
-		return true;
+async function timingSafeEqual(a: string, b: string): Promise<boolean> {
+	// Compare fixed-length digests instead of the raw strings so neither the early-exit
+	// behavior of `===` nor the input length itself can leak timing information.
+	const encoder = new TextEncoder();
+	const [digestA, digestB] = await Promise.all([
+		crypto.subtle.digest("SHA-256", encoder.encode(a)),
+		crypto.subtle.digest("SHA-256", encoder.encode(b)),
+	]);
+	const bytesA = new Uint8Array(digestA);
+	const bytesB = new Uint8Array(digestB);
+	let diff = 0;
+	for (let i = 0; i < bytesA.length; i++) {
+		diff |= bytesA[i]! ^ bytesB[i]!;
 	}
-	return request.headers.get("x-phase0-debug-token") === token;
+	return diff === 0;
+}
+
+async function phase0DebugAuthorized(request: Request, env: Env): Promise<boolean> {
+	const token = env.PHASE0_DEBUG_TOKEN;
+	// Fail closed: debug endpoints are disabled entirely unless an operator explicitly
+	// configures PHASE0_DEBUG_TOKEN. An unset/empty token must never authorize access.
+	if (!token) {
+		return false;
+	}
+	const provided = request.headers.get("x-phase0-debug-token");
+	if (!provided) {
+		return false;
+	}
+	return timingSafeEqual(provided, token);
 }
 
 api.get("/api/debug/phase0/mailboxes/:mailboxId/schema", async (c) => {
-	if (!phase0DebugAuthorized(c.req.raw, c.env)) {
+	if (!(await phase0DebugAuthorized(c.req.raw, c.env))) {
 		return c.notFound();
 	}
 	const mailboxId = c.req.param("mailboxId");
@@ -24,7 +47,7 @@ api.get("/api/debug/phase0/mailboxes/:mailboxId/schema", async (c) => {
 });
 
 api.get("/api/debug/phase0/schema/:mailboxId", async (c) => {
-	if (!phase0DebugAuthorized(c.req.raw, c.env)) {
+	if (!(await phase0DebugAuthorized(c.req.raw, c.env))) {
 		return c.notFound();
 	}
 	const mailboxId = c.req.param("mailboxId");
@@ -36,7 +59,7 @@ api.get("/api/debug/phase0/schema/:mailboxId", async (c) => {
 });
 
 api.get("/api/debug/phase0/mailboxes/:mailboxId", async (c) => {
-	if (!phase0DebugAuthorized(c.req.raw, c.env)) {
+	if (!(await phase0DebugAuthorized(c.req.raw, c.env))) {
 		return c.notFound();
 	}
 	const mailboxId = c.req.param("mailboxId");
@@ -46,7 +69,7 @@ api.get("/api/debug/phase0/mailboxes/:mailboxId", async (c) => {
 
 
 api.get("/api/debug/phase0/r2/head", async (c) => {
-	if (!phase0DebugAuthorized(c.req.raw, c.env)) {
+	if (!(await phase0DebugAuthorized(c.req.raw, c.env))) {
 		return c.notFound();
 	}
 	const key = c.req.query("key");
@@ -63,7 +86,7 @@ api.get("/api/debug/phase0/r2/head", async (c) => {
 });
 
 api.get("/api/debug/phase0/test-mailbox-id", async (c) => {
-	if (!phase0DebugAuthorized(c.req.raw, c.env)) {
+	if (!(await phase0DebugAuthorized(c.req.raw, c.env))) {
 		return c.notFound();
 	}
 	return c.json({ mailboxId: await deriveDevTestMailboxId() });
@@ -95,7 +118,7 @@ export default {
 			return handleLocalEmailSimulation(request, env, ctx);
 		}
 		if (url.pathname === "/api/debug/phase0/email") {
-			if (!phase0DebugAuthorized(request, env)) {
+			if (!(await phase0DebugAuthorized(request, env))) {
 				return new Response("Not found", { status: 404 });
 			}
 			const { handleLocalEmailSimulation } = await import("./cloudflare/local-email");

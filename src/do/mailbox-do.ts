@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflare/types";
 import { sha256Hex } from "../lib/crypto";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
@@ -9,6 +10,45 @@ import {
 	sendHello,
 	type WebSocketAttachment,
 } from "./mailbox-realtime";
+
+type SqlStorage = DurableObjectState["storage"]["sql"];
+
+// Target schema_migrations version. Bump this (and the migration logic in the
+// constructor) when a future legacy-schema migration needs to run again.
+const MAILBOX_SCHEMA_VERSION = 1;
+
+// Minimal runtime validation for the /ingest payload. Defined locally (rather than
+// imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
+// layer's schema module. Mirrors InboundEmailQueueMessage in ../cloudflare/types.
+const inboundEmailQueueMessageSchema = z.object({
+	schemaVersion: z.literal(1),
+	eventType: z.literal("email.received.v1"),
+	traceId: z.string(),
+	enqueuedAt: z.string(),
+	receivedAt: z.string(),
+	mailboxId: z.string(),
+	domain: z.string(),
+	recipient: z.string(),
+	sender: z.string(),
+	rawR2Key: z.string(),
+	rawSha256: z.string(),
+	rawSize: z.number(),
+	messageId: z.string().nullable(),
+	headers: z.object({
+		subject: z.string().nullable(),
+		date: z.string().nullable(),
+		inReplyTo: z.string().nullable(),
+		references: z.array(z.string()),
+	}),
+	routing: z.object({
+		ruleId: z.string().nullable(),
+		action: z.enum(["store", "forward", "reject"]),
+		matchedAlias: z.string(),
+		forwardTo: z.array(z.string()).optional(),
+		rejectReason: z.string().optional(),
+	}),
+	idempotencyKey: z.string(),
+});
 
 function extractProviderMessageId(result: unknown): string | null {
 	if (!result || typeof result !== "object") return null;
@@ -46,23 +86,363 @@ function readSendMarker(value: unknown): { status: "sending" | "sent"; providerM
 	return { status: "sent", providerMessageId: null };
 }
 
+// --- Pure DO query/command logic -----------------------------------------
+// These mirror the IngestContext pattern in mailbox-ingest.ts: plain functions
+// taking an explicit `sql` (and, for confirmSendDraft, an explicit context
+// object) instead of closing over `this`. That makes them testable without a
+// real DurableObjectState. The class methods below are thin wrappers that
+// just supply the DO-bound dependencies. Behavior is unchanged from before
+// this extraction.
+
+function listThreads(sql: SqlStorage, limit: number) {
+	return sql
+		.exec(
+			`SELECT t.*, (
+          SELECT m.subject FROM messages m WHERE m.thread_id = t.id ORDER BY m.received_at DESC LIMIT 1
+        ) AS latest_subject
+        FROM threads t
+        ORDER BY t.last_message_at DESC
+        LIMIT ?`,
+			limit,
+		)
+		.toArray();
+}
+
+function getThread(sql: SqlStorage, threadId: string | undefined) {
+	if (!threadId) return null;
+	const thread = sql.exec("SELECT * FROM threads WHERE id = ?", threadId).toArray()[0];
+	const messages = sql
+		.exec("SELECT * FROM messages WHERE thread_id = ? ORDER BY received_at ASC", threadId)
+		.toArray();
+	return { thread, messages };
+}
+
+function getMessage(sql: SqlStorage, messageId: string | undefined) {
+	if (!messageId) return null;
+	const message = sql.exec("SELECT * FROM messages WHERE id = ?", messageId).toArray()[0];
+	const attachments = sql.exec("SELECT * FROM attachments WHERE message_id = ?", messageId).toArray();
+	return { ...message, attachments };
+}
+
+function getRawMessageR2Key(sql: SqlStorage, messageId: string | undefined): string | null {
+	if (!messageId) return null;
+	const row = sql
+		.exec<{ raw_r2_key: string }>("SELECT raw_r2_key FROM messages WHERE id = ?", messageId)
+		.toArray()[0];
+	return row?.raw_r2_key ?? null;
+}
+
+function applyMessageAction(sql: SqlStorage, messageId: string | undefined, action: string) {
+	if (!messageId) throw new Error("messageId required");
+	const now = new Date().toISOString();
+	if (action === "mark_read") {
+		sql.exec("UPDATE messages SET is_read = 1, updated_at = ? WHERE id = ?", now, messageId);
+	} else if (action === "mark_unread") {
+		sql.exec("UPDATE messages SET is_read = 0, updated_at = ? WHERE id = ?", now, messageId);
+	} else if (action === "archive") {
+		sql.exec("UPDATE messages SET state = 'archive', updated_at = ? WHERE id = ?", now, messageId);
+	} else if (action === "trash") {
+		sql.exec("UPDATE messages SET state = 'trash', updated_at = ? WHERE id = ?", now, messageId);
+	} else if (action === "restore_inbox") {
+		sql.exec("UPDATE messages SET state = 'inbox', updated_at = ? WHERE id = ?", now, messageId);
+	}
+	return { ok: true, messageId, action };
+}
+
+function listDrafts(sql: SqlStorage) {
+	return sql.exec("SELECT * FROM outbound_drafts ORDER BY updated_at DESC").toArray();
+}
+
+function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
+	const id = crypto.randomUUID();
+	const now = new Date().toISOString();
+	sql.exec(
+		`INSERT INTO outbound_drafts
+       (id, thread_id, to_json, cc_json, bcc_json, subject, body_text, body_html, status, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
+		id,
+		(body.threadId as string | null) ?? null,
+		JSON.stringify(body.to ?? []),
+		JSON.stringify(body.cc ?? []),
+		JSON.stringify(body.bcc ?? []),
+		body.subject,
+		body.bodyText ?? null,
+		body.bodyHtml ?? null,
+		(body.createdBy as string | undefined) ?? "user",
+		now,
+		now,
+	);
+	return { id, status: "draft" };
+}
+
+function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<string, unknown>) {
+	if (!draftId) throw new Error("draftId required");
+	const now = new Date().toISOString();
+	const existing = sql.exec("SELECT * FROM outbound_drafts WHERE id = ?", draftId).toArray()[0];
+	if (!existing) throw new Error("draft not found");
+	sql.exec(
+		`UPDATE outbound_drafts SET
+         to_json = ?, cc_json = ?, bcc_json = ?, subject = ?, body_text = ?, body_html = ?, updated_at = ?
+       WHERE id = ?`,
+		JSON.stringify(body.to ?? JSON.parse(String(existing.to_json))),
+		JSON.stringify(body.cc ?? JSON.parse(String(existing.cc_json))),
+		JSON.stringify(body.bcc ?? JSON.parse(String(existing.bcc_json))),
+		body.subject ?? existing.subject,
+		body.bodyText ?? existing.body_text,
+		body.bodyHtml ?? existing.body_html,
+		now,
+		draftId,
+	);
+	return { id: draftId, status: "draft" };
+}
+
+function requestSendDraft(sql: SqlStorage, draftId: string | undefined) {
+	if (!draftId) throw new Error("draftId required");
+	const now = new Date().toISOString();
+	sql.exec(
+		"UPDATE outbound_drafts SET status = 'pending_confirmation', updated_at = ? WHERE id = ?",
+		now,
+		draftId,
+	);
+	return { id: draftId, status: "pending_confirmation" };
+}
+
+type ConfirmSendDraftContext = {
+	sql: SqlStorage;
+	transactionSync: (fn: () => void) => void;
+	email: Env["EMAIL"];
+	fromAddress: string;
+};
+
+async function confirmSendDraft(
+	ctx: ConfirmSendDraftContext,
+	draftId: string | undefined,
+	idempotencyKey: string,
+): Promise<Record<string, unknown>> {
+	if (!draftId) throw new Error("draftId required");
+	const draft = ctx.sql
+		.exec<{
+			to_json: string;
+			cc_json: string;
+			bcc_json: string;
+			subject: string;
+			body_text: string | null;
+			body_html: string | null;
+			status: string;
+		}>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
+		.toArray()[0];
+	if (!draft) throw new Error("draft not found");
+
+	const sentMarker = ctx.sql
+		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", `send:${idempotencyKey}`)
+		.toArray()[0];
+	if (sentMarker) {
+		const marker = readSendMarker(sentMarker.value);
+		return {
+			id: draftId,
+			status: marker.status,
+			sent: false,
+			duplicate: true,
+			providerMessageId: marker.providerMessageId,
+			reason: marker.status === "sending" ? "send_in_progress" : undefined,
+		};
+	}
+	if (draft.status !== "pending_confirmation") {
+		return { id: draftId, status: draft.status, sent: false, reason: "not_pending_confirmation" };
+	}
+
+	const to = JSON.parse(draft.to_json) as string[];
+	const cc = JSON.parse(draft.cc_json) as string[];
+	const bcc = JSON.parse(draft.bcc_json) as string[];
+	const totalRecipients = to.length + cc.length + bcc.length;
+	if (totalRecipients > 50) {
+		return {
+			id: draftId,
+			status: draft.status,
+			sent: false,
+			error: "too_many_recipients",
+			recipientCount: totalRecipients,
+		};
+	}
+
+	const fromAddress = ctx.fromAddress;
+	const now = new Date().toISOString();
+	const sentKey = `send:${idempotencyKey}`;
+	try {
+		ctx.sql.exec(
+			"INSERT INTO mailbox_meta (key, value, updated_at) VALUES (?, 'sending', ?)",
+			sentKey,
+			now,
+		);
+	} catch {
+		return { id: draftId, status: "sending", sent: false, duplicate: true };
+	}
+
+	let providerMessageId: string | null = null;
+	try {
+		const providerResult = await ctx.email.send({
+			from: fromAddress,
+			to,
+			cc: cc.length ? cc : undefined,
+			bcc: bcc.length ? bcc : undefined,
+			subject: draft.subject,
+			text: draft.body_text ?? undefined,
+			html: draft.body_html ?? undefined,
+		});
+		providerMessageId = extractProviderMessageId(providerResult);
+	} catch (error) {
+		ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", sentKey);
+		throw error;
+	}
+
+	const messageLocalId = crypto.randomUUID();
+	const threadId = crypto.randomUUID();
+	const rawR2Key = `sent/${draftId}`;
+	const rawSha256 = await sha256Hex(
+		new TextEncoder().encode(
+			JSON.stringify({
+				draftId,
+				idempotencyKey,
+				to,
+				cc,
+				bcc,
+				subject: draft.subject,
+				text: draft.body_text ?? null,
+				html: draft.body_html ?? null,
+			}),
+		),
+	);
+	ctx.transactionSync(() => {
+		ctx.sql.exec(
+			"UPDATE mailbox_meta SET value = ?, updated_at = ? WHERE key = ?",
+			sentMarkerValue(providerMessageId),
+			now,
+			sentKey,
+		);
+		ctx.sql.exec(
+			"UPDATE outbound_drafts SET status = 'sent', updated_at = ? WHERE id = ?",
+			now,
+			draftId,
+		);
+		ctx.sql.exec(
+			`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
+         VALUES (?, ?, ?, 1, 0, ?, ?)`,
+			threadId,
+			draft.subject.toLowerCase(),
+			now,
+			now,
+			now,
+		);
+		ctx.sql.exec(
+			`INSERT INTO messages
+         (id, idempotency_key, thread_id, direction, state, from_addr, to_json, cc_json, bcc_json, subject, snippet,
+          received_at, raw_r2_key, raw_sha256, raw_size, parse_status, has_attachments, is_read, created_at, updated_at, references_json)
+         VALUES (?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'parsed', 0, 1, ?, ?, '[]')`,
+			messageLocalId,
+			sentKey,
+			threadId,
+			fromAddress,
+			draft.to_json,
+			draft.cc_json,
+			draft.bcc_json,
+			draft.subject,
+			(draft.body_text ?? draft.subject).slice(0, 200),
+			now,
+			rawR2Key,
+			rawSha256,
+			now,
+			now,
+		);
+	});
+
+	recordRealtimeEvent(ctx.sql, "message.created", {
+		messageId: messageLocalId,
+		threadId,
+		direction: "outbound",
+	});
+
+	return {
+		id: draftId,
+		status: "sent",
+		sent: true,
+		messageLocalId,
+		threadId,
+		idempotencyKey,
+		providerMessageId,
+		subject: draft.subject,
+		fromAddr: fromAddress,
+		toJson: draft.to_json,
+		snippet: (draft.body_text ?? draft.subject).slice(0, 200),
+		receivedAt: now,
+		rawR2Key,
+		rawSha256,
+	};
+}
+
+function cancelDraft(sql: SqlStorage, draftId: string | undefined) {
+	if (!draftId) throw new Error("draftId required");
+	const now = new Date().toISOString();
+	sql.exec("UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?", now, draftId);
+	return { id: draftId, status: "cancelled" };
+}
+
+function exportMessageIndex(sql: SqlStorage) {
+	return sql
+		.exec(
+			`SELECT id AS message_local_id, thread_id, rfc_message_id, subject, from_addr, to_json, snippet,
+              received_at, has_attachments, state, raw_r2_key, raw_sha256
+         FROM messages ORDER BY received_at ASC`,
+		)
+		.toArray();
+}
+
+function debugState(sql: SqlStorage) {
+	const messages = sql
+		.exec(
+			`SELECT id, idempotency_key, raw_r2_key, raw_sha256, subject, thread_id, parse_status, state
+         FROM messages ORDER BY created_at ASC`,
+		)
+		.toArray();
+	return { messageCount: messages.length, messages };
+}
+
 export class MailboxDurableObject extends DurableObject<Env> {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.renameLegacyMessagesBeforeSchema();
-		this.ctx.storage.sql.exec(MAILBOX_SCHEMA_SQL);
-		try {
-			this.rebuildLegacyMessagesTable();
-			this.migrateLegacySchema();
-		} catch (error) {
-			console.error("mailbox.schema_migration_failed", {
-				error: error instanceof Error ? error.message : String(error),
-			});
+		// The legacy PRAGMA/ALTER migration scan below is only needed once per DO
+		// (it rebuilds/backfills pre-thread_id-era tables). Re-running it on every
+		// cold start is wasted work — gate it behind the persisted schema version.
+		const alreadyMigrated = this.hasAppliedSchemaVersion(MAILBOX_SCHEMA_VERSION);
+		if (!alreadyMigrated) {
+			// Must run before MAILBOX_SCHEMA_SQL: it renames a pre-existing legacy
+			// "messages" table out of the way so the CREATE TABLE IF NOT EXISTS below
+			// can create the current schema instead of leaving the legacy table in place.
+			this.renameLegacyMessagesBeforeSchema();
 		}
-		this.ctx.storage.sql.exec(
-			"INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?)",
-			new Date().toISOString(),
-		);
+		this.ctx.storage.sql.exec(MAILBOX_SCHEMA_SQL);
+		if (!alreadyMigrated) {
+			try {
+				this.rebuildLegacyMessagesTable();
+				this.migrateLegacySchema();
+			} catch (error) {
+				console.error("mailbox.schema_migration_failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			this.ctx.storage.sql.exec(
+				"INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+				MAILBOX_SCHEMA_VERSION,
+				new Date().toISOString(),
+			);
+		}
+	}
+
+	private hasAppliedSchemaVersion(version: number): boolean {
+		if (!this.tableExists("schema_migrations")) return false;
+		const row = this.ctx.storage.sql
+			.exec<{ version: number }>("SELECT version FROM schema_migrations WHERE version = ?", version)
+			.toArray()[0];
+		return Boolean(row);
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -71,8 +451,20 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			return this.handleWebSocketUpgrade(request);
 		}
 		if (url.pathname === "/ingest" && request.method === "POST") {
-			const message = (await request.json()) as InboundEmailQueueMessage;
-			const result = await this.ingestEmail(message);
+			let json: unknown;
+			try {
+				json = await request.json();
+			} catch {
+				return Response.json({ error: "invalid_json" }, { status: 400 });
+			}
+			const parsed = inboundEmailQueueMessageSchema.safeParse(json);
+			if (!parsed.success) {
+				return Response.json(
+					{ error: "invalid_payload", issues: parsed.error.issues },
+					{ status: 400 },
+				);
+			}
+			const result = await this.ingestEmail(parsed.data);
 			return Response.json(result);
 		}
 		if (url.pathname === "/search" && request.method === "GET") {
@@ -358,6 +750,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 	}
 
+	// Reserved, currently unused: fires only if something calls storage.setAlarm(),
+	// which today only happens from inside runPendingJobs() itself (see its comment).
 	async alarm(): Promise<void> {
 		await this.runPendingJobs();
 	}
@@ -399,48 +793,21 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	}
 
 	private listThreads(limit: number) {
-		return this.ctx.storage.sql
-			.exec(
-				`SELECT t.*, (
-          SELECT m.subject FROM messages m WHERE m.thread_id = t.id ORDER BY m.received_at DESC LIMIT 1
-        ) AS latest_subject
-        FROM threads t
-        ORDER BY t.last_message_at DESC
-        LIMIT ?`,
-				limit,
-			)
-			.toArray();
+		return listThreads(this.ctx.storage.sql, limit);
 	}
 
 	private getThread(threadId: string | undefined) {
-		if (!threadId) return null;
-		const thread = this.ctx.storage.sql
-			.exec("SELECT * FROM threads WHERE id = ?", threadId)
-			.toArray()[0];
-		const messages = this.ctx.storage.sql
-			.exec("SELECT * FROM messages WHERE thread_id = ? ORDER BY received_at ASC", threadId)
-			.toArray();
-		return { thread, messages };
+		return getThread(this.ctx.storage.sql, threadId);
 	}
 
 	private getMessage(messageId: string | undefined) {
-		if (!messageId) return null;
-		const message = this.ctx.storage.sql
-			.exec("SELECT * FROM messages WHERE id = ?", messageId)
-			.toArray()[0];
-		const attachments = this.ctx.storage.sql
-			.exec("SELECT * FROM attachments WHERE message_id = ?", messageId)
-			.toArray();
-		return { ...message, attachments };
+		return getMessage(this.ctx.storage.sql, messageId);
 	}
 
 	private async getRawMessage(messageId: string | undefined): Promise<Response> {
-		if (!messageId) return new Response("Not found", { status: 404 });
-		const row = this.ctx.storage.sql
-			.exec<{ raw_r2_key: string }>("SELECT raw_r2_key FROM messages WHERE id = ?", messageId)
-			.toArray()[0];
-		if (!row) return new Response("Not found", { status: 404 });
-		const object = await this.env.MAIL_OBJECTS.get(row.raw_r2_key);
+		const r2Key = getRawMessageR2Key(this.ctx.storage.sql, messageId);
+		if (!r2Key) return new Response("Not found", { status: 404 });
+		const object = await this.env.MAIL_OBJECTS.get(r2Key);
 		if (!object) return new Response("Not found", { status: 404 });
 		return new Response(object.body, {
 			headers: { "content-type": "message/rfc822" },
@@ -448,266 +815,50 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	}
 
 	private applyMessageAction(messageId: string | undefined, action: string) {
-		if (!messageId) throw new Error("messageId required");
-		const now = new Date().toISOString();
-		if (action === "mark_read") {
-			this.ctx.storage.sql.exec("UPDATE messages SET is_read = 1, updated_at = ? WHERE id = ?", now, messageId);
-		} else if (action === "mark_unread") {
-			this.ctx.storage.sql.exec("UPDATE messages SET is_read = 0, updated_at = ? WHERE id = ?", now, messageId);
-		} else if (action === "archive") {
-			this.ctx.storage.sql.exec("UPDATE messages SET state = 'archive', updated_at = ? WHERE id = ?", now, messageId);
-		} else if (action === "trash") {
-			this.ctx.storage.sql.exec("UPDATE messages SET state = 'trash', updated_at = ? WHERE id = ?", now, messageId);
-		} else if (action === "restore_inbox") {
-			this.ctx.storage.sql.exec("UPDATE messages SET state = 'inbox', updated_at = ? WHERE id = ?", now, messageId);
-		}
-		return { ok: true, messageId, action };
+		return applyMessageAction(this.ctx.storage.sql, messageId, action);
 	}
 
 	private listDrafts() {
-		return this.ctx.storage.sql
-			.exec("SELECT * FROM outbound_drafts ORDER BY updated_at DESC")
-			.toArray();
+		return listDrafts(this.ctx.storage.sql);
 	}
 
 	private createDraft(body: Record<string, unknown>) {
-		const id = crypto.randomUUID();
-		const now = new Date().toISOString();
-		this.ctx.storage.sql.exec(
-			`INSERT INTO outbound_drafts
-       (id, thread_id, to_json, cc_json, bcc_json, subject, body_text, body_html, status, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
-			id,
-			(body.threadId as string | null) ?? null,
-			JSON.stringify(body.to ?? []),
-			JSON.stringify(body.cc ?? []),
-			JSON.stringify(body.bcc ?? []),
-			body.subject,
-			body.bodyText ?? null,
-			body.bodyHtml ?? null,
-			(body.createdBy as string | undefined) ?? "user",
-			now,
-			now,
-		);
-		return { id, status: "draft" };
+		return createDraft(this.ctx.storage.sql, body);
 	}
 
 	private updateDraft(draftId: string | undefined, body: Record<string, unknown>) {
-		if (!draftId) throw new Error("draftId required");
-		const now = new Date().toISOString();
-		const existing = this.ctx.storage.sql
-			.exec("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
-			.toArray()[0];
-		if (!existing) throw new Error("draft not found");
-		this.ctx.storage.sql.exec(
-			`UPDATE outbound_drafts SET
-         to_json = ?, cc_json = ?, bcc_json = ?, subject = ?, body_text = ?, body_html = ?, updated_at = ?
-       WHERE id = ?`,
-			JSON.stringify(body.to ?? JSON.parse(String(existing.to_json))),
-			JSON.stringify(body.cc ?? JSON.parse(String(existing.cc_json))),
-			JSON.stringify(body.bcc ?? JSON.parse(String(existing.bcc_json))),
-			body.subject ?? existing.subject,
-			body.bodyText ?? existing.body_text,
-			body.bodyHtml ?? existing.body_html,
-			now,
-			draftId,
-		);
-		return { id: draftId, status: "draft" };
+		return updateDraft(this.ctx.storage.sql, draftId, body);
 	}
 
 	private requestSendDraft(draftId: string | undefined) {
-		if (!draftId) throw new Error("draftId required");
-		const now = new Date().toISOString();
-		this.ctx.storage.sql.exec(
-			"UPDATE outbound_drafts SET status = 'pending_confirmation', updated_at = ? WHERE id = ?",
-			now,
-			draftId,
-		);
-		return { id: draftId, status: "pending_confirmation" };
+		return requestSendDraft(this.ctx.storage.sql, draftId);
 	}
 
 	private async confirmSendDraft(draftId: string | undefined, idempotencyKey: string): Promise<Record<string, unknown>> {
-		if (!draftId) throw new Error("draftId required");
-		const draft = this.ctx.storage.sql
-			.exec<{
-				to_json: string;
-				cc_json: string;
-				bcc_json: string;
-				subject: string;
-				body_text: string | null;
-				body_html: string | null;
-				status: string;
-			}>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
-			.toArray()[0];
-		if (!draft) throw new Error("draft not found");
-
-		const sentMarker = this.ctx.storage.sql
-			.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", `send:${idempotencyKey}`)
-			.toArray()[0];
-		if (sentMarker) {
-			const marker = readSendMarker(sentMarker.value);
-			return {
-				id: draftId,
-				status: marker.status,
-				sent: false,
-				duplicate: true,
-				providerMessageId: marker.providerMessageId,
-				reason: marker.status === "sending" ? "send_in_progress" : undefined,
-			};
-		}
-		if (draft.status !== "pending_confirmation") {
-			return { id: draftId, status: draft.status, sent: false, reason: "not_pending_confirmation" };
-		}
-
-		const to = JSON.parse(draft.to_json) as string[];
-		const cc = JSON.parse(draft.cc_json) as string[];
-		const bcc = JSON.parse(draft.bcc_json) as string[];
-		const totalRecipients = to.length + cc.length + bcc.length;
-		if (totalRecipients > 50) {
-			return {
-				id: draftId,
-				status: draft.status,
-				sent: false,
-				error: "too_many_recipients",
-				recipientCount: totalRecipients,
-			};
-		}
-
-		const fromAddress = this.env.MAIL_FROM_ADDRESS ?? "noreply@mail.example.com";
-		const now = new Date().toISOString();
-		const sentKey = `send:${idempotencyKey}`;
-		try {
-			this.ctx.storage.sql.exec(
-				"INSERT INTO mailbox_meta (key, value, updated_at) VALUES (?, 'sending', ?)",
-				sentKey,
-				now,
-			);
-		} catch {
-			return { id: draftId, status: "sending", sent: false, duplicate: true };
-		}
-
-		let providerMessageId: string | null = null;
-		try {
-			const providerResult = await this.env.EMAIL.send({
-				from: fromAddress,
-				to,
-				cc: cc.length ? cc : undefined,
-				bcc: bcc.length ? bcc : undefined,
-				subject: draft.subject,
-				text: draft.body_text ?? undefined,
-				html: draft.body_html ?? undefined,
-			});
-			providerMessageId = extractProviderMessageId(providerResult);
-		} catch (error) {
-			this.ctx.storage.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", sentKey);
-			throw error;
-		}
-
-		const messageLocalId = crypto.randomUUID();
-		const threadId = crypto.randomUUID();
-		const rawR2Key = `sent/${draftId}`;
-		const rawSha256 = await sha256Hex(
-			new TextEncoder().encode(
-				JSON.stringify({
-					draftId,
-					idempotencyKey,
-					to,
-					cc,
-					bcc,
-					subject: draft.subject,
-					text: draft.body_text ?? null,
-					html: draft.body_html ?? null,
-				}),
-			),
-		);
-		this.ctx.storage.transactionSync(() => {
-			this.ctx.storage.sql.exec(
-				"UPDATE mailbox_meta SET value = ?, updated_at = ? WHERE key = ?",
-				sentMarkerValue(providerMessageId),
-				now,
-				sentKey,
-			);
-			this.ctx.storage.sql.exec(
-				"UPDATE outbound_drafts SET status = 'sent', updated_at = ? WHERE id = ?",
-				now,
-				draftId,
-			);
-			this.ctx.storage.sql.exec(
-				`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
-         VALUES (?, ?, ?, 1, 0, ?, ?)`,
-				threadId,
-				draft.subject.toLowerCase(),
-				now,
-				now,
-				now,
-			);
-			this.ctx.storage.sql.exec(
-				`INSERT INTO messages
-         (id, idempotency_key, thread_id, direction, state, from_addr, to_json, cc_json, bcc_json, subject, snippet,
-          received_at, raw_r2_key, raw_sha256, raw_size, parse_status, has_attachments, is_read, created_at, updated_at, references_json)
-         VALUES (?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'parsed', 0, 1, ?, ?, '[]')`,
-				messageLocalId,
-				sentKey,
-				threadId,
-				fromAddress,
-				draft.to_json,
-				draft.cc_json,
-				draft.bcc_json,
-				draft.subject,
-				(draft.body_text ?? draft.subject).slice(0, 200),
-				now,
-				rawR2Key,
-				rawSha256,
-				now,
-				now,
-			);
-		});
-
-		recordRealtimeEvent(this.ctx.storage.sql, "message.created", {
-			messageId: messageLocalId,
-			threadId,
-			direction: "outbound",
-		});
-
-		return {
-			id: draftId,
-			status: "sent",
-			sent: true,
-			messageLocalId,
-			threadId,
+		return confirmSendDraft(
+			{
+				sql: this.ctx.storage.sql,
+				transactionSync: (fn) => this.ctx.storage.transactionSync(fn),
+				email: this.env.EMAIL,
+				fromAddress: this.env.MAIL_FROM_ADDRESS ?? "noreply@mail.example.com",
+			},
+			draftId,
 			idempotencyKey,
-			providerMessageId,
-			subject: draft.subject,
-			fromAddr: fromAddress,
-			toJson: draft.to_json,
-			snippet: (draft.body_text ?? draft.subject).slice(0, 200),
-			receivedAt: now,
-			rawR2Key,
-			rawSha256,
-		};
+		);
 	}
 
 	private cancelDraft(draftId: string | undefined) {
-		if (!draftId) throw new Error("draftId required");
-		const now = new Date().toISOString();
-		this.ctx.storage.sql.exec(
-			"UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?",
-			now,
-			draftId,
-		);
-		return { id: draftId, status: "cancelled" };
+		return cancelDraft(this.ctx.storage.sql, draftId);
 	}
 
 	private exportMessageIndex() {
-		return this.ctx.storage.sql
-			.exec(
-				`SELECT id AS message_local_id, thread_id, rfc_message_id, subject, from_addr, to_json, snippet,
-              received_at, has_attachments, state, raw_r2_key, raw_sha256
-         FROM messages ORDER BY received_at ASC`,
-			)
-			.toArray();
+		return exportMessageIndex(this.ctx.storage.sql);
 	}
 
+	// Reserved, currently unused: the `jobs` table (see the comment on its CREATE
+	// TABLE in mailbox-schema-content.ts) has no writers yet, so this always finds
+	// zero pending jobs. Kept wired up (and gated by DO alarm) for the planned
+	// mailbox-local job-queue milestone in docs/IMPLEMENTATION.md.
 	private async runPendingJobs(): Promise<void> {
 		const now = new Date().toISOString();
 		const jobs = this.ctx.storage.sql
@@ -739,12 +890,6 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	}
 
 	private debugState() {
-		const messages = this.ctx.storage.sql
-			.exec(
-				`SELECT id, idempotency_key, raw_r2_key, raw_sha256, subject, thread_id, parse_status, state
-         FROM messages ORDER BY created_at ASC`,
-			)
-			.toArray();
-		return { messageCount: messages.length, messages };
+		return debugState(this.ctx.storage.sql);
 	}
 }

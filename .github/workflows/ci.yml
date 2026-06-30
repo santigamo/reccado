@@ -30,8 +30,25 @@ jobs:
       - name: Typecheck
         run: pnpm run typecheck
 
+      - name: Lint
+        run: pnpm run lint
+
       - name: Test
         run: pnpm test
 
       - name: Build
         run: pnpm run build
+
+      - name: Validate Worker bundle (dry run)
+        run: pnpm exec wrangler deploy --dry-run --outdir .wrangler/dry-run
+
+      - name: Check generated artifacts are up to date
+        # src/routeTree.gen.ts is already regenerated as a side effect of the
+        # Build step above (via the TanStack Start Vite plugin). Re-running
+        # `pnpm generate-routes` (the standalone `tsr` CLI) here would
+        # overwrite it with an incomplete file, since the CLI doesn't apply
+        # the Start-specific SSR register augmentation that the Vite plugin
+        # adds — so only `cf-typegen` needs to run explicitly.
+        run: |
+          pnpm run cf-typegen
+          git diff --exit-code -- worker-configuration.d.ts src/routeTree.gen.ts

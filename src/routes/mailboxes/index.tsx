@@ -28,7 +28,7 @@ function MailboxesPage() {
 	return (
 		<main className="page-wrap px-4 pb-8 pt-14">
 			<section className="island-shell rounded-2xl p-6">
-				<p className="island-kicker mb-2">Inbox MCP</p>
+				<p className="island-kicker mb-2">Reccado</p>
 				<h1 className="mb-4 text-3xl font-bold text-[var(--sea-ink)]">Mailboxes</h1>
 				{error ? <p className="text-red-700">Failed to load mailboxes: {error}</p> : null}
 				<ul className="space-y-3">

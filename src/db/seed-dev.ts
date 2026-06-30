@@ -14,7 +14,24 @@ export async function deriveDevTestMailboxId(): Promise<string> {
 	return deriveMailboxId(DEV_SECRET, "test@example.com");
 }
 
-export async function seedDevData(db: D1Database): Promise<{ mailboxId: string; seeded: boolean }> {
+/**
+ * DEV ONLY. Seeds a deterministic `test@example.com` mailbox (plus a second
+ * multi-domain fixture) into the D1 control plane. This is scaffolding for
+ * local/dev environments and must never run against a production database.
+ *
+ * Safe by default: callers MUST explicitly opt in via `opts.force`. Without
+ * it, this is a no-op that only resolves the deterministic dev mailbox id,
+ * so an accidental/forgotten call site (e.g. left on a production code path)
+ * can't scaffold fake mailbox/domain/alias rows into a real database.
+ */
+export async function seedDevData(
+	db: D1Database,
+	opts: { force?: boolean } = {},
+): Promise<{ mailboxId: string; seeded: boolean }> {
+	if (!opts.force) {
+		return { mailboxId: await deriveDevTestMailboxId(), seeded: false };
+	}
+
 	const existing = await lookupActiveAlias(db, "test@example.com");
 	if (existing) {
 		return { mailboxId: existing.mailbox_id, seeded: false };

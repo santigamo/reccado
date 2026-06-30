@@ -12,5 +12,17 @@ export default defineConfig({
 	],
 	test: {
 		pool: "@cloudflare/vitest-pool-workers",
+		coverage: {
+			provider: "istanbul",
+			reporter: ["text", "html", "lcov"],
+			include: ["src/**"],
+			exclude: [
+				"src/routeTree.gen.ts",
+				"src/env.d.ts",
+				"**/*.test.ts",
+				"**/*.test.tsx",
+				"tests/**",
+			],
+		},
 	},
 });

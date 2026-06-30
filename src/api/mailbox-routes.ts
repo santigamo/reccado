@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { ApiBindings } from "./hono";
 import { assertMailboxAccess } from "./auth";
 import {
+	adminMailboxActionSchema,
 	createDraftSchema,
 	confirmSendSchema,
 	messageActionSchema,
@@ -24,6 +25,15 @@ import { backupManifestR2Key } from "../lib/r2-keys";
 import { outboundSendIdempotencyKey } from "../lib/idempotency";
 import { AppError } from "../lib/errors";
 
+function sanitizeAttachmentFilename(filename: string | null | undefined, attachmentId: string): string {
+	const trimmed = filename?.trim();
+	if (!trimmed) {
+		return attachmentId;
+	}
+	const safe = trimmed.replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
+	return safe || attachmentId;
+}
+
 async function mailboxStub(env: Env, mailboxId: string) {
 	const mailbox = await getMailbox(env.INDEX_DB, mailboxId);
 	if (!mailbox) {
@@ -36,7 +46,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/mailboxes/:mailboxId/threads", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		threadListQuerySchema.parse({
 			limit: c.req.query("limit"),
 			cursor: c.req.query("cursor"),
@@ -52,7 +62,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/mailboxes/:mailboxId/threads/:threadId", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/threads/${c.req.param("threadId")}`);
 	});
@@ -60,7 +70,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/mailboxes/:mailboxId/messages/:messageId", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/messages/${c.req.param("messageId")}`);
 	});
@@ -68,7 +78,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/mailboxes/:mailboxId/messages/:messageId/raw", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/messages/${c.req.param("messageId")}/raw`);
 	});
@@ -78,12 +88,14 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const attachmentId = c.req.param("attachmentId");
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		const messageResponse = await stub.fetch(`https://mailbox-do/messages/${messageId}`);
 		if (!messageResponse.ok) return messageResponse;
 		const payload = (await messageResponse.json()) as {
-			message?: { attachments?: Array<{ id: string; r2_key: string; content_type?: string }> };
+			message?: {
+				attachments?: Array<{ id: string; r2_key: string; content_type?: string; filename?: string | null }>;
+			};
 		};
 		const attachment = payload.message?.attachments?.find((row) => row.id === attachmentId);
 		if (!attachment) {
@@ -93,9 +105,13 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		if (!object) {
 			return c.json({ error: "attachment_missing" }, 404);
 		}
+		const safeFilename = sanitizeAttachmentFilename(attachment.filename, attachmentId);
 		return new Response(object.body, {
 			headers: {
 				"content-type": attachment.content_type ?? "application/octet-stream",
+				"content-disposition": `attachment; filename="${safeFilename}"`,
+				"x-content-type-options": "nosniff",
+				"content-security-policy": "default-src 'none'; sandbox",
 			},
 		});
 	});
@@ -103,7 +119,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.post("/api/mailboxes/:mailboxId/messages/:messageId/actions", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const body = messageActionSchema.parse(await c.req.json());
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/messages/${c.req.param("messageId")}/actions`, {
@@ -116,7 +132,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/mailboxes/:mailboxId/search", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const query = searchQuerySchema.parse({
 			q: c.req.query("q"),
 			limit: c.req.query("limit"),
@@ -132,7 +148,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/mailboxes/:mailboxId/drafts", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch("https://mailbox-do/drafts");
 	});
@@ -140,7 +156,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.post("/api/mailboxes/:mailboxId/drafts", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const body = createDraftSchema.parse(await c.req.json());
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch("https://mailbox-do/drafts", {
@@ -153,7 +169,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.patch("/api/mailboxes/:mailboxId/drafts/:draftId", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const body = updateDraftSchema.parse(await c.req.json());
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}`, {
@@ -166,7 +182,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.post("/api/mailboxes/:mailboxId/drafts/:draftId/request-send", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}/request-send`, {
 			method: "POST",
@@ -176,7 +192,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.post("/api/mailboxes/:mailboxId/drafts/:draftId/confirm-send", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const draftId = c.req.param("draftId");
 		const body = confirmSendSchema.parse(await c.req.json());
 		const stub = await mailboxStub(c.env, mailboxId);
@@ -282,7 +298,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	api.post("/api/mailboxes/:mailboxId/drafts/:draftId/cancel", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}/cancel`, {
 			method: "POST",
@@ -304,7 +320,7 @@ export function registerAdminRoutes(api: Hono<ApiBindings>): void {
 	});
 
 	api.post("/api/admin/reindex", async (c) => {
-		const body = (await c.req.json()) as { mailboxId: string };
+		const body = adminMailboxActionSchema.parse(await c.req.json());
 		const stub = c.env.MAILBOX_DO.getByName(body.mailboxId);
 		const exportResponse = await stub.fetch("https://mailbox-do/export-index");
 		if (!exportResponse.ok) {
@@ -357,10 +373,13 @@ export function registerAdminRoutes(api: Hono<ApiBindings>): void {
 	});
 
 	api.post("/api/admin/backups/run", async (c) => {
-		const body = (await c.req.json()) as { mailboxId: string };
+		const body = adminMailboxActionSchema.parse(await c.req.json());
 		const date = new Date().toISOString().slice(0, 10);
 		const stub = c.env.MAILBOX_DO.getByName(body.mailboxId);
 		const exportResponse = await stub.fetch("https://mailbox-do/export-index");
+		if (!exportResponse.ok) {
+			return c.json({ error: "export_failed" }, 500);
+		}
 		const exported = await exportResponse.json();
 		const key = backupManifestR2Key({ date, mailboxId: body.mailboxId });
 		await c.env.MAIL_OBJECTS.put(key, JSON.stringify(exported, null, 2), {

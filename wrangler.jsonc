@@ -14,6 +14,10 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
+	// Production (default) env should not be reachable on the shared
+	// *.workers.dev subdomain; forkers should front it with their own
+	// route/custom domain instead.
+	"workers_dev": false,
 	"vars": {
 		"MAIL_FROM_ADDRESS": "noreply@mail.example.com"
 	},
@@ -36,20 +40,20 @@
 	"r2_buckets": [
 		{
 			"binding": "MAIL_OBJECTS",
-			"bucket_name": "inbox-mcp-raw-dev"
+			"bucket_name": "inbox-mcp-raw"
 		}
 	],
 	"queues": {
 		"producers": [
 			{
 				"binding": "INBOUND_EMAIL_QUEUE",
-				"queue": "inbox-mcp-inbound-dev"
+				"queue": "inbox-mcp-inbound"
 			}
 		],
 		"consumers": [
 			{
-				"queue": "inbox-mcp-inbound-dev",
-				"dead_letter_queue": "inbox-mcp-inbound-dlq-dev",
+				"queue": "inbox-mcp-inbound",
+				"dead_letter_queue": "inbox-mcp-inbound-dlq",
 				"max_batch_size": 5,
 				"max_batch_timeout": 2,
 				"max_retries": 3
@@ -59,8 +63,11 @@
 	"d1_databases": [
 		{
 			"binding": "INDEX_DB",
-			"database_name": "inbox-mcp-index-dev",
-			"database_id": "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
+			"database_name": "inbox-mcp-index",
+			// Forkers: create your own D1 database (`wrangler d1 create
+			// inbox-mcp-index`) and paste its id here. This is a template
+			// value, not a real database.
+			"database_id": "<your-prod-d1-database-id>",
 			"migrations_dir": "migrations/d1"
 		}
 	],

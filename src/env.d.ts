@@ -6,4 +6,6 @@ declare interface Env {
 	ACCESS_TEAM_DOMAIN?: string;
 	PHASE0_DEBUG_TOKEN?: string;
 	CLOUDFLARE_API_TOKEN?: string;
+	/** Comma-separated allowlist of owner emails permitted to use the API. Unset = open single-operator mode. */
+	ACCESS_ALLOWED_EMAILS?: string;
 }

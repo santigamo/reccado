@@ -119,6 +119,21 @@ For a personal v0, steps 5 through 7 can be replaced by a DO-local `pending_jobs
 an Alarm loop. That keeps infrastructure smaller but moves retry, backoff, poison-message,
 and DLQ behavior into application code.
 
+```mermaid
+flowchart LR
+    sender(("External sender")) -->|SMTP| ER["Email Routing<br/>Worker: email handler"]
+    ER -->|raw MIME bytes| R2[("R2<br/>raw MIME + attachments")]
+    ER -->|metadata only, under 128 KiB| Q["Queue<br/>inbound-email"]
+    Q -->|terminal failures| DLQ[("Dead Letter Queue")]
+    Q --> DO["Mailbox Durable Object<br/>SQLite: messages · threads · FTS"]
+    R2 -. fetch raw MIME to parse .-> DO
+    DO -->|cross-mailbox index| D1[("D1<br/>domains · aliases · message_index")]
+    DO -->|realtime push| WS["Hibernatable WebSocket"]
+    API["Hono API Worker"] --> DO
+    UI["TanStack Start UI"] -->|HTTP| API
+    UI <-->|live updates| WS
+```
+
 ## Outbound Email Flow
 
 1. A user or authorized MCP/agent action creates a draft.

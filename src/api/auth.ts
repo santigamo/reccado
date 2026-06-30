@@ -126,6 +126,41 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 	}
 }
 
+function parseAllowedEmails(env: Env): string[] | null {
+	const raw = env.ACCESS_ALLOWED_EMAILS;
+	if (!raw || !raw.trim()) {
+		return null;
+	}
+	const emails = raw
+		.split(",")
+		.map((email) => email.trim().toLowerCase())
+		.filter((email) => email.length > 0);
+	return emails.length > 0 ? emails : null;
+}
+
+let warnedOpenAccess = false;
+
+function warnOpenAccessOnce(): void {
+	if (warnedOpenAccess) {
+		return;
+	}
+	warnedOpenAccess = true;
+	console.warn(
+		"auth.open_access: ACCESS_ALLOWED_EMAILS is not set; every authenticated Access identity is treated as the single operator. Set ACCESS_ALLOWED_EMAILS to a comma-separated owner allowlist to restrict access.",
+	);
+}
+
+function isAllowedOwner(auth: AuthContext, env: Env): boolean {
+	const allowed = parseAllowedEmails(env);
+	if (!allowed) {
+		// Single-user private inbox v0: no allowlist configured, so any authenticated Access
+		// identity may access all mailboxes (open single-operator mode).
+		warnOpenAccessOnce();
+		return true;
+	}
+	return allowed.includes(auth.email.trim().toLowerCase());
+}
+
 export async function requireAuth(request: Request, env: Env): Promise<AuthContext> {
 	const auth = await getAuthContext(request, env);
 	if (!auth) {
@@ -134,9 +169,27 @@ export async function requireAuth(request: Request, env: Env): Promise<AuthConte
 			headers: { "content-type": "application/json" },
 		});
 	}
+	const allowed = parseAllowedEmails(env);
+	if (allowed) {
+		if (!allowed.includes(auth.email.trim().toLowerCase())) {
+			throw new Response(JSON.stringify({ error: "forbidden" }), {
+				status: 403,
+				headers: { "content-type": "application/json" },
+			});
+		}
+	} else {
+		warnOpenAccessOnce();
+	}
 	return auth;
 }
 
-export function assertMailboxAccess(_auth: AuthContext, _mailboxId: string): void {
-	// Single-user private inbox v0: any authenticated Access user may access all mailboxes.
+// TODO: per-mailbox ACL — today every allowed owner can access every mailbox; there is no
+// per-mailbox ownership table yet, so this only enforces the global owner allowlist.
+export function assertMailboxAccess(auth: AuthContext, _mailboxId: string, env: Env): void {
+	if (!isAllowedOwner(auth, env)) {
+		throw new Response(JSON.stringify({ error: "forbidden" }), {
+			status: 403,
+			headers: { "content-type": "application/json" },
+		});
+	}
 }

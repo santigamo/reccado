@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { ZodError } from "zod";
 import { assertMailboxAccess, getAuthContext, requireAuth } from "./auth";
 import {
 	createAliasSchema,
@@ -32,6 +33,29 @@ export type ApiBindings = {
 
 export function createApiApp(): Hono<ApiBindings> {
 	const api = new Hono<ApiBindings>();
+
+	// Baseline security headers on every response from this app.
+	api.use("*", async (c, next) => {
+		await next();
+		c.res.headers.set("X-Content-Type-Options", "nosniff");
+		c.res.headers.set("X-Frame-Options", "DENY");
+		c.res.headers.set("Referrer-Policy", "no-referrer");
+	});
+
+	// Lightweight CSRF defense for state-changing requests: an Origin header that doesn't
+	// match this request's own host is rejected. Requests without an Origin header (curl,
+	// tests, server-to-server calls) are not affected.
+	api.use("/api/*", async (c, next) => {
+		const method = c.req.method.toUpperCase();
+		const isStateChanging = method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+		if (isStateChanging && c.req.path !== "/api/health") {
+			const origin = c.req.header("Origin");
+			if (origin && origin !== new URL(c.req.url).origin) {
+				return c.json({ error: "origin_mismatch" }, 403);
+			}
+		}
+		return next();
+	});
 
 	api.use("/api/*", async (c, next) => {
 		if (c.req.path === "/api/health" || c.req.path.startsWith("/api/debug/")) {
@@ -82,7 +106,7 @@ export function createApiApp(): Hono<ApiBindings> {
 	api.get("/api/mailboxes/:mailboxId", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId);
+		assertMailboxAccess(auth, mailboxId, c.env);
 		const mailbox = await getMailbox(c.env.INDEX_DB, mailboxId);
 		if (!mailbox) {
 			return c.json({ error: "mailbox_not_found" }, 404);
@@ -210,6 +234,9 @@ export function createApiApp(): Hono<ApiBindings> {
 	registerAdminRoutes(api);
 
 	api.onError((error, c) => {
+		if (error instanceof ZodError) {
+			return c.json({ error: "validation_error", issues: error.flatten() }, 400);
+		}
 		if (error instanceof AppError) {
 			return c.json({ error: error.code, message: error.message }, error.status as 400);
 		}

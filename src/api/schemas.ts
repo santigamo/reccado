@@ -58,3 +58,7 @@ export const threadListQuerySchema = z.object({
 	q: z.string().optional(),
 	label: z.string().optional(),
 });
+
+export const adminMailboxActionSchema = z.object({
+	mailboxId: z.string().min(1),
+});

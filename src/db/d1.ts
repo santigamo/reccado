@@ -425,6 +425,25 @@ export async function getOutboundSendByIdempotency(
 		.first<OutboundSendRow>();
 }
 
+// Outbound sends move pending_confirmation -> sending -> {sent | failed} as the
+// confirm-send saga progresses (see mailbox-routes.ts). If the worker crashes or
+// the DO call never returns between the "sending" write and the terminal write,
+// the row is stuck at status="sending" forever. This finds those for a cron sweep
+// to reconcile; see reconcileStaleOutboundSends in cloudflare/scheduled.ts.
+export async function listStaleSendingOutboundSends(
+	db: D1Database,
+	olderThanIso: string,
+	limit = 50,
+): Promise<OutboundSendRow[]> {
+	const result = await db
+		.prepare(
+			"SELECT * FROM outbound_sends WHERE status = 'sending' AND updated_at < ? ORDER BY updated_at ASC LIMIT ?",
+		)
+		.bind(olderThanIso, limit)
+		.all<OutboundSendRow>();
+	return result.results ?? [];
+}
+
 export async function updateOutboundSendStatus(
 	db: D1Database,
 	input: {

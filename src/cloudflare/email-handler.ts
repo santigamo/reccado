@@ -4,22 +4,41 @@ import { readHeader, readReferences, normalizeMessageId } from "../lib/email-met
 import { inboundIdempotencyKey } from "../lib/idempotency";
 import { rawEmailR2Key } from "../lib/r2-keys";
 import { resolveRoutingForRecipient, insertOpsEvent } from "../db/d1";
-import { seedDevData } from "../db/seed-dev";
 
 const MAX_QUEUE_BYTES = 128 * 1024;
+// Hard cap on inbound MIME size, enforced before the raw body is read/parsed, to bound
+// memory and CPU usage on outsized or abusive messages.
+const MAX_EMAIL_BYTES = 25 * 1024 * 1024;
 
 export async function handleEmail(
 	message: ForwardableEmailMessage,
 	env: Env,
 	_ctx: ExecutionContext,
 ): Promise<void> {
-	await seedDevData(env.INDEX_DB);
+	const recipient = message.to.trim().toLowerCase();
+	const sender = message.from.trim().toLowerCase();
+
+	if (message.rawSize > MAX_EMAIL_BYTES) {
+		await insertOpsEvent(env.INDEX_DB, {
+			id: crypto.randomUUID(),
+			event_type: "inbound.rejected",
+			severity: "info",
+			subject: recipient,
+			payload_json: JSON.stringify({
+				reason: "email_too_large",
+				recipient,
+				rawSize: message.rawSize,
+				maxBytes: MAX_EMAIL_BYTES,
+			}),
+		});
+		message.setReject("Message too large");
+		console.log("email.rejected", { recipient, reason: "email_too_large", rawSize: message.rawSize });
+		return;
+	}
 
 	const rawBytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
 	const rawSha256 = await sha256Hex(rawBytes);
 	const receivedAt = new Date();
-	const recipient = message.to.trim().toLowerCase();
-	const sender = message.from.trim().toLowerCase();
 	const domain = recipient.split("@")[1] ?? "";
 
 	const routing = await resolveRoutingForRecipient(env.INDEX_DB, recipient);

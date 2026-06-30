@@ -1,21 +1,8 @@
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "./types";
+import { inboundEmailQueueMessageSchema } from "./types";
 import { insertOpsEvent, upsertIngestEvent, upsertMessageIndex } from "../db/d1";
 
 const MAX_RETRIES = 3;
-
-function isInboundEmailQueueMessage(value: unknown): value is InboundEmailQueueMessage {
-	const candidate = value as Partial<InboundEmailQueueMessage> | null;
-	return (
-		typeof candidate === "object" &&
-		candidate !== null &&
-		candidate.schemaVersion === 1 &&
-		candidate.eventType === "email.received.v1" &&
-		typeof candidate.mailboxId === "string" &&
-		typeof candidate.rawR2Key === "string" &&
-		typeof candidate.rawSha256 === "string" &&
-		typeof candidate.idempotencyKey === "string"
-	);
-}
 
 export async function handleInboundQueue(
 	batch: MessageBatch<InboundEmailQueueMessage>,
@@ -24,18 +11,23 @@ export async function handleInboundQueue(
 ): Promise<void> {
 	for (const message of batch.messages) {
 		try {
-			const body = message.body;
-			if (!isInboundEmailQueueMessage(body)) {
+			const parseResult = inboundEmailQueueMessageSchema.safeParse(message.body);
+			if (!parseResult.success) {
 				await insertOpsEvent(env.INDEX_DB, {
 					id: crypto.randomUUID(),
 					event_type: "queue.poison_schema",
 					severity: "error",
 					subject: message.id,
-					payload_json: JSON.stringify({ body, attempts: message.attempts }),
+					payload_json: JSON.stringify({
+						body: message.body,
+						attempts: message.attempts,
+						issues: parseResult.error.flatten(),
+					}),
 				});
 				message.retry({ delaySeconds: 2 });
 				continue;
 			}
+			const body = parseResult.data;
 
 			const rawObject = await env.MAIL_OBJECTS.head(body.rawR2Key);
 			if (!rawObject) {
