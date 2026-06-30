@@ -141,18 +141,18 @@ pnpm smoke:ws ws://localhost:3000/api/mailboxes/mbx_test/ws   # WebSocket hello/
 
 ## Deploy your own
 
-The repo ships with placeholder identity so it's safe to fork. It deploys two named environments:
-the default (`reccado`, for production) and `dev` (`reccado-dev`). Replace every `example.com` /
-`mail.example.com` reference and every Cloudflare ID below with your own before going further than
-local dev. Full step-by-step detail (including command-level acceptance criteria) lives in
-[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/santigamo/reccado)
 
-> **One-click deploy:** the [Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/santigamo/reccado)
-> button forks the repo, builds it, and provisions the R2 bucket, D1 database and queues for you. You
-> still need to set the secrets (step 3), enable Email Routing (step 4) and put Cloudflare Access in
-> front (step 5) — the steps below cover both the one-click and the fully-manual path.
+The one-click button forks the repo, **provisions the R2 bucket, D1 database, queues and Durable
+Object** from `wrangler.jsonc`, prompts you for the secrets, and deploys the Worker. The numbered
+steps below are the equivalent CLI path — and whichever route you take, **steps 4–5 (Email Routing
+and Cloudflare Access) are domain-level setup you wire once**, since they live outside the Worker.
 
-### 1. Create the Cloudflare resources
+The repo ships with placeholder identity so it's safe to fork: replace every `example.com` /
+`mail.example.com` reference and the placeholder Cloudflare IDs with your own. Full command-level
+detail lives in [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+
+### 1. Create the Cloudflare resources <sub>(the one-click button provisions these for you)</sub>
 
 ```bash
 pnpm wrangler r2 bucket create <your-raw-mail-bucket>
@@ -179,7 +179,7 @@ maintainer's D1 database names (`inbox-mcp-index-dev` / `inbox-mcp-index`) direc
 script commands to your own database names after step 1, or run the underlying
 `wrangler d1 migrations apply` command directly.
 
-### 3. Set secrets
+### 3. Set secrets <sub>(the one-click setup page prompts for these)</sub>
 
 Every secret name below is documented in [`.dev.vars.example`](.dev.vars.example) for local dev.
 For a deployed environment, set each with `wrangler secret put`:
@@ -215,7 +215,7 @@ allow policy for your email (or identity provider group), and capture the applic
 Optionally set `ACCESS_ALLOWED_EMAILS` as a second, app-level allowlist on top of Access. See
 [`SECURITY.md`](SECURITY.md) for the full auth model.
 
-### 6. Deploy
+### 6. Deploy <sub>(done by the one-click button)</sub>
 
 ```bash
 pnpm run deploy:dev   # build + wrangler deploy --env dev --name reccado-dev
