@@ -13,6 +13,10 @@
 [![Built with Hono](https://img.shields.io/badge/built%20with-Hono-E36002?logo=hono&logoColor=white)](https://hono.dev)
 [![Status: Phase 1 complete](https://img.shields.io/badge/status-Phase%201%20complete-F38020)](CHANGELOG.md)
 
+<br>
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/santigamo/reccado)
+
 </div>
 
 ---
@@ -142,6 +146,11 @@ the default (`reccado`, for production) and `dev` (`reccado-dev`). Replace every
 `mail.example.com` reference and every Cloudflare ID below with your own before going further than
 local dev. Full step-by-step detail (including command-level acceptance criteria) lives in
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+
+> **One-click deploy:** the [Deploy to Cloudflare](https://deploy.workers.cloudflare.com/?url=https://github.com/santigamo/reccado)
+> button forks the repo, builds it, and provisions the R2 bucket, D1 database and queues for you. You
+> still need to set the secrets (step 3), enable Email Routing (step 4) and put Cloudflare Access in
+> front (step 5) — the steps below cover both the one-click and the fully-manual path.
 
 ### 1. Create the Cloudflare resources
 
