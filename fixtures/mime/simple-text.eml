@@ -1,0 +1,8 @@
+From: Sender Example <sender@example.com>
+To: Test Inbox <test@example.com>
+Subject: Phase 0.3 smoke
+Message-ID: <phase-0.3-smoke@example.com>
+Date: Tue, 30 Jun 2026 14:00:00 +0000
+
+This is a small plain text fixture for the Phase 0.3 ingest smoke.
+

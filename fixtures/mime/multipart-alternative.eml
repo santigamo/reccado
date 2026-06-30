@@ -1,0 +1,19 @@
+From: Sender Example <sender@example.com>
+To: Test Inbox <test@example.com>
+Subject: Multipart alternative
+Message-ID: <multipart-alternative-fixture@example.com>
+Date: Tue, 30 Jun 2026 14:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="boundary-alt"
+
+--boundary-alt
+Content-Type: text/plain; charset=utf-8
+
+Plain part of multipart alternative.
+
+--boundary-alt
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>HTML part of multipart alternative.</p></body></html>
+
+--boundary-alt--

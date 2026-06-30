@@ -1,0 +1,7 @@
+From: Sender Example <sender@example.com>
+To: Test Inbox <test@example.com>
+Subject: Duplicate Message-ID B
+Message-ID: <duplicate-shared-id@example.com>
+Date: Tue, 30 Jun 2026 14:01:00 +0000
+
+Second body with same Message-ID but different content.

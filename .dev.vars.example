@@ -1,0 +1,16 @@
+# Local-only example values. Do not commit real secrets in `.dev.vars`.
+
+# Optional Phase 0 debug endpoint token.
+PHASE0_DEBUG_TOKEN=replace-with-local-debug-token
+
+# Stable mailbox ID derivation secret for Phase 1.3+.
+# Use this exact value locally so dev seed and smokes match (see scripts/seed-dev-d1.ts).
+MAILBOX_ID_SECRET=dev-mailbox-id-secret-v1
+
+# Cloudflare API token for admin provisioning workflows.
+# Minimum intended scope: zone read, email routing write for test zones, and Access app/policy write only when configuring Access by API.
+CLOUDFLARE_API_TOKEN=replace-with-least-privilege-token
+
+# Cloudflare Access validation settings for protected UI/API.
+ACCESS_JWT_AUDIENCE=replace-with-access-aud-tag
+ACCESS_TEAM_DOMAIN=https://replace-team.cloudflareaccess.com

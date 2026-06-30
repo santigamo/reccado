@@ -1,0 +1,8 @@
+From: Cloudflare Smoke <smoke@mail.example.com>
+To: Test Inbox <test@example.com>
+Subject: Phase 0.3 Cloudflare routing smoke
+Message-ID: <phase-0.3-cloudflare-routing@example.com>
+Date: Tue, 30 Jun 2026 14:58:00 +0000
+
+This fixture is sent through Cloudflare Email Sending to exercise Email Routing into the dev Worker.
+

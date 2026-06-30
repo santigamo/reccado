@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@600;700;800&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1440px; height: 617px; }
+  .banner {
+    position: relative;
+    width: 1440px;
+    height: 617px;
+    overflow: hidden;
+    background:
+      radial-gradient(820px 620px at 72% 50%, rgba(243,128,32,0.30), rgba(243,128,32,0.10) 38%, rgba(12,10,9,0) 66%),
+      radial-gradient(1100px 900px at 100% 120%, rgba(226,64,15,0.22), rgba(12,10,9,0) 60%),
+      #0C0A09;
+    font-family: 'Poppins', 'Futura', 'Avenir Next', 'Helvetica Neue', Arial, sans-serif;
+  }
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.020) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.020) 1px, transparent 1px);
+    background-size: 46px 46px;
+    mask-image: radial-gradient(900px 600px at 60% 50%, #000 30%, transparent 75%);
+    -webkit-mask-image: radial-gradient(900px 600px at 60% 50%, #000 30%, transparent 75%);
+  }
+  .word { position: absolute; left: 110px; top: 50%; transform: translateY(-50%); }
+  .mark {
+    font-weight: 800;
+    font-size: 116px;
+    letter-spacing: 1px;
+    line-height: 1;
+    color: #ffffff;
+    text-shadow: 0 2px 40px rgba(243,128,32,0.25);
+  }
+  .rule {
+    margin-top: 24px;
+    height: 4px; width: 120px;
+    border-radius: 4px;
+    background: linear-gradient(90deg, #FBAD41, #F38020 55%, #E2400F);
+    box-shadow: 0 0 26px rgba(243,128,32,0.6);
+  }
+  .stack { position: absolute; right: 130px; top: 50%; width: 520px; height: 420px; transform: translateY(-50%); }
+  .env {
+    position: absolute;
+    width: 360px; height: 240px;
+    border-radius: 26px;
+    border: 1.6px solid rgba(255,255,255,0.22);
+    box-shadow:
+      0 40px 90px rgba(243,128,32,0.30),
+      inset 0 2px 1px rgba(255,255,255,0.40),
+      inset 0 -34px 60px rgba(226,64,15,0.22);
+  }
+  .env svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .flap { fill: none; stroke: rgba(255,255,255,0.42); stroke-width: 2.2; }
+  .flapfill { fill: rgba(255,255,255,0.07); }
+  .glint { fill: rgba(255,255,255,0.55); }
+  .env.back { right: 18px; top: 0; transform: scale(0.86) rotate(-9deg);
+    background: linear-gradient(135deg, rgba(251,173,65,0.34), rgba(243,128,32,0.26) 50%, rgba(226,64,15,0.24));
+    opacity: 0.7; filter: blur(0.4px); }
+  .env.mid { right: 96px; top: 92px; transform: scale(0.94) rotate(-3deg);
+    background: linear-gradient(135deg, rgba(251,173,65,0.46), rgba(243,128,32,0.34) 50%, rgba(226,64,15,0.30));
+    opacity: 0.9; }
+  .env.front { right: 70px; top: 176px; transform: rotate(4deg);
+    background: linear-gradient(135deg, rgba(251,173,65,0.62), rgba(243,128,32,0.46) 48%, rgba(226,64,15,0.40)); }
+  .halo { position: absolute; right: 130px; top: 50%; width: 560px; height: 460px; transform: translateY(-50%);
+    background: radial-gradient(closest-side, rgba(243,128,32,0.30), rgba(243,128,32,0) 70%); filter: blur(8px); }
+  .spark { position:absolute; border-radius:50%; background:#FBAD41; box-shadow:0 0 12px 2px rgba(251,173,65,.8); }
+</style>
+</head>
+<body>
+  <div class="banner">
+    <div class="grid"></div>
+    <div class="halo"></div>
+    <div class="stack">
+      <div class="env back"><svg viewBox="0 0 360 240" preserveAspectRatio="none"><path class="flapfill" d="M0,0 L360,0 L180,150 Z"/><path class="flap" d="M2,14 L180,150 L358,14"/></svg></div>
+      <div class="env mid"><svg viewBox="0 0 360 240" preserveAspectRatio="none"><path class="flapfill" d="M0,0 L360,0 L180,150 Z"/><path class="flap" d="M2,14 L180,150 L358,14"/><circle class="glint" cx="40" cy="36" r="3"/></svg></div>
+      <div class="env front"><svg viewBox="0 0 360 240" preserveAspectRatio="none"><path class="flapfill" d="M0,0 L360,0 L180,150 Z"/><path class="flap" d="M2,14 L180,150 L358,14"/><circle class="glint" cx="44" cy="40" r="3.4"/></svg></div>
+    </div>
+    <span class="spark" style="right:140px; top:120px; width:7px; height:7px;"></span>
+    <span class="spark" style="right:560px; top:430px; width:5px; height:5px;"></span>
+    <span class="spark" style="right:96px; top:470px; width:6px; height:6px; opacity:.8;"></span>
+    <div class="word">
+      <div class="mark">RECCADO</div>
+      <div class="rule"></div>
+    </div>
+  </div>
+</body>
+</html>

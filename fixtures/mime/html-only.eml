@@ -1,0 +1,8 @@
+From: Sender Example <sender@example.com>
+To: Test Inbox <test@example.com>
+Subject: HTML only fixture
+Message-ID: <html-only-fixture@example.com>
+Date: Tue, 30 Jun 2026 14:00:00 +0000
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>HTML body only</p></body></html>
