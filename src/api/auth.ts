@@ -24,14 +24,24 @@ function decodeBase64Url(input: string): Uint8Array {
 	return Uint8Array.from(binary, (c) => c.charCodeAt(0));
 }
 
-function parseJwt(token: string): { header: Record<string, unknown>; payload: AccessJwtPayload; signature: Uint8Array; signed: Uint8Array } {
+function parseJwt(token: string): {
+	header: Record<string, unknown>;
+	payload: AccessJwtPayload;
+	signature: Uint8Array;
+	signed: Uint8Array;
+} {
 	const parts = token.split(".");
 	if (parts.length !== 3) {
 		throw new Error("Invalid JWT");
 	}
 	const [headerPart, payloadPart, signaturePart] = parts as [string, string, string];
-	const header = JSON.parse(new TextDecoder().decode(decodeBase64Url(headerPart))) as Record<string, unknown>;
-	const payload = JSON.parse(new TextDecoder().decode(decodeBase64Url(payloadPart))) as AccessJwtPayload;
+	const header = JSON.parse(new TextDecoder().decode(decodeBase64Url(headerPart))) as Record<
+		string,
+		unknown
+	>;
+	const payload = JSON.parse(
+		new TextDecoder().decode(decodeBase64Url(payloadPart)),
+	) as AccessJwtPayload;
 	return {
 		header,
 		payload,
@@ -134,7 +144,7 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 
 function parseAllowedEmails(env: Env): string[] | null {
 	const raw = env.ACCESS_ALLOWED_EMAILS;
-	if (!raw || !raw.trim()) {
+	if (!raw?.trim()) {
 		return null;
 	}
 	const emails = raw

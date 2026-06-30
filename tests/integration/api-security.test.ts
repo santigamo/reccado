@@ -1,16 +1,20 @@
-import { env } from "cloudflare:workers";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
-import worker from "#/server";
-import { sha256Hex } from "#/lib/crypto";
-import { rawEmailR2Key } from "#/lib/r2-keys";
-import { inboundIdempotencyKey } from "#/lib/idempotency";
 import type { InboundEmailQueueMessage } from "#/cloudflare/types";
+import { sha256Hex } from "#/lib/crypto";
+import { inboundIdempotencyKey } from "#/lib/idempotency";
+import { rawEmailR2Key } from "#/lib/r2-keys";
+import worker from "#/server";
+import attachmentSmallEml from "../../fixtures/mime/attachment-small.eml?raw";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
-import attachmentSmallEml from "../../fixtures/mime/attachment-small.eml?raw";
 
-type TestEnv = Env & { INDEX_DB: D1Database; MAIL_OBJECTS: R2Bucket; MAILBOX_DO: DurableObjectNamespace };
+type TestEnv = Env & {
+	INDEX_DB: D1Database;
+	MAIL_OBJECTS: R2Bucket;
+	MAILBOX_DO: DurableObjectNamespace;
+};
 
 const testEnv = env as unknown as TestEnv;
 
@@ -73,7 +77,9 @@ describe("malformed/invalid request bodies", () => {
 describe("phase0 debug routes fail closed", () => {
 	it("returns 404 for the mailbox debug route when PHASE0_DEBUG_TOKEN is not configured", async () => {
 		expect(testEnv.PHASE0_DEBUG_TOKEN).toBeUndefined();
-		const response = await fetchWorker(new Request("http://localhost/api/debug/phase0/mailboxes/mbx_anything"));
+		const response = await fetchWorker(
+			new Request("http://localhost/api/debug/phase0/mailboxes/mbx_anything"),
+		);
 		expect(response.status).toBe(404);
 	});
 
@@ -87,7 +93,9 @@ describe("phase0 debug routes fail closed", () => {
 	});
 
 	it("returns 404 for the r2/head debug route when no token is configured", async () => {
-		const response = await fetchWorker(new Request("http://localhost/api/debug/phase0/r2/head?key=anything"));
+		const response = await fetchWorker(
+			new Request("http://localhost/api/debug/phase0/r2/head?key=anything"),
+		);
 		expect(response.status).toBe(404);
 	});
 });
@@ -151,7 +159,14 @@ describe("attachment download route", () => {
 		await testEnv.INDEX_DB.prepare(
 			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
 		)
-			.bind(mailboxId, "attachment-route@example.com", null, "active", new Date().toISOString(), new Date().toISOString())
+			.bind(
+				mailboxId,
+				"attachment-route@example.com",
+				null,
+				"active",
+				new Date().toISOString(),
+				new Date().toISOString(),
+			)
 			.run();
 
 		const rawBytes = new TextEncoder().encode(attachmentSmallEml as string);
@@ -178,11 +193,14 @@ describe("attachment download route", () => {
 			routing: { ruleId: null, action: "store", matchedAlias: "test@example.com" },
 			idempotencyKey: inboundIdempotencyKey({ mailboxId, messageId, rawSha256 }),
 		};
-		const ingestResponse = await testEnv.MAILBOX_DO.getByName(mailboxId).fetch("https://mailbox-do/ingest", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(queueMessage),
-		});
+		const ingestResponse = await testEnv.MAILBOX_DO.getByName(mailboxId).fetch(
+			"https://mailbox-do/ingest",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(queueMessage),
+			},
+		);
 		const ingestResult = (await ingestResponse.json()) as { messageLocalId: string };
 
 		// Fetch the message metadata straight from the DO (not through
@@ -206,7 +224,9 @@ describe("attachment download route", () => {
 			),
 		);
 		expect(attachmentResponse.status).toBe(200);
-		expect(attachmentResponse.headers.get("content-disposition")).toBe('attachment; filename="note.txt"');
+		expect(attachmentResponse.headers.get("content-disposition")).toBe(
+			'attachment; filename="note.txt"',
+		);
 		expect(attachmentResponse.headers.get("x-content-type-options")).toBe("nosniff");
 		const csp = attachmentResponse.headers.get("content-security-policy");
 		expect(csp).toContain("sandbox");
@@ -220,7 +240,14 @@ describe("attachment download route", () => {
 		await testEnv.INDEX_DB.prepare(
 			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
 		)
-			.bind(mailboxId, "attachment-missing@example.com", null, "active", new Date().toISOString(), new Date().toISOString())
+			.bind(
+				mailboxId,
+				"attachment-missing@example.com",
+				null,
+				"active",
+				new Date().toISOString(),
+				new Date().toISOString(),
+			)
 			.run();
 
 		const rawBytes = new TextEncoder().encode(attachmentSmallEml as string);
@@ -246,11 +273,14 @@ describe("attachment download route", () => {
 			routing: { ruleId: null, action: "store", matchedAlias: "test@example.com" },
 			idempotencyKey: inboundIdempotencyKey({ mailboxId, messageId, rawSha256 }),
 		};
-		const ingestResponse = await testEnv.MAILBOX_DO.getByName(mailboxId).fetch("https://mailbox-do/ingest", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(queueMessage),
-		});
+		const ingestResponse = await testEnv.MAILBOX_DO.getByName(mailboxId).fetch(
+			"https://mailbox-do/ingest",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(queueMessage),
+			},
+		);
 		const ingestResult = (await ingestResponse.json()) as { messageLocalId: string };
 
 		const response = await fetchWorker(
@@ -276,7 +306,14 @@ describe("DO-proxied routes vs. the global security-header middleware", () => {
 		await testEnv.INDEX_DB.prepare(
 			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
 		)
-			.bind(mailboxId, "do-proxy-bug@example.com", null, "active", new Date().toISOString(), new Date().toISOString())
+			.bind(
+				mailboxId,
+				"do-proxy-bug@example.com",
+				null,
+				"active",
+				new Date().toISOString(),
+				new Date().toISOString(),
+			)
 			.run();
 
 		const rawBytes = new TextEncoder().encode(attachmentSmallEml as string);
@@ -302,15 +339,20 @@ describe("DO-proxied routes vs. the global security-header middleware", () => {
 			routing: { ruleId: null, action: "store", matchedAlias: "test@example.com" },
 			idempotencyKey: inboundIdempotencyKey({ mailboxId, messageId, rawSha256 }),
 		};
-		const ingestResponse = await testEnv.MAILBOX_DO.getByName(mailboxId).fetch("https://mailbox-do/ingest", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(queueMessage),
-		});
+		const ingestResponse = await testEnv.MAILBOX_DO.getByName(mailboxId).fetch(
+			"https://mailbox-do/ingest",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(queueMessage),
+			},
+		);
 		const ingestResult = (await ingestResponse.json()) as { messageLocalId: string };
 
 		const response = await fetchWorker(
-			new Request(`http://localhost/api/mailboxes/${mailboxId}/messages/${ingestResult.messageLocalId}`),
+			new Request(
+				`http://localhost/api/mailboxes/${mailboxId}/messages/${ingestResult.messageLocalId}`,
+			),
 		);
 		expect(response.status).toBe(200);
 		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
@@ -323,10 +365,19 @@ describe("DO-proxied routes vs. the global security-header middleware", () => {
 		await testEnv.INDEX_DB.prepare(
 			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
 		)
-			.bind(mailboxId, "do-proxy-bug-threads@example.com", null, "active", new Date().toISOString(), new Date().toISOString())
+			.bind(
+				mailboxId,
+				"do-proxy-bug-threads@example.com",
+				null,
+				"active",
+				new Date().toISOString(),
+				new Date().toISOString(),
+			)
 			.run();
 
-		const response = await fetchWorker(new Request(`http://localhost/api/mailboxes/${mailboxId}/threads`));
+		const response = await fetchWorker(
+			new Request(`http://localhost/api/mailboxes/${mailboxId}/threads`),
+		);
 		expect(response.status).toBe(200);
 		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
 	});

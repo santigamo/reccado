@@ -6,7 +6,13 @@ const secret = process.env.MAILBOX_ID_SECRET ?? "dev-mailbox-id-secret-v1";
 process.env.MAILBOX_ID_SECRET = secret;
 
 const mailboxId = await deriveDevTestMailboxId();
-console.log(JSON.stringify({ mailboxId, secretUsed: secret === "dev-mailbox-id-secret-v1" ? "default-dev" : "env" }, null, 2));
+console.log(
+	JSON.stringify(
+		{ mailboxId, secretUsed: secret === "dev-mailbox-id-secret-v1" ? "default-dev" : "env" },
+		null,
+		2,
+	),
+);
 
 if (process.argv.includes("--sql")) {
 	const now = new Date().toISOString();

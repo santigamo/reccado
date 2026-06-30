@@ -1,15 +1,8 @@
 import { Hono } from "hono";
 import { ZodError } from "zod";
-import { assertMailboxAccess, getAuthContext, requireAuth } from "./auth";
 import {
-	createAliasSchema,
-	createDomainSchema,
-	createMailboxSchema,
-	createRoutingRuleSchema,
-} from "./schemas";
-import {
-	getDomainByName,
 	getDomainById,
+	getDomainByName,
 	getMailbox,
 	insertAlias,
 	insertDomain,
@@ -22,7 +15,14 @@ import {
 } from "../db/d1";
 import { AppError } from "../lib/errors";
 import { mailboxIdFromPrimaryAddress } from "../lib/mailbox-id";
+import { assertMailboxAccess, type getAuthContext, requireAuth } from "./auth";
 import { registerAdminRoutes, registerMailboxRoutes } from "./mailbox-routes";
+import {
+	createAliasSchema,
+	createDomainSchema,
+	createMailboxSchema,
+	createRoutingRuleSchema,
+} from "./schemas";
 
 export type ApiBindings = {
 	Bindings: Env;
@@ -59,7 +59,8 @@ export function createApiApp(): Hono<ApiBindings> {
 	// tests, server-to-server calls) are not affected.
 	api.use("/api/*", async (c, next) => {
 		const method = c.req.method.toUpperCase();
-		const isStateChanging = method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+		const isStateChanging =
+			method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
 		if (isStateChanging && c.req.path !== "/api/health") {
 			const origin = c.req.header("Origin");
 			if (origin && origin !== new URL(c.req.url).origin) {
@@ -160,11 +161,13 @@ export function createApiApp(): Hono<ApiBindings> {
 				cloudflare: { configured: false, reason: "CLOUDFLARE_API_TOKEN not set" },
 			});
 		}
-		const response = await fetch(
-			`https://api.cloudflare.com/client/v4/zones/${domain.zone_id}`,
-			{ headers: { Authorization: `Bearer ${token}` } },
-		);
-		const payload = (await response.json()) as { success?: boolean; result?: { status?: string; name?: string } };
+		const response = await fetch(`https://api.cloudflare.com/client/v4/zones/${domain.zone_id}`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		const payload = (await response.json()) as {
+			success?: boolean;
+			result?: { status?: string; name?: string };
+		};
 		return c.json({
 			domain,
 			cloudflare: {
@@ -225,7 +228,11 @@ export function createApiApp(): Hono<ApiBindings> {
 			}
 		}
 		if (body.action === "forward" && !body.forwardTo?.length) {
-			throw new AppError("Forward routing rules require at least one destination", "forward_to_required", 400);
+			throw new AppError(
+				"Forward routing rules require at least one destination",
+				"forward_to_required",
+				400,
+			);
 		}
 		const id = crypto.randomUUID();
 		await insertRoutingRule(c.env.INDEX_DB, {

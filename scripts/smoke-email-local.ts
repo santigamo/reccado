@@ -1,12 +1,14 @@
 import { readFileSync } from "node:fs";
 
-const baseUrl = process.argv[2];
+const baseUrlArg = process.argv[2];
 const fixturePath = process.argv[3] ?? "fixtures/mime/simple-text.eml";
 
-if (!baseUrl) {
+if (!baseUrlArg) {
 	console.error("Usage: pnpm smoke:email:local <http-base-url> [fixture]");
 	process.exit(1);
 }
+
+const baseUrl: string = baseUrlArg;
 
 const raw = readFileSync(fixturePath);
 const to = "test@example.com";

@@ -8,11 +8,13 @@
 	"files": {
 		"includes": [
 			"**",
-			"!**/src/routeTree.gen.ts",
+			"!**/routeTree.gen.ts",
 			"!**/worker-configuration.d.ts",
-			"!**/dist/**",
-			"!**/.wrangler/**",
-			"!**/coverage/**",
+			"!dist",
+			"!.wrangler",
+			"!coverage",
+			"!docs/assets",
+			"!**/*.css",
 			"!**/pnpm-lock.yaml"
 		]
 	},
@@ -30,7 +32,10 @@
 	"linter": {
 		"enabled": true,
 		"rules": {
-			"recommended": true
+			"recommended": true,
+			"style": {
+				"noNonNullAssertion": "off"
+			}
 		}
 	}
 }

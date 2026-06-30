@@ -15,7 +15,10 @@ import {
 
 describe("createMailboxSchema", () => {
 	it("accepts a valid primaryAddress with an optional displayName", () => {
-		const result = createMailboxSchema.parse({ primaryAddress: "user@example.com", displayName: "User" });
+		const result = createMailboxSchema.parse({
+			primaryAddress: "user@example.com",
+			displayName: "User",
+		});
 		expect(result).toEqual({ primaryAddress: "user@example.com", displayName: "User" });
 	});
 
@@ -33,24 +36,34 @@ describe("createMailboxSchema", () => {
 	});
 
 	it("rejects an empty displayName", () => {
-		expect(() => createMailboxSchema.parse({ primaryAddress: "user@example.com", displayName: "" })).toThrow();
+		expect(() =>
+			createMailboxSchema.parse({ primaryAddress: "user@example.com", displayName: "" }),
+		).toThrow();
 	});
 
 	it("rejects a displayName longer than 120 characters", () => {
 		expect(() =>
-			createMailboxSchema.parse({ primaryAddress: "user@example.com", displayName: "x".repeat(121) }),
+			createMailboxSchema.parse({
+				primaryAddress: "user@example.com",
+				displayName: "x".repeat(121),
+			}),
 		).toThrow();
 	});
 });
 
 describe("createAliasSchema", () => {
 	it("accepts a valid alias", () => {
-		const result = createAliasSchema.parse({ aliasAddress: "alias@example.com", mailboxId: "mbx_1" });
+		const result = createAliasSchema.parse({
+			aliasAddress: "alias@example.com",
+			mailboxId: "mbx_1",
+		});
 		expect(result).toEqual({ aliasAddress: "alias@example.com", mailboxId: "mbx_1" });
 	});
 
 	it("rejects an invalid aliasAddress", () => {
-		expect(() => createAliasSchema.parse({ aliasAddress: "not-an-email", mailboxId: "mbx_1" })).toThrow();
+		expect(() =>
+			createAliasSchema.parse({ aliasAddress: "not-an-email", mailboxId: "mbx_1" }),
+		).toThrow();
 	});
 
 	it("rejects a missing mailboxId", () => {
@@ -58,7 +71,9 @@ describe("createAliasSchema", () => {
 	});
 
 	it("rejects an empty mailboxId", () => {
-		expect(() => createAliasSchema.parse({ aliasAddress: "alias@example.com", mailboxId: "" })).toThrow();
+		expect(() =>
+			createAliasSchema.parse({ aliasAddress: "alias@example.com", mailboxId: "" }),
+		).toThrow();
 	});
 });
 
@@ -114,7 +129,12 @@ describe("createRoutingRuleSchema", () => {
 
 	it("rejects an invalid action enum value", () => {
 		expect(() =>
-			createRoutingRuleSchema.parse({ domainId: "dom_1", pattern: "*", priority: 0, action: "delete" }),
+			createRoutingRuleSchema.parse({
+				domainId: "dom_1",
+				pattern: "*",
+				priority: 0,
+				action: "delete",
+			}),
 		).toThrow();
 	});
 
@@ -132,28 +152,43 @@ describe("createRoutingRuleSchema", () => {
 
 	it("rejects a negative priority", () => {
 		expect(() =>
-			createRoutingRuleSchema.parse({ domainId: "dom_1", pattern: "*", priority: -1, action: "store" }),
+			createRoutingRuleSchema.parse({
+				domainId: "dom_1",
+				pattern: "*",
+				priority: -1,
+				action: "store",
+			}),
 		).toThrow();
 	});
 
 	it("rejects a non-integer priority", () => {
 		expect(() =>
-			createRoutingRuleSchema.parse({ domainId: "dom_1", pattern: "*", priority: 1.5, action: "store" }),
+			createRoutingRuleSchema.parse({
+				domainId: "dom_1",
+				pattern: "*",
+				priority: 1.5,
+				action: "store",
+			}),
 		).toThrow();
 	});
 
 	it("rejects a missing domainId", () => {
-		expect(() => createRoutingRuleSchema.parse({ pattern: "*", priority: 0, action: "store" })).toThrow();
+		expect(() =>
+			createRoutingRuleSchema.parse({ pattern: "*", priority: 0, action: "store" }),
+		).toThrow();
 	});
 });
 
 describe("messageActionSchema", () => {
-	it.each(["mark_read", "mark_unread", "archive", "trash", "restore_inbox"])(
-		"accepts the %s action",
-		(action) => {
-			expect(messageActionSchema.parse({ action })).toEqual({ action });
-		},
-	);
+	it.each([
+		"mark_read",
+		"mark_unread",
+		"archive",
+		"trash",
+		"restore_inbox",
+	])("accepts the %s action", (action) => {
+		expect(messageActionSchema.parse({ action })).toEqual({ action });
+	});
 
 	it("rejects an unknown action", () => {
 		expect(() => messageActionSchema.parse({ action: "delete_forever" })).toThrow();
@@ -212,7 +247,9 @@ describe("createDraftSchema / updateDraftSchema", () => {
 
 describe("confirmSendSchema", () => {
 	it("accepts a non-empty idempotencyKey", () => {
-		expect(confirmSendSchema.parse({ idempotencyKey: "key-1" })).toEqual({ idempotencyKey: "key-1" });
+		expect(confirmSendSchema.parse({ idempotencyKey: "key-1" })).toEqual({
+			idempotencyKey: "key-1",
+		});
 	});
 
 	it("rejects an empty idempotencyKey", () => {
@@ -254,7 +291,12 @@ describe("threadListQuerySchema", () => {
 	});
 
 	it("coerces limit and accepts cursor/q/label", () => {
-		const result = threadListQuerySchema.parse({ limit: "5", cursor: "c1", q: "hi", label: "inbox" });
+		const result = threadListQuerySchema.parse({
+			limit: "5",
+			cursor: "c1",
+			q: "hi",
+			label: "inbox",
+		});
 		expect(result).toEqual({ limit: 5, cursor: "c1", q: "hi", label: "inbox" });
 	});
 

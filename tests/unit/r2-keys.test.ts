@@ -40,6 +40,7 @@ describe("sanitizeFilename", () => {
 	it("strips control characters (collapsing runs into a single underscore)", () => {
 		const withControlChars = "control\x00char\x1Fname\ttab\nnewline.txt";
 		const sanitized = sanitizeFilename(withControlChars);
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: deliberately asserts control characters are stripped
 		expect(sanitized).not.toMatch(/[\x00-\x1f]/);
 		expect(sanitized).toBe("control_char_name_tab_newline.txt");
 	});

@@ -32,7 +32,9 @@ describe("sha256Hex", () => {
 describe("hmacSha256", () => {
 	it("matches the known HMAC-SHA256 vector for key='key'", async () => {
 		const signature = await hmacSha256("key", "The quick brown fox jumps over the lazy dog");
-		expect(toHex(signature)).toBe("f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");
+		expect(toHex(signature)).toBe(
+			"f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
+		);
 	});
 
 	it("rejects an empty secret (WebCrypto requires a non-zero-length raw HMAC key)", async () => {

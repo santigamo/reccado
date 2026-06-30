@@ -1,6 +1,6 @@
-import { mkdirSync, statSync, createWriteStream } from "node:fs";
-import { dirname } from "node:path";
 import { once } from "node:events";
+import { createWriteStream, mkdirSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 
 const outputPath = process.argv[2] ?? ".tmp/large-email-near-limit.eml";
 const targetMiB = Number(process.argv[3] ?? "24");
@@ -31,8 +31,8 @@ const header = [
 const footer = [
 	"",
 	`--${boundary}`,
-	"Content-Type: text/plain; name=\"tiny.txt\"",
-	"Content-Disposition: attachment; filename=\"tiny.txt\"",
+	'Content-Type: text/plain; name="tiny.txt"',
+	'Content-Disposition: attachment; filename="tiny.txt"',
 	"Content-Transfer-Encoding: 7bit",
 	"",
 	"attachment marker",

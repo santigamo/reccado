@@ -67,7 +67,17 @@ function MailboxInboxPage() {
 				// ignore
 			}
 		};
-		ws.onopen = () => ws.send(JSON.stringify({ v: 1, type: "ping", id: "1", mailboxId, ts: new Date().toISOString(), payload: {} }));
+		ws.onopen = () =>
+			ws.send(
+				JSON.stringify({
+					v: 1,
+					type: "ping",
+					id: "1",
+					mailboxId,
+					ts: new Date().toISOString(),
+					payload: {},
+				}),
+			);
 		return () => ws.close();
 	}, [mailboxId, wsUrl]);
 
@@ -93,7 +103,11 @@ function MailboxInboxPage() {
 						value={search}
 						onChange={(event) => setSearch(event.target.value)}
 					/>
-					<button type="button" className="rounded-lg bg-[var(--lagoon-deep)] px-4 py-2 text-white" onClick={runSearch}>
+					<button
+						type="button"
+						className="rounded-lg bg-[var(--lagoon-deep)] px-4 py-2 text-white"
+						onClick={runSearch}
+					>
 						Search
 					</button>
 				</div>
@@ -113,9 +127,12 @@ function MailboxInboxPage() {
 										className="w-full rounded-lg border px-3 py-2 text-left hover:bg-white"
 										onClick={() => setSelectedThreadId(thread.id)}
 									>
-										<div className="font-medium">{thread.latest_subject ?? thread.subject_norm ?? "(no subject)"}</div>
+										<div className="font-medium">
+											{thread.latest_subject ?? thread.subject_norm ?? "(no subject)"}
+										</div>
 										<div className="text-xs text-[var(--sea-ink-soft)]">
-											{thread.unread_count} unread · {new Date(thread.last_message_at).toLocaleString()}
+											{thread.unread_count} unread ·{" "}
+											{new Date(thread.last_message_at).toLocaleString()}
 										</div>
 									</button>
 								</li>
@@ -130,7 +147,9 @@ function MailboxInboxPage() {
 								<p className="text-sm text-[var(--sea-ink-soft)]">
 									{message.from_addr} · {new Date(message.received_at).toLocaleString()}
 								</p>
-								<p className="mt-2 whitespace-pre-wrap text-sm">{message.body_text ?? message.snippet}</p>
+								<p className="mt-2 whitespace-pre-wrap text-sm">
+									{message.body_text ?? message.snippet}
+								</p>
 								<div className="mt-2 flex gap-2">
 									<button
 										type="button"

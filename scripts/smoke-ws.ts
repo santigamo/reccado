@@ -67,7 +67,16 @@ ws.addEventListener("message", (event) => {
 			return;
 		}
 		pass("received hello");
-		ws.send(JSON.stringify({ v: 1, type: "ping", id: "1", mailboxId: expectedMailboxId, ts: new Date().toISOString(), payload: {} }));
+		ws.send(
+			JSON.stringify({
+				v: 1,
+				type: "ping",
+				id: "1",
+				mailboxId: expectedMailboxId,
+				ts: new Date().toISOString(),
+				payload: {},
+			}),
+		);
 		return;
 	}
 

@@ -1,9 +1,9 @@
-import type { InboundEmailQueueMessage } from "./types";
-import { sha256Hex, randomTraceId } from "../lib/crypto";
-import { readHeader, readReferences, normalizeMessageId } from "../lib/email-metadata";
+import { insertOpsEvent, resolveRoutingForRecipient } from "../db/d1";
+import { randomTraceId, sha256Hex } from "../lib/crypto";
+import { normalizeMessageId, readHeader, readReferences } from "../lib/email-metadata";
 import { inboundIdempotencyKey } from "../lib/idempotency";
 import { rawEmailR2Key } from "../lib/r2-keys";
-import { resolveRoutingForRecipient, insertOpsEvent } from "../db/d1";
+import type { InboundEmailQueueMessage } from "./types";
 
 const MAX_QUEUE_BYTES = 128 * 1024;
 // Hard cap on inbound MIME size, enforced before the raw body is read/parsed, to bound
@@ -32,7 +32,11 @@ export async function handleEmail(
 			}),
 		});
 		message.setReject("Message too large");
-		console.log("email.rejected", { recipient, reason: "email_too_large", rawSize: message.rawSize });
+		console.log("email.rejected", {
+			recipient,
+			reason: "email_too_large",
+			rawSize: message.rawSize,
+		});
 		return;
 	}
 
@@ -64,7 +68,11 @@ export async function handleEmail(
 			event_type: "inbound.forwarded",
 			severity: "info",
 			subject: recipient,
-			payload_json: JSON.stringify({ recipient, forwardTo: routing.forwardTo, ruleId: routing.ruleId }),
+			payload_json: JSON.stringify({
+				recipient,
+				forwardTo: routing.forwardTo,
+				ruleId: routing.ruleId,
+			}),
 		});
 		console.log("email.forwarded", { recipient, forwardTo: routing.forwardTo });
 		return;
@@ -73,7 +81,11 @@ export async function handleEmail(
 	const mailboxId = routing.mailboxId;
 	const rawR2Key = rawEmailR2Key({ mailboxId, receivedAt, rawSha256 });
 	const normalizedMessageId = normalizeMessageId(readHeader(message.headers, "message-id"));
-	const idempotencyKey = inboundIdempotencyKey({ mailboxId, messageId: normalizedMessageId, rawSha256 });
+	const idempotencyKey = inboundIdempotencyKey({
+		mailboxId,
+		messageId: normalizedMessageId,
+		rawSha256,
+	});
 
 	await env.MAIL_OBJECTS.put(rawR2Key, rawBytes, {
 		customMetadata: {

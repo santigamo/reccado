@@ -24,4 +24,3 @@ export function readReferences(headers: Headers): string[] {
 		.map((part) => normalizeMessageId(part))
 		.filter((part): part is string => Boolean(part));
 }
-

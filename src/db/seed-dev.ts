@@ -1,4 +1,3 @@
-import { deriveMailboxId } from "../lib/mailbox-id";
 import {
 	getDomainByName,
 	getMailbox,
@@ -7,6 +6,7 @@ import {
 	insertMailbox,
 	lookupActiveAlias,
 } from "../db/d1";
+import { deriveMailboxId } from "../lib/mailbox-id";
 
 const DEV_SECRET = "dev-mailbox-id-secret-v1";
 

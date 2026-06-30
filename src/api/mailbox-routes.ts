@@ -1,15 +1,4 @@
-import { Hono } from "hono";
-import type { ApiBindings } from "./hono";
-import { assertMailboxAccess } from "./auth";
-import {
-	adminMailboxActionSchema,
-	createDraftSchema,
-	confirmSendSchema,
-	messageActionSchema,
-	searchQuerySchema,
-	threadListQuerySchema,
-	updateDraftSchema,
-} from "./schemas";
+import type { Hono } from "hono";
 import {
 	createOutboundSendIfMissing,
 	deleteMessageIndexForMailbox,
@@ -21,11 +10,25 @@ import {
 	updateOutboundSendStatus,
 	upsertMessageIndex,
 } from "../db/d1";
-import { backupManifestR2Key } from "../lib/r2-keys";
-import { outboundSendIdempotencyKey } from "../lib/idempotency";
 import { AppError } from "../lib/errors";
+import { outboundSendIdempotencyKey } from "../lib/idempotency";
+import { backupManifestR2Key } from "../lib/r2-keys";
+import { assertMailboxAccess } from "./auth";
+import type { ApiBindings } from "./hono";
+import {
+	adminMailboxActionSchema,
+	confirmSendSchema,
+	createDraftSchema,
+	messageActionSchema,
+	searchQuerySchema,
+	threadListQuerySchema,
+	updateDraftSchema,
+} from "./schemas";
 
-function sanitizeAttachmentFilename(filename: string | null | undefined, attachmentId: string): string {
+function sanitizeAttachmentFilename(
+	filename: string | null | undefined,
+	attachmentId: string,
+): string {
 	const trimmed = filename?.trim();
 	if (!trimmed) {
 		return attachmentId;
@@ -94,7 +97,12 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		if (!messageResponse.ok) return messageResponse;
 		const payload = (await messageResponse.json()) as {
 			message?: {
-				attachments?: Array<{ id: string; r2_key: string; content_type?: string; filename?: string | null }>;
+				attachments?: Array<{
+					id: string;
+					r2_key: string;
+					content_type?: string;
+					filename?: string | null;
+				}>;
 			};
 		};
 		const attachment = payload.message?.attachments?.find((row) => row.id === attachmentId);
@@ -275,7 +283,9 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 					idempotencyKey: outboundIdempotencyKey,
 					status: result.status === "sending" ? "sending" : "sent",
 					providerMessageId:
-						result.status === "sending" ? null : (result.providerMessageId ?? outboundIdempotencyKey),
+						result.status === "sending"
+							? null
+							: (result.providerMessageId ?? outboundIdempotencyKey),
 					errorCode: null,
 				});
 			} else {

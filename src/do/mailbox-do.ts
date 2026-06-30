@@ -3,13 +3,13 @@ import { z } from "zod";
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflare/types";
 import { sha256Hex } from "../lib/crypto";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
-import { MAILBOX_SCHEMA_SQL } from "./mailbox-schema";
 import {
 	createRealtimeBroadcaster,
 	handleWebSocketMessage,
 	sendHello,
 	type WebSocketAttachment,
 } from "./mailbox-realtime";
+import { MAILBOX_SCHEMA_SQL } from "./mailbox-schema";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
@@ -62,7 +62,10 @@ function sentMarkerValue(providerMessageId: string | null): string {
 	return JSON.stringify({ status: "sent", providerMessageId });
 }
 
-function readSendMarker(value: unknown): { status: "sending" | "sent"; providerMessageId: string | null } {
+function readSendMarker(value: unknown): {
+	status: "sending" | "sent";
+	providerMessageId: string | null;
+} {
 	if (value === "sending") {
 		return { status: "sending", providerMessageId: null };
 	}
@@ -120,7 +123,9 @@ function getThread(sql: SqlStorage, threadId: string | undefined) {
 function getMessage(sql: SqlStorage, messageId: string | undefined) {
 	if (!messageId) return null;
 	const message = sql.exec("SELECT * FROM messages WHERE id = ?", messageId).toArray()[0];
-	const attachments = sql.exec("SELECT * FROM attachments WHERE message_id = ?", messageId).toArray();
+	const attachments = sql
+		.exec("SELECT * FROM attachments WHERE message_id = ?", messageId)
+		.toArray();
 	return { ...message, attachments };
 }
 
@@ -234,7 +239,10 @@ async function confirmSendDraft(
 	if (!draft) throw new Error("draft not found");
 
 	const sentMarker = ctx.sql
-		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", `send:${idempotencyKey}`)
+		.exec<{ value: string }>(
+			"SELECT value FROM mailbox_meta WHERE key = ?",
+			`send:${idempotencyKey}`,
+		)
 		.toArray()[0];
 	if (sentMarker) {
 		const marker = readSendMarker(sentMarker.value);
@@ -382,7 +390,11 @@ async function confirmSendDraft(
 function cancelDraft(sql: SqlStorage, draftId: string | undefined) {
 	if (!draftId) throw new Error("draftId required");
 	const now = new Date().toISOString();
-	sql.exec("UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?", now, draftId);
+	sql.exec(
+		"UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?",
+		now,
+		draftId,
+	);
 	return { id: draftId, status: "cancelled" };
 }
 
@@ -473,7 +485,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			return Response.json({ results: searchMessages(this.ctx.storage.sql, q, limit) });
 		}
 		if (url.pathname === "/threads" && request.method === "GET") {
-			return Response.json({ threads: this.listThreads(Number(url.searchParams.get("limit") ?? "25")) });
+			return Response.json({
+				threads: this.listThreads(Number(url.searchParams.get("limit") ?? "25")),
+			});
 		}
 		if (url.pathname.startsWith("/threads/") && request.method === "GET") {
 			const threadId = url.pathname.split("/")[2];
@@ -486,7 +500,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			}
 			return Response.json({ message: this.getMessage(messageId) });
 		}
-		if (url.pathname.startsWith("/messages/") && url.pathname.endsWith("/actions") && request.method === "POST") {
+		if (
+			url.pathname.startsWith("/messages/") &&
+			url.pathname.endsWith("/actions") &&
+			request.method === "POST"
+		) {
 			const messageId = url.pathname.split("/")[2];
 			const body = (await request.json()) as { action: string };
 			return Response.json(this.applyMessageAction(messageId, body.action));
@@ -552,7 +570,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 
 		const pair = new WebSocketPair();
-		const [client, server] = Object.values(pair);
+		const client = pair[0];
+		const server = pair[1];
 		this.ctx.acceptWebSocket(server);
 		server.serializeAttachment({ mailboxId } satisfies WebSocketAttachment);
 
@@ -583,7 +602,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	private tableExists(table: string): boolean {
 		return Boolean(
 			this.ctx.storage.sql
-				.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table)
+				.exec<{ name: string }>(
+					"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+					table,
+				)
 				.toArray()[0],
 		);
 	}
@@ -596,7 +618,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 	}
 
-	private addColumnIfMissing(table: string, columns: Set<string>, name: string, definition: string): void {
+	private addColumnIfMissing(
+		table: string,
+		columns: Set<string>,
+		name: string,
+		definition: string,
+	): void {
 		if (columns.has(name)) return;
 		this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
 		columns.add(name);
@@ -677,8 +704,18 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		this.addColumnIfMissing("messages", messageColumns, "thread_id", "TEXT NOT NULL DEFAULT ''");
 		this.addColumnIfMissing("messages", messageColumns, "rfc_message_id", "TEXT");
 		this.addColumnIfMissing("messages", messageColumns, "in_reply_to", "TEXT");
-		this.addColumnIfMissing("messages", messageColumns, "references_json", "TEXT NOT NULL DEFAULT '[]'");
-		this.addColumnIfMissing("messages", messageColumns, "direction", "TEXT NOT NULL DEFAULT 'inbound'");
+		this.addColumnIfMissing(
+			"messages",
+			messageColumns,
+			"references_json",
+			"TEXT NOT NULL DEFAULT '[]'",
+		);
+		this.addColumnIfMissing(
+			"messages",
+			messageColumns,
+			"direction",
+			"TEXT NOT NULL DEFAULT 'inbound'",
+		);
 		this.addColumnIfMissing("messages", messageColumns, "state", "TEXT NOT NULL DEFAULT 'inbox'");
 		this.addColumnIfMissing("messages", messageColumns, "from_addr", "TEXT NOT NULL DEFAULT ''");
 		this.addColumnIfMissing("messages", messageColumns, "to_json", "TEXT NOT NULL DEFAULT '[]'");
@@ -695,8 +732,18 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		this.addColumnIfMissing("messages", messageColumns, "raw_size", "INTEGER NOT NULL DEFAULT 0");
 		this.addColumnIfMissing("messages", messageColumns, "body_text", "TEXT");
 		this.addColumnIfMissing("messages", messageColumns, "body_html_r2_key", "TEXT");
-		this.addColumnIfMissing("messages", messageColumns, "parse_status", "TEXT NOT NULL DEFAULT 'parsed'");
-		this.addColumnIfMissing("messages", messageColumns, "has_attachments", "INTEGER NOT NULL DEFAULT 0");
+		this.addColumnIfMissing(
+			"messages",
+			messageColumns,
+			"parse_status",
+			"TEXT NOT NULL DEFAULT 'parsed'",
+		);
+		this.addColumnIfMissing(
+			"messages",
+			messageColumns,
+			"has_attachments",
+			"INTEGER NOT NULL DEFAULT 0",
+		);
 		this.addColumnIfMissing("messages", messageColumns, "is_read", "INTEGER NOT NULL DEFAULT 0");
 		this.addColumnIfMissing(
 			"messages",
@@ -712,9 +759,24 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 
 		const ingestColumns = this.columnNames("ingest_events");
-		this.addColumnIfMissing("ingest_events", ingestColumns, "raw_r2_key", "TEXT NOT NULL DEFAULT ''");
-		this.addColumnIfMissing("ingest_events", ingestColumns, "raw_sha256", "TEXT NOT NULL DEFAULT ''");
-		this.addColumnIfMissing("ingest_events", ingestColumns, "status", "TEXT NOT NULL DEFAULT 'processed'");
+		this.addColumnIfMissing(
+			"ingest_events",
+			ingestColumns,
+			"raw_r2_key",
+			"TEXT NOT NULL DEFAULT ''",
+		);
+		this.addColumnIfMissing(
+			"ingest_events",
+			ingestColumns,
+			"raw_sha256",
+			"TEXT NOT NULL DEFAULT ''",
+		);
+		this.addColumnIfMissing(
+			"ingest_events",
+			ingestColumns,
+			"status",
+			"TEXT NOT NULL DEFAULT 'processed'",
+		);
 		this.addColumnIfMissing("ingest_events", ingestColumns, "message_local_id", "TEXT");
 		this.addColumnIfMissing("ingest_events", ingestColumns, "error_code", "TEXT");
 		this.addColumnIfMissing("ingest_events", ingestColumns, "error_message", "TEXT");
@@ -733,9 +795,16 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
 		const now = new Date().toISOString();
 		this.ctx.storage.sql.exec("UPDATE messages SET thread_id = id WHERE thread_id = ''");
-		this.ctx.storage.sql.exec("UPDATE messages SET received_at = created_at WHERE received_at = '1970-01-01T00:00:00.000Z'");
-		this.ctx.storage.sql.exec("UPDATE messages SET updated_at = ? WHERE updated_at = '1970-01-01T00:00:00.000Z'", now);
-		this.ctx.storage.sql.exec("UPDATE messages SET created_at = updated_at WHERE created_at = '1970-01-01T00:00:00.000Z'");
+		this.ctx.storage.sql.exec(
+			"UPDATE messages SET received_at = created_at WHERE received_at = '1970-01-01T00:00:00.000Z'",
+		);
+		this.ctx.storage.sql.exec(
+			"UPDATE messages SET updated_at = ? WHERE updated_at = '1970-01-01T00:00:00.000Z'",
+			now,
+		);
+		this.ctx.storage.sql.exec(
+			"UPDATE messages SET created_at = updated_at WHERE created_at = '1970-01-01T00:00:00.000Z'",
+		);
 		this.ctx.storage.sql.exec(
 			`INSERT OR IGNORE INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
        SELECT thread_id, LOWER(COALESCE(subject, '')), received_at, 1, CASE WHEN is_read = 0 THEN 1 ELSE 0 END, created_at, updated_at
@@ -834,7 +903,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		return requestSendDraft(this.ctx.storage.sql, draftId);
 	}
 
-	private async confirmSendDraft(draftId: string | undefined, idempotencyKey: string): Promise<Record<string, unknown>> {
+	private async confirmSendDraft(
+		draftId: string | undefined,
+		idempotencyKey: string,
+	): Promise<Record<string, unknown>> {
 		return confirmSendDraft(
 			{
 				sql: this.ctx.storage.sql,

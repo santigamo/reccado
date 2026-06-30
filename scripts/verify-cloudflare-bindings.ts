@@ -36,9 +36,7 @@ const required = {
 };
 
 function stripJsonc(input: string): string {
-	return input
-		.replace(/\/\*[\s\S]*?\*\//g, "")
-		.replace(/^\s*\/\/.*$/gm, "");
+	return input.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 }
 
 function runWrangler(args: string[]): string {
@@ -64,10 +62,14 @@ assert(config.compatibility_flags?.includes("nodejs_compat"), "nodejs_compat fla
 assert(config.observability?.enabled === true, "observability.enabled missing");
 assert(dev.name === required.worker, "env.dev.name mismatch");
 assert(merged.triggers?.crons?.length, "Cron trigger missing");
-assert(merged.send_email?.some((binding) => binding.name === required.emailBinding), "send_email binding missing");
+assert(
+	merged.send_email?.some((binding) => binding.name === required.emailBinding),
+	"send_email binding missing",
+);
 assert(
 	merged.durable_objects?.bindings?.some(
-		(binding) => binding.name === required.doBinding && binding.class_name === "MailboxDurableObject",
+		(binding) =>
+			binding.name === required.doBinding && binding.class_name === "MailboxDurableObject",
 	),
 	"Durable Object binding missing",
 );

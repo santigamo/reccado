@@ -52,18 +52,47 @@ function ComposePage() {
 			<section className="island-shell max-w-2xl rounded-2xl p-6">
 				<h1 className="mb-4 text-2xl font-bold">Compose</h1>
 				<div className="space-y-3">
-					<input className="w-full rounded border px-3 py-2" placeholder="To" value={to} onChange={(e) => setTo(e.target.value)} />
-					<input className="w-full rounded border px-3 py-2" placeholder="Subject" value={subject} onChange={(e) => setSubject(e.target.value)} />
-					<textarea className="min-h-40 w-full rounded border px-3 py-2" placeholder="Body" value={bodyText} onChange={(e) => setBodyText(e.target.value)} />
+					<input
+						className="w-full rounded border px-3 py-2"
+						placeholder="To"
+						value={to}
+						onChange={(e) => setTo(e.target.value)}
+					/>
+					<input
+						className="w-full rounded border px-3 py-2"
+						placeholder="Subject"
+						value={subject}
+						onChange={(e) => setSubject(e.target.value)}
+					/>
+					<textarea
+						className="min-h-40 w-full rounded border px-3 py-2"
+						placeholder="Body"
+						value={bodyText}
+						onChange={(e) => setBodyText(e.target.value)}
+					/>
 				</div>
 				<div className="mt-4 flex flex-wrap gap-2">
-					<button type="button" className="rounded bg-[var(--lagoon-deep)] px-4 py-2 text-white" onClick={saveDraft}>
+					<button
+						type="button"
+						className="rounded bg-[var(--lagoon-deep)] px-4 py-2 text-white"
+						onClick={saveDraft}
+					>
 						Save draft
 					</button>
-					<button type="button" className="rounded border px-4 py-2" onClick={requestSend} disabled={!draftId}>
+					<button
+						type="button"
+						className="rounded border px-4 py-2"
+						onClick={requestSend}
+						disabled={!draftId}
+					>
 						Request send
 					</button>
-					<button type="button" className="rounded border px-4 py-2" onClick={confirmSend} disabled={!draftId}>
+					<button
+						type="button"
+						className="rounded border px-4 py-2"
+						onClick={confirmSend}
+						disabled={!draftId}
+					>
 						Confirm send
 					</button>
 				</div>

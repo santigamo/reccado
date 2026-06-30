@@ -1,6 +1,6 @@
 import { createApiApp } from "./api/hono";
-import { deriveDevTestMailboxId } from "./db/seed-dev";
 import type { InboundEmailQueueMessage } from "./cloudflare/types";
+import { deriveDevTestMailboxId } from "./db/seed-dev";
 
 export { MailboxDurableObject } from "./do/mailbox-do";
 
@@ -66,7 +66,6 @@ api.get("/api/debug/phase0/mailboxes/:mailboxId", async (c) => {
 	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
 	return stub.fetch("https://mailbox-do/debug");
 });
-
 
 api.get("/api/debug/phase0/r2/head", async (c) => {
 	if (!(await phase0DebugAuthorized(c.req.raw, c.env))) {

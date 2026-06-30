@@ -50,7 +50,11 @@ export function exportR2Key(input: {
 	return `exports/${env}/${input.mailboxId}/${input.date}/${input.exportId}.ndjson`;
 }
 
-export function backupManifestR2Key(input: { env?: string; date: string; mailboxId: string }): string {
+export function backupManifestR2Key(input: {
+	env?: string;
+	date: string;
+	mailboxId: string;
+}): string {
 	const env = input.env ?? "dev";
 	return `backups/${env}/${input.date}/${input.mailboxId}.manifest.json`;
 }

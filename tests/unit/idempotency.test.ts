@@ -59,15 +59,25 @@ describe("inboundIdempotencyKey", () => {
 	});
 
 	it("scopes the raw-sha256 fallback key so a different rawSha256 produces a different key", () => {
-		const a = inboundIdempotencyKey({ mailboxId: "mbx_abc123", messageId: null, rawSha256: "sha-a" });
-		const b = inboundIdempotencyKey({ mailboxId: "mbx_abc123", messageId: null, rawSha256: "sha-b" });
+		const a = inboundIdempotencyKey({
+			mailboxId: "mbx_abc123",
+			messageId: null,
+			rawSha256: "sha-a",
+		});
+		const b = inboundIdempotencyKey({
+			mailboxId: "mbx_abc123",
+			messageId: null,
+			rawSha256: "sha-b",
+		});
 		expect(a).not.toBe(b);
 	});
 });
 
 describe("outboundSendIdempotencyKey", () => {
 	it("builds the send:v1:{draftId}:{attemptKey} shape", () => {
-		expect(outboundSendIdempotencyKey("draft_123", "attempt_1")).toBe("send:v1:draft_123:attempt_1");
+		expect(outboundSendIdempotencyKey("draft_123", "attempt_1")).toBe(
+			"send:v1:draft_123:attempt_1",
+		);
 	});
 
 	it("is stable for repeated calls with the same inputs", () => {

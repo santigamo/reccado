@@ -81,12 +81,17 @@ function nowIso(): string {
 }
 
 export async function listMailboxes(db: D1Database): Promise<MailboxRow[]> {
-	const result = await db.prepare("SELECT * FROM mailboxes ORDER BY created_at ASC").all<MailboxRow>();
+	const result = await db
+		.prepare("SELECT * FROM mailboxes ORDER BY created_at ASC")
+		.all<MailboxRow>();
 	return result.results ?? [];
 }
 
 export async function getMailbox(db: D1Database, mailboxId: string): Promise<MailboxRow | null> {
-	return db.prepare("SELECT * FROM mailboxes WHERE mailbox_id = ?").bind(mailboxId).first<MailboxRow>();
+	return db
+		.prepare("SELECT * FROM mailboxes WHERE mailbox_id = ?")
+		.bind(mailboxId)
+		.first<MailboxRow>();
 }
 
 export async function insertMailbox(
@@ -131,11 +136,16 @@ export async function insertDomain(
 }
 
 export async function listAliases(db: D1Database): Promise<AliasRow[]> {
-	const result = await db.prepare("SELECT * FROM aliases ORDER BY alias_address ASC").all<AliasRow>();
+	const result = await db
+		.prepare("SELECT * FROM aliases ORDER BY alias_address ASC")
+		.all<AliasRow>();
 	return result.results ?? [];
 }
 
-export async function lookupActiveAlias(db: D1Database, aliasAddress: string): Promise<AliasLookup | null> {
+export async function lookupActiveAlias(
+	db: D1Database,
+	aliasAddress: string,
+): Promise<AliasLookup | null> {
 	const canonical = aliasAddress.trim().toLowerCase();
 	return db
 		.prepare(
@@ -162,7 +172,10 @@ export async function insertAlias(
 		.run();
 }
 
-export async function listRoutingRules(db: D1Database, domainId?: string): Promise<RoutingRuleRow[]> {
+export async function listRoutingRules(
+	db: D1Database,
+	domainId?: string,
+): Promise<RoutingRuleRow[]> {
 	if (domainId) {
 		const result = await db
 			.prepare("SELECT * FROM routing_rules WHERE domain_id = ? ORDER BY priority ASC")
@@ -228,7 +241,7 @@ export async function resolveRoutingForRecipient(
 	}
 
 	const domainRow = await getDomainByName(db, domain);
-	if (!domainRow || domainRow.status !== "active") {
+	if (domainRow?.status !== "active") {
 		return { action: "reject", reason: "unknown_domain", ruleId: null, matchedAlias: canonical };
 	}
 
@@ -382,15 +395,16 @@ export async function listOpsEvents(db: D1Database, limit = 50) {
 
 export async function listIngestFailures(db: D1Database, limit = 50) {
 	const result = await db
-		.prepare(
-			"SELECT * FROM ingest_events WHERE status = 'failed' ORDER BY updated_at DESC LIMIT ?",
-		)
+		.prepare("SELECT * FROM ingest_events WHERE status = 'failed' ORDER BY updated_at DESC LIMIT ?")
 		.bind(limit)
 		.all();
 	return result.results ?? [];
 }
 
-export async function deleteMessageIndexForMailbox(db: D1Database, mailboxId: string): Promise<void> {
+export async function deleteMessageIndexForMailbox(
+	db: D1Database,
+	mailboxId: string,
+): Promise<void> {
 	await db.prepare("DELETE FROM message_index WHERE mailbox_id = ?").bind(mailboxId).run();
 }
 

@@ -1,6 +1,10 @@
-import { listMailboxes, listStaleSendingOutboundSends, updateOutboundSendStatus } from "../db/d1";
+import {
+	insertOpsEvent,
+	listMailboxes,
+	listStaleSendingOutboundSends,
+	updateOutboundSendStatus,
+} from "../db/d1";
 import { backupManifestR2Key } from "../lib/r2-keys";
-import { insertOpsEvent } from "../db/d1";
 
 // Outbound sends stuck at status="sending" for longer than this are assumed to be
 // an interrupted saga (worker crash / DO call that never returned) rather than a
@@ -54,7 +58,10 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 		});
 	}
 
-	const reconciledSendCount = await reconcileStaleOutboundSends(env.INDEX_DB, controller.scheduledTime);
+	const reconciledSendCount = await reconcileStaleOutboundSends(
+		env.INDEX_DB,
+		controller.scheduledTime,
+	);
 
 	await insertOpsEvent(env.INDEX_DB, {
 		id: crypto.randomUUID(),

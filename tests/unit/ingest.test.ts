@@ -1,14 +1,14 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { sha256Hex } from "#/lib/crypto";
-import { rawEmailR2Key } from "#/lib/r2-keys";
-import { inboundIdempotencyKey } from "#/lib/idempotency";
 import type { InboundEmailQueueMessage } from "#/cloudflare/types";
+import { sha256Hex } from "#/lib/crypto";
+import { inboundIdempotencyKey } from "#/lib/idempotency";
+import { rawEmailR2Key } from "#/lib/r2-keys";
+import attachmentSmallEml from "../../fixtures/mime/attachment-small.eml?raw";
 import duplicateAEml from "../../fixtures/mime/duplicate-message-id-a.eml?raw";
 import duplicateBEml from "../../fixtures/mime/duplicate-message-id-b.eml?raw";
 import missingMessageIdEml from "../../fixtures/mime/missing-message-id.eml?raw";
 import multipartAlternativeEml from "../../fixtures/mime/multipart-alternative.eml?raw";
-import attachmentSmallEml from "../../fixtures/mime/attachment-small.eml?raw";
 
 type TestEnv = Env & { MAIL_OBJECTS: R2Bucket; MAILBOX_DO: DurableObjectNamespace };
 
@@ -18,7 +18,10 @@ function mailboxStub(mailboxId: string) {
 	return testEnv.MAILBOX_DO.getByName(mailboxId);
 }
 
-async function putRaw(mailboxId: string, bytes: Uint8Array): Promise<{ rawR2Key: string; rawSha256: string }> {
+async function putRaw(
+	mailboxId: string,
+	bytes: Uint8Array,
+): Promise<{ rawR2Key: string; rawSha256: string }> {
 	const rawSha256 = await sha256Hex(bytes);
 	const rawR2Key = rawEmailR2Key({ mailboxId, receivedAt: new Date(), rawSha256 });
 	await testEnv.MAIL_OBJECTS.put(rawR2Key, bytes);
@@ -74,7 +77,14 @@ async function ingestFixture(
 ): Promise<{ status: number; result: Record<string, unknown> }> {
 	const rawBytes = new TextEncoder().encode(fixtureText);
 	const { rawR2Key, rawSha256 } = await putRaw(mailboxId, rawBytes);
-	const message = buildQueueMessage({ mailboxId, rawBytes, rawR2Key, rawSha256, messageId, subject });
+	const message = buildQueueMessage({
+		mailboxId,
+		rawBytes,
+		rawR2Key,
+		rawSha256,
+		messageId,
+		subject,
+	});
 	const response = await mailboxStub(mailboxId).fetch("https://mailbox-do/ingest", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
@@ -83,8 +93,13 @@ async function ingestFixture(
 	return { status: response.status, result: (await response.json()) as Record<string, unknown> };
 }
 
-async function getDoMessage(mailboxId: string, messageLocalId: string): Promise<Record<string, unknown>> {
-	const response = await mailboxStub(mailboxId).fetch(`https://mailbox-do/messages/${messageLocalId}`);
+async function getDoMessage(
+	mailboxId: string,
+	messageLocalId: string,
+): Promise<Record<string, unknown>> {
+	const response = await mailboxStub(mailboxId).fetch(
+		`https://mailbox-do/messages/${messageLocalId}`,
+	);
 	const payload = (await response.json()) as { message: Record<string, unknown> };
 	return payload.message;
 }
@@ -107,12 +122,22 @@ describe("mailbox DO ingest", () => {
 	it("dedups a redelivery of the same message-id and raw bytes as duplicate", async () => {
 		const mailboxId = "mbx_ingest_dedupe";
 
-		const first = await ingestFixture(mailboxId, duplicateAEml as string, "duplicate-shared-id@example.com", "Duplicate Message-ID A");
+		const first = await ingestFixture(
+			mailboxId,
+			duplicateAEml as string,
+			"duplicate-shared-id@example.com",
+			"Duplicate Message-ID A",
+		);
 		expect(first.status).toBe(200);
 		expect(first.result.status).toBe("inserted");
 		expect(first.result.messageLocalId).toBeTruthy();
 
-		const second = await ingestFixture(mailboxId, duplicateAEml as string, "duplicate-shared-id@example.com", "Duplicate Message-ID A");
+		const second = await ingestFixture(
+			mailboxId,
+			duplicateAEml as string,
+			"duplicate-shared-id@example.com",
+			"Duplicate Message-ID A",
+		);
 		expect(second.status).toBe(200);
 		expect(second.result.status).toBe("duplicate");
 		expect(second.result.messageLocalId).toBe(first.result.messageLocalId);
@@ -125,10 +150,20 @@ describe("mailbox DO ingest", () => {
 	it("resolves a shared message-id with a different raw sha256 as a conflict", async () => {
 		const mailboxId = "mbx_ingest_conflict";
 
-		const first = await ingestFixture(mailboxId, duplicateAEml as string, "duplicate-shared-id@example.com", "Duplicate Message-ID A");
+		const first = await ingestFixture(
+			mailboxId,
+			duplicateAEml as string,
+			"duplicate-shared-id@example.com",
+			"Duplicate Message-ID A",
+		);
 		expect(first.result.status).toBe("inserted");
 
-		const second = await ingestFixture(mailboxId, duplicateBEml as string, "duplicate-shared-id@example.com", "Duplicate Message-ID B");
+		const second = await ingestFixture(
+			mailboxId,
+			duplicateBEml as string,
+			"duplicate-shared-id@example.com",
+			"Duplicate Message-ID B",
+		);
 		expect(second.status).toBe(200);
 		expect(second.result.status).toBe("conflict");
 		expect(second.result.errorCode).toBe("message_id_conflict");
@@ -142,12 +177,24 @@ describe("mailbox DO ingest", () => {
 	it("falls back to a raw-sha256 idempotency key when Message-ID is missing, and still dedups retries", async () => {
 		const mailboxId = "mbx_ingest_missing_id";
 
-		const first = await ingestFixture(mailboxId, missingMessageIdEml as string, null, "Missing Message-ID");
+		const first = await ingestFixture(
+			mailboxId,
+			missingMessageIdEml as string,
+			null,
+			"Missing Message-ID",
+		);
 		expect(first.result.status).toBe("inserted");
-		expect(first.result.idempotencyKey).toMatch(/^email:v1:mbx_ingest_missing_id:raw-sha256:[0-9a-f]{64}$/);
+		expect(first.result.idempotencyKey).toMatch(
+			/^email:v1:mbx_ingest_missing_id:raw-sha256:[0-9a-f]{64}$/,
+		);
 		expect(first.result.rfcMessageId).toBeNull();
 
-		const retry = await ingestFixture(mailboxId, missingMessageIdEml as string, null, "Missing Message-ID");
+		const retry = await ingestFixture(
+			mailboxId,
+			missingMessageIdEml as string,
+			null,
+			"Missing Message-ID",
+		);
 		expect(retry.result.status).toBe("duplicate");
 		expect(retry.result.messageLocalId).toBe(first.result.messageLocalId);
 	});

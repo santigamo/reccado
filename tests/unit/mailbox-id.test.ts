@@ -44,7 +44,9 @@ describe("mailbox-id", () => {
 	});
 
 	it("rejects an address with no '@' separator", () => {
-		expect(() => canonicalPrimaryAddress("not-an-email")).toThrow("Invalid email address: not-an-email");
+		expect(() => canonicalPrimaryAddress("not-an-email")).toThrow(
+			"Invalid email address: not-an-email",
+		);
 	});
 
 	it("rejects an address starting with '@' (empty local part)", () => {

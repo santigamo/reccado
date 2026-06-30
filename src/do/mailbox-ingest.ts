@@ -1,8 +1,8 @@
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflare/types";
 import { sha256Hex } from "../lib/crypto";
 import { normalizeMessageId } from "../lib/email-metadata";
-import { attachmentR2Key, bodyHtmlR2Key, sanitizeFilename } from "../lib/r2-keys";
 import { normalizeSubject, parseMimeBytes, snippetFromText } from "../lib/mime";
+import { attachmentR2Key, bodyHtmlR2Key, sanitizeFilename } from "../lib/r2-keys";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
@@ -31,7 +31,10 @@ function resolveThreadId(
 
 	for (const rfcId of candidates) {
 		const row = sql
-			.exec<{ thread_id: string }>("SELECT thread_id FROM messages WHERE rfc_message_id = ? LIMIT 1", rfcId)
+			.exec<{ thread_id: string }>(
+				"SELECT thread_id FROM messages WHERE rfc_message_id = ? LIMIT 1",
+				rfcId,
+			)
 			.toArray()[0];
 		if (row) return row.thread_id;
 	}
@@ -64,7 +67,9 @@ function bumpContact(sql: SqlStorage, email: string, now: string): void {
 }
 
 function nextRealtimeSeq(sql: SqlStorage): number {
-	const row = sql.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM realtime_events").toArray()[0];
+	const row = sql
+		.exec<{ seq: number }>("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM realtime_events")
+		.toArray()[0];
 	return row?.seq ?? 1;
 }
 
@@ -87,7 +92,10 @@ function resolveConcurrentIdempotencyConflict(
 		.exec<{
 			message_local_id: string | null;
 			raw_sha256: string;
-		}>("SELECT message_local_id, raw_sha256 FROM ingest_events WHERE idempotency_key = ?", message.idempotencyKey)
+		}>(
+			"SELECT message_local_id, raw_sha256 FROM ingest_events WHERE idempotency_key = ?",
+			message.idempotencyKey,
+		)
 		.toArray()[0];
 
 	if (!winner) {
@@ -152,7 +160,10 @@ export async function ingestInboundEmail(
 			message_local_id: string | null;
 			raw_sha256: string;
 			status: string;
-		}>("SELECT message_local_id, raw_sha256, status FROM ingest_events WHERE idempotency_key = ?", message.idempotencyKey)
+		}>(
+			"SELECT message_local_id, raw_sha256, status FROM ingest_events WHERE idempotency_key = ?",
+			message.idempotencyKey,
+		)
 		.toArray()[0];
 
 	if (existing?.raw_sha256 && existing.raw_sha256 !== message.rawSha256) {
@@ -193,7 +204,7 @@ export async function ingestInboundEmail(
 	let ccJson = "[]";
 	let inReplyTo: string | null = message.headers.inReplyTo;
 	let referencesJson = JSON.stringify(message.headers.references);
-	let attachments: Array<{
+	const attachments: Array<{
 		id: string;
 		filename: string | null;
 		contentType: string;
@@ -462,10 +473,16 @@ export async function ingestInboundEmail(
 }
 
 export function messageCount(sql: SqlStorage): number {
-	return sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM messages").toArray()[0]?.count ?? 0;
+	return (
+		sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM messages").toArray()[0]?.count ?? 0
+	);
 }
 
-export function searchMessages(sql: SqlStorage, query: string, limit: number): Array<{ message_id: string }> {
+export function searchMessages(
+	sql: SqlStorage,
+	query: string,
+	limit: number,
+): Array<{ message_id: string }> {
 	const escaped = query.replace(/"/g, '""');
 	return sql
 		.exec<{ message_id: string }>(

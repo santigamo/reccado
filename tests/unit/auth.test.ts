@@ -123,21 +123,17 @@ describe("assertMailboxAccess", () => {
 
 	it("throws a 403 Response when ACCESS_ALLOWED_EMAILS is set and the caller is not in it", () => {
 		expect(() =>
-			assertMailboxAccess(
-				{ userId: "u1", email: "intruder@example.com" },
-				"mbx_1",
-				{ ACCESS_ALLOWED_EMAILS: "owner@example.com" } as Env,
-			),
+			assertMailboxAccess({ userId: "u1", email: "intruder@example.com" }, "mbx_1", {
+				ACCESS_ALLOWED_EMAILS: "owner@example.com",
+			} as Env),
 		).toThrow(Response);
 	});
 
 	it("does not throw when ACCESS_ALLOWED_EMAILS is set and the caller is in it (case-insensitively)", () => {
 		expect(() =>
-			assertMailboxAccess(
-				{ userId: "u1", email: "Owner@Example.com" },
-				"mbx_1",
-				{ ACCESS_ALLOWED_EMAILS: "owner@example.com" } as Env,
-			),
+			assertMailboxAccess({ userId: "u1", email: "Owner@Example.com" }, "mbx_1", {
+				ACCESS_ALLOWED_EMAILS: "owner@example.com",
+			} as Env),
 		).not.toThrow();
 	});
 });

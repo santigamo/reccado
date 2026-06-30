@@ -1,6 +1,6 @@
+import { insertOpsEvent, upsertIngestEvent, upsertMessageIndex } from "../db/d1";
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "./types";
 import { inboundEmailQueueMessageSchema } from "./types";
-import { insertOpsEvent, upsertIngestEvent, upsertMessageIndex } from "../db/d1";
 
 const MAX_RETRIES = 3;
 
