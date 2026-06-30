@@ -458,6 +458,18 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	}
 
 	async fetch(request: Request): Promise<Response> {
+		try {
+			return await this.route(request);
+		} catch (error) {
+			// Map thrown handler errors to proper HTTP statuses so a missing draft/thread/message
+			// surfaces as 404/400 to the API layer instead of a generic 500.
+			const message = error instanceof Error ? error.message : String(error);
+			const status = /not found/i.test(message) ? 404 : /required/i.test(message) ? 400 : 500;
+			return Response.json({ error: message }, { status });
+		}
+	}
+
+	private async route(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname === "/ws" && request.headers.get("Upgrade") === "websocket") {
 			return this.handleWebSocketUpgrade(request);

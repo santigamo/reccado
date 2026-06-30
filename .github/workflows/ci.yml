@@ -7,8 +7,13 @@ on:
 
 jobs:
   build:
-    name: typecheck, test & build
+    name: typecheck, test & build (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exercise the engines floor (package.json) plus the primary current version.
+        node-version: ["22.12.0", "24"]
     steps:
       - uses: actions/checkout@v4
 
@@ -18,7 +23,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
 
       - name: Install dependencies

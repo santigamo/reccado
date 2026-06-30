@@ -381,4 +381,16 @@ describe("DO-proxied routes vs. the global security-header middleware", () => {
 		expect(response.status).toBe(200);
 		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
 	});
+
+	it("maps a Durable Object handler error to 404 (not 500) for a missing draft", async () => {
+		const mailboxId = "mbx_security_do_error_mapping";
+		const response = await fetchWorker(
+			new Request(`http://localhost/api/mailboxes/${mailboxId}/drafts/nonexistent-draft`, {
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ subject: "x" }),
+			}),
+		);
+		expect(response.status).toBe(404);
+	});
 });
