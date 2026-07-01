@@ -37,9 +37,9 @@ beforeAll(async () => {
 	await applyMigration(migrationMessageIndex as string);
 });
 
-async function fetchWorker(request: Request): Promise<Response> {
+async function fetchWorker(request: Request, workerEnv: Env = env): Promise<Response> {
 	const ctx = createExecutionContext();
-	const response = await worker.fetch(request, env, ctx);
+	const response = await worker.fetch(request, workerEnv, ctx);
 	await waitOnExecutionContext(ctx);
 	return response;
 }
@@ -75,10 +75,16 @@ describe("malformed/invalid request bodies", () => {
 });
 
 describe("phase0 debug routes fail closed", () => {
+	// Force the "unconfigured" state explicitly rather than relying on the ambient env:
+	// vitest-pool-workers loads `.dev.vars`, which locally defines PHASE0_DEBUG_TOKEN, so
+	// asserting on the global env is non-hermetic (passes in CI, fails after `pnpm dev`).
+	const envWithoutDebugToken: Env = { ...env, PHASE0_DEBUG_TOKEN: undefined };
+
 	it("returns 404 for the mailbox debug route when PHASE0_DEBUG_TOKEN is not configured", async () => {
-		expect(testEnv.PHASE0_DEBUG_TOKEN).toBeUndefined();
+		expect(envWithoutDebugToken.PHASE0_DEBUG_TOKEN).toBeUndefined();
 		const response = await fetchWorker(
 			new Request("http://localhost/api/debug/phase0/mailboxes/mbx_anything"),
+			envWithoutDebugToken,
 		);
 		expect(response.status).toBe(404);
 	});
@@ -88,6 +94,7 @@ describe("phase0 debug routes fail closed", () => {
 			new Request("http://localhost/api/debug/phase0/mailboxes/mbx_anything", {
 				headers: { "x-phase0-debug-token": "guessed-token" },
 			}),
+			envWithoutDebugToken,
 		);
 		expect(response.status).toBe(404);
 	});
@@ -95,6 +102,7 @@ describe("phase0 debug routes fail closed", () => {
 	it("returns 404 for the r2/head debug route when no token is configured", async () => {
 		const response = await fetchWorker(
 			new Request("http://localhost/api/debug/phase0/r2/head?key=anything"),
+			envWithoutDebugToken,
 		);
 		expect(response.status).toBe(404);
 	});
@@ -392,5 +400,38 @@ describe("DO-proxied routes vs. the global security-header middleware", () => {
 			}),
 		);
 		expect(response.status).toBe(404);
+	});
+});
+
+describe("setup status diagnostic", () => {
+	it("reports control-plane completeness and flips canReceive once an active alias exists", async () => {
+		const now = new Date().toISOString();
+		await testEnv.INDEX_DB.prepare(
+			"INSERT OR IGNORE INTO domains (id, domain, zone_id, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+		)
+			.bind("dom_setup_status", "setup-status.example", "zone", now, now)
+			.run();
+		await testEnv.INDEX_DB.prepare(
+			"INSERT OR IGNORE INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+		)
+			.bind("mbx_setup_status", "inbox@setup-status.example", "Setup Status", now, now)
+			.run();
+		await testEnv.INDEX_DB.prepare(
+			"INSERT OR IGNORE INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+		)
+			.bind("inbox@setup-status.example", "mbx_setup_status", "dom_setup_status", now, now)
+			.run();
+
+		const response = await fetchWorker(new Request("http://localhost/api/setup/status"));
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as {
+			ok: boolean;
+			controlPlane: { mailboxes: number; aliases: number; domains: number; canReceive: boolean };
+		};
+		expect(body.ok).toBe(true);
+		expect(body.controlPlane.mailboxes).toBeGreaterThanOrEqual(1);
+		expect(body.controlPlane.aliases).toBeGreaterThanOrEqual(1);
+		expect(body.controlPlane.domains).toBeGreaterThanOrEqual(1);
+		expect(body.controlPlane.canReceive).toBe(true);
 	});
 });

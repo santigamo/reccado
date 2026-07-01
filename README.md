@@ -95,18 +95,30 @@ architecture and the outbound flow.
 This runs entirely on your machine via local Cloudflare Workers emulation (`@cloudflare/vite-plugin`)
 — no Cloudflare account or deployed resources required.
 
+Starting fresh (no clone yet)? Scaffold a copy with `npx degit santigamo/reccado my-inbox && cd
+my-inbox` (or `node scripts/create-reccado.mjs my-inbox`, which also installs and points you at
+`pnpm doctor`). Already in the repo:
+
 ```bash
+corepack enable   # provides the repo-pinned pnpm; skip if you already have pnpm
 pnpm install
-cp .dev.vars.example .dev.vars
 pnpm dev
 ```
 
-`pnpm dev` runs a `predev` hook first that applies the D1 migrations (`migrations/d1/*.sql`) and
-seeds a deterministic `test@example.com` dev mailbox into the **same local D1** the dev server
-binds to — no separate migrate/seed step required, and it's safe to re-run (idempotent). Vite
+Node `24` is pinned in [`.node-version`](.node-version) (any `>=22.15.0` works), and a
+[`.devcontainer`](.devcontainer/devcontainer.json) is provided for one-click GitHub Codespaces /
+VS Code Dev Containers — open it and run `pnpm dev`.
+
+`pnpm dev` runs a `predev` hook first that (1) generates a minimal local `.dev.vars` if one is
+missing (`scripts/ensure-dev-vars.ts` — never overwrites an existing file; skip with
+`RECCADO_SKIP_DEV_VARS=1`), (2) applies the D1 migrations (`migrations/d1/*.sql`), and (3) seeds a
+deterministic `test@example.com` dev mailbox into the **same local D1** the dev server binds to —
+no separate copy/migrate/seed step required, and it's all safe to re-run (idempotent). Vite
 defaults to port `3000`; if it's busy it prints the port it actually bound to — use that port
-below. Copying `.dev.vars.example` to `.dev.vars` also unlocks the `/api/debug/phase0/*`
-introspection endpoints the smoke script below relies on (via `PHASE0_DEBUG_TOKEN`).
+below. The generated `.dev.vars` also unlocks the `/api/debug/phase0/*` introspection endpoints
+the smoke script below relies on (via `PHASE0_DEBUG_TOKEN`), and intentionally leaves Cloudflare
+Access unset so local `/api/*` uses the local-dev bypass. See
+[`.dev.vars.example`](.dev.vars.example) for every supported variable.
 
 In a second terminal, check the health endpoint and simulate an inbound email:
 
@@ -136,6 +148,7 @@ Durable Object deduplicated it. Open `http://localhost:3000/mailboxes` to see th
 Other local commands:
 
 ```bash
+pnpm doctor              # diagnose toolchain + local dev + config, with an exact fix per issue
 pnpm test               # vitest (Workers runtime via @cloudflare/vitest-pool-workers)
 pnpm typecheck           # tsc --noEmit
 pnpm lint                # biome lint .
@@ -156,6 +169,24 @@ and Cloudflare Access) are domain-level setup you wire once**, since they live o
 The repo ships with placeholder identity so it's safe to fork: replace every `example.com` /
 `mail.example.com` reference and the placeholder Cloudflare IDs with your own. Full command-level
 detail lives in [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+
+Run `pnpm doctor` (add `--env dev` and/or `--cloud`) at any point to see, per issue, exactly
+what's still a placeholder or missing and the command to fix it — it flags an unset `INDEX_DB`
+database id or example `MAIL_FROM_ADDRESS` before a deploy fails on them.
+
+To script the mechanical provisioning (steps 1–3 and 6 below — R2/queues/D1, remote migrations,
+`MAILBOX_ID_SECRET`, deploy), run `pnpm setup:cloud --env dev`. It is **dry-run by default**: it
+prints the exact, personalized, idempotent command sequence using your `wrangler.jsonc` names and
+changes nothing. Review it, then re-run with `--apply` to execute against the Cloudflare account
+your `wrangler` is logged into. It stops short of the domain/identity steps (4–5) on purpose and
+prints them as "Still required".
+
+Pass `--domain <d> --address inbox@<d>` (optionally `--catch-all`) to `setup:cloud` to also seed
+the first mailbox in the same run — this matters because the mailbox id is derived from the
+`MAILBOX_ID_SECRET` it just generated, which is write-only afterwards. You can also seed a mailbox
+on its own (local or remote) with `pnpm setup:mailbox` (dry-run by default; `INSERT OR IGNORE`, so
+idempotent). Seeding an **active domain + alias** is what turns a deployed Worker into an inbox
+that actually stores incoming mail, since routing resolves a recipient by its active alias first.
 
 ### 1. Create the Cloudflare resources <sub>(the one-click button provisions these for you)</sub>
 
@@ -215,21 +246,27 @@ each one does and whether it's required.
 
 ### 4. Configure Email Routing
 
-In the Cloudflare dashboard (or via the API), point Email Routing for your domain at this Worker:
+Point Email Routing for your domain at this Worker. `pnpm setup:routing --domain <d> --env dev`
+scripts the automatable parts (enable routing + create the "send to Worker" rule) — dry-run by
+default, `--apply` to run — and prints the required MX/SPF/DKIM records. Or do it by hand:
 
 - Enable Email Routing on your zone.
 - Add a routing rule: match the address(es) you want to receive, action "Send to a Worker", target
   your deployed Worker (`reccado-dev` / `reccado`, or your renamed equivalent).
+- Add the MX/SPF/DKIM records it requires and let Cloudflare verify them (this DNS step is the one
+  part that isn't automatable — check status with `pnpm wrangler email routing settings <domain>`).
 - For outbound, onboard your sending domain under Email Sending in the dashboard and set
   `MAIL_FROM_ADDRESS` in `wrangler.jsonc` (`vars`) to a verified sender on that domain.
 
 ### 5. Set up Cloudflare Access
 
 Reccado has no built-in login screen — **Cloudflare Access is the auth perimeter** for the UI and
-`/api/*`. Create a self-hosted Access application in front of your Worker's route/domain, add an
-allow policy for your email (or identity provider group), and capture the application's audience
-(`aud`) tag and your Zero Trust team domain for `ACCESS_JWT_AUDIENCE` / `ACCESS_TEAM_DOMAIN` above.
-Optionally set `ACCESS_ALLOWED_EMAILS` as a second, app-level allowlist on top of Access. See
+`/api/*`. `pnpm setup:access --url <deployed-url>` walks you through it: it prints the dashboard
+steps to create a self-hosted Access application (this varies by identity provider, so it is not
+automated), then sets `ACCESS_JWT_AUDIENCE` / `ACCESS_TEAM_DOMAIN` (and optional
+`ACCESS_ALLOWED_EMAILS`) as secrets once you pass `--aud` / `--team-domain` (dry-run by default).
+Verify it actually protects the route with `pnpm doctor --cloud --url <deployed-url>`, which fails
+if an unauthenticated request gets a `200` instead of an Access redirect. See
 [`SECURITY.md`](SECURITY.md) for the full auth model.
 
 ### 6. Deploy <sub>(done by the one-click button)</sub>
@@ -248,15 +285,9 @@ Access login, not return `200` (production isn't on `*.workers.dev` at all; see
 ### 7. Verify the Cloudflare bindings you actually deployed
 
 The repo ships a verifier for the Worker name, bindings, queues, D1, Email Sending, and an example
-Email Routing rule. The defaults still match the maintainer dev example so existing validation
-commands keep working:
-
-```bash
-pnpm verify:cf
-```
-
-For your own deployment, pass your resource names and IDs by env var or CLI flag instead of editing
-the script:
+Email Routing rule. Because the repo now ships a **placeholder** D1 id (see step 2), `pnpm verify:cf`
+exits early asking for your real id until you provide it — pass your resource names and IDs by env
+var or CLI flag:
 
 ```bash
 CF_VERIFY_ENV=dev \
@@ -276,6 +307,20 @@ Equivalent CLI flags are available (`--env`, `--worker`, `--r2`, `--queue`, `--d
 `--d1-id`, `--email-sending-domain`, `--routing-domain`, `--routing-address`). The verifier checks
 that the values in `wrangler.jsonc` match the resources you intended to use, then confirms those
 resources exist in the current Cloudflare account.
+
+### 8. Post-deploy smokes
+
+Two focused, exit-code-driven checks (good for a CI / post-deploy gate) prove the two things that
+matter most once live:
+
+```bash
+pnpm smoke:access https://<your-deployed-url>          # fails if unauthenticated /api/* returns 200
+pnpm smoke:routing --domain <your-domain> --env dev    # fails if no Email Routing rule targets the Worker
+```
+
+The deployed Worker also exposes `GET /api/setup/status` (behind the Access perimeter, like the
+rest of `/api/*`): index-DB health plus control-plane completeness (domain/mailbox/alias/routing
+counts and a `canReceive` flag) — runtime facts the CLI can't infer.
 
 ## Configuration
 
@@ -304,7 +349,7 @@ resources exist in the current Cloudflare account.
 
 ## Compatibility
 
-- **Node.js** — `engines.node: ">=22.12.0"` in `package.json`. CI runs Node 24.
+- **Node.js** — `engines.node: ">=22.15.0"` in `package.json`; `.node-version` pins `24`. CI runs Node 22.15.0 and 24.
 - **pnpm** — `packageManager: pnpm@11.1.1` in `package.json`. Use Corepack or install that version
   directly.
 - **Wrangler** — `^4.105.0` (devDependency). Cloudflare resource commands in this README assume a
