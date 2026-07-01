@@ -60,8 +60,8 @@
 		"cf-typegen": "wrangler types"
 	},
 	"dependencies": {
-		"@cloudflare/vite-plugin": "^1.26.0",
-		"@tailwindcss/vite": "^4.1.18",
+		"@cloudflare/vite-plugin": "^1.42.4",
+		"@tailwindcss/vite": "^4.3.2",
 		"@tanstack/react-devtools": "^0.10.8",
 		"@tanstack/react-router": "^1.170.16",
 		"@tanstack/react-router-devtools": "^1.167.0",
@@ -69,12 +69,12 @@
 		"@tanstack/react-start": "^1.168.26",
 		"@tanstack/router-plugin": "^1.132.0",
 		"hono": "^4.9.6",
-		"lucide-react": "^0.545.0",
+		"lucide-react": "^1.22.0",
 		"mimetext": "^3.0.28",
 		"postal-mime": "^2.7.5",
 		"react": "^19.2.0",
 		"react-dom": "^19.2.0",
-		"tailwindcss": "^4.1.18",
+		"tailwindcss": "^4.3.2",
 		"zod": "^4.4.3"
 	},
 	"devDependencies": {
