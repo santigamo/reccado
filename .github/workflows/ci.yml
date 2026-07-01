@@ -7,9 +7,6 @@ on:
 
 permissions:
   contents: read
-  # gitleaks-action@v3 reads PR metadata on pull_request events; without this it fails with
-  # "Resource not accessible by integration" (403) on every PR.
-  pull-requests: read
 
 jobs:
   build:
@@ -126,7 +123,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v3
+      - name: Gitleaks (pinned CLI)
+        # We run the gitleaks CLI directly instead of gitleaks/gitleaks-action@v3: on
+        # pull_request events that action reports "Unexpected exit code [1]" even after
+        # "no leaks found in partial scan", failing every PR (the exit-code wrapper is
+        # buggy). The CLI scans the working tree against .gitleaks.toml and exits non-zero
+        # only on a real finding — deterministic, and no GitHub API / PR permissions needed.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: "8.24.3"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+          gitleaks dir . --config .gitleaks.toml --redact --no-banner
