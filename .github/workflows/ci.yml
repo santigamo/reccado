@@ -107,6 +107,12 @@ jobs:
         # the Start-specific SSR register augmentation that the Vite plugin
         # adds — so only `cf-typegen` needs to run explicitly.
         run: |
+          # `wrangler types` bakes the keys of the local .dev.vars into
+          # worker-configuration.d.ts, so the committed artifact must be
+          # generated from a canonical, committed basis rather than whatever
+          # transient .dev.vars an earlier step left behind. Regenerate from
+          # .dev.vars.example (which is committed) to keep this check deterministic.
+          cp .dev.vars.example .dev.vars
           pnpm run cf-typegen
           git diff --exit-code -- worker-configuration.d.ts src/routeTree.gen.ts
 
