@@ -103,7 +103,8 @@ const defaultConfigByEnv: Record<
 		queue: "inbox-mcp-inbound-dev",
 		dlq: "inbox-mcp-inbound-dlq-dev",
 		d1: "inbox-mcp-index-dev",
-		d1Id: "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
+		// Placeholder — pass your real dev D1 id via CF_VERIFY_D1_ID (or --d1-id).
+		d1Id: "00000000-0000-0000-0000-000000000000",
 		emailSendingDomain: "mail.example.com",
 		routingDomain: "example.com",
 		routingAddress: "test@example.com",

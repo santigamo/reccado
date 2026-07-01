@@ -97,16 +97,19 @@ This runs entirely on your machine via local Cloudflare Workers emulation (`@clo
 
 ```bash
 pnpm install
-cp .dev.vars.example .dev.vars
 pnpm dev
 ```
 
-`pnpm dev` runs a `predev` hook first that applies the D1 migrations (`migrations/d1/*.sql`) and
-seeds a deterministic `test@example.com` dev mailbox into the **same local D1** the dev server
-binds to — no separate migrate/seed step required, and it's safe to re-run (idempotent). Vite
+`pnpm dev` runs a `predev` hook first that (1) generates a minimal local `.dev.vars` if one is
+missing (`scripts/ensure-dev-vars.ts` — never overwrites an existing file; skip with
+`RECCADO_SKIP_DEV_VARS=1`), (2) applies the D1 migrations (`migrations/d1/*.sql`), and (3) seeds a
+deterministic `test@example.com` dev mailbox into the **same local D1** the dev server binds to —
+no separate copy/migrate/seed step required, and it's all safe to re-run (idempotent). Vite
 defaults to port `3000`; if it's busy it prints the port it actually bound to — use that port
-below. Copying `.dev.vars.example` to `.dev.vars` also unlocks the `/api/debug/phase0/*`
-introspection endpoints the smoke script below relies on (via `PHASE0_DEBUG_TOKEN`).
+below. The generated `.dev.vars` also unlocks the `/api/debug/phase0/*` introspection endpoints
+the smoke script below relies on (via `PHASE0_DEBUG_TOKEN`), and intentionally leaves Cloudflare
+Access unset so local `/api/*` uses the local-dev bypass. See
+[`.dev.vars.example`](.dev.vars.example) for every supported variable.
 
 In a second terminal, check the health endpoint and simulate an inbound email:
 
@@ -136,6 +139,7 @@ Durable Object deduplicated it. Open `http://localhost:3000/mailboxes` to see th
 Other local commands:
 
 ```bash
+pnpm doctor              # diagnose toolchain + local dev + config, with an exact fix per issue
 pnpm test               # vitest (Workers runtime via @cloudflare/vitest-pool-workers)
 pnpm typecheck           # tsc --noEmit
 pnpm lint                # biome lint .
@@ -156,6 +160,24 @@ and Cloudflare Access) are domain-level setup you wire once**, since they live o
 The repo ships with placeholder identity so it's safe to fork: replace every `example.com` /
 `mail.example.com` reference and the placeholder Cloudflare IDs with your own. Full command-level
 detail lives in [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+
+Run `pnpm doctor` (add `--env dev` and/or `--cloud`) at any point to see, per issue, exactly
+what's still a placeholder or missing and the command to fix it — it flags an unset `INDEX_DB`
+database id or example `MAIL_FROM_ADDRESS` before a deploy fails on them.
+
+To script the mechanical provisioning (steps 1–3 and 6 below — R2/queues/D1, remote migrations,
+`MAILBOX_ID_SECRET`, deploy), run `pnpm setup:cloud --env dev`. It is **dry-run by default**: it
+prints the exact, personalized, idempotent command sequence using your `wrangler.jsonc` names and
+changes nothing. Review it, then re-run with `--apply` to execute against the Cloudflare account
+your `wrangler` is logged into. It stops short of the domain/identity steps (4–5) on purpose and
+prints them as "Still required".
+
+Pass `--domain <d> --address inbox@<d>` (optionally `--catch-all`) to `setup:cloud` to also seed
+the first mailbox in the same run — this matters because the mailbox id is derived from the
+`MAILBOX_ID_SECRET` it just generated, which is write-only afterwards. You can also seed a mailbox
+on its own (local or remote) with `pnpm setup:mailbox` (dry-run by default; `INSERT OR IGNORE`, so
+idempotent). Seeding an **active domain + alias** is what turns a deployed Worker into an inbox
+that actually stores incoming mail, since routing resolves a recipient by its active alias first.
 
 ### 1. Create the Cloudflare resources <sub>(the one-click button provisions these for you)</sub>
 

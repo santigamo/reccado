@@ -33,8 +33,12 @@
 		"#/*": "./src/*"
 	},
 	"scripts": {
-		"predev": "pnpm run d1:migrate:local && tsx scripts/seed-dev-d1.ts --apply-local",
+		"predev": "pnpm run ensure:dev-vars && pnpm run d1:migrate:local && tsx scripts/seed-dev-d1.ts --apply-local",
 		"dev": "vite dev --port 3000",
+		"ensure:dev-vars": "tsx scripts/ensure-dev-vars.ts",
+		"doctor": "tsx scripts/doctor.ts",
+		"setup:cloud": "tsx scripts/setup-cloud.ts",
+		"setup:mailbox": "tsx scripts/setup-mailbox.ts",
 		"generate-routes": "tsr generate",
 		"build": "vite build",
 		"preview": "pnpm run build && vite preview",

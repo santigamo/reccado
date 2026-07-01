@@ -37,9 +37,9 @@ beforeAll(async () => {
 	await applyMigration(migrationMessageIndex as string);
 });
 
-async function fetchWorker(request: Request): Promise<Response> {
+async function fetchWorker(request: Request, workerEnv: Env = env): Promise<Response> {
 	const ctx = createExecutionContext();
-	const response = await worker.fetch(request, env, ctx);
+	const response = await worker.fetch(request, workerEnv, ctx);
 	await waitOnExecutionContext(ctx);
 	return response;
 }
@@ -75,10 +75,16 @@ describe("malformed/invalid request bodies", () => {
 });
 
 describe("phase0 debug routes fail closed", () => {
+	// Force the "unconfigured" state explicitly rather than relying on the ambient env:
+	// vitest-pool-workers loads `.dev.vars`, which locally defines PHASE0_DEBUG_TOKEN, so
+	// asserting on the global env is non-hermetic (passes in CI, fails after `pnpm dev`).
+	const envWithoutDebugToken: Env = { ...env, PHASE0_DEBUG_TOKEN: undefined };
+
 	it("returns 404 for the mailbox debug route when PHASE0_DEBUG_TOKEN is not configured", async () => {
-		expect(testEnv.PHASE0_DEBUG_TOKEN).toBeUndefined();
+		expect(envWithoutDebugToken.PHASE0_DEBUG_TOKEN).toBeUndefined();
 		const response = await fetchWorker(
 			new Request("http://localhost/api/debug/phase0/mailboxes/mbx_anything"),
+			envWithoutDebugToken,
 		);
 		expect(response.status).toBe(404);
 	});
@@ -88,6 +94,7 @@ describe("phase0 debug routes fail closed", () => {
 			new Request("http://localhost/api/debug/phase0/mailboxes/mbx_anything", {
 				headers: { "x-phase0-debug-token": "guessed-token" },
 			}),
+			envWithoutDebugToken,
 		);
 		expect(response.status).toBe(404);
 	});
@@ -95,6 +102,7 @@ describe("phase0 debug routes fail closed", () => {
 	it("returns 404 for the r2/head debug route when no token is configured", async () => {
 		const response = await fetchWorker(
 			new Request("http://localhost/api/debug/phase0/r2/head?key=anything"),
+			envWithoutDebugToken,
 		);
 		expect(response.status).toBe(404);
 	});

@@ -1,0 +1,186 @@
+#!/usr/bin/env tsx
+/**
+ * `pnpm setup:mailbox` — seeds the D1 control-plane rows a mailbox needs to actually
+ * receive mail (domain + mailbox + alias, optionally a catch-all routing rule), deriving
+ * the `mailbox_id` with the SAME MAILBOX_ID_SECRET the Worker uses so the ids line up.
+ *
+ * This is the step that turns "deployed" into "an inbox that receives": `resolveRoutingForRecipient`
+ * stores mail for a recipient as soon as an active alias + active domain exist (src/db/d1.ts).
+ *
+ * SAFETY: dry-run by default (prints the mailbox id, the SQL, and the exact `wrangler d1
+ * execute` command). Pass `--apply` to run it. All inserts are `INSERT OR IGNORE`, so it is
+ * idempotent and safe to re-run.
+ *
+ * The secret coupling (important): the Worker's MAILBOX_ID_SECRET is write-only in Cloudflare,
+ * so for a REMOTE seed you must pass the same value via `--secret` (or MAILBOX_ID_SECRET in the
+ * env) — the CLI cannot read it back, and a mismatched secret derives a mailbox id the Worker
+ * will never route to. Locally it is read from `.dev.vars`.
+ *
+ * Usage:
+ *   pnpm setup:mailbox --domain example.com --address inbox@example.com            # local dry run
+ *   pnpm setup:mailbox --domain example.com --address inbox@example.com --local --apply
+ *   pnpm setup:mailbox --domain example.com --address inbox@example.com \
+ *     --env dev --secret <mailbox-id-secret> --catch-all --apply                   # remote
+ */
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { canonicalPrimaryAddress, deriveMailboxId } from "../src/lib/mailbox-id";
+
+function parseArgs(argv: string[]): Record<string, string> {
+	const args: Record<string, string> = {};
+	for (let i = 0; i < argv.length; i += 1) {
+		const arg = argv[i];
+		if (!arg?.startsWith("--")) continue;
+		const [rawKey, inlineValue] = arg.slice(2).split("=", 2);
+		if (!rawKey) continue;
+		if (inlineValue !== undefined) {
+			args[rawKey] = inlineValue;
+			continue;
+		}
+		const next = argv[i + 1];
+		if (!next || next.startsWith("--")) {
+			args[rawKey] = "true";
+			continue;
+		}
+		args[rawKey] = next;
+		i += 1;
+	}
+	return args;
+}
+
+function stripJsonc(input: string): string {
+	return input.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+}
+
+/** Reads a single key out of a dotenv-style file, ignoring comments. */
+function readDotEnvValue(path: string, key: string): string | undefined {
+	if (!existsSync(path)) return undefined;
+	for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const sep = trimmed.indexOf("=");
+		if (sep !== -1 && trimmed.slice(0, sep).trim() === key) {
+			return trimmed.slice(sep + 1).trim();
+		}
+	}
+	return undefined;
+}
+
+/** SQL single-quoted string literal with quotes escaped. */
+function q(value: string): string {
+	return `'${value.replace(/'/g, "''")}'`;
+}
+
+const args = parseArgs(process.argv.slice(2));
+const apply = args.apply === "true";
+const local = args.local === "true";
+const targetEnv = args.env;
+const catchAll = args["catch-all"] === "true";
+
+const domain = args.domain?.trim().toLowerCase();
+const rawAddress = args.address?.trim();
+if (!domain || !rawAddress) {
+	console.error("setup:mailbox: --domain and --address are required.");
+	console.error("Example: pnpm setup:mailbox --domain example.com --address inbox@example.com");
+	process.exit(1);
+}
+
+let address: string;
+try {
+	address = canonicalPrimaryAddress(rawAddress);
+} catch {
+	console.error(`setup:mailbox: invalid --address "${rawAddress}".`);
+	process.exit(1);
+}
+if (!address.endsWith(`@${domain}`)) {
+	console.error(`setup:mailbox: --address ${address} is not on --domain ${domain}.`);
+	process.exit(1);
+}
+
+const displayName = args["display-name"]?.trim() || address.split("@")[0] || "Inbox";
+const zoneId = args["zone-id"]?.trim() || "zone-placeholder";
+
+// Resolve the secret: explicit flag > env > .dev.vars (local only).
+const secret =
+	(args.secret?.trim() || undefined) ??
+	process.env.MAILBOX_ID_SECRET ??
+	readDotEnvValue(".dev.vars", "MAILBOX_ID_SECRET");
+if (!secret) {
+	console.error(
+		"setup:mailbox: no MAILBOX_ID_SECRET available.\n" +
+			"  Local: run `pnpm dev` once to generate .dev.vars, or set MAILBOX_ID_SECRET.\n" +
+			"  Remote: pass --secret <value> (the exact secret you set on the Worker) — it is\n" +
+			"  write-only in Cloudflare and the mailbox id must match what the Worker derives.",
+	);
+	process.exit(1);
+}
+
+const mailboxId = await deriveMailboxId(secret, address);
+const domainId = `dom_${domain.replace(/[^a-z0-9]+/g, "_")}`;
+const now = new Date().toISOString();
+
+const statements = [
+	`INSERT OR IGNORE INTO domains (id, domain, zone_id, status, created_at, updated_at)
+VALUES (${q(domainId)}, ${q(domain)}, ${q(zoneId)}, 'active', ${q(now)}, ${q(now)});`,
+	`INSERT OR IGNORE INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at)
+VALUES (${q(mailboxId)}, ${q(address)}, ${q(displayName)}, 'active', ${q(now)}, ${q(now)});`,
+	`INSERT OR IGNORE INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at)
+VALUES (${q(address)}, ${q(mailboxId)}, ${q(domainId)}, 'active', ${q(now)}, ${q(now)});`,
+];
+if (catchAll) {
+	statements.push(
+		`INSERT OR IGNORE INTO routing_rules (id, domain_id, pattern, priority, action, mailbox_id, forward_to_json, reject_reason, enabled, created_at, updated_at)
+VALUES (${q(`rule_${domainId}_catchall`)}, ${q(domainId)}, '*', 100, 'store', ${q(mailboxId)}, '[]', NULL, 1, ${q(now)}, ${q(now)});`,
+	);
+}
+const sql = `-- Reccado mailbox seed for ${address} (mailbox_id=${mailboxId}). Idempotent.\n${statements.join("\n")}\n`;
+
+// Resolve the D1 execute target.
+let execArgs: string[];
+let targetLabel: string;
+if (local) {
+	execArgs = ["d1", "execute", "INDEX_DB", "--local"];
+	targetLabel = "local D1 (INDEX_DB binding)";
+} else {
+	const config = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as {
+		d1_databases?: Array<{ binding: string; database_name: string }>;
+		env?: Record<string, { d1_databases?: Array<{ binding: string; database_name: string }> }>;
+	};
+	const block = targetEnv ? config.env?.[targetEnv] : config;
+	const d1Name = block?.d1_databases?.find((d) => d.binding === "INDEX_DB")?.database_name;
+	if (!d1Name) {
+		console.error(
+			`setup:mailbox: could not resolve the INDEX_DB name for env "${targetEnv ?? "production"}".`,
+		);
+		process.exit(1);
+	}
+	execArgs = ["d1", "execute", d1Name, "--remote", ...(targetEnv ? ["--env", targetEnv] : [])];
+	targetLabel = `remote D1 "${d1Name}"${targetEnv ? ` (env ${targetEnv})` : ""}`;
+}
+
+console.log(`\nReccado setup:mailbox\n`);
+console.log(`  address:     ${address}`);
+console.log(`  mailbox_id:  ${mailboxId}`);
+console.log(`  domain:      ${domain} (${domainId})`);
+console.log(
+	`  catch-all:   ${catchAll ? "yes (routing_rule pattern '*')" : "no (exact alias only)"}`,
+);
+console.log(`  target:      ${targetLabel}`);
+console.log(`  mode:        ${apply ? "APPLY" : "dry run (no changes)"}\n`);
+console.log(sql);
+
+if (!apply) {
+	console.log(
+		`Command that would run:\n  $ pnpm wrangler ${execArgs.join(" ")} --file <tmp.sql>\n`,
+	);
+	console.log("Dry run only. Re-run with --apply to execute.\n");
+	process.exit(0);
+}
+
+const dir = mkdtempSync(join(tmpdir(), "reccado-setup-mailbox-"));
+const sqlPath = join(dir, "seed.sql");
+writeFileSync(sqlPath, sql, "utf8");
+execFileSync("pnpm", ["wrangler", ...execArgs, `--file=${sqlPath}`], { stdio: "inherit" });
+console.log(`\nSeeded ${address} → ${mailboxId} into ${targetLabel}.`);
