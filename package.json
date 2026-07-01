@@ -39,6 +39,7 @@
 		"doctor": "tsx scripts/doctor.ts",
 		"setup:cloud": "tsx scripts/setup-cloud.ts",
 		"setup:mailbox": "tsx scripts/setup-mailbox.ts",
+		"setup:routing": "tsx scripts/setup-routing.ts",
 		"generate-routes": "tsr generate",
 		"build": "vite build",
 		"preview": "pnpm run build && vite preview",

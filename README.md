@@ -237,11 +237,15 @@ each one does and whether it's required.
 
 ### 4. Configure Email Routing
 
-In the Cloudflare dashboard (or via the API), point Email Routing for your domain at this Worker:
+Point Email Routing for your domain at this Worker. `pnpm setup:routing --domain <d> --env dev`
+scripts the automatable parts (enable routing + create the "send to Worker" rule) — dry-run by
+default, `--apply` to run — and prints the required MX/SPF/DKIM records. Or do it by hand:
 
 - Enable Email Routing on your zone.
 - Add a routing rule: match the address(es) you want to receive, action "Send to a Worker", target
   your deployed Worker (`reccado-dev` / `reccado`, or your renamed equivalent).
+- Add the MX/SPF/DKIM records it requires and let Cloudflare verify them (this DNS step is the one
+  part that isn't automatable — check status with `pnpm wrangler email routing settings <domain>`).
 - For outbound, onboard your sending domain under Email Sending in the dashboard and set
   `MAIL_FROM_ADDRESS` in `wrangler.jsonc` (`vars`) to a verified sender on that domain.
 
