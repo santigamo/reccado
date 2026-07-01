@@ -74,11 +74,11 @@ at tiny sizes — use the flat favicon.
 
 ## Asset generation recipe
 
-The current committed banner (`assets/banner.jpg`) is rendered from a self-contained HTML source
-(`assets/banner.html`) via headless Chrome — **zero credits, fully reproducible, version-controlled**.
-For a photographic, hero-grade glass render that matches the rest of the family, regenerate with
-**Midjourney V8.1** (via MeiGen) using the prompts below, then crop and optimize. *(Premium model —
-needs purchased MeiGen credits; the MCP/API path cannot use the daily free credits.)*
+The committed banner (`assets/banner.jpg`) is the **"edge flow" hero** — translucent glass envelopes
+streaming out of a glowing Cloudflare-orange edge-portal with god-rays and particles — generated with
+**gpt-image-2** (recipe below). A hand-authored HTML source (`assets/banner.html`) is kept as a
+**zero-credit, fully reproducible** fallback that can be re-rendered via headless Chrome. Midjourney
+V8.1 (via MeiGen) is an alternative for the logomark/avatar.
 
 **Reproduce the current banner** (no credits, macOS):
 
@@ -98,13 +98,22 @@ sips -s format jpeg -s formatOptions 82 banner-1440.png --out docs/assets/banner
 > depth, soft reflections and inner glow, in a vibrant amber-orange to ember iridescent gradient,
 > on a deep charcoal background. Ultra-clean, minimal, premium, centered. No text, no letters.
 
-**Banner** — `model: midjourney-v8.1`, `aspectRatio: 16:9`, `resolution: 2K`:
+**Banner — current hero, gpt-image-2 ("edge flow")**. Generated with OpenAI **gpt-image-2**. Easiest
+path: Codex's native image tool — enable once with `image_generation = true` under `[features]` in
+`~/.codex/config.toml` (or `codex features enable image_generation`) and restart the session; **no
+OpenAI API key needed**. Generate at landscape `1536x1024`, quality `high`, then crop/fit to
+`1440x617` and export JPG (see post-process). Verify the wordmark spells `RECCADO` exactly;
+regenerate if not. **The exact prompt used for the committed banner:**
 
-> Wide hero banner, dark-mode. Deep warm-charcoal background with a soft orange glow. On the
-> left, a large geometric sans-serif wordmark "RECCADO" in crisp white, perfectly spelled. On the
-> right, glassmorphism: translucent stacked rounded glass envelopes and letters with depth,
-> reflections and inner glow, amber-orange to ember iridescent gradient. Ultra-clean, premium,
-> generous negative space. No extra text besides RECCADO.
+> Ultra-premium wide cinematic hero banner, dark mode, 21:9. A dramatic 3D scene: translucent
+> iridescent glass envelopes and letters streaming across the frame out of a glowing amber-orange
+> light rift / portal on the right, with volumetric god-rays, floating glowing particles, soft
+> bokeh, depth and gentle motion. The glass is an amber-to-orange-to-ember iridescent gradient with
+> real refraction, caustics and thin bright edges. On the left, the wordmark "RECCADO" in a refined
+> distinctive geometric display sans-serif with elegant tight tracking, crisp white with a faint
+> warm glow and a subtle iridescent sheen along the letter edges, perfectly spelled uppercase. Deep
+> warm charcoal (#0C0A09) background. Editorial, Apple-keynote-grade, premium. The only text in the
+> image is "RECCADO" — nothing else.
 
 **Post-process** (macOS, no extra tooling):
 
