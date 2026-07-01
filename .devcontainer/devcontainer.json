@@ -1,0 +1,21 @@
+{
+	"name": "Reccado",
+	"image": "mcr.microsoft.com/devcontainers/typescript-node:24",
+	"features": {
+		"ghcr.io/devcontainers/features/github-cli:1": {}
+	},
+	"onCreateCommand": "corepack enable",
+	"postCreateCommand": "pnpm install",
+	"forwardPorts": [3000],
+	"portsAttributes": {
+		"3000": {
+			"label": "reccado dev",
+			"onAutoForward": "notify"
+		}
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": ["biomejs.biome"]
+		}
+	}
+}

@@ -95,10 +95,19 @@ architecture and the outbound flow.
 This runs entirely on your machine via local Cloudflare Workers emulation (`@cloudflare/vite-plugin`)
 — no Cloudflare account or deployed resources required.
 
+Starting fresh (no clone yet)? Scaffold a copy with `npx degit santigamo/reccado my-inbox && cd
+my-inbox` (or `node scripts/create-reccado.mjs my-inbox`, which also installs and points you at
+`pnpm doctor`). Already in the repo:
+
 ```bash
+corepack enable   # provides the repo-pinned pnpm; skip if you already have pnpm
 pnpm install
 pnpm dev
 ```
+
+Node `24` is pinned in [`.node-version`](.node-version) (any `>=22.15.0` works), and a
+[`.devcontainer`](.devcontainer/devcontainer.json) is provided for one-click GitHub Codespaces /
+VS Code Dev Containers — open it and run `pnpm dev`.
 
 `pnpm dev` runs a `predev` hook first that (1) generates a minimal local `.dev.vars` if one is
 missing (`scripts/ensure-dev-vars.ts` — never overwrites an existing file; skip with
@@ -252,10 +261,12 @@ default, `--apply` to run — and prints the required MX/SPF/DKIM records. Or do
 ### 5. Set up Cloudflare Access
 
 Reccado has no built-in login screen — **Cloudflare Access is the auth perimeter** for the UI and
-`/api/*`. Create a self-hosted Access application in front of your Worker's route/domain, add an
-allow policy for your email (or identity provider group), and capture the application's audience
-(`aud`) tag and your Zero Trust team domain for `ACCESS_JWT_AUDIENCE` / `ACCESS_TEAM_DOMAIN` above.
-Optionally set `ACCESS_ALLOWED_EMAILS` as a second, app-level allowlist on top of Access. See
+`/api/*`. `pnpm setup:access --url <deployed-url>` walks you through it: it prints the dashboard
+steps to create a self-hosted Access application (this varies by identity provider, so it is not
+automated), then sets `ACCESS_JWT_AUDIENCE` / `ACCESS_TEAM_DOMAIN` (and optional
+`ACCESS_ALLOWED_EMAILS`) as secrets once you pass `--aud` / `--team-domain` (dry-run by default).
+Verify it actually protects the route with `pnpm doctor --cloud --url <deployed-url>`, which fails
+if an unauthenticated request gets a `200` instead of an Access redirect. See
 [`SECURITY.md`](SECURITY.md) for the full auth model.
 
 ### 6. Deploy <sub>(done by the one-click button)</sub>
@@ -302,6 +313,16 @@ Equivalent CLI flags are available (`--env`, `--worker`, `--r2`, `--queue`, `--d
 `--d1-id`, `--email-sending-domain`, `--routing-domain`, `--routing-address`). The verifier checks
 that the values in `wrangler.jsonc` match the resources you intended to use, then confirms those
 resources exist in the current Cloudflare account.
+
+### 8. Post-deploy smokes
+
+Two focused, exit-code-driven checks (good for a CI / post-deploy gate) prove the two things that
+matter most once live:
+
+```bash
+pnpm smoke:access https://<your-deployed-url>          # fails if unauthenticated /api/* returns 200
+pnpm smoke:routing --domain <your-domain> --env dev    # fails if no Email Routing rule targets the Worker
+```
 
 ## Configuration
 

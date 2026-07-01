@@ -315,12 +315,71 @@ if (args.cloud === "true") {
 			fix: "Run `pnpm wrangler login`, then re-run with --cloud.",
 		});
 	}
+	if (args.url) {
+		add(await checkAccessRedirect(args.url));
+	} else {
+		add({
+			id: "cloud.access",
+			status: "info",
+			message: "Pass --url <deployed-url> to check that Cloudflare Access is protecting /api/*.",
+		});
+	}
 	add({
 		id: "cloud.bindings",
 		status: "info",
-		message:
-			"Deep remote binding checks (resources, secrets, routing, Access) live in `pnpm verify:cf`.",
+		message: "Deep remote binding checks (resources, secrets, routing) live in `pnpm verify:cf`.",
 	});
+}
+
+/**
+ * An unauthenticated request to a Worker fronted by Cloudflare Access should be redirected to
+ * the team's cloudflareaccess.com login. A 200 means Access is NOT protecting the route.
+ */
+async function checkAccessRedirect(rawUrl: string): Promise<Check> {
+	const url = new URL("/api/health", rawUrl).toString();
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 8000);
+	try {
+		const res = await fetch(url, { redirect: "manual", signal: controller.signal });
+		const location = res.headers.get("location") ?? "";
+		if ((res.status === 302 || res.status === 303) && /cloudflareaccess\.com/i.test(location)) {
+			return {
+				id: "cloud.access",
+				status: "pass",
+				message: `Access redirects unauthenticated ${url} to login.`,
+			};
+		}
+		if (res.status === 403 || res.status === 401) {
+			return {
+				id: "cloud.access",
+				status: "pass",
+				message: `Access blocks unauthenticated ${url} (${res.status}).`,
+			};
+		}
+		if (res.status === 200) {
+			return {
+				id: "cloud.access",
+				status: "fail",
+				message: `Unauthenticated ${url} returned 200 — Cloudflare Access is NOT protecting it.`,
+				fix: "Create a self-hosted Access app for the route and an allow policy (see `pnpm setup:access`).",
+			};
+		}
+		return {
+			id: "cloud.access",
+			status: "warn",
+			message: `Unauthenticated ${url} returned ${res.status} (expected a 302 to cloudflareaccess.com).`,
+			fix: "Confirm the Access application covers this exact route.",
+		};
+	} catch {
+		return {
+			id: "cloud.access",
+			status: "warn",
+			message: `Could not reach ${url} to check Access.`,
+			fix: "Check the URL and that the Worker is deployed.",
+		};
+	} finally {
+		clearTimeout(timeout);
+	}
 }
 
 // --- Report ------------------------------------------------------------------
