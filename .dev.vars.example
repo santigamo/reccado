@@ -2,29 +2,30 @@
 #
 # You normally do NOT need to copy this: `pnpm dev` auto-generates a minimal
 # `.dev.vars` via scripts/ensure-dev-vars.ts if one is missing. This file is the
-# reference for every supported variable.
+# reference for every supported variable AND the canonical basis for `wrangler types`
+# (`pnpm cf-typegen`) — so every key must stay present here even when its value is empty,
+# or the generated worker-configuration.d.ts would drop it.
 #
-# IMPORTANT: the Cloudflare Access / API-token vars below are commented out on
-# purpose. The local-dev bypass in src/lib/runtime-config.ts only kicks in when
-# BOTH Access vars are empty/absent, so leaving them set to placeholder values
-# would break unauthenticated local `/api/*`. Uncomment them only when you are
-# deliberately testing the real Access perimeter or admin provisioning locally.
+# The Access / API-token values are intentionally LEFT EMPTY (not placeholder strings):
+# the local-dev bypass in src/lib/runtime-config.ts stays active only while BOTH Access
+# vars are empty/absent, so copying this file verbatim keeps local `/api/*` working.
+# Fill them in only when you deliberately test the real Access perimeter or admin
+# provisioning locally.
 
-# --- Local-safe (used by `pnpm dev` and the smoke scripts) ---
+# Key order below is significant: `wrangler types` emits keys in this order, so it must match
+# the committed worker-configuration.d.ts (the CI "generated artifacts" check diffs it).
+
+# Unlocks the local /api/debug/phase0/* introspection endpoints the smoke scripts use.
+PHASE0_DEBUG_TOKEN=dev-phase0-debug-token
 
 # Stable mailbox ID derivation secret for Phase 1.3+.
 # Use this exact value locally so dev seed and smokes match (see scripts/seed-dev-d1.ts).
 MAILBOX_ID_SECRET=dev-mailbox-id-secret-v1
 
-# Optional Phase 0 debug endpoint token (unlocks /api/debug/phase0/*).
-PHASE0_DEBUG_TOKEN=dev-phase0-debug-token
-
-# --- Remote-only (leave commented for local dev; see note above) ---
-
-# Cloudflare API token for admin provisioning workflows.
+# Cloudflare API token for admin provisioning workflows (leave empty for local dev).
 # Minimum intended scope: zone read, email routing write for test zones, and Access app/policy write only when configuring Access by API.
-# CLOUDFLARE_API_TOKEN=replace-with-least-privilege-token
+CLOUDFLARE_API_TOKEN=
 
-# Cloudflare Access validation settings for protected UI/API.
-# ACCESS_JWT_AUDIENCE=replace-with-access-aud-tag
-# ACCESS_TEAM_DOMAIN=https://replace-team.cloudflareaccess.com
+# Cloudflare Access validation settings (leave empty for local dev; see note above).
+ACCESS_JWT_AUDIENCE=
+ACCESS_TEAM_DOMAIN=

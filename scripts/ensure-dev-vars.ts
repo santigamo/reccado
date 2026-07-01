@@ -23,15 +23,20 @@ const LOCAL_DEV_VARS = `# Auto-generated minimal local dev config (scripts/ensur
 # Safe to edit or delete — it is only (re)generated when missing, never overwritten.
 # See .dev.vars.example for every supported variable and what it does.
 
-# Stable mailbox ID derivation secret. Must match the dev seed default.
-MAILBOX_ID_SECRET=dev-mailbox-id-secret-v1
+# Key order matches .dev.vars.example / the committed types (a local \`pnpm cf-typegen\` stays clean).
 
 # Unlocks the local /api/debug/phase0/* introspection endpoints the smoke scripts use.
 PHASE0_DEBUG_TOKEN=dev-phase0-debug-token
 
-# Cloudflare Access is intentionally left UNSET locally so /api/* uses local-dev-bypass.
-# Set ACCESS_JWT_AUDIENCE + ACCESS_TEAM_DOMAIN (and optionally CLOUDFLARE_API_TOKEN)
-# only when you want to exercise the real Access perimeter against local dev.
+# Stable mailbox ID derivation secret. Must match the dev seed default.
+MAILBOX_ID_SECRET=dev-mailbox-id-secret-v1
+
+# Access / API-token vars are present-but-EMPTY: this keeps the full key set (so a local
+# \`pnpm cf-typegen\` matches the committed types) while leaving the local-dev bypass active
+# (it needs both Access vars empty/absent). Fill them in only to test real Access locally.
+CLOUDFLARE_API_TOKEN=
+ACCESS_JWT_AUDIENCE=
+ACCESS_TEAM_DOMAIN=
 `;
 
 if (process.env.RECCADO_SKIP_DEV_VARS === "1") {
