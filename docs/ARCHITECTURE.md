@@ -6,7 +6,7 @@
 - Date: 2026-07-01.
 - Source of truth: this repository's current docs and code (`README.md`, `docs/OPERATIONS.md`,
   `SECURITY.md`, `src/*`). Historical validation evidence lives in
-  `docs/PHASE0_VALIDATION.md` and `docs/PHASE1_VALIDATION.md`.
+  `docs/validation/PHASE0_VALIDATION.md` and `docs/validation/PHASE1_VALIDATION.md`.
 - Scope: architecture/ADR context for the current product shape. This file is not a task list or a
   release checklist.
 

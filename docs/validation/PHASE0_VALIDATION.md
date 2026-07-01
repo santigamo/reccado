@@ -3,8 +3,8 @@
 > **Internal build-validation log — historical record, not current operating docs.** This file
 > captures the evidence gathered while building Phase 0. Resource names, IDs, secrets, and
 > commands below reflect the maintainer's environment at that point in time and may be stale —
-> see [`README.md`](../README.md), [`docs/OPERATIONS.md`](OPERATIONS.md), and
-> [`SECURITY.md`](../SECURITY.md) for current, accurate operating guidance.
+> see [`README.md`](../../README.md), [`docs/OPERATIONS.md`](../OPERATIONS.md), and
+> [`SECURITY.md`](../../SECURITY.md) for current, accurate operating guidance.
 
 **Date:** 2026-06-30  
 **Worktree:** `~/orca/workspaces/reccado/inbox-phase0-cursor`  

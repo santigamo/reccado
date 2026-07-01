@@ -56,7 +56,7 @@ Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox.
 - Split `AGENTS.md` into durable invariants vs. one-time build/process notes, and scrubbed
   maintainer-specific Cloudflare resource literals (D1 database ID, account/worker URLs) in favor
   of placeholders.
-- Marked `docs/PHASE0_VALIDATION.md` and `docs/PHASE1_VALIDATION.md` as historical
+- Marked `docs/validation/PHASE0_VALIDATION.md` and `docs/validation/PHASE1_VALIDATION.md` as historical
   build-validation logs rather than current operating docs.
 - Fixed a stale "Inbox MCP" UI string (the product was renamed to Reccado).
 
@@ -95,7 +95,7 @@ Initial senior-validated milestone: a usable self-hosted inbox without any AI/ag
   `d1:migrate:dev` package scripts) after pulling a release that touches `migrations/d1/`, and
   review new migrations before applying them to a database with real mail in it.
 - Validated end-to-end against real Cloudflare resources in a `dev` environment; see
-  `docs/PHASE0_VALIDATION.md` and `docs/PHASE1_VALIDATION.md` for the historical validation
+  `docs/validation/PHASE0_VALIDATION.md` and `docs/validation/PHASE1_VALIDATION.md` for the historical validation
   record (debug tokens, deployment names, and account identifiers in those files are the
   maintainer's own and have since been redacted/placeholder'd where they leaked into current
   docs).

@@ -7,8 +7,8 @@ self-hosting Reccado into a Cloudflare account (deployment, not code changes), s
 overview.
 
 This repository was implemented from `docs/IMPLEMENTATION.md` under senior-gated phases — do not
-spend context rediscovering facts already validated in `docs/PHASE0_VALIDATION.md` and
-`docs/PHASE1_VALIDATION.md`. Those two files are a **historical build-validation log**, not
+spend context rediscovering facts already validated in `docs/validation/PHASE0_VALIDATION.md` and
+`docs/validation/PHASE1_VALIDATION.md`. Those two files are a **historical build-validation log**, not
 current operating docs; treat their concrete IDs/URLs as examples from a past run, not live
 state.
 
@@ -110,7 +110,7 @@ actual repo state, fix this section rather than trusting it blindly.
 
 ### Current baseline
 
-- Phase 1 (Tier A inbox) is senior-validated; see `docs/PHASE1_VALIDATION.md` for the historical
+- Phase 1 (Tier A inbox) is senior-validated; see `docs/validation/PHASE1_VALIDATION.md` for the historical
   record. Phase 2 (Tier B: Workflows, EmailAgent, MCP endpoint, RAG) has not started.
 - A security-hardening pass on top of Phase 1 is current/recent work: debug endpoints fail closed
   by default, attachment/raw downloads get hardened response headers, dev-data seeding requires

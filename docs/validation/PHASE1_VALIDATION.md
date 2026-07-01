@@ -3,8 +3,8 @@
 > **Internal build-validation log — historical record, not current operating docs.** This file
 > captures the evidence gathered while building and senior-validating Phase 1. Resource names,
 > IDs, secrets, and commands below reflect the maintainer's environment at that point in time and
-> may be stale — see [`README.md`](../README.md), [`docs/OPERATIONS.md`](OPERATIONS.md), and
-> [`SECURITY.md`](../SECURITY.md) for current, accurate operating guidance.
+> may be stale — see [`README.md`](../../README.md), [`docs/OPERATIONS.md`](../OPERATIONS.md), and
+> [`SECURITY.md`](../../SECURITY.md) for current, accurate operating guidance.
 
 ## Milestone 1.1 - Project Foundation
 
