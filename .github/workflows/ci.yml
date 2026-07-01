@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: typecheck, test & build (Node ${{ matrix.node-version }})
@@ -44,6 +47,30 @@ jobs:
       - name: Build
         run: pnpm run build
 
+      - name: Local HTTP smoke
+        env:
+          PHASE0_DEBUG_TOKEN: ci-debug-token
+          MAILBOX_ID_SECRET: dev-mailbox-id-secret-v1
+        run: |
+          pnpm dev --host 127.0.0.1 --strictPort > /tmp/reccado-ci-dev.log 2>&1 &
+          dev_pid=$!
+          cleanup() {
+            kill "$dev_pid" >/dev/null 2>&1 || true
+            wait "$dev_pid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for _ in $(seq 1 60); do
+            if curl --silent --fail http://127.0.0.1:3000/api/health >/tmp/reccado-ci-health.json; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl --silent --fail http://127.0.0.1:3000/api/health | tee /tmp/reccado-ci-health.json
+          curl --silent --fail http://127.0.0.1:3000/ >/tmp/reccado-ci-root.html
+          test -s /tmp/reccado-ci-root.html
+
       - name: Validate Worker bundle (dry run)
         run: pnpm exec wrangler deploy --dry-run --outdir .wrangler/dry-run
 
@@ -57,3 +84,14 @@ jobs:
         run: |
           pnpm run cf-typegen
           git diff --exit-code -- worker-configuration.d.ts src/routeTree.gen.ts
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,3 +1,10 @@
+import {
+	fetchWithTimeout,
+	getAccessConfigStatus,
+	isAbortTimeoutError,
+	isLocalRequest,
+} from "../lib/runtime-config";
+
 export type AuthContext = {
 	userId: string;
 	email: string;
@@ -55,7 +62,10 @@ async function getAccessCerts(teamDomain: string): Promise<AccessCertResponse> {
 	if (cachedCerts && now - cachedCertsAt < 60_000) {
 		return cachedCerts;
 	}
-	const response = await fetch(`${teamDomain.replace(/\/$/, "")}/cdn-cgi/access/certs`);
+	const response = await fetchWithTimeout(
+		`${teamDomain.replace(/\/$/, "")}/cdn-cgi/access/certs`,
+		{ timeoutMs: 5_000 },
+	);
 	if (!response.ok) {
 		throw new Error(`Failed to fetch Access certs: ${response.status}`);
 	}
@@ -65,11 +75,12 @@ async function getAccessCerts(teamDomain: string): Promise<AccessCertResponse> {
 }
 
 async function verifyAccessJwt(token: string, env: Env): Promise<AccessJwtPayload> {
-	const audience = env.ACCESS_JWT_AUDIENCE;
-	const teamDomain = env.ACCESS_TEAM_DOMAIN;
-	if (!audience || !teamDomain) {
-		throw new Error("Access validation is not configured");
+	const accessConfig = getAccessConfigStatus(env);
+	if (!accessConfig.configured || accessConfig.mode !== "access-jwt") {
+		throw new Error(accessConfig.reason ?? "Access validation is not configured");
 	}
+	const audience = env.ACCESS_JWT_AUDIENCE!;
+	const teamDomain = env.ACCESS_TEAM_DOMAIN!;
 
 	const { header, payload, signature, signed } = parseJwt(token);
 	const kid = header.kid;
@@ -113,19 +124,15 @@ async function verifyAccessJwt(token: string, env: Env): Promise<AccessJwtPayloa
 }
 
 export async function getAuthContext(request: Request, env: Env): Promise<AuthContext | null> {
-	const audience = env.ACCESS_JWT_AUDIENCE;
-	if (!audience) {
-		const hostname = new URL(request.url).hostname;
-		// URL parsing returns IPv6 hosts in bracketed form ("[::1]"), so accept both spellings.
-		if (
-			hostname !== "localhost" &&
-			hostname !== "127.0.0.1" &&
-			hostname !== "::1" &&
-			hostname !== "[::1]"
-		) {
+	const accessConfig = getAccessConfigStatus(env);
+	if (accessConfig.mode === "local-dev-bypass") {
+		if (!isLocalRequest(request)) {
 			return null;
 		}
 		return { userId: "dev-local", email: "dev@local" };
+	}
+	if (!accessConfig.ok) {
+		throw new Error(accessConfig.reason ?? "Access validation is misconfigured");
 	}
 
 	const token = request.headers.get("CF-Access-JWT-Assertion");
@@ -137,7 +144,19 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 		const payload = await verifyAccessJwt(token, env);
 		const email = payload.email ?? payload.sub ?? "unknown";
 		return { userId: payload.sub ?? email, email };
-	} catch {
+	} catch (error) {
+		if (
+			isAbortTimeoutError(error) ||
+			(error instanceof Error && error.message.startsWith("Failed to fetch Access certs:"))
+		) {
+			throw error;
+		}
+		if (
+			error instanceof Error &&
+			(error.message.includes("misconfigured") || error.message.includes("not configured"))
+		) {
+			throw error;
+		}
 		return null;
 	}
 }
@@ -178,7 +197,21 @@ function isAllowedOwner(auth: AuthContext, env: Env): boolean {
 }
 
 export async function requireAuth(request: Request, env: Env): Promise<AuthContext> {
-	const auth = await getAuthContext(request, env);
+	let auth: AuthContext | null;
+	try {
+		auth = await getAuthContext(request, env);
+	} catch (error) {
+		const message =
+			error instanceof Error
+				? isAbortTimeoutError(error)
+					? "Cloudflare Access validation timed out."
+					: error.message
+				: "Cloudflare Access validation failed.";
+		throw new Response(JSON.stringify({ error: "auth_unavailable", reason: message }), {
+			status: 503,
+			headers: { "content-type": "application/json" },
+		});
+	}
 	if (!auth) {
 		throw new Response(JSON.stringify({ error: "unauthorized" }), {
 			status: 401,

@@ -41,6 +41,17 @@ describe("getAuthContext dev-localhost bypass", () => {
 		} as Env);
 		expect(auth).toBeNull();
 	});
+
+	it("throws for non-local requests when Access config is partially set", async () => {
+		const request = new Request("https://example.com/api/me");
+		await expect(
+			getAuthContext(request, {
+				ACCESS_JWT_AUDIENCE: "aud-1",
+			} as Env),
+		).rejects.toThrow(
+			"Cloudflare Access validation is misconfigured; missing ACCESS_TEAM_DOMAIN.",
+		);
+	});
 });
 
 describe("getAuthContext with ACCESS_JWT_AUDIENCE configured", () => {
@@ -111,6 +122,23 @@ describe("requireAuth", () => {
 		const request = new Request("http://localhost/api/me");
 		const auth = await requireAuth(request, noAccessConfig);
 		expect(auth).toEqual({ userId: "dev-local", email: "dev@local" });
+	});
+
+	it("throws a 503 Response when Access config is partially set", async () => {
+		const request = new Request("https://example.com/api/me");
+		let caught: unknown;
+		try {
+			await requireAuth(request, { ACCESS_JWT_AUDIENCE: "aud-1" } as Env);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(Response);
+		const response = caught as Response;
+		expect(response.status).toBe(503);
+		expect(await response.json()).toEqual({
+			error: "auth_unavailable",
+			reason: "Cloudflare Access validation is misconfigured; missing ACCESS_TEAM_DOMAIN.",
+		});
 	});
 });
 

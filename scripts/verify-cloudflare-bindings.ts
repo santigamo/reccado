@@ -20,19 +20,22 @@ type WranglerConfig = {
 	env?: Record<string, Partial<WranglerConfig>>;
 };
 
-const required = {
-	worker: "reccado-dev",
-	r2: "inbox-mcp-raw-dev",
-	queue: "inbox-mcp-inbound-dev",
-	dlq: "inbox-mcp-inbound-dlq-dev",
-	d1: "inbox-mcp-index-dev",
-	d1Id: "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
-	emailSendingDomain: "mail.example.com",
-	doBinding: "MAILBOX_DO",
-	r2Binding: "MAIL_OBJECTS",
-	queueBinding: "INBOUND_EMAIL_QUEUE",
-	d1Binding: "INDEX_DB",
-	emailBinding: "EMAIL",
+type VerificationConfig = {
+	configEnv: "production" | "dev";
+	worker: string;
+	r2: string;
+	queue: string;
+	dlq: string;
+	d1: string;
+	d1Id: string;
+	emailSendingDomain: string;
+	routingDomain: string;
+	routingAddress: string;
+	doBinding: string;
+	r2Binding: string;
+	queueBinding: string;
+	d1Binding: string;
+	emailBinding: string;
 };
 
 function stripJsonc(input: string): string {
@@ -52,15 +55,137 @@ function assert(condition: unknown, message: string): asserts condition {
 	}
 }
 
+function parseArgs(argv: string[]): Record<string, string> {
+	const args: Record<string, string> = {};
+	for (let i = 0; i < argv.length; i += 1) {
+		const arg = argv[i];
+		if (!arg?.startsWith("--")) continue;
+		const [rawKey, inlineValue] = arg.slice(2).split("=", 2);
+		if (!rawKey) continue;
+		if (inlineValue !== undefined) {
+			args[rawKey] = inlineValue;
+			continue;
+		}
+		const next = argv[i + 1];
+		if (!next || next.startsWith("--")) {
+			args[rawKey] = "true";
+			continue;
+		}
+		args[rawKey] = next;
+		i += 1;
+	}
+	return args;
+}
+
+function resolveString(
+	args: Record<string, string>,
+	argName: string,
+	envName: string,
+	fallback: string,
+): string {
+	return args[argName] ?? process.env[envName] ?? fallback;
+}
+
+const args = parseArgs(process.argv.slice(2));
+const configEnvArg = args.env ?? process.env.CF_VERIFY_ENV ?? "dev";
+assert(
+	configEnvArg === "dev" || configEnvArg === "production",
+	`Invalid env ${configEnvArg}; expected "dev" or "production"`,
+);
+
+const defaultConfigByEnv: Record<VerificationConfig["configEnv"], Omit<VerificationConfig, "configEnv">> =
+	{
+		dev: {
+			worker: "reccado-dev",
+			r2: "inbox-mcp-raw-dev",
+			queue: "inbox-mcp-inbound-dev",
+			dlq: "inbox-mcp-inbound-dlq-dev",
+			d1: "inbox-mcp-index-dev",
+			d1Id: "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
+			emailSendingDomain: "mail.example.com",
+			routingDomain: "example.com",
+			routingAddress: "test@example.com",
+			doBinding: "MAILBOX_DO",
+			r2Binding: "MAIL_OBJECTS",
+			queueBinding: "INBOUND_EMAIL_QUEUE",
+			d1Binding: "INDEX_DB",
+			emailBinding: "EMAIL",
+		},
+		production: {
+			worker: "reccado",
+			r2: "inbox-mcp-raw",
+			queue: "inbox-mcp-inbound",
+			dlq: "inbox-mcp-inbound-dlq",
+			d1: "inbox-mcp-index",
+			d1Id: "<your-prod-d1-database-id>",
+			emailSendingDomain: "mail.example.com",
+			routingDomain: "example.com",
+			routingAddress: "test@example.com",
+			doBinding: "MAILBOX_DO",
+			r2Binding: "MAIL_OBJECTS",
+			queueBinding: "INBOUND_EMAIL_QUEUE",
+			d1Binding: "INDEX_DB",
+			emailBinding: "EMAIL",
+		},
+	};
+
+const defaults = defaultConfigByEnv[configEnvArg];
+const required: VerificationConfig = {
+	configEnv: configEnvArg,
+	worker: resolveString(args, "worker", "CF_VERIFY_WORKER", defaults.worker),
+	r2: resolveString(args, "r2", "CF_VERIFY_R2_BUCKET", defaults.r2),
+	queue: resolveString(args, "queue", "CF_VERIFY_QUEUE", defaults.queue),
+	dlq: resolveString(args, "dlq", "CF_VERIFY_DLQ", defaults.dlq),
+	d1: resolveString(args, "d1", "CF_VERIFY_D1_NAME", defaults.d1),
+	d1Id: resolveString(args, "d1-id", "CF_VERIFY_D1_ID", defaults.d1Id),
+	emailSendingDomain: resolveString(
+		args,
+		"email-sending-domain",
+		"CF_VERIFY_EMAIL_SENDING_DOMAIN",
+		defaults.emailSendingDomain,
+	),
+	routingDomain: resolveString(
+		args,
+		"routing-domain",
+		"CF_VERIFY_ROUTING_DOMAIN",
+		defaults.routingDomain,
+	),
+	routingAddress: resolveString(
+		args,
+		"routing-address",
+		"CF_VERIFY_ROUTING_ADDRESS",
+		defaults.routingAddress,
+	),
+	doBinding: resolveString(args, "do-binding", "CF_VERIFY_DO_BINDING", defaults.doBinding),
+	r2Binding: resolveString(args, "r2-binding", "CF_VERIFY_R2_BINDING", defaults.r2Binding),
+	queueBinding: resolveString(
+		args,
+		"queue-binding",
+		"CF_VERIFY_QUEUE_BINDING",
+		defaults.queueBinding,
+	),
+	d1Binding: resolveString(args, "d1-binding", "CF_VERIFY_D1_BINDING", defaults.d1Binding),
+	emailBinding: resolveString(
+		args,
+		"email-binding",
+		"CF_VERIFY_EMAIL_BINDING",
+		defaults.emailBinding,
+	),
+};
+
 const config = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as WranglerConfig;
-const dev = config.env?.dev ?? {};
-const merged: WranglerConfig = { ...config, ...dev };
+const envConfig = required.configEnv === "dev" ? (config.env?.dev ?? {}) : {};
+const merged: WranglerConfig = { ...config, ...envConfig };
 
 assert(config.main === "src/server.ts", "wrangler main must be src/server.ts");
 assert(config.compatibility_date === "2026-06-30", "compatibility_date mismatch");
 assert(config.compatibility_flags?.includes("nodejs_compat"), "nodejs_compat flag missing");
 assert(config.observability?.enabled === true, "observability.enabled missing");
-assert(dev.name === required.worker, "env.dev.name mismatch");
+if (required.configEnv === "dev") {
+	assert(envConfig.name === required.worker, "env.dev.name mismatch");
+} else {
+	assert(config.name === required.worker, "top-level worker name mismatch");
+}
 assert(merged.triggers?.crons?.length, "Cron trigger missing");
 assert(
 	merged.send_email?.some((binding) => binding.name === required.emailBinding),
@@ -116,14 +241,15 @@ const emailSending = runWrangler(["email", "sending", "list"]);
 assert(emailSending.includes(required.emailSendingDomain), "Email Sending domain missing");
 assert(emailSending.includes("yes"), "Email Sending domain is not enabled");
 
-const routingRules = runWrangler(["email", "routing", "rules", "list", "example.com"]);
-assert(routingRules.includes("test@example.com"), "Email Routing test alias missing");
+const routingRules = runWrangler(["email", "routing", "rules", "list", required.routingDomain]);
+assert(routingRules.includes(required.routingAddress), "Email Routing test alias missing");
 assert(routingRules.includes(required.worker), "Email Routing worker action missing");
 
 console.log(
 	JSON.stringify(
 		{
 			ok: true,
+			env: required.configEnv,
 			worker: required.worker,
 			resources: {
 				r2: required.r2,
@@ -132,6 +258,8 @@ console.log(
 				d1: required.d1,
 				d1Id: required.d1Id,
 				emailSendingDomain: required.emailSendingDomain,
+				routingDomain: required.routingDomain,
+				routingAddress: required.routingAddress,
 				cron: merged.triggers?.crons,
 				emailBinding: required.emailBinding,
 			},

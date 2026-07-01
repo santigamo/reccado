@@ -174,10 +174,17 @@ pnpm d1:migrate:dev     # wrangler d1 migrations apply <db> --remote --env dev
 pnpm d1:migrate:prod    # wrangler d1 migrations apply <db> --remote (default/production env)
 ```
 
-Note `d1:migrate:local`/`d1:migrate:dev`/`d1:migrate:prod` in `package.json` reference the
-maintainer's D1 database names (`inbox-mcp-index-dev` / `inbox-mcp-index`) directly — update those
-script commands to your own database names after step 1, or run the underlying
-`wrangler d1 migrations apply` command directly.
+By default those scripts target the example names already in `wrangler.jsonc`
+(`inbox-mcp-index-dev` / `inbox-mcp-index`) so the maintainer dev flow keeps working. Self-hosters
+should override them with env vars instead of editing `package.json`:
+
+```bash
+D1_DB_NAME_LOCAL=<your-dev-db-name> pnpm d1:migrate:local
+D1_DB_NAME_DEV=<your-dev-db-name> pnpm d1:migrate:dev
+D1_DB_NAME_PROD=<your-prod-db-name> pnpm d1:migrate:prod
+```
+
+You can also run `wrangler d1 migrations apply <db> ...` directly if you prefer.
 
 ### 3. Set secrets <sub>(the one-click setup page prompts for these)</sub>
 
@@ -227,6 +234,38 @@ After deploying, confirm Access is actually blocking unauthenticated traffic —
 Access login, not return `200` (production isn't on `*.workers.dev` at all; see
 [Compatibility](#compatibility)). Then log in through Access and confirm `/api/health` returns
 `{"ok":true}`.
+
+### 7. Verify the Cloudflare bindings you actually deployed
+
+The repo ships a verifier for the Worker name, bindings, queues, D1, Email Sending, and an example
+Email Routing rule. The defaults still match the maintainer dev example so existing validation
+commands keep working:
+
+```bash
+pnpm verify:cf
+```
+
+For your own deployment, pass your resource names and IDs by env var or CLI flag instead of editing
+the script:
+
+```bash
+CF_VERIFY_ENV=dev \
+CF_VERIFY_WORKER=<your-dev-worker-name> \
+CF_VERIFY_R2_BUCKET=<your-dev-r2-bucket> \
+CF_VERIFY_QUEUE=<your-dev-queue> \
+CF_VERIFY_DLQ=<your-dev-dlq> \
+CF_VERIFY_D1_NAME=<your-dev-d1-name> \
+CF_VERIFY_D1_ID=<your-dev-d1-id> \
+CF_VERIFY_EMAIL_SENDING_DOMAIN=<your-sending-domain> \
+CF_VERIFY_ROUTING_DOMAIN=<your-routing-domain> \
+CF_VERIFY_ROUTING_ADDRESS=<your-test-alias> \
+pnpm verify:cf
+```
+
+Equivalent CLI flags are available (`--env`, `--worker`, `--r2`, `--queue`, `--dlq`, `--d1`,
+`--d1-id`, `--email-sending-domain`, `--routing-domain`, `--routing-address`). The verifier checks
+that the values in `wrangler.jsonc` match the resources you intended to use, then confirms those
+resources exist in the current Cloudflare account.
 
 ## Configuration
 
@@ -284,6 +323,10 @@ Access login, not return `200` (production isn't on `*.workers.dev` at all; see
 | `curl /api/health` returns `200` directly instead of redirecting to Access login | Cloudflare Access is misconfigured or not enabled on that route | Treat this as a security incident: block public access to the API first (disable the route or tighten the Access policy), then fix and re-verify the Access app/policy before reopening it. |
 | `pnpm wrangler deploy --env dev` deploys the wrong Worker name | The Cloudflare Vite plugin can redirect Wrangler to its own generated config and drop the `--env` name override | Always deploy with both flags explicit: `pnpm wrangler deploy --env dev --name reccado-dev` (this is exactly what `pnpm run deploy:dev` does). |
 | Local large-MIME smoke (`pnpm smoke:email:large`) fails around 1 MiB | Cloudflare's local Email Routing test path enforces a much lower size limit (~1 MiB) than the 25 MiB production inbound limit | Expected local-tooling behavior, not a bug — generate a fixture under ~1 MiB for local smoke (`pnpm generate:large-mime`), and trust the documented 25 MiB production limit (see [`docs/PHASE0_VALIDATION.md`](docs/PHASE0_VALIDATION.md)). |
+
+For actual operating procedures, rollback, DLQ handling, and current retention/export limitations,
+use [`docs/OPERATIONS.md`](docs/OPERATIONS.md). That document is the current-state runbook; this
+README stays at deploy/setup depth.
 
 ## Learn more
 

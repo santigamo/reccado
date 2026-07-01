@@ -2,10 +2,13 @@
 
 ## Status
 
-- Status: accepted architecture for initial build; implementation not started.
-- Date: 2026-06-30.
-- Source of truth: `internal planning notes (not in repo)`.
-- Scope: architecture/ADR context only. This file is not a task list.
+- Status: Tier A architecture is implemented in this repository; Tier B remains roadmap-only.
+- Date: 2026-07-01.
+- Source of truth: this repository's current docs and code (`README.md`, `docs/OPERATIONS.md`,
+  `SECURITY.md`, `src/*`). Historical validation evidence lives in
+  `docs/PHASE0_VALIDATION.md` and `docs/PHASE1_VALIDATION.md`.
+- Scope: architecture/ADR context for the current product shape. This file is not a task list or a
+  release checklist.
 
 ## Project Goal
 
@@ -16,6 +19,15 @@ across multiple domains.
 
 Tier B adds Agents, MCP, and RAG on top for demos, reliability-audit material, and
 agent-in-production learning. Tier B must not redefine Tier A's data model.
+
+Current repo status:
+
+- Tier A is the implemented product surface today: inbound Email Routing, mailbox Durable Objects,
+  R2 raw storage, Queue ingest, D1 cross-mailbox index, realtime UI, and human-confirmed outbound
+  send.
+- Tier B capabilities named in this document (`McpAgent`, MCP endpoint, Vectorize/RAG, AI Gateway
+  model path, long Workflow sagas) are architectural roadmap items, not shipped features in the
+  current repo.
 
 ## Non-Goals
 
@@ -244,4 +256,3 @@ upgrades deliberate.
 - Agents: https://developers.cloudflare.com/agents/
 - TanStack Start on Cloudflare Workers: https://developers.cloudflare.com/workers/framework-guides/web-apps/tanstack-start/
 - Cloudflare acquisition of Astro: https://www.cloudflare.com/press/press-releases/2026/cloudflare-acquires-astro-to-accelerate-the-future-of-high-performance-web-development/
-

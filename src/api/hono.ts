@@ -15,6 +15,12 @@ import {
 } from "../db/d1";
 import { AppError } from "../lib/errors";
 import { mailboxIdFromPrimaryAddress } from "../lib/mailbox-id";
+import {
+	fetchWithTimeout,
+	getAccessConfigStatus,
+	isAbortTimeoutError,
+	isLocalRequest,
+} from "../lib/runtime-config";
 import { assertMailboxAccess, type getAuthContext, requireAuth } from "./auth";
 import { registerAdminRoutes, registerMailboxRoutes } from "./mailbox-routes";
 import {
@@ -86,7 +92,41 @@ export function createApiApp(): Hono<ApiBindings> {
 		return next();
 	});
 
-	api.get("/api/health", (c) => c.json({ ok: true }));
+	api.get("/api/health", (c) => {
+		const access = getAccessConfigStatus(c.env);
+		const authOk = access.ok && (access.mode !== "local-dev-bypass" || isLocalRequest(c.req.raw));
+		const authReason =
+			authOk || access.mode !== "local-dev-bypass"
+				? access.reason
+				: "Cloudflare Access validation is not configured for non-localhost requests.";
+		const cloudflareApiConfigured = Boolean(c.env.CLOUDFLARE_API_TOKEN?.trim());
+		const dependencyStates = {
+			auth: {
+				ok: authOk,
+				configured: access.configured,
+				mode: access.mode,
+				reason: authReason,
+				missing: access.missing,
+			},
+			indexDb: {
+				ok: true,
+				configured: true,
+			},
+			cloudflareApi: {
+				ok: true,
+				configured: cloudflareApiConfigured,
+				reason: cloudflareApiConfigured ? null : "CLOUDFLARE_API_TOKEN is not set.",
+			},
+		};
+		return c.json({
+			ok: true,
+			readiness: {
+				ok: authOk,
+				status: authOk ? "ready" : "degraded",
+			},
+			dependencies: dependencyStates,
+		});
+	});
 
 	api.get("/api/me", (c) => {
 		const auth = c.get("auth");
@@ -161,18 +201,44 @@ export function createApiApp(): Hono<ApiBindings> {
 				cloudflare: { configured: false, reason: "CLOUDFLARE_API_TOKEN not set" },
 			});
 		}
-		const response = await fetch(`https://api.cloudflare.com/client/v4/zones/${domain.zone_id}`, {
-			headers: { Authorization: `Bearer ${token}` },
-		});
-		const payload = (await response.json()) as {
-			success?: boolean;
-			result?: { status?: string; name?: string };
-		};
+		let payload:
+			| {
+					success?: boolean;
+					result?: { status?: string; name?: string };
+			  }
+			| undefined;
+		try {
+			const response = await fetchWithTimeout(
+				`https://api.cloudflare.com/client/v4/zones/${domain.zone_id}`,
+				{
+					headers: { Authorization: `Bearer ${token}` },
+					timeoutMs: 5_000,
+				},
+			);
+			payload = (await response.json()) as {
+				success?: boolean;
+				result?: { status?: string; name?: string };
+			};
+		} catch (error) {
+			return c.json({
+				domain,
+				cloudflare: {
+					configured: true,
+					ok: false,
+					reason: isAbortTimeoutError(error)
+						? "Cloudflare API request timed out."
+						: "Cloudflare API request failed.",
+					status: null,
+					name: null,
+				},
+			});
+		}
 		return c.json({
 			domain,
 			cloudflare: {
 				configured: true,
 				ok: payload.success === true,
+				reason: payload.success === true ? null : "Cloudflare API returned an unsuccessful response.",
 				status: payload.result?.status ?? null,
 				name: payload.result?.name ?? null,
 			},

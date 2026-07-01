@@ -92,6 +92,63 @@ which documents names and placeholder values only. Never rotate `MAILBOX_ID_SECR
 without a mailbox-ID migration plan — it's the HMAC key every mailbox ID is derived from, and
 rotating it changes every mailbox ID in the system.
 
+## Supply-chain posture
+
+### Dependency update cadence
+
+This repository uses GitHub Dependabot for two update streams:
+
+- `npm` dependencies in the workspace root.
+- `github-actions` versions used by CI.
+
+Both are scheduled weekly. That is the default maintenance cadence, not a promise that every PR
+will be auto-merged unchanged. Review is still required, especially for packages or Actions that
+touch build, deploy, auth, or parsing paths.
+
+### Local and CI verification
+
+The baseline verification for dependency changes is the same local checkpoint used for regular
+code changes:
+
+- `pnpm run lint`
+- `pnpm run typecheck`
+- `pnpm test`
+- `pnpm run build`
+- `pnpm exec wrangler deploy --dry-run --outdir .wrangler/dry-run`
+
+CI also starts the local dev server and performs a minimal HTTP smoke against `/api/health` and
+`/` so dependency churn has to survive more than static compilation.
+
+### Secret scanning
+
+CI runs a repository secret scan on every push and pull request. That is meant to catch
+accidental credential commits before release, but it is not a substitute for scoping and rotating
+real secrets correctly.
+
+For GitHub-hosted copies of this repo, enable GitHub Secret Scanning and Push Protection when the
+plan/account supports them. For self-hosted mirrors or other forge platforms, use an equivalent
+pre-receive or CI secret-scanning control.
+
+### GitHub Actions permissions
+
+The CI workflow declares repository-level read-only `contents` permission by default and does not
+grant write scopes for build/test jobs. If you add workflows later, keep permissions explicit and
+job-scoped, and only widen them for a concrete need such as release publishing.
+
+### Auditing and manual review expectations
+
+Automated updates and scans reduce drift, but they do not prove a dependency is safe. Self-hosters
+should still:
+
+- review dependency and GitHub Actions update PRs before merging;
+- prefer pinned major versions and avoid unreviewed action swaps;
+- run `pnpm audit` or an equivalent advisory review as part of release preparation;
+- verify Cloudflare/Wrangler/Auth changes against current upstream documentation before a real
+  production deploy;
+- keep branch protection, CODEOWNERS/reviewer rules, and repository secret-scanning settings in
+  the Git hosting platform, since those controls are account/repo policy rather than application
+  code.
+
 ## Supported versions
 
 Reccado is pre-1.0 and self-hosted: there is one actively maintained line (`main`). Security fixes

@@ -52,9 +52,9 @@
 		"smoke:email:large": "tsx scripts/smoke-large-email-local.ts",
 		"smoke:email:local": "tsx scripts/smoke-email-local.ts",
 		"verify:cf": "tsx scripts/verify-cloudflare-bindings.ts",
-		"d1:migrate:local": "wrangler d1 migrations apply inbox-mcp-index-dev --local",
-		"d1:migrate:dev": "wrangler d1 migrations apply inbox-mcp-index-dev --remote --env dev",
-		"d1:migrate:prod": "wrangler d1 migrations apply inbox-mcp-index --remote",
+		"d1:migrate:local": "sh -c 'wrangler d1 migrations apply \"${D1_DB_NAME_LOCAL:-inbox-mcp-index-dev}\" --local'",
+		"d1:migrate:dev": "sh -c 'wrangler d1 migrations apply \"${D1_DB_NAME_DEV:-inbox-mcp-index-dev}\" --remote --env dev'",
+		"d1:migrate:prod": "sh -c 'wrangler d1 migrations apply \"${D1_DB_NAME_PROD:-inbox-mcp-index}\" --remote'",
 		"seed:dev-id": "tsx scripts/seed-dev-d1.ts",
 		"cf-typegen": "wrangler types"
 	},

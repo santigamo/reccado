@@ -37,6 +37,11 @@ Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox.
 
 ### Tooling & docs
 
+- Added `PRODUCTION-READINESS.md` to declare the current production claim honestly and record the
+  remaining gaps that still keep Reccado at `READY-WITH-CAVEATS` rather than an unqualified
+  production-ready status.
+- Updated `docs/ARCHITECTURE.md` status language so it reflects the current repo state: Tier A is
+  implemented, while Tier B agent/MCP/RAG capabilities remain roadmap items.
 - Added Biome for linting/formatting (`pnpm lint`, `pnpm format`, `pnpm format:check`) and a
   combined `pnpm check` (typecheck + lint + test) script; wired into CI alongside a Worker
   bundle dry-run deploy check and a check that generated artifacts
