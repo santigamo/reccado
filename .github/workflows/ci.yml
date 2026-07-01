@@ -21,7 +21,7 @@ jobs:
         # which was only added in Node 22.15.0. Anything lower fails `pnpm run build`.
         node-version: ["22.15.0", "24"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v6
@@ -121,7 +121,7 @@ jobs:
     name: Secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Gitleaks
         uses: gitleaks/gitleaks-action@v3
