@@ -3,9 +3,9 @@
 The visual identity for Reccado. Use this when creating any asset (banners, social cards,
 favicons, slides) so everything stays consistent.
 
-The concept: Reccado is an *agent-native inbox* — a self-hosted email mailbox that runs entirely
-on Cloudflare (Workers, Durable Objects, R2, D1, Queues) and exposes an MCP layer so AI agents
-can read, triage and draft mail. The name is the Spanish and Portuguese *recado* ("a message left
+The concept: Reccado is a *self-hosted, edge-native email inbox on Cloudflare* — receive, store,
+thread and reply to mail from your own domains, running entirely on Cloudflare (Workers, Durable
+Objects, R2, D1, Queues), with an optional MCP layer so AI agents can read, triage and draft mail. The name is the Spanish and Portuguese *recado* ("a message left
 for someone") with the family's doubled-consonant twist (·cc) — you leave a *recado* and your
 agent handles it. The identity is **premium glassmorphism** — translucent **stacked glass
 envelopes** (messages arriving, queued and handled at the edge) in a Cloudflare amber→orange

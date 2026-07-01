@@ -1,8 +1,8 @@
 <div align="center">
 
-![Reccado — the agent-native inbox, self-hosted on Cloudflare](docs/assets/banner.jpg)
+![Reccado — self-hosted, edge-native email inbox on Cloudflare](docs/assets/banner.jpg)
 
-<h3>The agent-native inbox — self-hosted email on Cloudflare</h3>
+<h3>The edge-native inbox — self-hosted email on Cloudflare, for your own domains</h3>
 
 <p>Receive, store, thread, search and send email from your own domains, running <strong>entirely on Cloudflare</strong> (Workers · Durable Objects · R2 · D1 · Queues) — with an <strong>MCP layer</strong> on the roadmap so agents can read, triage and draft your mail.</p>
 
@@ -58,7 +58,7 @@ account** — no third-party mail provider, no separate database to operate, no 
   request-send → confirm-send flow with an idempotency key; nothing sends silently.
 - **Multi-domain routing** — store, forward or reject rules per domain/alias, with isolated
   mailboxes per address.
-- **Agent-native by design** — an MCP layer is on the roadmap so agents can read, search and
+- **Agent-ready (optional)** — an MCP layer is on the roadmap so agents can read, search and
   draft mail, gated by the same human-confirmation invariant as the UI (see
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
 
