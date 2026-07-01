@@ -1,6 +1,6 @@
 {
 	"name": "reccado",
-	"description": "Agent-native, self-hosted email inbox on Cloudflare Workers.",
+	"description": "Self-hosted, edge-native email inbox on Cloudflare Workers — receive and reply from your own domains.",
 	"private": true,
 	"type": "module",
 	"license": "MIT",
