@@ -106,16 +106,15 @@ Node `24` is pinned in [`.node-version`](.node-version) (any `>=22.15.0` works),
 [`.devcontainer`](.devcontainer/devcontainer.json) is provided for one-click GitHub Codespaces /
 VS Code Dev Containers — open it and run `pnpm dev`.
 
-`pnpm dev` runs a `predev` hook first that (1) generates a minimal local `.dev.vars` if one is
-missing (`scripts/ensure-dev-vars.ts` — never overwrites an existing file; skip with
-`RECCADO_SKIP_DEV_VARS=1`), (2) applies the D1 migrations (`migrations/d1/*.sql`), and (3) seeds a
-deterministic `test@example.com` dev mailbox into the **same local D1** the dev server binds to —
-no separate copy/migrate/seed step required, and it's all safe to re-run (idempotent). Vite
-defaults to port `3000`; if it's busy it prints the port it actually bound to — use that port
-below. The generated `.dev.vars` also unlocks the `/api/debug/phase0/*` introspection endpoints
-the smoke script below relies on (via `PHASE0_DEBUG_TOKEN`), and intentionally leaves Cloudflare
-Access unset so local `/api/*` uses the local-dev bypass. See
-[`.dev.vars.example`](.dev.vars.example) for every supported variable.
+You don't run a setup step first: `pnpm dev` runs a `predev` hook that generates a local `.dev.vars`
+(if one is missing), applies the D1 migrations, and seeds a `test@example.com` mailbox into the same
+local D1 the dev server binds to. It's all idempotent, so re-running is safe (skip the `.dev.vars`
+generation with `RECCADO_SKIP_DEV_VARS=1`). Vite defaults to port `3000`; if that's taken it prints
+the port it actually bound to — use that one in the commands below.
+
+That generated `.dev.vars` also unlocks the `/api/debug/phase0/*` introspection endpoints the smoke
+script below uses, and intentionally leaves Cloudflare Access unset so local `/api/*` falls back to
+the dev bypass. See [`.dev.vars.example`](.dev.vars.example) for every supported variable.
 
 In a second terminal, check the health endpoint and simulate an inbound email:
 
