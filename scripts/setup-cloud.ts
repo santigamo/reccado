@@ -173,7 +173,11 @@ type MutableBlock = {
 type MutableConfig = MutableBlock & { env?: Record<string, MutableBlock> };
 
 let resolvedD1Id: string | undefined;
-let generatedConfigPath: string | undefined;
+// Computed unconditionally so the dry-run prints the same `--config` the apply path uses; the file
+// itself is only written in apply. At the repo ROOT (gitignored) so wrangler resolves relative
+// paths (`main`, `migrations_dir`) exactly as the tracked config would.
+const generatedConfigPath = `wrangler.generated.${envLabel}.json`;
+const configFlag = ["--config", generatedConfigPath];
 console.log(`\n▸ Resolve D1 database_id + render deploy config`);
 if (apply) {
 	try {
@@ -197,18 +201,14 @@ if (apply) {
 	const targetBlock: MutableBlock | undefined = targetEnv ? full.env?.[targetEnv] : full;
 	const d1Entry = targetBlock?.d1_databases?.find((d) => d.binding === "INDEX_DB");
 	if (d1Entry) d1Entry.database_id = resolvedD1Id;
-	// Written at the repo ROOT (gitignored) so wrangler resolves `main`/`migrations_dir` — which are
-	// relative to the config file's directory — exactly as the tracked config would.
-	generatedConfigPath = `wrangler.generated.${envLabel}.json`;
 	writeFileSync(generatedConfigPath, `${JSON.stringify(full, null, 2)}\n`);
 	console.log(`  ${d1Name} → ${resolvedD1Id}`);
 	console.log(`  Wrote ${generatedConfigPath} (used for migrations + deploy; gitignored).`);
 } else {
 	console.log(
-		`  → would resolve ${d1Name}'s id and write wrangler.generated.${envLabel}.json for --config deploy`,
+		`  → would resolve ${d1Name}'s id and write ${generatedConfigPath}, used via --config below`,
 	);
 }
-const configFlag = generatedConfigPath ? ["--config", generatedConfigPath] : [];
 
 // 6. Remote migrations (against the generated config, so the real id/binding is used).
 runIdempotent("Apply D1 migrations (remote)", [
@@ -295,8 +295,12 @@ if (seedDomain && seedAddress) {
 				`    MAILBOX_ID_SECRET=<your-secret> pnpm ${mailboxArgs.join(" ")} --apply`,
 		);
 	}
-} else {
+} else if (skipSeed) {
 	console.log("  → (skipped via --skip-seed) seed later with setup:mailbox.");
+} else {
+	console.log(
+		"  → no --domain/--address given; --apply would require them (or --skip-seed). Seed later with setup:mailbox.",
+	);
 }
 
 // Manifest (apply only): records a NON-sensitive fingerprint of the secret so a later run/tool can

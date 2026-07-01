@@ -142,10 +142,12 @@ console.log(`\n${"─".repeat(72)}`);
 console.log("Still required (only DNS + verification — not automatable here):\n");
 console.log(`- Add the MX/SPF/DKIM records above on ${domain} and let Email Routing verify them.`);
 console.log(`- Check status any time:  pnpm wrangler email routing settings ${domain}`);
-console.log(`- Seed the mailbox that receives it (if not done):`);
 console.log(
-	`    pnpm setup:mailbox --domain ${domain} --address ${address}` +
-		`${targetEnv ? ` --env ${targetEnv}` : ""} --secret <your-secret> --apply`,
+	`- Seed the mailbox that receives it (if not done); pass the secret via env, not argv:`,
+);
+console.log(
+	`    MAILBOX_ID_SECRET=<your-secret> pnpm setup:mailbox --domain ${domain} --address ${address}` +
+		`${targetEnv ? ` --env ${targetEnv}` : ""} --apply`,
 );
 console.log(`\nRe-check anytime:  pnpm doctor --env ${targetEnv ?? "production"} --cloud\n`);
 

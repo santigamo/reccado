@@ -178,7 +178,12 @@ const required: VerificationConfig = {
 
 // The repo ships a placeholder D1 id (public template). Fail early with an actionable message
 // instead of querying Cloudflare for a UUID no real account can have.
-if (required.d1Id === "00000000-0000-0000-0000-000000000000" || required.d1Id === "") {
+// Catches the dev UUID-zero, empty, and the textual `<your-...-d1-database-id>` prod placeholder.
+if (
+	required.d1Id === "00000000-0000-0000-0000-000000000000" ||
+	required.d1Id === "" ||
+	/^<.*>$/.test(required.d1Id)
+) {
 	console.error(
 		"verify:cf: INDEX_DB database_id is a placeholder. Pass your real id via CF_VERIFY_D1_ID " +
 			"(or --d1-id), e.g. CF_VERIFY_D1_ID=<uuid> pnpm verify:cf.",

@@ -270,14 +270,14 @@ if (!block) {
 			id: "config.d1-id",
 			status: "warn",
 			message: `INDEX_DB database_id is a placeholder for ${envLabel} — fine locally, not for a remote deploy.`,
-			fix: `wrangler d1 create <name> --update-config --binding INDEX_DB --env ${targetEnv}`,
+			fix: `pnpm setup:cloud --env ${targetEnv} --domain <d> --address inbox@<d> --apply (writes a gitignored generated config; don't edit wrangler.jsonc)`,
 		});
 	} else {
 		add({
 			id: "config.d1-id",
 			status: "warn",
 			message: `INDEX_DB database_id is a placeholder for ${envLabel} — local dev is fine, but a remote deploy will fail until it is set.`,
-			fix: "wrangler d1 create <name> --update-config --binding INDEX_DB",
+			fix: "pnpm setup:cloud --domain <d> --address inbox@<d> --apply (writes a gitignored generated config; don't edit wrangler.jsonc)",
 		});
 	}
 
