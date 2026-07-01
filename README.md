@@ -159,168 +159,103 @@ pnpm smoke:ws ws://localhost:3000/api/mailboxes/mbx_test/ws   # WebSocket hello/
 
 ## Deploy your own
 
+A deploy has **three parts, and only the first is fully automatable** — so the layout below is
+"pick one way to do Part 1, then always do Parts 2 and 3", not a single checklist where some steps
+are secretly optional:
+
+1. **Provision + deploy** the Worker and its Cloudflare resources (R2, queues, D1, Durable Object,
+   secrets). Fully automatable — **pick one** of the three ways in Part 1.
+2. **Wire your domain**: Email Routing (so mail reaches the Worker) and Cloudflare Access (the auth
+   perimeter). Domain/identity setup you do **once**; helpers script the automatable pieces but the
+   DNS/identity parts are inherently manual. **Always required**, whichever way you did Part 1.
+3. **Verify** what you actually deployed.
+
+The repo ships with placeholder identity so it's safe to fork: `wrangler.jsonc` carries example
+resource names and a **placeholder D1 id**, and `vars.MAIL_FROM_ADDRESS` is `noreply@mail.example.com`.
+Run `pnpm doctor --env dev` (add `--cloud`/`--url`) at any point to see, per issue, exactly what is
+still a placeholder or missing and the command to fix it. Full command-level detail lives in
+[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+
+### Part 1 — provision + deploy (pick ONE)
+
+You do not do all three of these — each one accomplishes the same thing (resources + secrets +
+deployed Worker).
+
+**Way A — scripted, recommended.** `pnpm setup:cloud` provisions R2/queues/D1, resolves the real
+D1 id into a **gitignored** `wrangler.generated.<env>.json` (it never edits the tracked
+`wrangler.jsonc`), applies remote migrations, sets `MAILBOX_ID_SECRET`, deploys, and — because you
+pass `--domain`/`--address` — **seeds the first mailbox in the same run** (the mailbox id derives
+from the just-generated secret, which is write-only afterwards). It is **dry-run by default**: the
+first command below prints the exact plan and changes nothing; add `--apply` to execute it against
+the account your `wrangler` is logged into.
+
+```bash
+pnpm wrangler login
+pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com>          # review the plan
+pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com> --apply  # run it
+```
+
+**Way B — one-click button.** Forks the repo, provisions the R2 bucket / D1 / queues / Durable
+Object from `wrangler.jsonc`, prompts you for the secrets, and deploys the Worker. (It does not seed
+the first mailbox — run `pnpm setup:mailbox` afterwards, or use Way A.)
+
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/santigamo/reccado)
 
-The one-click button forks the repo, **provisions the R2 bucket, D1 database, queues and Durable
-Object** from `wrangler.jsonc`, prompts you for the secrets, and deploys the Worker. The numbered
-steps below are the equivalent CLI path — and whichever route you take, **steps 4–5 (Email Routing
-and Cloudflare Access) are domain-level setup you wire once**, since they live outside the Worker.
-
-The repo ships with placeholder identity so it's safe to fork: replace every `example.com` /
-`mail.example.com` reference and the placeholder Cloudflare IDs with your own. Full command-level
-detail lives in [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
-
-Run `pnpm doctor` (add `--env dev` and/or `--cloud`) at any point to see, per issue, exactly
-what's still a placeholder or missing and the command to fix it — it flags an unset `INDEX_DB`
-database id or example `MAIL_FROM_ADDRESS` before a deploy fails on them.
-
-To script the mechanical provisioning (steps 1–3 and 6 below — R2/queues/D1, remote migrations,
-`MAILBOX_ID_SECRET`, deploy), run `pnpm setup:cloud --env dev`. It is **dry-run by default**: it
-prints the exact, personalized, idempotent command sequence using your `wrangler.jsonc` names and
-changes nothing. Review it, then re-run with `--apply` to execute against the Cloudflare account
-your `wrangler` is logged into. It stops short of the domain/identity steps (4–5) on purpose and
-prints them as "Still required".
-
-Pass `--domain <d> --address inbox@<d>` (optionally `--catch-all`) to `setup:cloud` to also seed
-the first mailbox in the same run — this matters because the mailbox id is derived from the
-`MAILBOX_ID_SECRET` it just generated, which is write-only afterwards. You can also seed a mailbox
-on its own (local or remote) with `pnpm setup:mailbox` (dry-run by default; `INSERT OR IGNORE`, so
-idempotent). Seeding an **active domain + alias** is what turns a deployed Worker into an inbox
-that actually stores incoming mail, since routing resolves a recipient by its active alias first.
-
-### 1. Create the Cloudflare resources <sub>(the one-click button provisions these for you)</sub>
+**Way C — manual commands.** What Ways A and B do under the hood, if you want to run each yourself.
+Create the resources, set the D1 id (either `--update-config` on create or by hand in
+`wrangler.jsonc`), migrate, set secrets, and deploy:
 
 ```bash
 pnpm wrangler r2 bucket create <your-raw-mail-bucket>
 pnpm wrangler queues create <your-inbound-queue>
 pnpm wrangler queues create <your-inbound-dlq>
-pnpm wrangler d1 create <your-index-db-name> --location=weur
+pnpm wrangler d1 create <your-index-db-name> --location=weur   # add --update-config to fill the binding
+pnpm d1:migrate:dev                                            # D1_DB_NAME_DEV=<db> to override the name
+pnpm wrangler secret put MAILBOX_ID_SECRET --env dev           # + ACCESS_JWT_AUDIENCE / ACCESS_TEAM_DOMAIN (Part 2)
+pnpm run deploy:dev                                           # build + wrangler deploy --env dev --name reccado-dev
 ```
 
-Update `wrangler.jsonc` (`r2_buckets`, `queues.producers`/`queues.consumers`, `d1_databases`) with
-the names and the `database_id` `wrangler d1 create` prints. The Durable Object binding
-(`MAILBOX_DO` / `MailboxDurableObject`) needs no separate creation step — Wrangler provisions it
-from the `migrations` block on first deploy.
+The Durable Object (`MAILBOX_DO`) needs no create step — Wrangler provisions it from the
+`migrations` block on first deploy. `MAILBOX_ID_SECRET` must be paired with a seeded mailbox
+(`pnpm setup:mailbox`), since it becomes write-only once set. Drop `--env dev` (and use `deploy` /
+`d1:migrate:prod`) for production. Every secret is documented in
+[`.dev.vars.example`](.dev.vars.example) and [Configuration](#configuration); full detail in
+[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
-### 2. Apply D1 migrations
+### Part 2 — wire your domain (always required)
+
+These live outside the Worker (DNS + identity), so no button or script fully does them for you.
+
+**Email Routing** — point your domain's inbound mail at the Worker.
+`pnpm setup:routing --domain <you.com> --env dev` scripts the automatable pieces (enable routing +
+create the "send to Worker" rule) — dry-run by default, `--apply` to run — and prints the required
+MX/SPF/DKIM records. The **DNS records are the one part you must add yourself** (check status with
+`pnpm wrangler email routing settings <you.com>`). For outbound, onboard your sending domain under
+Email Sending and set `vars.MAIL_FROM_ADDRESS` in `wrangler.jsonc` to a verified sender.
+
+**Cloudflare Access** — Reccado has no built-in login; **Access is the auth perimeter** for the UI
+and `/api/*`. `pnpm setup:access --url <deployed-url>` prints the dashboard steps to create a
+self-hosted Access application (this varies by identity provider, so it is not automated), then sets
+`ACCESS_JWT_AUDIENCE` / `ACCESS_TEAM_DOMAIN` (+ optional `ACCESS_ALLOWED_EMAILS`) as secrets once you
+pass `--aud` / `--team-domain` (dry-run by default). See [`SECURITY.md`](SECURITY.md) for the model.
+
+### Part 3 — verify
 
 ```bash
-pnpm d1:migrate:local   # wrangler d1 migrations apply INDEX_DB --local (top-level d1_databases entry)
-pnpm d1:migrate:dev     # wrangler d1 migrations apply <db> --remote --env dev
-pnpm d1:migrate:prod    # wrangler d1 migrations apply <db> --remote (default/production env)
+pnpm doctor --env dev --cloud --url https://<deployed-url>   # auth, D1, secrets, Access redirect
+pnpm smoke:access https://<deployed-url>                     # fails if unauthenticated /api/* returns 200
+pnpm smoke:routing --domain <you.com> --env dev              # fails if no Email Routing rule targets the Worker
 ```
 
-`d1:migrate:local` targets the `INDEX_DB` **binding** rather than a hardcoded database name, so it
-always applies to whatever local D1 `pnpm dev` itself uses (the top-level `d1_databases` entry in
-`wrangler.jsonc`, no `--env`) — nothing to override for local, and no drift between the two
-commands. It also runs automatically as a `predev` hook before every `pnpm dev`, so this is only
-needed standalone if you want to apply migrations without starting the dev server.
+`pnpm doctor --cloud --url` fails if an unauthenticated request gets a `200` instead of an Access
+redirect (for `dev`, production isn't on `*.workers.dev` at all; see [Compatibility](#compatibility)).
+The deployed Worker also exposes `GET /api/setup/status` (behind Access): index-DB health plus
+control-plane completeness (domain/mailbox/alias/routing counts and a `canReceive` flag).
 
-The remote scripts (`d1:migrate:dev` / `d1:migrate:prod`) still target the example database names
-already in `wrangler.jsonc` (`inbox-mcp-index-dev` / `inbox-mcp-index`) so the maintainer flow keeps
-working. Self-hosters should override them with env vars instead of editing `package.json`:
-
-```bash
-D1_DB_NAME_DEV=<your-dev-db-name> pnpm d1:migrate:dev
-D1_DB_NAME_PROD=<your-prod-db-name> pnpm d1:migrate:prod
-```
-
-You can also run `wrangler d1 migrations apply <db> ...` directly if you prefer.
-
-### 3. Set secrets <sub>(the one-click setup page prompts for these)</sub>
-
-Every secret name below is documented in [`.dev.vars.example`](.dev.vars.example) for local dev.
-For a deployed environment, set each with `wrangler secret put`:
-
-```bash
-pnpm wrangler secret put MAILBOX_ID_SECRET --env dev
-pnpm wrangler secret put ACCESS_JWT_AUDIENCE --env dev
-pnpm wrangler secret put ACCESS_TEAM_DOMAIN --env dev
-pnpm wrangler secret put CLOUDFLARE_API_TOKEN --env dev   # only if you use admin provisioning
-pnpm wrangler secret put PHASE0_DEBUG_TOKEN --env dev     # only if you need the debug endpoints
-pnpm wrangler secret put ACCESS_ALLOWED_EMAILS --env dev  # optional owner allowlist
-```
-
-Drop `--env dev` for the production environment. See [Configuration](#configuration) for what
-each one does and whether it's required.
-
-### 4. Configure Email Routing
-
-Point Email Routing for your domain at this Worker. `pnpm setup:routing --domain <d> --env dev`
-scripts the automatable parts (enable routing + create the "send to Worker" rule) — dry-run by
-default, `--apply` to run — and prints the required MX/SPF/DKIM records. Or do it by hand:
-
-- Enable Email Routing on your zone.
-- Add a routing rule: match the address(es) you want to receive, action "Send to a Worker", target
-  your deployed Worker (`reccado-dev` / `reccado`, or your renamed equivalent).
-- Add the MX/SPF/DKIM records it requires and let Cloudflare verify them (this DNS step is the one
-  part that isn't automatable — check status with `pnpm wrangler email routing settings <domain>`).
-- For outbound, onboard your sending domain under Email Sending in the dashboard and set
-  `MAIL_FROM_ADDRESS` in `wrangler.jsonc` (`vars`) to a verified sender on that domain.
-
-### 5. Set up Cloudflare Access
-
-Reccado has no built-in login screen — **Cloudflare Access is the auth perimeter** for the UI and
-`/api/*`. `pnpm setup:access --url <deployed-url>` walks you through it: it prints the dashboard
-steps to create a self-hosted Access application (this varies by identity provider, so it is not
-automated), then sets `ACCESS_JWT_AUDIENCE` / `ACCESS_TEAM_DOMAIN` (and optional
-`ACCESS_ALLOWED_EMAILS`) as secrets once you pass `--aud` / `--team-domain` (dry-run by default).
-Verify it actually protects the route with `pnpm doctor --cloud --url <deployed-url>`, which fails
-if an unauthenticated request gets a `200` instead of an Access redirect. See
-[`SECURITY.md`](SECURITY.md) for the full auth model.
-
-### 6. Deploy <sub>(done by the one-click button)</sub>
-
-```bash
-pnpm run deploy:dev   # build + wrangler deploy --env dev --name reccado-dev
-pnpm run deploy       # build + wrangler deploy (default/production environment)
-```
-
-After deploying, confirm Access is actually blocking unauthenticated traffic — for `dev`,
-`curl -i https://reccado-dev.<your-subdomain>.workers.dev/api/health` should redirect to your
-Access login, not return `200` (production isn't on `*.workers.dev` at all; see
-[Compatibility](#compatibility)). Then log in through Access and confirm `/api/health` returns
-`{"ok":true}`.
-
-### 7. Verify the Cloudflare bindings you actually deployed
-
-The repo ships a verifier for the Worker name, bindings, queues, D1, Email Sending, and an example
-Email Routing rule. Because the repo now ships a **placeholder** D1 id (see step 2), `pnpm verify:cf`
-exits early asking for your real id until you provide it — pass your resource names and IDs by env
-var or CLI flag:
-
-```bash
-CF_VERIFY_ENV=dev \
-CF_VERIFY_WORKER=<your-dev-worker-name> \
-CF_VERIFY_R2_BUCKET=<your-dev-r2-bucket> \
-CF_VERIFY_QUEUE=<your-dev-queue> \
-CF_VERIFY_DLQ=<your-dev-dlq> \
-CF_VERIFY_D1_NAME=<your-dev-d1-name> \
-CF_VERIFY_D1_ID=<your-dev-d1-id> \
-CF_VERIFY_EMAIL_SENDING_DOMAIN=<your-sending-domain> \
-CF_VERIFY_ROUTING_DOMAIN=<your-routing-domain> \
-CF_VERIFY_ROUTING_ADDRESS=<your-test-alias> \
-pnpm verify:cf
-```
-
-Equivalent CLI flags are available (`--env`, `--worker`, `--r2`, `--queue`, `--dlq`, `--d1`,
-`--d1-id`, `--email-sending-domain`, `--routing-domain`, `--routing-address`). The verifier checks
-that the values in `wrangler.jsonc` match the resources you intended to use, then confirms those
-resources exist in the current Cloudflare account.
-
-### 8. Post-deploy smokes
-
-Two focused, exit-code-driven checks (good for a CI / post-deploy gate) prove the two things that
-matter most once live:
-
-```bash
-pnpm smoke:access https://<your-deployed-url>          # fails if unauthenticated /api/* returns 200
-pnpm smoke:routing --domain <your-domain> --env dev    # fails if no Email Routing rule targets the Worker
-```
-
-The deployed Worker also exposes `GET /api/setup/status` (behind the Access perimeter, like the
-rest of `/api/*`): index-DB health plus control-plane completeness (domain/mailbox/alias/routing
-counts and a `canReceive` flag) — runtime facts the CLI can't infer.
+For an exhaustive binding audit, `pnpm verify:cf` cross-checks the Worker name, R2, queues, D1,
+Email Sending and an example routing rule against the account. It exits early asking for your real
+D1 id (the repo ships a placeholder) — pass resource names/IDs by env var or CLI flag
+(`CF_VERIFY_D1_ID=<uuid>`, `--worker`, `--r2`, …); see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
 ## Configuration
 
