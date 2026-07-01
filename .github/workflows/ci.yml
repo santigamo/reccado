@@ -16,9 +16,10 @@ jobs:
       fail-fast: false
       matrix:
         # Exercise the engines floor (package.json) plus the primary current version.
-        # 22.13.0, not 22.12.0: the pinned pnpm (packageManager) refuses to run
-        # under Node < 22.13, so 22.13.0 is the lowest floor CI can actually exercise.
-        node-version: ["22.13.0", "24"]
+        # 22.15.0 is the real floor: pnpm (packageManager) needs Node >= 22.13, and
+        # the build toolchain (vite config loader) needs module.registerHooks(),
+        # which was only added in Node 22.15.0. Anything lower fails `pnpm run build`.
+        node-version: ["22.15.0", "24"]
     steps:
       - uses: actions/checkout@v4
 

@@ -274,7 +274,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 					has_attachments: 0,
 					labels_json: "[]",
 					state: "sent",
-					raw_r2_key: result.rawR2Key ?? `sent/${draftId}`,
+					raw_r2_key: result.rawR2Key ?? `sent/${draftId}`, // gitleaks:allow (field name trips generic-api-key; no secret here)
 					raw_sha256: result.rawSha256 ?? outboundIdempotencyKey,
 					updated_at: new Date().toISOString(),
 				});

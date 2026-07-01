@@ -1,0 +1,30 @@
+# Gitleaks configuration for Reccado.
+#
+# Extends the default gitleaks ruleset and allowlists a small set of findings
+# that were manually reviewed and are NOT live secrets:
+#
+#   - docs/PHASE1_VALIDATION.md is a historical validation log. It records
+#     Cloudflare Access service-token and policy IDs (UUIDs) that were created
+#     for a single validation run and then DELETED (see the doc itself), plus
+#     R2 object SHA-256 keys. None are live credentials.
+#   - The generic-api-key hit in src/api/mailbox-routes.ts is a false positive on
+#     the `raw_r2_key:` object field name (there is no literal secret on that
+#     line); it also carries an inline `// gitleaks:allow` marker.
+#
+# Keep this allowlist as narrow as possible so real secrets are still caught.
+
+title = "Reccado gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Reviewed non-secrets (validation log + generic-api-key false positive)"
+paths = [
+  '''docs/PHASE1_VALIDATION\.md''',
+]
+regexes = [
+  # Deleted Cloudflare Access service-token / policy identifiers from the Phase 1 log.
+  '''6691b004-f78a-4258-928f-033c94881b48''',
+  '''254520d9-ca00-4177-a4c6-cb7307009dd6''',
+]
