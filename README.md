@@ -30,12 +30,9 @@ account** — no third-party mail provider, no separate database to operate, no 
 - [How it works](#how-it-works)
 - [Quickstart (prove it locally in ~5 min)](#quickstart-prove-it-locally-in-5-min)
 - [Deploy your own](#deploy-your-own)
-  - [1. Create the Cloudflare resources](#1-create-the-cloudflare-resources)
-  - [2. Apply D1 migrations](#2-apply-d1-migrations)
-  - [3. Set secrets](#3-set-secrets)
-  - [4. Configure Email Routing](#4-configure-email-routing)
-  - [5. Set up Cloudflare Access](#5-set-up-cloudflare-access)
-  - [6. Deploy](#6-deploy)
+  - [1. Provision and deploy (pick one)](#1-provision-and-deploy-pick-one)
+  - [2. Wire your domain](#2-wire-your-domain)
+  - [3. Verify](#3-verify)
 - [Configuration](#configuration)
 - [Compatibility](#compatibility)
 - [Troubleshooting](#troubleshooting)
@@ -159,51 +156,40 @@ pnpm smoke:ws ws://localhost:3000/api/mailboxes/mbx_test/ws   # WebSocket hello/
 
 ## Deploy your own
 
-A deploy has **three parts, and only the first is fully automatable** — so the layout below is
-"pick one way to do Part 1, then always do Parts 2 and 3", not a single checklist where some steps
-are secretly optional:
+Three steps: **provision + deploy** the Worker and its resources, **wire your domain** (Email
+Routing + Access), then **verify**. Step 1 is fully automated — **pick one way below**. Steps 2 and
+3 are always required, whichever way you did step 1.
 
-1. **Provision + deploy** the Worker and its Cloudflare resources (R2, queues, D1, Durable Object,
-   secrets). Fully automatable — **pick one** of the three ways in Part 1.
-2. **Wire your domain**: Email Routing (so mail reaches the Worker) and Cloudflare Access (the auth
-   perimeter). Domain/identity setup you do **once**; helpers script the automatable pieces but the
-   DNS/identity parts are inherently manual. **Always required**, whichever way you did Part 1.
-3. **Verify** what you actually deployed.
+> **Safe to fork.** `wrangler.jsonc` ships placeholder resource names, a placeholder D1 id, and
+> `MAIL_FROM_ADDRESS=noreply@mail.example.com`. At any point, `pnpm doctor --env dev` (add
+> `--cloud`/`--url`) shows exactly what's still a placeholder or missing and the command to fix it.
+> Full command-level detail: [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
-The repo ships with placeholder identity so it's safe to fork: `wrangler.jsonc` carries example
-resource names and a **placeholder D1 id**, and `vars.MAIL_FROM_ADDRESS` is `noreply@mail.example.com`.
-Run `pnpm doctor --env dev` (add `--cloud`/`--url`) at any point to see, per issue, exactly what is
-still a placeholder or missing and the command to fix it. Full command-level detail lives in
-[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+### 1. Provision and deploy (pick one)
 
-### Part 1 — provision + deploy (pick ONE)
-
-You do not do all three of these — each one accomplishes the same thing (resources + secrets +
-deployed Worker).
-
-**Way A — scripted, recommended.** `pnpm setup:cloud` provisions R2/queues/D1, resolves the real
-D1 id into a **gitignored** `wrangler.generated.<env>.json` (it never edits the tracked
-`wrangler.jsonc`), applies remote migrations, sets `MAILBOX_ID_SECRET`, deploys, and — because you
-pass `--domain`/`--address` — **seeds the first mailbox in the same run** (the mailbox id derives
-from the just-generated secret, which is write-only afterwards). It is **dry-run by default**: the
-first command below prints the exact plan and changes nothing; add `--apply` to execute it against
-the account your `wrangler` is logged into.
-
-```bash
-pnpm wrangler login
-pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com>          # review the plan
-pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com> --apply  # run it
-```
-
-**Way B — one-click button.** Forks the repo, provisions the R2 bucket / D1 / queues / Durable
-Object from `wrangler.jsonc`, prompts you for the secrets, and deploys the Worker. (It does not seed
-the first mailbox — run `pnpm setup:mailbox` afterwards, or use Way A.)
+**Fastest — one-click button.** Forks the repo, provisions the R2 bucket / D1 / queues / Durable
+Object, prompts you for the secrets, and deploys the Worker — entirely in the browser, no local
+tooling.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/santigamo/reccado)
 
-**Way C — manual commands.** What Ways A and B do under the hood, if you want to run each yourself.
-Create the resources, set the D1 id (either `--update-config` on create or by hand in
-`wrangler.jsonc`), migrate, set secrets, and deploy:
+One follow-up: the button doesn't seed your first mailbox, so run `pnpm setup:mailbox` once
+afterward (the scripted path below does it for you).
+
+**Complete — scripted.** `pnpm setup:cloud` does everything the button does **and seeds the first
+mailbox in the same run** — it has to, because the mailbox id derives from a freshly generated
+`MAILBOX_ID_SECRET` that Cloudflare makes write-only the moment it's set. It also resolves the real
+D1 id into a gitignored `wrangler.generated.<env>.json` (never edits the tracked `wrangler.jsonc`).
+It's **dry-run by default** — the first command prints the plan and changes nothing:
+
+```bash
+pnpm wrangler login
+pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com>          # preview the plan
+pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com> --apply  # run it
+```
+
+**Manual — run the commands yourself.** What the two paths wrap. Create the resources, set the D1 id
+(via `--update-config` on create, or by hand in `wrangler.jsonc`), migrate, set secrets, deploy:
 
 ```bash
 pnpm wrangler r2 bucket create <your-raw-mail-bucket>
@@ -211,20 +197,19 @@ pnpm wrangler queues create <your-inbound-queue>
 pnpm wrangler queues create <your-inbound-dlq>
 pnpm wrangler d1 create <your-index-db-name> --location=weur   # add --update-config to fill the binding
 pnpm d1:migrate:dev                                            # D1_DB_NAME_DEV=<db> to override the name
-pnpm wrangler secret put MAILBOX_ID_SECRET --env dev           # + ACCESS_JWT_AUDIENCE / ACCESS_TEAM_DOMAIN (Part 2)
+pnpm wrangler secret put MAILBOX_ID_SECRET --env dev           # + ACCESS_JWT_AUDIENCE / ACCESS_TEAM_DOMAIN (step 2)
 pnpm run deploy:dev                                           # build + wrangler deploy --env dev --name reccado-dev
 ```
 
 The Durable Object (`MAILBOX_DO`) needs no create step — Wrangler provisions it from the
-`migrations` block on first deploy. `MAILBOX_ID_SECRET` must be paired with a seeded mailbox
-(`pnpm setup:mailbox`), since it becomes write-only once set. Drop `--env dev` (and use `deploy` /
-`d1:migrate:prod`) for production. Every secret is documented in
-[`.dev.vars.example`](.dev.vars.example) and [Configuration](#configuration); full detail in
-[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
+`migrations` block on first deploy. `MAILBOX_ID_SECRET` becomes write-only once set, so pair it with
+a seeded mailbox (`pnpm setup:mailbox`). Drop `--env dev` (and use `deploy` / `d1:migrate:prod`) for
+production. Every secret is documented in [`.dev.vars.example`](.dev.vars.example) and
+[Configuration](#configuration); full detail in [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
-### Part 2 — wire your domain (always required)
+### 2. Wire your domain
 
-These live outside the Worker (DNS + identity), so no button or script fully does them for you.
+DNS and identity live outside the Worker, so no button or script fully does them for you.
 
 **Email Routing** — point your domain's inbound mail at the Worker.
 `pnpm setup:routing --domain <you.com> --env dev` scripts the automatable pieces (enable routing +
@@ -239,7 +224,7 @@ self-hosted Access application (this varies by identity provider, so it is not a
 `ACCESS_JWT_AUDIENCE` / `ACCESS_TEAM_DOMAIN` (+ optional `ACCESS_ALLOWED_EMAILS`) as secrets once you
 pass `--aud` / `--team-domain` (dry-run by default). See [`SECURITY.md`](SECURITY.md) for the model.
 
-### Part 3 — verify
+### 3. Verify
 
 ```bash
 pnpm doctor --env dev --cloud --url https://<deployed-url>   # auth, D1, secrets, Access redirect
