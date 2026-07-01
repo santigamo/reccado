@@ -62,10 +62,9 @@ async function getAccessCerts(teamDomain: string): Promise<AccessCertResponse> {
 	if (cachedCerts && now - cachedCertsAt < 60_000) {
 		return cachedCerts;
 	}
-	const response = await fetchWithTimeout(
-		`${teamDomain.replace(/\/$/, "")}/cdn-cgi/access/certs`,
-		{ timeoutMs: 5_000 },
-	);
+	const response = await fetchWithTimeout(`${teamDomain.replace(/\/$/, "")}/cdn-cgi/access/certs`, {
+		timeoutMs: 5_000,
+	});
 	if (!response.ok) {
 		throw new Error(`Failed to fetch Access certs: ${response.status}`);
 	}

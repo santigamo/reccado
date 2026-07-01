@@ -16,7 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         # Exercise the engines floor (package.json) plus the primary current version.
-        node-version: ["22.12.0", "24"]
+        # 22.13.0, not 22.12.0: the pinned pnpm (packageManager) refuses to run
+        # under Node < 22.13, so 22.13.0 is the lowest floor CI can actually exercise.
+        node-version: ["22.13.0", "24"]
     steps:
       - uses: actions/checkout@v4
 
@@ -33,13 +35,23 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Provide dev vars for tests
-        run: cp .dev.vars.example .dev.vars
+        # Deliberately NOT `cp .dev.vars.example .dev.vars`: that deploy-oriented
+        # template sets non-empty ACCESS_JWT_AUDIENCE/ACCESS_TEAM_DOMAIN (which
+        # flips auth from local-dev-bypass to enforced, breaking security tests
+        # that expect 200/404) and sets PHASE0_DEBUG_TOKEN (which violates the
+        # tests/integration/api-security.test.ts assertion that it is undefined).
+        run: |
+          printf 'MAILBOX_ID_SECRET=%s\nACCESS_JWT_AUDIENCE=\nACCESS_TEAM_DOMAIN=\n' \
+            "dev-mailbox-id-secret-v1" > .dev.vars
 
       - name: Typecheck
         run: pnpm run typecheck
 
       - name: Lint
         run: pnpm run lint
+
+      - name: Format check
+        run: pnpm run format:check
 
       - name: Test
         run: pnpm test
@@ -52,6 +64,13 @@ jobs:
           PHASE0_DEBUG_TOKEN: ci-debug-token
           MAILBOX_ID_SECRET: dev-mailbox-id-secret-v1
         run: |
+          # The dev server reads secrets from .dev.vars (not process env), and the
+          # Test step above wrote a hermetic .dev.vars without PHASE0_DEBUG_TOKEN.
+          # This smoke hits the token-gated /api/debug/phase0/* routes, so it
+          # needs its own .dev.vars carrying PHASE0_DEBUG_TOKEN + MAILBOX_ID_SECRET.
+          printf 'PHASE0_DEBUG_TOKEN=%s\nMAILBOX_ID_SECRET=%s\nACCESS_JWT_AUDIENCE=\nACCESS_TEAM_DOMAIN=\n' \
+            "$PHASE0_DEBUG_TOKEN" "$MAILBOX_ID_SECRET" > .dev.vars
+
           pnpm dev --host 127.0.0.1 --strictPort > /tmp/reccado-ci-dev.log 2>&1 &
           dev_pid=$!
           cleanup() {
@@ -70,6 +89,12 @@ jobs:
           curl --silent --fail http://127.0.0.1:3000/api/health | tee /tmp/reccado-ci-health.json
           curl --silent --fail http://127.0.0.1:3000/ >/tmp/reccado-ci-root.html
           test -s /tmp/reccado-ci-root.html
+
+          # By the time /api/health is healthy, `pnpm dev`'s predev hook has
+          # already applied D1 migrations to the local database, so the
+          # email-ingest tables exist and this smoke can exercise the real
+          # /cdn-cgi/handler/email + /api/debug/phase0/* path end to end.
+          pnpm smoke:email:local http://127.0.0.1:3000 fixtures/mime/simple-text.eml
 
       - name: Validate Worker bundle (dry run)
         run: pnpm exec wrangler deploy --dry-run --outdir .wrangler/dry-run

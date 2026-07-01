@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const baseUrlArg = process.argv[2];
 const fixturePath = process.argv[3] ?? "fixtures/mime/simple-text.eml";
@@ -9,6 +9,37 @@ if (!baseUrlArg) {
 }
 
 const baseUrl: string = baseUrlArg;
+
+// The /api/debug/phase0/* routes fail closed (404) unless the caller presents the same
+// PHASE0_DEBUG_TOKEN the Worker was started with. Prefer an explicit env var (CI sets one);
+// otherwise fall back to reading the local `.dev.vars` file (created via
+// `cp .dev.vars.example .dev.vars`, see README quickstart) so this script keeps working with
+// zero extra manual steps.
+function readDebugToken(): string | undefined {
+	if (process.env.PHASE0_DEBUG_TOKEN) {
+		return process.env.PHASE0_DEBUG_TOKEN;
+	}
+	if (!existsSync(".dev.vars")) {
+		return undefined;
+	}
+	const content = readFileSync(".dev.vars", "utf8");
+	for (const line of content.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const separator = trimmed.indexOf("=");
+		if (separator === -1) continue;
+		const key = trimmed.slice(0, separator).trim();
+		if (key === "PHASE0_DEBUG_TOKEN") {
+			return trimmed.slice(separator + 1).trim();
+		}
+	}
+	return undefined;
+}
+
+const debugToken = readDebugToken();
+const debugHeaders: HeadersInit | undefined = debugToken
+	? { "x-phase0-debug-token": debugToken }
+	: undefined;
 
 const raw = readFileSync(fixturePath);
 const to = "test@example.com";
@@ -30,9 +61,13 @@ async function postFixture(label: string) {
 }
 
 async function fetchDebug(baseUrl: string) {
-	const mailboxResponse = await fetch(new URL("/api/debug/phase0/test-mailbox-id", baseUrl));
+	const mailboxResponse = await fetch(new URL("/api/debug/phase0/test-mailbox-id", baseUrl), {
+		headers: debugHeaders,
+	});
 	const { mailboxId } = (await mailboxResponse.json()) as { mailboxId: string };
-	const response = await fetch(new URL(`/api/debug/phase0/mailboxes/${mailboxId}`, baseUrl));
+	const response = await fetch(new URL(`/api/debug/phase0/mailboxes/${mailboxId}`, baseUrl), {
+		headers: debugHeaders,
+	});
 	if (!response.ok) {
 		throw new Error(`debug failed with ${response.status}: ${await response.text()}`);
 	}
@@ -69,7 +104,9 @@ if (!message) {
 
 const r2HeadUrl = new URL("/api/debug/phase0/r2/head", baseUrl);
 r2HeadUrl.searchParams.set("key", message.raw_r2_key);
-const r2Head = (await (await fetch(r2HeadUrl)).json()) as { exists?: boolean };
+const r2Head = (await (await fetch(r2HeadUrl, { headers: debugHeaders })).json()) as {
+	exists?: boolean;
+};
 console.log("r2-head:", JSON.stringify(r2Head));
 if (!r2Head.exists) {
 	throw new Error(`R2 object missing: ${message.raw_r2_key}`);

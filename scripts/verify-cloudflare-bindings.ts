@@ -93,41 +93,43 @@ assert(
 	`Invalid env ${configEnvArg}; expected "dev" or "production"`,
 );
 
-const defaultConfigByEnv: Record<VerificationConfig["configEnv"], Omit<VerificationConfig, "configEnv">> =
-	{
-		dev: {
-			worker: "reccado-dev",
-			r2: "inbox-mcp-raw-dev",
-			queue: "inbox-mcp-inbound-dev",
-			dlq: "inbox-mcp-inbound-dlq-dev",
-			d1: "inbox-mcp-index-dev",
-			d1Id: "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
-			emailSendingDomain: "mail.example.com",
-			routingDomain: "example.com",
-			routingAddress: "test@example.com",
-			doBinding: "MAILBOX_DO",
-			r2Binding: "MAIL_OBJECTS",
-			queueBinding: "INBOUND_EMAIL_QUEUE",
-			d1Binding: "INDEX_DB",
-			emailBinding: "EMAIL",
-		},
-		production: {
-			worker: "reccado",
-			r2: "inbox-mcp-raw",
-			queue: "inbox-mcp-inbound",
-			dlq: "inbox-mcp-inbound-dlq",
-			d1: "inbox-mcp-index",
-			d1Id: "<your-prod-d1-database-id>",
-			emailSendingDomain: "mail.example.com",
-			routingDomain: "example.com",
-			routingAddress: "test@example.com",
-			doBinding: "MAILBOX_DO",
-			r2Binding: "MAIL_OBJECTS",
-			queueBinding: "INBOUND_EMAIL_QUEUE",
-			d1Binding: "INDEX_DB",
-			emailBinding: "EMAIL",
-		},
-	};
+const defaultConfigByEnv: Record<
+	VerificationConfig["configEnv"],
+	Omit<VerificationConfig, "configEnv">
+> = {
+	dev: {
+		worker: "reccado-dev",
+		r2: "inbox-mcp-raw-dev",
+		queue: "inbox-mcp-inbound-dev",
+		dlq: "inbox-mcp-inbound-dlq-dev",
+		d1: "inbox-mcp-index-dev",
+		d1Id: "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
+		emailSendingDomain: "mail.example.com",
+		routingDomain: "example.com",
+		routingAddress: "test@example.com",
+		doBinding: "MAILBOX_DO",
+		r2Binding: "MAIL_OBJECTS",
+		queueBinding: "INBOUND_EMAIL_QUEUE",
+		d1Binding: "INDEX_DB",
+		emailBinding: "EMAIL",
+	},
+	production: {
+		worker: "reccado",
+		r2: "inbox-mcp-raw",
+		queue: "inbox-mcp-inbound",
+		dlq: "inbox-mcp-inbound-dlq",
+		d1: "inbox-mcp-index",
+		d1Id: "<your-prod-d1-database-id>",
+		emailSendingDomain: "mail.example.com",
+		routingDomain: "example.com",
+		routingAddress: "test@example.com",
+		doBinding: "MAILBOX_DO",
+		r2Binding: "MAIL_OBJECTS",
+		queueBinding: "INBOUND_EMAIL_QUEUE",
+		d1Binding: "INDEX_DB",
+		emailBinding: "EMAIL",
+	},
+};
 
 const defaults = defaultConfigByEnv[configEnvArg];
 const required: VerificationConfig = {

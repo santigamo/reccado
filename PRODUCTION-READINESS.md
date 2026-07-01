@@ -1,7 +1,7 @@
 # Production Readiness - Reccado
 
 Profile: `app/service`
-Modifiers: `[agent-developed, agent-facing, stateful, integration-heavy, regulated]`
+Modifiers: `[agent-developed, agent-facing, stateful, integration-heavy, privacy-sensitive, regulated, product-ui]`
 Production claim: self-hostable Cloudflare Tier A inbox for a single operator, running on Workers,
 Durable Objects, R2, D1, Queues, Email Routing, Email Sending, Cron, and Cloudflare Access.
 Audited: 2026-07-01
@@ -45,6 +45,10 @@ This audit is intentionally narrow about what is in scope today:
 | 11. Integration & resilience | Required | partial | Queue + DLQ + idempotent ingest documented in `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, and validated historically in `docs/PHASE1_VALIDATION.md`; explicit timeouts added for Access cert and Cloudflare API fetches | maintainer | replay runbook exists, but no operator-facing DLQ replay endpoint and no provisioned alert automation for backlog/DLQ conditions |
 | 12. Operational readiness | Required | partial | dependency-aware `/api/health` in `src/api/hono.ts`; runbook/SLO/alerting expectations in `docs/OPERATIONS.md`; Wrangler observability enabled in `wrangler.jsonc` | maintainer | alerting/error-sink resources are documented as required operator setup, not provisioned by this repo; no automated prod smoke after deploy |
 | 13. Data lifecycle | Required | partial | ownership/source-of-truth rules are clear in `docs/ARCHITECTURE.md`; retention/export/delete/restore limitations documented in `docs/OPERATIONS.md`; backups exist in `src/cloudflare/scheduled.ts` | maintainer | lifecycle/deletion/restore are documented but not automated or enforced by repo-managed resources |
+| 14. Privacy & compliance | Required | partial | PII/inbox-data model and admin-access controls in `SECURITY.md` (`ACCESS_ALLOWED_EMAILS` owner allowlist, Access-only admin routes, reliance on Cloudflare platform encryption at rest); retention/export/delete policy and its current gaps spelled out in `docs/OPERATIONS.md:176-224` ("Data lifecycle, retention, privacy, and current limitations" and "Manual delete/export/restore reality"); only Cloudflare-native services (R2, D1, DO, Email Routing/Sending) are in the data path per `docs/ARCHITECTURE.md` | maintainer | `docs/OPERATIONS.md:193-197` states plainly there is "no user-facing export job," "no end-user delete workflow [that] guarantees removal of all raw MIME, attachment blobs, D1 rows," and "no documented trash-retention timer or legal-hold model"; export/delete are manual, unverified-by-fixture procedures (`docs/OPERATIONS.md:214-224`), not automated or tested — required for `regulated`'s formal compliance bar |
+| 15. Automation, release & change control | Required | partial | `.github/workflows/ci.yml` runs separated lint/format-check/typecheck/test/build/local-HTTP-smoke steps plus `wrangler deploy --dry-run --outdir .wrangler/dry-run`, a generated-artifact drift check, and a `secret-scan` job (`gitleaks/gitleaks-action@v2`); Node matrix pins the `engines` floor and current (`22.12.0`, `24`); `pnpm install --frozen-lockfile` and `packageManager: pnpm@11.1.1` pin the install; `.github/dependabot.yml` schedules weekly `npm` and `github-actions` updates | maintainer | CI has no deploy/promotion job — `pnpm run deploy`/`deploy:dev` are manual local scripts with no CI environment gate, protected-environment approval, or rollback automation; branch protection and required-checks enforcement are GitHub repo settings, not verifiable from committed code |
+| 16. Public credibility & repository hygiene | Required | partial | root layout is legible (`src/`, `docs/`, `tests/`, `migrations/`, `scripts/`, `fixtures/`); `package.json` scripts follow the expected `dev`/`build`/`test`/`typecheck`/`lint`/`format`/`deploy`/`smoke:*` naming; `README.md` badges are live (CI workflow badge, MIT license, edge/runtime, "Status: Phase 1 complete"); `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE` (MIT) all present; `SECURITY.md`'s "Supported versions" section states the maintenance posture honestly (pre-1.0, `main`-only, no LTS branch, best-effort response) | maintainer | `CONTRIBUTING.md` invites external contributions but there are no GitHub issue/PR templates, labels, or `CODEOWNERS` in `.github/` (only `dependabot.yml` and `workflows/ci.yml` exist); no `CODE_OF_CONDUCT.md` |
+| 17. Product UI quality | Required | partial | `src/routes/mailboxes/index.tsx:16-50` implements explicit loading/empty/error states (`error` state rendered, empty-mailbox-list message) for the mailbox list view; compose flow (`src/routes/mailboxes/$mailboxId/compose.tsx:86,94`) disables send actions until a draft exists | maintainer | the primary mailbox/thread view (`src/routes/mailboxes/$mailboxId/index.tsx`) has no loading or error state around its `threads`/`messages`/search `fetch` calls (lines 40-62) — a failed fetch just leaves empty lists with no user-visible signal; accessibility attributes (`aria-*`, `role=`) appear only 3 times across all of `src/components` and `src/routes`; there is no Playwright, visual-regression, or a11y test anywhere in the repo (`tests/` is exclusively Vitest unit/integration specs) and CI runs no UI/browser checks |
 
 ## Why the verdict is `READY-WITH-CAVEATS`
 
@@ -61,9 +65,11 @@ are still incomplete:
 1. Ops/alerting still requires operator setup. The repo now documents SLOs, metrics, alerting
    expectations, and exposes dependency-aware health state, but it does not provision Cloudflare
    Alert Policies, an error sink, or pager/webhook notifications.
-2. Data lifecycle is not fully automated. The repo documents retention/export/delete/restore
-   limitations and the policy decisions an operator must make, but it does not yet enforce R2
-   lifecycle rules or provide full mailbox export/delete/restore workflows.
+2. Data lifecycle and privacy/compliance are not fully automated. The repo is `privacy-sensitive`
+   (and `regulated`) and documents retention/export/delete/restore limitations and the policy
+   decisions an operator must make (`docs/OPERATIONS.md:176-224`), but it does not yet enforce R2
+   lifecycle rules or provide full, fixture-verified mailbox export/delete/restore workflows —
+   the gap spans both Gate 13 (Data lifecycle) and Gate 14 (Privacy & compliance).
 3. Supply-chain automation is improved but not complete. Dependabot, CI secret scanning, and
    minimal Actions permissions are present; SBOM/provenance and repository branch-protection
    settings remain outside the committed app code.
@@ -72,6 +78,12 @@ are still incomplete:
 5. The repo is `agent-facing` by modifier because the product intent includes agents, but the
    actual MCP/agent product surface is not implemented. Tier B remains roadmap-only and must not
    be advertised as shipped.
+6. CI (`.github/workflows/ci.yml`) verifies build/test/typecheck/lint/dry-run-deploy but has no
+   deploy/promotion/rollback job; deploy remains a manual local script (Gate 15).
+7. The repo is `product-ui` by modifier because it ships a TanStack Start web UI, but UI quality
+   evidence is thin: the primary mailbox/thread view has no loading/error state around its data
+   fetches, accessibility attributes are sparse, and there are no Playwright/visual/a11y tests
+   (Gate 17).
 
 ## Recommended claim to use right now
 
@@ -93,3 +105,6 @@ Use this narrower production claim in repo-facing docs and audits:
    self-hosted service.
 5. Keep Tier B claims explicitly roadmap-only until MCP/agent surfaces ship with tool contracts,
    auth scopes, and validation evidence.
+6. Add a loading/error state to the primary mailbox/thread view (`src/routes/mailboxes/$mailboxId/index.tsx`)
+   and at least a minimal Playwright/a11y smoke, proportional to the newly declared `product-ui`
+   modifier (Gate 17).

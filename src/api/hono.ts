@@ -37,6 +37,44 @@ export type ApiBindings = {
 	};
 };
 
+// Tables the D1 index schema is expected to have (see migrations/d1/0001_initial.sql
+// and 0002_message_index.sql). Health checks against sqlite_master so a missing
+// migration (e.g. the "aliases" table not existing) surfaces as a real failure
+// instead of a hardcoded ok:true.
+const REQUIRED_INDEX_DB_TABLES = ["aliases", "message_index"] as const;
+
+type IndexDbHealth = {
+	ok: boolean;
+	reason: string | null;
+};
+
+async function checkIndexDbHealth(indexDb: D1Database): Promise<IndexDbHealth> {
+	try {
+		const placeholders = REQUIRED_INDEX_DB_TABLES.map(() => "?").join(", ");
+		const result = await indexDb
+			.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${placeholders})`)
+			.bind(...REQUIRED_INDEX_DB_TABLES)
+			.all<{ name: string }>();
+		const foundTables = new Set(result.results.map((row) => row.name));
+		const missingTables = REQUIRED_INDEX_DB_TABLES.filter((table) => !foundTables.has(table));
+		if (missingTables.length > 0) {
+			return {
+				ok: false,
+				reason: `Missing D1 table(s): ${missingTables.join(", ")}. Run migrations in migrations/d1.`,
+			};
+		}
+		return { ok: true, reason: null };
+	} catch (error) {
+		return {
+			ok: false,
+			reason:
+				error instanceof Error
+					? `D1 query against INDEX_DB failed: ${error.message}`
+					: "D1 query against INDEX_DB failed with an unknown error.",
+		};
+	}
+}
+
 export function createApiApp(): Hono<ApiBindings> {
 	const api = new Hono<ApiBindings>();
 
@@ -92,7 +130,7 @@ export function createApiApp(): Hono<ApiBindings> {
 		return next();
 	});
 
-	api.get("/api/health", (c) => {
+	api.get("/api/health", async (c) => {
 		const access = getAccessConfigStatus(c.env);
 		const authOk = access.ok && (access.mode !== "local-dev-bypass" || isLocalRequest(c.req.raw));
 		const authReason =
@@ -100,6 +138,7 @@ export function createApiApp(): Hono<ApiBindings> {
 				? access.reason
 				: "Cloudflare Access validation is not configured for non-localhost requests.";
 		const cloudflareApiConfigured = Boolean(c.env.CLOUDFLARE_API_TOKEN?.trim());
+		const indexDbHealth = await checkIndexDbHealth(c.env.INDEX_DB);
 		const dependencyStates = {
 			auth: {
 				ok: authOk,
@@ -109,8 +148,9 @@ export function createApiApp(): Hono<ApiBindings> {
 				missing: access.missing,
 			},
 			indexDb: {
-				ok: true,
+				ok: indexDbHealth.ok,
 				configured: true,
+				reason: indexDbHealth.reason,
 			},
 			cloudflareApi: {
 				ok: true,
@@ -118,11 +158,12 @@ export function createApiApp(): Hono<ApiBindings> {
 				reason: cloudflareApiConfigured ? null : "CLOUDFLARE_API_TOKEN is not set.",
 			},
 		};
+		const readinessOk = authOk && indexDbHealth.ok;
 		return c.json({
 			ok: true,
 			readiness: {
-				ok: authOk,
-				status: authOk ? "ready" : "degraded",
+				ok: readinessOk,
+				status: readinessOk ? "ready" : "degraded",
 			},
 			dependencies: dependencyStates,
 		});
@@ -238,7 +279,8 @@ export function createApiApp(): Hono<ApiBindings> {
 			cloudflare: {
 				configured: true,
 				ok: payload.success === true,
-				reason: payload.success === true ? null : "Cloudflare API returned an unsuccessful response.",
+				reason:
+					payload.success === true ? null : "Cloudflare API returned an unsuccessful response.",
 				status: payload.result?.status ?? null,
 				name: payload.result?.name ?? null,
 			},

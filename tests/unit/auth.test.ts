@@ -48,9 +48,7 @@ describe("getAuthContext dev-localhost bypass", () => {
 			getAuthContext(request, {
 				ACCESS_JWT_AUDIENCE: "aud-1",
 			} as Env),
-		).rejects.toThrow(
-			"Cloudflare Access validation is misconfigured; missing ACCESS_TEAM_DOMAIN.",
-		);
+		).rejects.toThrow("Cloudflare Access validation is misconfigured; missing ACCESS_TEAM_DOMAIN.");
 	});
 });
 

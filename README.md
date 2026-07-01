@@ -97,17 +97,22 @@ This runs entirely on your machine via local Cloudflare Workers emulation (`@clo
 
 ```bash
 pnpm install
+cp .dev.vars.example .dev.vars
 pnpm dev
 ```
 
-Vite defaults to port `3000`; if it's busy it prints the port it actually bound to — use that port
-below.
+`pnpm dev` runs a `predev` hook first that applies the D1 migrations (`migrations/d1/*.sql`) and
+seeds a deterministic `test@example.com` dev mailbox into the **same local D1** the dev server
+binds to — no separate migrate/seed step required, and it's safe to re-run (idempotent). Vite
+defaults to port `3000`; if it's busy it prints the port it actually bound to — use that port
+below. Copying `.dev.vars.example` to `.dev.vars` also unlocks the `/api/debug/phase0/*`
+introspection endpoints the smoke script below relies on (via `PHASE0_DEBUG_TOKEN`).
 
 In a second terminal, check the health endpoint and simulate an inbound email:
 
 ```bash
 curl -sS http://localhost:3000/api/health
-# {"ok":true}
+# {"ok":true,"readiness":{"ok":true,"status":"ready"},...}
 
 pnpm smoke:email:local http://localhost:3000 fixtures/mime/simple-text.eml
 ```
@@ -169,17 +174,22 @@ from the `migrations` block on first deploy.
 ### 2. Apply D1 migrations
 
 ```bash
-pnpm d1:migrate:local   # wrangler d1 migrations apply <db> --local
+pnpm d1:migrate:local   # wrangler d1 migrations apply INDEX_DB --local (top-level d1_databases entry)
 pnpm d1:migrate:dev     # wrangler d1 migrations apply <db> --remote --env dev
 pnpm d1:migrate:prod    # wrangler d1 migrations apply <db> --remote (default/production env)
 ```
 
-By default those scripts target the example names already in `wrangler.jsonc`
-(`inbox-mcp-index-dev` / `inbox-mcp-index`) so the maintainer dev flow keeps working. Self-hosters
-should override them with env vars instead of editing `package.json`:
+`d1:migrate:local` targets the `INDEX_DB` **binding** rather than a hardcoded database name, so it
+always applies to whatever local D1 `pnpm dev` itself uses (the top-level `d1_databases` entry in
+`wrangler.jsonc`, no `--env`) — nothing to override for local, and no drift between the two
+commands. It also runs automatically as a `predev` hook before every `pnpm dev`, so this is only
+needed standalone if you want to apply migrations without starting the dev server.
+
+The remote scripts (`d1:migrate:dev` / `d1:migrate:prod`) still target the example database names
+already in `wrangler.jsonc` (`inbox-mcp-index-dev` / `inbox-mcp-index`) so the maintainer flow keeps
+working. Self-hosters should override them with env vars instead of editing `package.json`:
 
 ```bash
-D1_DB_NAME_LOCAL=<your-dev-db-name> pnpm d1:migrate:local
 D1_DB_NAME_DEV=<your-dev-db-name> pnpm d1:migrate:dev
 D1_DB_NAME_PROD=<your-prod-db-name> pnpm d1:migrate:prod
 ```
