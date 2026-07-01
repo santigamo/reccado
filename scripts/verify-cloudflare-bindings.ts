@@ -176,6 +176,16 @@ const required: VerificationConfig = {
 	),
 };
 
+// The repo ships a placeholder D1 id (public template). Fail early with an actionable message
+// instead of querying Cloudflare for a UUID no real account can have.
+if (required.d1Id === "00000000-0000-0000-0000-000000000000" || required.d1Id === "") {
+	console.error(
+		"verify:cf: INDEX_DB database_id is a placeholder. Pass your real id via CF_VERIFY_D1_ID " +
+			"(or --d1-id), e.g. CF_VERIFY_D1_ID=<uuid> pnpm verify:cf.",
+	);
+	process.exit(1);
+}
+
 const config = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as WranglerConfig;
 const envConfig = required.configEnv === "dev" ? (config.env?.dev ?? {}) : {};
 const merged: WranglerConfig = { ...config, ...envConfig };

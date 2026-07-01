@@ -402,3 +402,36 @@ describe("DO-proxied routes vs. the global security-header middleware", () => {
 		expect(response.status).toBe(404);
 	});
 });
+
+describe("setup status diagnostic", () => {
+	it("reports control-plane completeness and flips canReceive once an active alias exists", async () => {
+		const now = new Date().toISOString();
+		await testEnv.INDEX_DB.prepare(
+			"INSERT OR IGNORE INTO domains (id, domain, zone_id, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+		)
+			.bind("dom_setup_status", "setup-status.example", "zone", now, now)
+			.run();
+		await testEnv.INDEX_DB.prepare(
+			"INSERT OR IGNORE INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+		)
+			.bind("mbx_setup_status", "inbox@setup-status.example", "Setup Status", now, now)
+			.run();
+		await testEnv.INDEX_DB.prepare(
+			"INSERT OR IGNORE INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+		)
+			.bind("inbox@setup-status.example", "mbx_setup_status", "dom_setup_status", now, now)
+			.run();
+
+		const response = await fetchWorker(new Request("http://localhost/api/setup/status"));
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as {
+			ok: boolean;
+			controlPlane: { mailboxes: number; aliases: number; domains: number; canReceive: boolean };
+		};
+		expect(body.ok).toBe(true);
+		expect(body.controlPlane.mailboxes).toBeGreaterThanOrEqual(1);
+		expect(body.controlPlane.aliases).toBeGreaterThanOrEqual(1);
+		expect(body.controlPlane.domains).toBeGreaterThanOrEqual(1);
+		expect(body.controlPlane.canReceive).toBe(true);
+	});
+});

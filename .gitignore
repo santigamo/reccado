@@ -15,6 +15,7 @@ todos.json
 coverage
 .artifacts
 .reccado
+wrangler.generated.*.json
 
 .dev.vars*
 !.dev.vars.example

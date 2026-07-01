@@ -15,6 +15,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { canonicalPrimaryAddress } from "../src/lib/mailbox-id";
 
 function parseArgs(argv: string[]): Record<string, string> {
 	const args: Record<string, string> = {};
@@ -50,7 +51,17 @@ if (!domain) {
 	console.error("setup:routing: --domain is required (e.g. --domain example.com).");
 	process.exit(1);
 }
-const address = (args.address?.trim() || `inbox@${domain}`).toLowerCase();
+let address: string;
+try {
+	address = canonicalPrimaryAddress(args.address?.trim() || `inbox@${domain}`);
+} catch {
+	console.error(`setup:routing: invalid --address "${args.address}".`);
+	process.exit(1);
+}
+if (!address.endsWith(`@${domain}`)) {
+	console.error(`setup:routing: --address ${address} is not on --domain ${domain}.`);
+	process.exit(1);
+}
 
 // Resolve the Worker name (the rule's action target) from wrangler.jsonc.
 const config = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as {
@@ -65,8 +76,12 @@ if (!worker) {
 	process.exit(1);
 }
 
+// stderr PIPED so error.stderr is populated for the idempotency check; printed on real failures.
 function wrangler(argv: string[]): void {
-	execFileSync("pnpm", ["wrangler", ...argv], { stdio: "inherit" });
+	execFileSync("pnpm", ["wrangler", ...argv], {
+		encoding: "utf8",
+		stdio: ["ignore", "inherit", "pipe"],
+	});
 }
 
 /** Runs a step, treating an "already exists/enabled" failure as success (idempotency). */
@@ -76,10 +91,15 @@ function runIdempotent(title: string, argv: string[]): void {
 	try {
 		wrangler(argv);
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		if (/already exists|already enabled|already created|duplicate/i.test(message)) {
+		const stderr =
+			typeof (error as { stderr?: unknown })?.stderr === "string"
+				? (error as { stderr: string }).stderr
+				: "";
+		const haystack = `${error instanceof Error ? error.message : String(error)}\n${stderr}`;
+		if (/already exists|already enabled|already created|duplicate|409/i.test(haystack)) {
 			console.log("  (already in place — skipping)");
 		} else {
+			if (stderr) console.error(stderr);
 			throw error;
 		}
 	}

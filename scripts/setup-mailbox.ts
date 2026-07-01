@@ -12,15 +12,16 @@
  * idempotent and safe to re-run.
  *
  * The secret coupling (important): the Worker's MAILBOX_ID_SECRET is write-only in Cloudflare,
- * so for a REMOTE seed you must pass the same value via `--secret` (or MAILBOX_ID_SECRET in the
- * env) — the CLI cannot read it back, and a mismatched secret derives a mailbox id the Worker
- * will never route to. Locally it is read from `.dev.vars`.
+ * so for a REMOTE seed you must supply the same value — the CLI cannot read it back, and a
+ * mismatched secret derives a mailbox id the Worker will never route to. Prefer passing it via
+ * the MAILBOX_ID_SECRET env var (not `--secret`, which would land in shell history / process
+ * listings). Locally it is read from `.dev.vars`.
  *
  * Usage:
  *   pnpm setup:mailbox --domain example.com --address inbox@example.com            # local dry run
  *   pnpm setup:mailbox --domain example.com --address inbox@example.com --local --apply
- *   pnpm setup:mailbox --domain example.com --address inbox@example.com \
- *     --env dev --secret <mailbox-id-secret> --catch-all --apply                   # remote
+ *   MAILBOX_ID_SECRET=<secret> pnpm setup:mailbox --domain example.com \
+ *     --address inbox@example.com --env dev --catch-all --apply                    # remote
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -111,8 +112,9 @@ if (!secret) {
 	console.error(
 		"setup:mailbox: no MAILBOX_ID_SECRET available.\n" +
 			"  Local: run `pnpm dev` once to generate .dev.vars, or set MAILBOX_ID_SECRET.\n" +
-			"  Remote: pass --secret <value> (the exact secret you set on the Worker) — it is\n" +
-			"  write-only in Cloudflare and the mailbox id must match what the Worker derives.",
+			"  Remote: MAILBOX_ID_SECRET=<value> pnpm setup:mailbox ... (the exact secret you set on\n" +
+			"  the Worker) — it is write-only in Cloudflare and the mailbox id must match what the\n" +
+			"  Worker derives. Prefer the env var over --secret so it stays out of shell history.",
 	);
 	process.exit(1);
 }

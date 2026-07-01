@@ -37,6 +37,7 @@
 		"dev": "vite dev --port 3000",
 		"ensure:dev-vars": "tsx scripts/ensure-dev-vars.ts",
 		"doctor": "tsx scripts/doctor.ts",
+		"doctor:json": "tsx scripts/doctor.ts --json",
 		"setup:cloud": "tsx scripts/setup-cloud.ts",
 		"setup:mailbox": "tsx scripts/setup-mailbox.ts",
 		"setup:routing": "tsx scripts/setup-routing.ts",

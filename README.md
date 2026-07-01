@@ -285,15 +285,9 @@ Access login, not return `200` (production isn't on `*.workers.dev` at all; see
 ### 7. Verify the Cloudflare bindings you actually deployed
 
 The repo ships a verifier for the Worker name, bindings, queues, D1, Email Sending, and an example
-Email Routing rule. The defaults still match the maintainer dev example so existing validation
-commands keep working:
-
-```bash
-pnpm verify:cf
-```
-
-For your own deployment, pass your resource names and IDs by env var or CLI flag instead of editing
-the script:
+Email Routing rule. Because the repo now ships a **placeholder** D1 id (see step 2), `pnpm verify:cf`
+exits early asking for your real id until you provide it — pass your resource names and IDs by env
+var or CLI flag:
 
 ```bash
 CF_VERIFY_ENV=dev \
@@ -324,6 +318,10 @@ pnpm smoke:access https://<your-deployed-url>          # fails if unauthenticate
 pnpm smoke:routing --domain <your-domain> --env dev    # fails if no Email Routing rule targets the Worker
 ```
 
+The deployed Worker also exposes `GET /api/setup/status` (behind the Access perimeter, like the
+rest of `/api/*`): index-DB health plus control-plane completeness (domain/mailbox/alias/routing
+counts and a `canReceive` flag) — runtime facts the CLI can't infer.
+
 ## Configuration
 
 ### Secrets and vars
@@ -351,7 +349,7 @@ pnpm smoke:routing --domain <your-domain> --env dev    # fails if no Email Routi
 
 ## Compatibility
 
-- **Node.js** — `engines.node: ">=22.12.0"` in `package.json`. CI runs Node 24.
+- **Node.js** — `engines.node: ">=22.15.0"` in `package.json`; `.node-version` pins `24`. CI runs Node 22.15.0 and 24.
 - **pnpm** — `packageManager: pnpm@11.1.1` in `package.json`. Use Corepack or install that version
   directly.
 - **Wrangler** — `^4.105.0` (devDependency). Cloudflare resource commands in this README assume a

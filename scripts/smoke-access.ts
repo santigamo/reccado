@@ -31,7 +31,11 @@ try {
 		process.exit(0);
 	}
 	if (blocked) {
-		console.log(`PASS: unauthenticated ${url} blocked with ${res.status}`);
+		// Not open (good), but a WAF/firewall/wrong route can also produce 401/403, so this is
+		// weaker evidence than a 302 to cloudflareaccess.com. Pass, but say so.
+		console.log(
+			`PASS (weak): unauthenticated ${url} blocked with ${res.status} — not open, but not confirmed as an Access login.`,
+		);
 		process.exit(0);
 	}
 	if (res.status === 200) {

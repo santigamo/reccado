@@ -485,3 +485,33 @@ export async function updateOutboundSendStatus(
 		)
 		.run();
 }
+
+export type SetupStatus = {
+	domains: number;
+	mailboxes: number;
+	aliases: number;
+	routingRules: number;
+	/** True once at least one active alias resolves to an active mailbox on an active domain. */
+	canReceive: boolean;
+};
+
+/** Control-plane completeness snapshot for the protected `/api/setup/status` diagnostic. */
+export async function getSetupStatus(db: D1Database): Promise<SetupStatus> {
+	const one = async (sql: string): Promise<number> => {
+		const row = await db.prepare(sql).first<{ n: number }>();
+		return row?.n ?? 0;
+	};
+	const [domains, mailboxes, aliases, routingRules, receivable] = await Promise.all([
+		one("SELECT COUNT(*) AS n FROM domains"),
+		one("SELECT COUNT(*) AS n FROM mailboxes"),
+		one("SELECT COUNT(*) AS n FROM aliases"),
+		one("SELECT COUNT(*) AS n FROM routing_rules"),
+		one(
+			`SELECT COUNT(*) AS n FROM aliases a
+       JOIN mailboxes m ON m.mailbox_id = a.mailbox_id AND m.status = 'active'
+       JOIN domains d ON d.id = a.domain_id AND d.status = 'active'
+       WHERE a.status = 'active'`,
+		),
+	]);
+	return { domains, mailboxes, aliases, routingRules, canReceive: receivable > 0 };
+}

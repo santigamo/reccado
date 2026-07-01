@@ -39,6 +39,15 @@ if (process.env.RECCADO_SKIP_DEV_VARS === "1") {
 } else if (existsSync(DEV_VARS_PATH)) {
 	console.log("ensure-dev-vars: .dev.vars already exists, leaving it untouched.");
 } else {
-	writeFileSync(DEV_VARS_PATH, LOCAL_DEV_VARS, { encoding: "utf8", flag: "wx" });
-	console.log("ensure-dev-vars: wrote a minimal .dev.vars for local development.");
+	try {
+		// `wx` fails if the file appeared between the existsSync check and here (concurrent predev).
+		writeFileSync(DEV_VARS_PATH, LOCAL_DEV_VARS, { encoding: "utf8", flag: "wx" });
+		console.log("ensure-dev-vars: wrote a minimal .dev.vars for local development.");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "EEXIST") {
+			console.log("ensure-dev-vars: .dev.vars already exists, leaving it untouched.");
+		} else {
+			throw error;
+		}
+	}
 }

@@ -4,14 +4,15 @@
  * fix whatever is incomplete, instead of failing opaquely at `pnpm dev` or deploy.
  *
  * Default run is offline and deterministic (toolchain + local dev + config placeholders).
- * Pass `--cloud` to add a Cloudflare auth probe. Deeper remote binding verification
- * (resources, secrets, Email Routing, Access) lives in `pnpm verify:cf` for now.
+ * Pass `--cloud` to add remote checks (auth, D1 exists + id match, required secrets, and — with
+ * `--url` — that Cloudflare Access is protecting the route). Exhaustive R2/queue/Email-Routing
+ * binding verification lives in `pnpm verify:cf`.
  *
  * Usage:
- *   pnpm doctor                 # local + config checks for the default (production) config
- *   pnpm doctor --env dev       # inspect the env.dev block instead
- *   pnpm doctor --cloud         # also probe `wrangler whoami`
- *   pnpm --silent doctor --json # machine-readable output (--silent drops pnpm's banner; exit 1 if any check fails)
+ *   pnpm doctor                       # local + config checks for the default (production) config
+ *   pnpm doctor --env dev             # inspect the env.dev block instead
+ *   pnpm doctor --env dev --cloud --url https://…   # remote: D1, secrets, Access redirect
+ *   pnpm -s doctor:json               # machine-readable output (-s drops pnpm's banner; exit 1 on any fail)
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -239,8 +240,9 @@ if (migrationFiles.length > 0) {
 // --- Config (wrangler.jsonc) -------------------------------------------------
 
 type WranglerConfig = {
+	name?: string;
 	vars?: { MAIL_FROM_ADDRESS?: string };
-	d1_databases?: Array<{ binding: string; database_id: string }>;
+	d1_databases?: Array<{ binding: string; database_name?: string; database_id: string }>;
 	env?: Record<string, WranglerConfig>;
 };
 const wrangler = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as WranglerConfig;
@@ -315,6 +317,8 @@ if (args.cloud === "true") {
 			fix: "Run `pnpm wrangler login`, then re-run with --cloud.",
 		});
 	}
+	addAll(checkD1Remote());
+	addAll(checkSecretsRemote());
 	if (args.url) {
 		add(await checkAccessRedirect(args.url));
 	} else {
@@ -327,8 +331,116 @@ if (args.cloud === "true") {
 	add({
 		id: "cloud.bindings",
 		status: "info",
-		message: "Deep remote binding checks (resources, secrets, routing) live in `pnpm verify:cf`.",
+		message: "Exhaustive binding verification (R2/queues/Email Routing) lives in `pnpm verify:cf`.",
 	});
+}
+
+function addAll(items: Check[]): void {
+	for (const c of items) add(c);
+}
+
+/** Confirms the target env's INDEX_DB database exists in the account and its id matches config. */
+function checkD1Remote(): Check[] {
+	const entry = block?.d1_databases?.find((d) => d.binding === "INDEX_DB");
+	if (!entry?.database_name) return [];
+	try {
+		const list = JSON.parse(
+			execFileSync("pnpm", ["wrangler", "d1", "list", "--json"], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			}),
+		) as Array<{ name: string; uuid?: string; database_id?: string }>;
+		const found = list.find((d) => d.name === entry.database_name);
+		if (!found) {
+			return [
+				{
+					id: "cloud.d1",
+					status: "fail",
+					message: `D1 "${entry.database_name}" not found in this account.`,
+					fix: `pnpm setup:cloud${targetEnv ? ` --env ${targetEnv}` : ""} --domain <d> --address inbox@<d> --apply`,
+				},
+			];
+		}
+		const realId = found.uuid ?? found.database_id;
+		const isPlaceholder =
+			entry.database_id === PROD_D1_PLACEHOLDER || entry.database_id === DEV_D1_PLACEHOLDER;
+		if (!isPlaceholder && realId && realId !== entry.database_id) {
+			return [
+				{
+					id: "cloud.d1",
+					status: "warn",
+					message: `D1 "${entry.database_name}" exists but its id (${realId}) differs from wrangler.jsonc (${entry.database_id}).`,
+					fix: "Update the INDEX_DB database_id, or deploy with the generated wrangler config.",
+				},
+			];
+		}
+		return [
+			{
+				id: "cloud.d1",
+				status: "pass",
+				message: `D1 "${entry.database_name}" exists in the account.`,
+			},
+		];
+	} catch {
+		return [{ id: "cloud.d1", status: "warn", message: "Could not list D1 databases (auth?)." }];
+	}
+}
+
+/** Confirms the Worker's remote secrets: MAILBOX_ID_SECRET (required) and the Access pair. */
+function checkSecretsRemote(): Check[] {
+	const worker = block?.name ?? wrangler.name;
+	if (!worker) return [];
+	let names: Set<string>;
+	try {
+		const secrets = JSON.parse(
+			execFileSync(
+				"pnpm",
+				[
+					"wrangler",
+					"secret",
+					"list",
+					"--format",
+					"json",
+					"--name",
+					worker,
+					...(targetEnv ? ["--env", targetEnv] : []),
+				],
+				{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+			),
+		) as Array<{ name: string }>;
+		names = new Set(secrets.map((s) => s.name));
+	} catch {
+		return [
+			{
+				id: "cloud.secrets",
+				status: "warn",
+				message: `Could not list secrets for "${worker}" (deployed?).`,
+			},
+		];
+	}
+	const out: Check[] = [];
+	out.push(
+		names.has("MAILBOX_ID_SECRET")
+			? { id: "cloud.secret.mailbox", status: "pass", message: "MAILBOX_ID_SECRET is set." }
+			: {
+					id: "cloud.secret.mailbox",
+					status: "fail",
+					message: "MAILBOX_ID_SECRET is not set — mailbox id derivation will fail.",
+					fix: `pnpm setup:cloud${targetEnv ? ` --env ${targetEnv}` : ""} --domain <d> --address inbox@<d> --apply`,
+				},
+	);
+	const missingAccess = ["ACCESS_JWT_AUDIENCE", "ACCESS_TEAM_DOMAIN"].filter((n) => !names.has(n));
+	out.push(
+		missingAccess.length === 0
+			? { id: "cloud.secret.access", status: "pass", message: "Access secrets are set." }
+			: {
+					id: "cloud.secret.access",
+					status: "warn",
+					message: `Access secret(s) missing: ${missingAccess.join(", ")} — /api/* is unprotected without them.`,
+					fix: "pnpm setup:access --url <deployed-url> ... --apply",
+				},
+	);
+	return out;
 }
 
 /**
@@ -352,8 +464,9 @@ async function checkAccessRedirect(rawUrl: string): Promise<Check> {
 		if (res.status === 403 || res.status === 401) {
 			return {
 				id: "cloud.access",
-				status: "pass",
-				message: `Access blocks unauthenticated ${url} (${res.status}).`,
+				status: "warn",
+				message: `Unauthenticated ${url} is blocked (${res.status}) but not confirmed as an Access login — a WAF/firewall/wrong route looks the same.`,
+				fix: "Confirm it's a 302 to cloudflareaccess.com for the exact route.",
 			};
 		}
 		if (res.status === 200) {
