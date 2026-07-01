@@ -4,6 +4,7 @@ import {
 	getDomainById,
 	getDomainByName,
 	getMailbox,
+	getSetupStatus,
 	insertAlias,
 	insertDomain,
 	insertMailbox,
@@ -172,6 +173,20 @@ export function createApiApp(): Hono<ApiBindings> {
 	api.get("/api/me", (c) => {
 		const auth = c.get("auth");
 		return c.json({ userId: auth?.userId, email: auth?.email });
+	});
+
+	// Protected setup diagnostic (behind the Access perimeter, like the rest of /api/*): runtime
+	// facts the CLI `pnpm doctor` cannot infer — index health plus control-plane completeness.
+	api.get("/api/setup/status", async (c) => {
+		const indexDbHealth = await checkIndexDbHealth(c.env.INDEX_DB);
+		if (!indexDbHealth.ok) {
+			return c.json({ ok: false, indexDb: indexDbHealth, controlPlane: null }, 503);
+		}
+		return c.json({
+			ok: true,
+			indexDb: indexDbHealth,
+			controlPlane: await getSetupStatus(c.env.INDEX_DB),
+		});
 	});
 
 	api.get("/api/mailboxes", async (c) => {

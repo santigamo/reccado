@@ -103,7 +103,8 @@ const defaultConfigByEnv: Record<
 		queue: "inbox-mcp-inbound-dev",
 		dlq: "inbox-mcp-inbound-dlq-dev",
 		d1: "inbox-mcp-index-dev",
-		d1Id: "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
+		// Placeholder — pass your real dev D1 id via CF_VERIFY_D1_ID (or --d1-id).
+		d1Id: "00000000-0000-0000-0000-000000000000",
 		emailSendingDomain: "mail.example.com",
 		routingDomain: "example.com",
 		routingAddress: "test@example.com",
@@ -174,6 +175,21 @@ const required: VerificationConfig = {
 		defaults.emailBinding,
 	),
 };
+
+// The repo ships a placeholder D1 id (public template). Fail early with an actionable message
+// instead of querying Cloudflare for a UUID no real account can have.
+// Catches the dev UUID-zero, empty, and the textual `<your-...-d1-database-id>` prod placeholder.
+if (
+	required.d1Id === "00000000-0000-0000-0000-000000000000" ||
+	required.d1Id === "" ||
+	/^<.*>$/.test(required.d1Id)
+) {
+	console.error(
+		"verify:cf: INDEX_DB database_id is a placeholder. Pass your real id via CF_VERIFY_D1_ID " +
+			"(or --d1-id), e.g. CF_VERIFY_D1_ID=<uuid> pnpm verify:cf.",
+	);
+	process.exit(1);
+}
 
 const config = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as WranglerConfig;
 const envConfig = required.configEnv === "dev" ? (config.env?.dev ?? {}) : {};
