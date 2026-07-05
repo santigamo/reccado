@@ -8,8 +8,8 @@
  * stores mail for a recipient as soon as an active alias + active domain exist (src/db/d1.ts).
  *
  * SAFETY: dry-run by default (prints the mailbox id, the SQL, and the exact `wrangler d1
- * execute` command). Pass `--apply` to run it. All inserts are `INSERT OR IGNORE`, so it is
- * idempotent and safe to re-run.
+ * execute` command). Pass `--apply` to run it. The SQL uses conflict-safe inserts/upserts and
+ * resolves the live domain row by name, so it is idempotent and safe to re-run.
  *
  * The secret coupling (important): the Worker's MAILBOX_ID_SECRET is write-only in Cloudflare,
  * so for a REMOTE seed you must supply the same value — the CLI cannot read it back, and a
@@ -28,6 +28,20 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalPrimaryAddress, deriveMailboxId } from "../src/lib/mailbox-id";
+
+type WranglerBlock = {
+	d1_databases?: Array<{ binding: string; database_name: string }>;
+};
+
+type WranglerConfig = WranglerBlock & {
+	env?: Record<string, WranglerBlock>;
+};
+
+type D1ExecuteJson = Array<{
+	results?: Array<Record<string, unknown>>;
+	success?: boolean;
+	meta?: { duration?: number };
+}>;
 
 function parseArgs(argv: string[]): Record<string, string> {
 	const args: Record<string, string> = {};
@@ -74,11 +88,21 @@ function q(value: string): string {
 	return `'${value.replace(/'/g, "''")}'`;
 }
 
+function runD1Query(execArgs: string[], sqlCommand: string): D1ExecuteJson {
+	return JSON.parse(
+		execFileSync("pnpm", ["wrangler", ...execArgs, `--command=${sqlCommand}`, "--json"], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "inherit"],
+		}),
+	) as D1ExecuteJson;
+}
+
 const args = parseArgs(process.argv.slice(2));
 const apply = args.apply === "true";
 const local = args.local === "true";
 const targetEnv = args.env;
 const catchAll = args["catch-all"] === "true";
+const envLabel = targetEnv ?? "production";
 
 const domain = args.domain?.trim().toLowerCase();
 const rawAddress = args.address?.trim();
@@ -122,22 +146,50 @@ if (!secret) {
 const mailboxId = await deriveMailboxId(secret, address);
 const domainId = `dom_${domain.replace(/[^a-z0-9]+/g, "_")}`;
 const now = new Date().toISOString();
+const generatedConfigPath = `wrangler.generated.${envLabel}.json`;
+const preferredConfigPath = existsSync(generatedConfigPath)
+	? generatedConfigPath
+	: "wrangler.jsonc";
 
 const statements = [
-	`INSERT OR IGNORE INTO domains (id, domain, zone_id, status, created_at, updated_at)
-VALUES (${q(domainId)}, ${q(domain)}, ${q(zoneId)}, 'active', ${q(now)}, ${q(now)});`,
-	`INSERT OR IGNORE INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at)
-VALUES (${q(mailboxId)}, ${q(address)}, ${q(displayName)}, 'active', ${q(now)}, ${q(now)});`,
-	`INSERT OR IGNORE INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at)
-VALUES (${q(address)}, ${q(mailboxId)}, ${q(domainId)}, 'active', ${q(now)}, ${q(now)});`,
+	`INSERT INTO domains (id, domain, zone_id, status, created_at, updated_at)
+VALUES (${q(domainId)}, ${q(domain)}, ${q(zoneId)}, 'active', ${q(now)}, ${q(now)})
+ON CONFLICT(domain) DO NOTHING;`,
+	`INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at)
+VALUES (${q(mailboxId)}, ${q(address)}, ${q(displayName)}, 'active', ${q(now)}, ${q(now)})
+ON CONFLICT(primary_address) DO NOTHING;`,
+	`INSERT INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at)
+SELECT ${q(address)}, ${q(mailboxId)}, id, 'active', ${q(now)}, ${q(now)}
+FROM domains
+WHERE domain = ${q(domain)}
+ON CONFLICT(alias_address) DO UPDATE SET
+	mailbox_id = excluded.mailbox_id,
+	domain_id = excluded.domain_id,
+	status = excluded.status,
+	updated_at = excluded.updated_at;`,
 ];
 if (catchAll) {
 	statements.push(
-		`INSERT OR IGNORE INTO routing_rules (id, domain_id, pattern, priority, action, mailbox_id, forward_to_json, reject_reason, enabled, created_at, updated_at)
-VALUES (${q(`rule_${domainId}_catchall`)}, ${q(domainId)}, '*', 100, 'store', ${q(mailboxId)}, '[]', NULL, 1, ${q(now)}, ${q(now)});`,
+		`INSERT INTO routing_rules (id, domain_id, pattern, priority, action, mailbox_id, forward_to_json, reject_reason, enabled, created_at, updated_at)
+SELECT ${q(`rule_${domainId}_catchall`)}, id, '*', 100, 'store', ${q(mailboxId)}, '[]', NULL, 1, ${q(now)}, ${q(now)}
+FROM domains
+WHERE domain = ${q(domain)}
+ON CONFLICT(id) DO UPDATE SET
+	domain_id = excluded.domain_id,
+	pattern = excluded.pattern,
+	priority = excluded.priority,
+	action = excluded.action,
+	mailbox_id = excluded.mailbox_id,
+	forward_to_json = excluded.forward_to_json,
+	reject_reason = excluded.reject_reason,
+	enabled = excluded.enabled,
+	updated_at = excluded.updated_at;`,
 	);
 }
-const sql = `-- Reccado mailbox seed for ${address} (mailbox_id=${mailboxId}). Idempotent.\n${statements.join("\n")}\n`;
+const sql =
+	`-- Reccado mailbox seed for ${address} (mailbox_id=${mailboxId}). Idempotent.\n` +
+	`-- Domains are resolved by name at execution time, so an existing domains.id is reused.\n` +
+	`${statements.join("\n")}\n`;
 
 // Resolve the D1 execute target.
 let execArgs: string[];
@@ -146,36 +198,79 @@ if (local) {
 	execArgs = ["d1", "execute", "INDEX_DB", "--local"];
 	targetLabel = "local D1 (INDEX_DB binding)";
 } else {
-	const config = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as {
-		d1_databases?: Array<{ binding: string; database_name: string }>;
-		env?: Record<string, { d1_databases?: Array<{ binding: string; database_name: string }> }>;
-	};
+	const config = JSON.parse(
+		stripJsonc(readFileSync(preferredConfigPath, "utf8")),
+	) as WranglerConfig;
 	const block = targetEnv ? config.env?.[targetEnv] : config;
 	const d1Name = block?.d1_databases?.find((d) => d.binding === "INDEX_DB")?.database_name;
 	if (!d1Name) {
 		console.error(
-			`setup:mailbox: could not resolve the INDEX_DB name for env "${targetEnv ?? "production"}".`,
+			`setup:mailbox: could not resolve the INDEX_DB name for env "${envLabel}" from ${preferredConfigPath}.`,
 		);
 		process.exit(1);
 	}
-	execArgs = ["d1", "execute", d1Name, "--remote", ...(targetEnv ? ["--env", targetEnv] : [])];
+	execArgs = [
+		"d1",
+		"execute",
+		d1Name,
+		"--remote",
+		...(preferredConfigPath === "wrangler.jsonc" ? [] : ["--config", preferredConfigPath]),
+		...(targetEnv ? ["--env", targetEnv] : []),
+	];
 	targetLabel = `remote D1 "${d1Name}"${targetEnv ? ` (env ${targetEnv})` : ""}`;
+}
+
+let existingDomainId: string | undefined;
+if (apply) {
+	const [domainLookup, mailboxLookup] = runD1Query(
+		execArgs,
+		`SELECT id FROM domains WHERE domain = ${q(domain)} LIMIT 1;
+SELECT mailbox_id FROM mailboxes WHERE primary_address = ${q(address)} LIMIT 1;`,
+	);
+	existingDomainId =
+		typeof domainLookup?.results?.[0]?.id === "string"
+			? (domainLookup.results[0].id as string)
+			: undefined;
+	const existingMailboxId =
+		typeof mailboxLookup?.results?.[0]?.mailbox_id === "string"
+			? (mailboxLookup.results[0].mailbox_id as string)
+			: undefined;
+	if (existingMailboxId && existingMailboxId !== mailboxId) {
+		console.error(
+			"setup:mailbox: an existing mailbox row already owns this primary address with a different mailbox_id.\n" +
+				`  address:              ${address}\n` +
+				`  existing mailbox_id:  ${existingMailboxId}\n` +
+				`  derived mailbox_id:   ${mailboxId}\n` +
+				"  This usually means MAILBOX_ID_SECRET does not match the deployed Worker secret.\n" +
+				"  Cloudflare secrets are write-only, so reuse the original secret value before seeding.",
+		);
+		process.exit(1);
+	}
 }
 
 console.log(`\nReccado setup:mailbox\n`);
 console.log(`  address:     ${address}`);
 console.log(`  mailbox_id:  ${mailboxId}`);
-console.log(`  domain:      ${domain} (${domainId})`);
+console.log(
+	`  domain:      ${domain} (${existingDomainId ?? domainId}${existingDomainId ? ", existing row" : ", preferred id"})`,
+);
 console.log(
 	`  catch-all:   ${catchAll ? "yes (routing_rule pattern '*')" : "no (exact alias only)"}`,
 );
 console.log(`  target:      ${targetLabel}`);
+if (!local && preferredConfigPath !== "wrangler.jsonc") {
+	console.log(`  config:      ${preferredConfigPath}`);
+}
 console.log(`  mode:        ${apply ? "APPLY" : "dry run (no changes)"}\n`);
 console.log(sql);
 
 if (!apply) {
 	console.log(
 		`Command that would run:\n  $ pnpm wrangler ${execArgs.join(" ")} --file <tmp.sql>\n`,
+	);
+	console.log(
+		"Reminder: MAILBOX_ID_SECRET must exactly match the deployed Worker secret. If this address was\n" +
+			"seeded before and you no longer have that secret value, derive/reuse it before applying.\n",
 	);
 	console.log("Dry run only. Re-run with --apply to execute.\n");
 	process.exit(0);

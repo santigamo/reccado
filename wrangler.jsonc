@@ -12,9 +12,8 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
-	// Production (default) env should not be reachable on the shared
-	// *.workers.dev subdomain; forkers should front it with their own
-	// route/custom domain instead.
+	// Production should not be reachable on the shared *.workers.dev subdomain.
+	// Front public installs with a custom domain and Cloudflare Access.
 	"workers_dev": false,
 	"vars": {
 		"MAIL_FROM_ADDRESS": "noreply@mail.example.com"
@@ -78,6 +77,9 @@
 	"env": {
 		"dev": {
 			"name": "reccado-dev",
+			// Dev keeps workers.dev available for smoke tests. Cloudflare Access still
+			// needs a custom domain; use `pnpm setup:domain` for the protected UI.
+			"workers_dev": true,
 			"vars": {
 				"MAIL_FROM_ADDRESS": "noreply@mail.example.com"
 			},

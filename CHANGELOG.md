@@ -60,6 +60,42 @@ Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox.
   build-validation logs rather than current operating docs.
 - Fixed a stale "Inbox MCP" UI string (the product was renamed to Reccado).
 
+### Self-host setup hardening
+
+- `setup:cloud` now checks the inbound queue's consumer before deploying and aborts with the exact
+  `wrangler queues consumer remove <queue> <old-worker>` fix if a different Worker (e.g. left over
+  from a rename) is still registered as its consumer, instead of letting deploy fail with a
+  generic error. Added `--reset-secret` to recover an **orphaned** `MAILBOX_ID_SECRET` — one a
+  prior `--apply` run set but then failed before seeding a mailbox with — by overwriting it with a
+  fresh value and reseeding atomically in the same run; the orphaned state is detected from a
+  non-sensitive fingerprint recorded in `.reccado/setup.<env>.json`.
+- `setup:mailbox` resolves the domain row by name and reuses it instead of assuming a fresh insert,
+  so reseeding an env with pre-existing (including foreign-key-owning) domain rows is idempotent
+  rather than failing.
+- `setup:routing` adds `--catch-all`, which configures `*@<domain> -> Worker` via Cloudflare's
+  Email Routing REST API (`PUT .../rules/catch_all`) because Wrangler currently rejects that rule
+  shape client-side even though the platform endpoint supports it.
+- Added `setup:domain`: attaches a custom domain to a Worker env through a generated, gitignored
+  Wrangler config (never edits the tracked `wrangler.jsonc`). Idempotent for the same Worker;
+  refuses to reattach a hostname already claimed by a **different** Worker, checked up front via
+  the Workers Custom Domains API when `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` are available,
+  falling back to an error-string guard around `wrangler deploy` otherwise.
+- Added `setup:sending`: provisions a dedicated Cloudflare Email Sending subdomain (`send.<domain>`
+  by default) and writes `MAIL_FROM_ADDRESS` + `allowed_sender_addresses` into the generated
+  config. Prints a prominent Workers Paid preflight (arbitrary-recipient sending needs a paid plan;
+  free-plan accounts are limited to verified destinations). DMARC defaults to `p=none` (monitor
+  mode, relaxed alignment) as the start of a documented none → quarantine → reject ramp
+  (`--dmarc-policy`, `--dmarc-alignment relaxed|strict`, `--dmarc-rua`). With
+  `CLOUDFLARE_API_TOKEN` it also auto-adds the provider-generated DKIM + MX records (parsed from
+  `wrangler email sending dns get`, an open-beta command with no `--json` mode) unless
+  `--skip-provider-records` is passed; SPF and DMARC remain exclusively script-owned, so the
+  provider's own suggested DMARC record (typically `p=reject`) is never applied.
+- `pnpm doctor --cloud` now reads the setup manifest and warns when it finds an orphaned
+  `MAILBOX_ID_SECRET` (set but never paired with a successful seed), pointing at `--reset-secret`.
+- Aligned the `workers.dev` vs. custom-domain narrative across `doctor`, `setup:domain`, and
+  `setup:access`: the `dev` environment keeps `workers_dev: true` only for local-to-cloud smoke
+  tests, and Access verification is only ever treated as valid against a custom domain.
+
 ## [0.1.0] — Phase 1: Tier A inbox complete
 
 Initial senior-validated milestone: a usable self-hosted inbox without any AI/agent layer.

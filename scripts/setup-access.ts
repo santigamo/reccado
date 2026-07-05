@@ -11,7 +11,7 @@
  * SAFETY: dry-run by default. Pass `--apply` to set the secrets.
  *
  * Usage:
- *   pnpm setup:access --url https://reccado-dev.<sub>.workers.dev            # print guided steps
+ *   pnpm setup:access --hostname inbox-dev.example.com                        # print guided steps
  *   pnpm setup:access --env dev --aud <access-aud-tag> \
  *     --team-domain https://<team>.cloudflareaccess.com --apply             # set the secrets
  */
@@ -48,6 +48,7 @@ const args = parseArgs(process.argv.slice(2));
 const apply = args.apply === "true";
 const targetEnv = args.env;
 const url = args.url?.trim();
+const hostname = args.hostname?.trim().toLowerCase();
 const aud = args.aud?.trim();
 const teamDomain = args["team-domain"]?.trim();
 const allowedEmails = args["allowed-emails"]?.trim();
@@ -58,13 +59,22 @@ const config = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as
 };
 const worker = (targetEnv ? config.env?.[targetEnv]?.name : config.name) ?? config.name;
 const envFlag = targetEnv ? ["--env", targetEnv] : [];
+const accessHost = hostname ?? (url ? new URL(url).hostname : undefined);
+
+if (accessHost?.endsWith(".workers.dev")) {
+	console.error(
+		"setup:access: use your custom hostname, not a *.workers.dev URL.\n" +
+			"Reccado's supported public path is custom domain + Cloudflare Access.",
+	);
+	process.exit(1);
+}
 
 function putSecret(name: string, value: string): void {
 	console.log(
-		`\n▸ Set ${name}\n  $ pnpm wrangler secret put ${name} --name ${worker}${targetEnv ? ` --env ${targetEnv}` : ""}`,
+		`\n▸ Set ${name}\n  $ pnpm wrangler secret put ${name}${targetEnv ? ` --env ${targetEnv}` : ""}`,
 	);
 	if (!apply) return;
-	execFileSync("pnpm", ["wrangler", "secret", "put", name, "--name", worker ?? "", ...envFlag], {
+	execFileSync("pnpm", ["wrangler", "secret", "put", name, ...envFlag], {
 		input: value,
 		stdio: ["pipe", "inherit", "inherit"],
 	});
@@ -74,9 +84,19 @@ console.log(
 	`\nReccado setup:access — worker: ${worker}\nmode: ${apply ? "APPLY (setting secrets)" : "dry run / guide"}\n`,
 );
 
-console.log("Create the Access application (varies by IdP — do this in the dashboard):");
+if (!accessHost) {
+	console.log(
+		"Pass --hostname <app.example.com> (preferred) or --url https://app.example.com for the exact route.",
+	);
+}
+
+console.log(
+	"Create the Access application on your custom domain (varies by IdP — do this in the dashboard):",
+);
 console.log("  1. Zero Trust → Access → Applications → Add → Self-hosted.");
-console.log(`  2. Application domain: the route in front of ${worker}${url ? ` (${url})` : ""}.`);
+console.log(
+	`  2. Application domain: ${accessHost ?? "<app.example.com>"}${url ? ` (${url})` : ""}.`,
+);
 console.log("  3. Add an allow policy for your email (or an IdP group).");
 console.log("  4. Copy the application Audience (aud) tag, and note your team domain");
 console.log("     (https://<team>.cloudflareaccess.com).\n");
@@ -100,5 +120,5 @@ if (aud && teamDomain) {
 
 console.log(
 	`\nThen verify Access is actually protecting the route:` +
-		`\n  pnpm doctor --env ${targetEnv ?? "production"} --cloud --url ${url ?? "<deployed-url>"}\n`,
+		`\n  pnpm doctor --env ${targetEnv ?? "production"} --cloud --url ${url ?? (accessHost ? `https://${accessHost}` : "<deployed-url>")}\n`,
 );

@@ -64,60 +64,190 @@ invariant instead.
 | `ACCESS_JWT_AUDIENCE` | secret | **Required** for any public deployment | Cloudflare Access application `aud` tag. Auth fails closed without it outside `localhost`. |
 | `ACCESS_TEAM_DOMAIN` | secret | **Required** for any public deployment | `https://<team>.cloudflareaccess.com` for the user's Zero Trust org. |
 | `ACCESS_ALLOWED_EMAILS` | secret | Strongly recommended | Comma-separated owner allowlist on top of Access. Without it, every Access-authenticated identity is treated as the single operator — fine for true single-user installs, risky for shared Access orgs. |
-| `CLOUDFLARE_API_TOKEN` | secret | Optional | Least-privilege token for in-app provisioning automation only. Don't request broader scopes than zone read + Email Routing write + Access app/policy write. |
+| `CLOUDFLARE_API_TOKEN` | secret | Optional | Least-privilege token for in-app provisioning automation only. Don't request broader scopes than zone read + DNS edit (setup:sending's SPF/DMARC/DKIM/MX records) + Email Routing write + Access app/policy write. Also enables setup:domain's up-front custom-domain conflict check. |
 | `PHASE0_DEBUG_TOKEN` | secret | Optional, dev-only | Gates `/api/debug/phase0/*` introspection endpoints. Leave unset in any deployment the user cares about being airtight — unset means the endpoints are unreachable. |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc`) | **Required** | Verified outbound sender address on a domain onboarded to Email Sending. |
 
 See [`.dev.vars.example`](.dev.vars.example) for the local-dev form of these and
 [README.md § Configuration](README.md#configuration) for the full binding table.
 
-### Numbered deploy steps
+### Preferred scripted flow
 
-1. **Clone/fork the repo** and run `pnpm install`.
-2. **Create Cloudflare resources** under the user's own names (do not reuse this repo's
-   `inbox-mcp-*-dev` example names beyond local dev):
+This repo's current self-host path is script-first, not manual-first. Use the package scripts
+unless the user explicitly wants the low-level Wrangler sequence.
+
+1. **Clone/fork the repo**, run `pnpm install`, then run the local diagnosis once:
    ```bash
-   pnpm wrangler r2 bucket create <raw-mail-bucket>
-   pnpm wrangler queues create <inbound-queue>
-   pnpm wrangler queues create <inbound-dlq>
-   pnpm wrangler d1 create <index-db-name> --location=<closest-region>
+   pnpm doctor --env dev
    ```
-3. **Update `wrangler.jsonc`** with the bucket/queue/database names and the `database_id` printed
-   by `wrangler d1 create`, for both the top-level config and the `env.dev` block (or whichever
-   environments the user wants).
-4. **Apply D1 migrations**:
+2. **Provision core Cloudflare resources with the scripted path**:
    ```bash
-   pnpm wrangler d1 migrations apply <index-db-name> --local           # local emulation
-   pnpm wrangler d1 migrations apply <index-db-name> --remote --env dev
-   pnpm wrangler d1 migrations apply <prod-index-db-name> --remote     # production/default env
+   pnpm wrangler login
+   pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com>
+   pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com> --apply
    ```
-   (The repo's `d1:migrate:local`/`d1:migrate:dev`/`d1:migrate:prod` package scripts hardcode the
-   maintainer's database names — update those scripts or call `wrangler d1 migrations apply`
-   directly with the user's database names.)
-5. **Generate and set secrets** (see table above):
+   What this actually does today:
+   - creates the R2 bucket, queue, DLQ, and D1 database idempotently
+   - resolves the real D1 id with `wrangler d1 list --json`
+   - writes a gitignored `wrangler.generated.<env>.json`
+   - builds the TanStack Start app for the chosen env
+   - patches the real bindings/ids into `dist/server/wrangler.json`
+   - applies remote D1 migrations against the patched built config
+   - deploys the Worker from `dist/server/wrangler.json`
+   - generates `MAILBOX_ID_SECRET` only if it is absent
+   - seeds the first mailbox only when that same run generated the secret
+   - checks the inbound queue's consumer before deploying, and aborts with the exact
+     `wrangler queues consumer remove <queue> <old-worker>` fix if a different Worker (e.g. from a
+     rename) is still registered as its consumer
+   - recovers an **orphaned** `MAILBOX_ID_SECRET` — one a prior `--apply` run set but then failed
+     before seeding a mailbox with — via `--reset-secret`, which overwrites it with a fresh value
+     and reseeds atomically in the same run (never run this after go-live; it changes every
+     mailbox id derived from the current secret)
+
+   Important boundary: `setup:cloud` provisions core infra and deploys the Worker. The usable inbox
+   path still needs a custom domain, Email Routing/Sending, and Cloudflare Access.
+
+3. **If `MAILBOX_ID_SECRET` already existed, finish mailbox seeding manually**:
    ```bash
-   pnpm wrangler secret put MAILBOX_ID_SECRET --env dev
-   pnpm wrangler secret put ACCESS_JWT_AUDIENCE --env dev
-   pnpm wrangler secret put ACCESS_TEAM_DOMAIN --env dev
-   pnpm wrangler secret put ACCESS_ALLOWED_EMAILS --env dev
+   MAILBOX_ID_SECRET=<original-secret> pnpm setup:mailbox \
+     --domain <you.com> --address inbox@<you.com> --env dev --apply
    ```
-   Generate `MAILBOX_ID_SECRET` with a real random value (e.g. `openssl rand -hex 32`), not a
-   guessable string.
-6. **Configure Email Routing** in the Cloudflare dashboard: enable Email Routing on the user's
-   zone, add a rule routing the target address(es) to this Worker, and onboard the sending domain
-   under Email Sending if outbound is needed.
-7. **Set up Cloudflare Access**: create a self-hosted Access application in front of the Worker's
-   route, add an allow policy scoped to the user's identity (email or IdP group), and record the
-   `aud` tag and team domain for step 5.
-8. **Deploy**:
+   The CLI cannot read the secret back from Cloudflare. If the secret was already set, the script
+   intentionally leaves it alone and prints this command instead of guessing.
+
+4. **Attach a custom domain for the UI/API**:
    ```bash
-   pnpm run deploy:dev    # or pnpm run deploy for production
+   pnpm setup:domain --env dev --hostname inbox.<you.com>
+   pnpm setup:domain --env dev --hostname inbox.<you.com> --apply
    ```
-   Note: `wrangler.jsonc` sets `workers_dev: false` on the default/production environment, so the
-   production Worker is intentionally **not** reachable on `*.workers.dev` — the user needs a
-   route/custom domain in front of it before it's reachable at all. The `dev` environment
-   (`reccado-dev`) stays reachable on `*.workers.dev` for this checklist's `dev` checks.
-9. **Run the verification checklist below** before telling the user the install is done.
+   Do not use `*.workers.dev` as the proof of a protected inbox. It can be useful for smoke tests,
+   but Cloudflare Access must be verified on the custom hostname users will actually visit.
+
+   Idempotent by design: re-running for the same Worker is safe. If the hostname is already
+   attached to a **different** Worker (e.g. a stale attachment from a rename), the script refuses
+   to steal it and prints how to detach it first — never silently reassigns a hostname. With
+   `CLOUDFLARE_API_TOKEN` (+ `CLOUDFLARE_ACCOUNT_ID`, or an account resolvable via
+   `wrangler whoami`), this is checked up front via the Workers Custom Domains API; otherwise it
+   falls back to an error-string check around the `wrangler deploy` call.
+
+5. **Wire inbound routing**:
+   ```bash
+   pnpm setup:routing --domain <you.com> --env dev
+   pnpm setup:routing --domain <you.com> --env dev --apply
+   pnpm setup:routing --domain <you.com> --env dev --catch-all --apply
+   ```
+   The normal path creates an explicit address rule. `--catch-all` configures `*@domain -> Worker`
+   through Cloudflare's Email Routing REST API because Wrangler currently rejects that specific
+   catch-all `worker` rule client-side. Then add the MX/SPF/DKIM records the script prints.
+
+   Before choosing sender addresses, read [`docs/EMAIL-DELIVERABILITY.md`](docs/EMAIL-DELIVERABILITY.md).
+   Use separate outbound subdomains per stream, keep inbound and outbound separated, and never send
+   bulk or experiments from the apex domain.
+
+6. **Configure outbound sending identity if replies are needed**:
+   ```bash
+   pnpm setup:sending --env dev --domain <you.com>
+   pnpm setup:sending --env dev --domain <you.com> --dmarc-rua you@<you.com> --apply
+   ```
+   Every run prints a loud **Workers Paid** preflight first: Email Sending on a free plan can only
+   send to *verified destination addresses* — arbitrary-recipient sending needs a Workers Paid
+   plan. The script can't detect the account's plan, so this is a manual check that does not block
+   `--apply`.
+
+   This uses a dedicated sending subdomain (`send.<you.com>` by default), writes
+   `MAIL_FROM_ADDRESS` and `allowed_sender_addresses` into `wrangler.generated.<env>.json`, and
+   upserts SPF (always) and DMARC (per the ramp below) — the two records it keeps under its own
+   control. With `CLOUDFLARE_API_TOKEN` set, it also **auto-adds the provider-generated DKIM TXT +
+   MX records** (parsed from `wrangler email sending dns get <sending-domain>`); pass
+   `--skip-provider-records` to opt out and manage those two by hand. Cloudflare's own DKIM/MX
+   output includes a suggested DMARC record too (typically `p=reject`) — this script never applies
+   it, so DMARC stays exclusively owned by the ramp below.
+
+   DMARC defaults to `p=none` (monitor mode) with **relaxed** alignment
+   (`adkim=r; aspf=r`) — the safe start for a brand-new sending subdomain. Pass
+   `--dmarc-rua you@example.com` to actually receive aggregate reports (the script warns loudly if
+   you don't), then ramp with `--dmarc-policy quarantine` once reports look aligned, and
+   `--dmarc-policy reject` once quarantine looks clean. Tighten with `--dmarc-alignment strict`
+   only after you're confident in alignment.
+
+   Outbound send still requires `request-send` -> `confirm-send`; never add a direct send
+   shortcut.
+
+7. **Put Cloudflare Access in front of the custom domain**:
+   ```bash
+   pnpm setup:access --env dev --hostname inbox.<you.com>
+   pnpm setup:access --env dev --hostname inbox.<you.com> --aud <aud-tag> \
+     --team-domain https://<team>.cloudflareaccess.com --apply
+   ```
+   That script sets the Worker secrets once you have the `aud` and team domain, but it does not
+   create the Access application itself. Follow the dashboard guide it prints.
+
+8. **Verify before calling it done**:
+   ```bash
+   pnpm doctor --env dev --cloud --url https://inbox.<you.com>
+   pnpm smoke:access https://inbox.<you.com>
+   pnpm smoke:routing --domain <you.com> --env dev
+   CF_VERIFY_D1_ID=<uuid> pnpm verify:cf --env dev
+   ```
+
+### Manual fallback
+
+Use this only when the user explicitly wants the raw Wrangler path or the setup scripts are not
+appropriate for the account.
+
+```bash
+pnpm wrangler r2 bucket create <your-raw-mail-bucket>
+pnpm wrangler queues create <your-inbound-queue>
+pnpm wrangler queues create <your-inbound-dlq>
+pnpm wrangler d1 create <your-index-db-name> --location=<closest-region>
+pnpm wrangler d1 migrations apply <your-index-db-name> --remote --env dev
+pnpm wrangler secret put MAILBOX_ID_SECRET --env dev
+pnpm run deploy:dev
+```
+
+If you use the manual path, you own the two sharp edges the scripted flow is designed to avoid:
+
+- keeping the real D1 id out of the tracked template config while still deploying with the right
+  value
+- pairing `MAILBOX_ID_SECRET` with `pnpm setup:mailbox` before you lose access to the original
+  secret value
+
+### Known deployment footguns
+
+- **TanStack/Vite build failure during scripted deploy**: `setup:cloud --apply` now builds first
+  and deploys from `dist/server/wrangler.json`. If it fails before deploy, fix `pnpm run build`
+  and rerun the same `setup:cloud` command. Do not hand-edit the tracked `wrangler.jsonc`.
+- **Queue consumer stale after a Worker rename**: `setup:cloud` now checks the queue consumer before
+  deploy. If it finds an old Worker name, run the exact `wrangler queues consumer remove` command it
+  prints, then rerun `setup:cloud`.
+- **Access check on workers.dev**: do not use `*.workers.dev` as the Access proof. Attach a custom
+  domain with `setup:domain`, protect that hostname with `setup:access`, and verify that exact URL.
+- **Custom domain already claimed by another Worker**: `setup:domain` refuses to reattach a
+  hostname that's already a Workers Custom Domain on a different Worker (e.g. after a rename) —
+  detach it there first, or pick a different hostname. Re-running for the same Worker is
+  idempotent and safe.
+- **Catch-all routing to Worker**: use `pnpm setup:routing --catch-all --apply`. That path uses the
+  Cloudflare REST API because the Wrangler catch-all command rejects `worker` client-side even
+  though the platform endpoint accepts it.
+- **Outbound identity**: use `pnpm setup:sending` for the dedicated sender subdomain and generated
+  `MAIL_FROM_ADDRESS`. DMARC defaults to `p=none` (monitor mode, relaxed alignment) as the start of
+  a none → quarantine → reject ramp (`--dmarc-policy`, `--dmarc-alignment strict`); with
+  `CLOUDFLARE_API_TOKEN` it also auto-adds the provider's DKIM/MX records unless
+  `--skip-provider-records` is passed. It does not alter the send-security invariant.
+- **`wrangler --env` still using the placeholder D1 id**: `--env` alone still reads the tracked
+  `wrangler.jsonc`. Prefer `setup:cloud`, which patches the built deploy config from
+  `wrangler.generated.<env>.json`; use `deploy:dev` only after the config path Wrangler reads has a
+  real D1 id.
+- **Old seed data when seeding a mailbox**: current `setup:mailbox` reuses the existing
+  `domains.id` by domain name. If it still fails after manual/older seeds, inspect
+  `mailboxes`, `aliases`, and `routing_rules`; a primary address mapped with a different
+  `mailbox_id` usually means you are using the wrong `MAILBOX_ID_SECRET`.
+- **Secret set, seed failed, secret value lost**: Cloudflare secrets are write-only. If you still
+  have the original `MAILBOX_ID_SECRET`, rerun `setup:mailbox` with it via the environment. If you
+  lost it before go-live, run `pnpm setup:cloud --domain <d> --address inbox@<d> --reset-secret
+  --apply` — `setup:cloud` and `pnpm doctor --cloud` both detect this orphaned state (a secret set
+  with no seed fingerprint recorded) and point here. This overwrites the secret and reseeds
+  atomically; never do this after go-live, since it changes every existing mailbox's derived id.
 
 ## Part B — MCP / agent layer (stub — not yet implemented)
 
@@ -143,19 +273,22 @@ Run these before reporting the deploy as done:
       checkout.
 - [ ] `pnpm wrangler d1 migrations apply <db> --remote --env <env>` reports the expected
       migrations applied (or "No migrations to apply" on a rerun).
-- [ ] `pnpm wrangler deploy --env <env> --name <worker-name> --dry-run` shows every expected
-      binding (`MAILBOX_DO`, `MAIL_OBJECTS`, `INBOUND_EMAIL_QUEUE`, `INDEX_DB`, `EMAIL`).
-- [ ] After deploy, an **unauthenticated** request to the deployed URL (e.g.
-      `curl -i https://<worker>.<subdomain>.workers.dev/api/health`) redirects to the Cloudflare
-      Access login (`302` to `*.cloudflareaccess.com`) — it must NOT return `200` directly.
+- [ ] The deploy config used by `setup:cloud` is the built config:
+      `dist/server/wrangler.json` exists after build and contains every expected binding
+      (`MAILBOX_DO`, `MAIL_OBJECTS`, `INBOUND_EMAIL_QUEUE`, `INDEX_DB`, `EMAIL`) plus the real D1
+      `database_id`.
+- [ ] After deploy, an **unauthenticated** request to the custom-domain URL (e.g.
+      `curl -i https://inbox.<domain>/api/health`) redirects to the Cloudflare Access login
+      (`302` to `*.cloudflareaccess.com`) — it must NOT return `200` directly.
 - [ ] After logging in through Access, `/api/health` returns `{"ok":true}`.
 - [ ] A real inbound email to the configured address lands in the mailbox: confirm via
       `GET /api/mailboxes/{mailboxId}/threads` (authenticated) that a new thread/message appears,
       and that R2 contains the raw MIME object referenced by `raw_r2_key`.
 - [ ] Sending a test draft requires the explicit `request-send` → `confirm-send` sequence and
       cannot be triggered by a single call.
-- [ ] `pnpm wrangler secret list --name <worker-name>` shows exactly the secrets the user intended
-      to set — no leftover debug tokens in a deployment meant to be locked down.
+- [ ] `pnpm wrangler secret list --env <env>` (or no `--env` for production) shows exactly the
+      secrets the user intended to set — no leftover debug tokens in a deployment meant to be
+      locked down.
 
 ## Success criteria
 

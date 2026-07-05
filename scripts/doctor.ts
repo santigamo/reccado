@@ -241,6 +241,8 @@ if (migrationFiles.length > 0) {
 
 type WranglerConfig = {
 	name?: string;
+	workers_dev?: boolean;
+	routes?: Array<{ pattern: string; custom_domain?: boolean }>;
 	vars?: { MAIL_FROM_ADDRESS?: string };
 	d1_databases?: Array<{ binding: string; database_name?: string; database_id: string }>;
 	env?: Record<string, WranglerConfig>;
@@ -296,6 +298,46 @@ if (!block) {
 			fix: "Set vars.MAIL_FROM_ADDRESS to a verified Email Sending address.",
 		});
 	}
+
+	if (block.workers_dev === false) {
+		add({
+			id: "config.public-host",
+			status: "pass",
+			message: `${envLabel} disables workers.dev; use a custom domain for the deployed UI/API.`,
+		});
+	} else if (targetEnv === "dev") {
+		add({
+			id: "config.public-host",
+			status: "info",
+			message:
+				"dev keeps workers.dev available for remote smoke tests; use a custom domain for Access-protected UI/API checks.",
+			fix: `Attach a custom domain with pnpm setup:domain --env dev --hostname app.<your-domain>`,
+		});
+	} else {
+		add({
+			id: "config.public-host",
+			status: "warn",
+			message: `${envLabel} still exposes workers.dev.`,
+			fix: `Set workers_dev=false and attach a custom domain with pnpm setup:domain${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain>`,
+		});
+	}
+
+	const customDomainRoutes =
+		block.routes?.filter((route) => route.custom_domain).map((route) => route.pattern) ?? [];
+	if (customDomainRoutes.length > 0) {
+		add({
+			id: "config.custom-domain",
+			status: "pass",
+			message: `Custom domain route configured: ${customDomainRoutes.join(", ")}.`,
+		});
+	} else {
+		add({
+			id: "config.custom-domain",
+			status: targetEnv ? "info" : "warn",
+			message: "No custom domain route is configured in tracked wrangler.jsonc.",
+			fix: `Use pnpm setup:domain${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain> (writes a gitignored generated config; doesn't edit wrangler.jsonc).`,
+		});
+	}
 }
 
 // --- Cloud (opt-in) ----------------------------------------------------------
@@ -319,6 +361,7 @@ if (args.cloud === "true") {
 	}
 	addAll(checkD1Remote());
 	addAll(checkSecretsRemote());
+	addAll(checkSetupManifest());
 	if (args.url) {
 		add(await checkAccessRedirect(args.url));
 	} else {
@@ -388,8 +431,6 @@ function checkD1Remote(): Check[] {
 
 /** Confirms the Worker's remote secrets: MAILBOX_ID_SECRET (required) and the Access pair. */
 function checkSecretsRemote(): Check[] {
-	const worker = block?.name ?? wrangler.name;
-	if (!worker) return [];
 	let names: Set<string>;
 	try {
 		const secrets = JSON.parse(
@@ -401,8 +442,6 @@ function checkSecretsRemote(): Check[] {
 					"list",
 					"--format",
 					"json",
-					"--name",
-					worker,
 					...(targetEnv ? ["--env", targetEnv] : []),
 				],
 				{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
@@ -414,7 +453,7 @@ function checkSecretsRemote(): Check[] {
 			{
 				id: "cloud.secrets",
 				status: "warn",
-				message: `Could not list secrets for "${worker}" (deployed?).`,
+				message: `Could not list secrets for ${targetEnv ? `env "${targetEnv}"` : "the default Worker"} (deployed?).`,
 			},
 		];
 	}
@@ -437,10 +476,44 @@ function checkSecretsRemote(): Check[] {
 					id: "cloud.secret.access",
 					status: "warn",
 					message: `Access secret(s) missing: ${missingAccess.join(", ")} — /api/* is unprotected without them.`,
-					fix: "pnpm setup:access --url <deployed-url> ... --apply",
+					fix: "pnpm setup:access --hostname <app.your-domain> ... --apply",
 				},
 	);
 	return out;
+}
+
+function checkSetupManifest(): Check[] {
+	const manifestPath = `.reccado/setup.${targetEnv ?? "production"}.json`;
+	if (!existsSync(manifestPath)) return [];
+
+	try {
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+			mailbox?: { address?: string } | null;
+			mailboxSecretFingerprint?: string | null;
+		};
+		if (manifest.mailboxSecretFingerprint && !manifest.mailbox?.address) {
+			return [
+				{
+					id: "cloud.mailbox-secret-recovery",
+					status: "warn",
+					message: `Setup manifest ${manifestPath} records a generated MAILBOX_ID_SECRET but no seeded mailbox.`,
+					fix:
+						"If you still have the original secret, seed now with `MAILBOX_ID_SECRET=<saved-secret> pnpm setup:mailbox --domain <your-domain> --address inbox@<your-domain> --apply`. If you lost it and this env is still disposable, delete the secret (`pnpm wrangler secret delete MAILBOX_ID_SECRET" +
+						`${targetEnv ? ` --env ${targetEnv}` : ""}` +
+						"`) and rerun `pnpm setup:cloud --domain <d> --address inbox@<d> --apply`.",
+				},
+			];
+		}
+	} catch {
+		return [
+			{
+				id: "cloud.mailbox-secret-recovery",
+				status: "warn",
+				message: `Could not read ${manifestPath}.`,
+			},
+		];
+	}
+	return [];
 }
 
 /**
@@ -449,6 +522,14 @@ function checkSecretsRemote(): Check[] {
  */
 async function checkAccessRedirect(rawUrl: string): Promise<Check> {
 	const url = new URL("/api/health", rawUrl).toString();
+	if (url.includes(".workers.dev/")) {
+		return {
+			id: "cloud.access",
+			status: "warn",
+			message: `Access check skipped for ${url}: Reccado's supported public path is a custom domain, not workers.dev.`,
+			fix: `Attach a custom domain first with pnpm setup:domain${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain>`,
+		};
+	}
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 8000);
 	try {
