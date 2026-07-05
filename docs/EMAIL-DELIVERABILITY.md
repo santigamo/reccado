@@ -71,15 +71,20 @@ verified destination addresses, and this script cannot detect your plan for you.
 The script enables Cloudflare Email Sending for the sending subdomain, writes
 `MAIL_FROM_ADDRESS` into `wrangler.generated.<env>.json`, adds the sender to
 `send_email[].allowed_sender_addresses`, and upserts SPF (always) and DMARC (per the ramp) when
-`CLOUDFLARE_API_TOKEN` has DNS edit access — the two records it keeps under its own control.
+`CLOUDFLARE_API_TOKEN` has DNS edit access — the two records it keeps under its own control. That
+token only needs **Zone · DNS · Edit** (plus **Zone · Read** to resolve the zone); it does *not*
+need account or Email Sending scope, because the `wrangler email sending` calls authenticate with
+your `wrangler login` session, not the token — the script strips the token from wrangler's env so
+the two never collide.
 
 With that same token, it also **auto-adds the provider-generated DKIM TXT + MX records**, parsed
 from `wrangler email sending dns get <sending-domain>` (there's no `--json` mode for this open-beta
 command, so the script parses its plain-text output). Pass `--skip-provider-records` to opt out and
-manage those two by hand instead. Cloudflare's own DKIM/MX output includes a suggested DMARC record
-too (typically `p=reject`) — this script never applies it, so DMARC always stays owned by the ramp
-below, not by whatever Cloudflare suggests. Review what Cloudflare says after enabling the sending
-domain:
+manage those two by hand instead. Enabling Email Sending also makes Cloudflare **provision its own
+DMARC record** for the sending subdomain (typically `p=reject`). Two DMARC records at one name are
+invalid — RFC 7489 then treats the policy as absent — so the script reconciles DMARC to exactly one
+record (its own ramp record below), deleting Cloudflare's rather than leaving a broken pair. Review
+what Cloudflare says after enabling the sending domain:
 
 ```bash
 pnpm wrangler email sending dns get send.example.com
@@ -118,8 +123,9 @@ login codes, receipts, or support replies.
 ## DMARC ramp
 
 Do not jump straight to strict enforcement on a fresh setup. `pnpm setup:sending` defaults to
-`p=none` for exactly this reason and never lets it be overridden by Cloudflare's own suggested
-DMARC record (see above).
+`p=none` for exactly this reason, and reconciles DMARC to a single record so Cloudflare's own
+auto-provisioned `p=reject` record can't sit alongside it and either override the ramp or break
+DMARC entirely (see above).
 
 Recommended ramp, driven by `setup:sending`'s flags:
 
