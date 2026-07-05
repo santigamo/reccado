@@ -218,9 +218,21 @@ function buildDmarcValue(policy: string, alignment: string, rua?: string): strin
 }
 
 function wrangler(argv: string[], opts: { capture?: boolean } = {}): string {
+	// wrangler prefers CLOUDFLARE_API_TOKEN over the `wrangler login` OAuth session, but this
+	// script sets that token ONLY for its own DNS REST calls (a least-privilege Zone·DNS·Edit
+	// token). wrangler's `email sending` commands need the operator's full account auth, so strip
+	// the token (and the legacy global-key vars) from wrangler's env — it then falls back to the
+	// OAuth session, while the script's own fetch() DNS calls keep using the token.
+	// Node's child_process omits env keys whose value is undefined, so this removes them for the
+	// wrangler subprocess without a `delete` (which trips strict-mode TS on the augmented ProcessEnv).
+	const env: Record<string, string | undefined> = { ...process.env };
+	env.CLOUDFLARE_API_TOKEN = undefined;
+	env.CLOUDFLARE_API_KEY = undefined;
+	env.CLOUDFLARE_EMAIL = undefined;
 	return execFileSync("pnpm", ["wrangler", ...argv], {
 		encoding: "utf8",
 		stdio: opts.capture ? ["ignore", "pipe", "pipe"] : ["ignore", "inherit", "pipe"],
+		env: env as NodeJS.ProcessEnv,
 	});
 }
 
@@ -304,8 +316,13 @@ async function upsertTxtStyleRecord(opts: {
 	desiredContent: string;
 	comment: string;
 	ownsRecord: (record: MutableRecord) => boolean;
+	// Collapse multiple matching records to one instead of refusing. Needed for DMARC: Cloudflare
+	// Email Sending auto-provisions its own DMARC record alongside ours, and two DMARC TXT records
+	// at one name are invalid (RFC 7489 treats the policy as absent).
+	dedupe?: boolean;
 }): Promise<void> {
-	const { apply, token, zoneId, name, styleLabel, desiredContent, comment, ownsRecord } = opts;
+	const { apply, token, zoneId, name, styleLabel, desiredContent, comment, ownsRecord, dedupe } =
+		opts;
 	console.log(`\n▸ Ensure ${styleLabel} TXT`);
 	console.log(`  name: ${name}`);
 	console.log(`  content: ${desiredContent}`);
@@ -314,11 +331,19 @@ async function upsertTxtStyleRecord(opts: {
 		throw new Error(`setup:sending: missing Cloudflare API context for ${styleLabel} upsert.`);
 	}
 	const existing = await listTxtRecords(token, zoneId, name);
-	const managed = existing.filter(ownsRecord);
+	let managed = existing.filter(ownsRecord);
 	if (managed.length > 1) {
-		throw new Error(
-			`setup:sending: refusing to modify ${styleLabel} at ${name} because multiple matching TXT records already exist.`,
-		);
+		if (!dedupe) {
+			throw new Error(
+				`setup:sending: refusing to modify ${styleLabel} at ${name} because multiple matching TXT records already exist.`,
+			);
+		}
+		// Keep the first, patch it below, delete the rest so exactly one record remains.
+		for (const record of managed.slice(1)) {
+			await cloudflareRequest(token, "DELETE", `/zones/${zoneId}/dns_records/${record.id}`);
+			console.log(`  Removed a duplicate ${styleLabel} record.`);
+		}
+		managed = managed.slice(0, 1);
 	}
 	if (managed.length === 1) {
 		const current = managed[0];
@@ -659,6 +684,8 @@ if (apply && token && zoneId) {
 		desiredContent: dmarcValue,
 		comment: "Reccado setup:sending managed DMARC for dedicated sending subdomain",
 		ownsRecord: (record) => record.content.trim().toLowerCase().startsWith("v=dmarc1"),
+		// Cloudflare Email Sending provisions its own DMARC; collapse to a single record.
+		dedupe: true,
 	});
 } else {
 	console.log(`\n▸ Planned SPF TXT\n  ${bounceDomain} -> ${spfValue}`);
