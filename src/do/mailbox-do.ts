@@ -503,7 +503,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 		if (url.pathname.startsWith("/threads/") && request.method === "GET") {
 			const threadId = url.pathname.split("/")[2];
-			return Response.json({ thread: this.getThread(threadId) });
+			// getThread already returns { thread, messages }; return it flat so the
+			// client reads data.messages / data.thread directly (not data.thread.messages).
+			return Response.json(this.getThread(threadId));
 		}
 		if (url.pathname.startsWith("/messages/") && request.method === "GET") {
 			const messageId = url.pathname.split("/")[2];

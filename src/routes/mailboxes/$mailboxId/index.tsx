@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 
 export const Route = createFileRoute("/mailboxes/$mailboxId/")({
@@ -93,8 +93,19 @@ function MailboxInboxPage() {
 	return (
 		<main className="page-wrap px-4 pb-8 pt-14">
 			<section className="island-shell rounded-2xl p-4">
-				<h1 className="mb-2 text-2xl font-bold text-[var(--sea-ink)]">Inbox</h1>
-				<p className="mb-4 text-sm text-[var(--sea-ink-soft)]">{mailboxId}</p>
+				<div className="mb-4 flex items-start justify-between gap-3">
+					<div>
+						<h1 className="text-2xl font-bold text-[var(--sea-ink)]">Inbox</h1>
+						<p className="text-sm text-[var(--sea-ink-soft)]">{mailboxId}</p>
+					</div>
+					<Link
+						to="/mailboxes/$mailboxId/compose"
+						params={{ mailboxId }}
+						className="shrink-0 rounded-lg bg-[var(--lagoon-deep)] px-4 py-2 text-sm text-white no-underline hover:opacity-90"
+					>
+						New message
+					</Link>
+				</div>
 				{status ? <p className="mb-3 text-sm text-[var(--lagoon-deep)]">{status}</p> : null}
 				<div className="mb-4 flex gap-2">
 					<input
@@ -151,6 +162,22 @@ function MailboxInboxPage() {
 									{message.body_text ?? message.snippet}
 								</p>
 								<div className="mt-2 flex gap-2">
+									<Link
+										to="/mailboxes/$mailboxId/compose"
+										params={{ mailboxId }}
+										search={{
+											to: message.from_addr,
+											subject: message.subject
+												? /^re:/i.test(message.subject)
+													? message.subject
+													: `Re: ${message.subject}`
+												: "",
+											threadId: selectedThreadId ?? "",
+										}}
+										className="rounded border px-2 py-1 text-xs no-underline"
+									>
+										Reply
+									</Link>
 									<button
 										type="button"
 										className="rounded border px-2 py-1 text-xs"

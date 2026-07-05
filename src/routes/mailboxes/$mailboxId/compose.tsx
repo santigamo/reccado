@@ -1,14 +1,26 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 
+type ComposeSearch = {
+	to?: string;
+	subject?: string;
+	threadId?: string;
+};
+
 export const Route = createFileRoute("/mailboxes/$mailboxId/compose")({
 	component: ComposePage,
+	validateSearch: (search: Record<string, unknown>): ComposeSearch => ({
+		to: typeof search.to === "string" ? search.to : undefined,
+		subject: typeof search.subject === "string" ? search.subject : undefined,
+		threadId: typeof search.threadId === "string" ? search.threadId : undefined,
+	}),
 });
 
 function ComposePage() {
 	const { mailboxId } = Route.useParams();
-	const [to, setTo] = useState("");
-	const [subject, setSubject] = useState("");
+	const prefill = Route.useSearch();
+	const [to, setTo] = useState(prefill.to ?? "");
+	const [subject, setSubject] = useState(prefill.subject ?? "");
 	const [bodyText, setBodyText] = useState("");
 	const [draftId, setDraftId] = useState<string | null>(null);
 	const [status, setStatus] = useState<string | null>(null);
@@ -19,6 +31,7 @@ function ComposePage() {
 			to: [to],
 			subject,
 			bodyText,
+			...(prefill.threadId ? { threadId: prefill.threadId } : {}),
 		};
 		const response = await fetch(`/api/mailboxes/${mailboxId}/drafts`, {
 			method: "POST",

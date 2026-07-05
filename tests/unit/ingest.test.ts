@@ -325,4 +325,35 @@ describe("mailbox DO ingest", () => {
 		const debug = (await debugResp.json()) as { messageCount: number };
 		expect(debug.messageCount).toBe(1);
 	});
+
+	it("returns thread detail with a top-level messages array (not double-wrapped)", async () => {
+		const mailboxId = "mbx_thread_detail_shape";
+
+		const ingest = await ingestFixture(
+			mailboxId,
+			attachmentSmallEml as string,
+			"thread-detail-shape@example.com",
+			"Thread detail shape",
+		);
+		expect(ingest.result.status).toBe("inserted");
+
+		const threadsResp = await mailboxStub(mailboxId).fetch("https://mailbox-do/threads?limit=50");
+		const { threads } = (await threadsResp.json()) as { threads: Array<{ id: string }> };
+		const firstThread = threads[0];
+		if (!firstThread) throw new Error("expected at least one thread after ingest");
+
+		const detailResp = await mailboxStub(mailboxId).fetch(
+			`https://mailbox-do/threads/${firstThread.id}`,
+		);
+		const detail = (await detailResp.json()) as {
+			thread?: unknown;
+			messages?: Array<{ id: string }>;
+		};
+
+		// Regression: the handler used to double-wrap as { thread: { thread, messages } },
+		// so the reading pane's data.messages was undefined and stayed empty on click.
+		expect(Array.isArray(detail.messages)).toBe(true);
+		expect(detail.messages?.length).toBeGreaterThan(0);
+		expect(detail.thread).toBeTruthy();
+	});
 });
