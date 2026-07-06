@@ -356,4 +356,148 @@ describe("mailbox DO ingest", () => {
 		expect(detail.messages?.length).toBeGreaterThan(0);
 		expect(detail.thread).toBeTruthy();
 	});
+
+	it("thread list carries the fields a Gmail-style row needs (sender/snippet/state)", async () => {
+		const mailboxId = "mbx_thread_list_enriched";
+
+		await ingestFixture(
+			mailboxId,
+			attachmentSmallEml as string,
+			"thread-list-enriched@example.com",
+			"Thread list enriched",
+		);
+
+		const resp = await mailboxStub(mailboxId).fetch("https://mailbox-do/threads?limit=50");
+		const { threads } = (await resp.json()) as {
+			threads: Array<{
+				id: string;
+				latest_from?: string;
+				latest_snippet?: string | null;
+				latest_subject?: string | null;
+				latest_state?: string;
+				latest_has_attachments?: number;
+				latest_received_at?: string;
+			}>;
+		};
+		const row = threads[0];
+		if (!row) throw new Error("expected at least one thread after ingest");
+
+		// The list must render a full row without a per-thread round-trip.
+		expect(typeof row.latest_from).toBe("string");
+		expect(row.latest_from).toBeTruthy();
+		expect(row.latest_state).toBe("inbox");
+		expect(typeof row.latest_received_at).toBe("string");
+		expect("latest_snippet" in row).toBe(true);
+		expect("latest_has_attachments" in row).toBe(true);
+	});
+
+	it("filters the thread list by folder state (archive moves a thread out of inbox)", async () => {
+		const mailboxId = "mbx_thread_state_filter";
+
+		await ingestFixture(
+			mailboxId,
+			attachmentSmallEml as string,
+			"thread-state-filter@example.com",
+			"Thread state filter",
+		);
+
+		// Grab the single message in the freshly-ingested thread.
+		const inboxResp = await mailboxStub(mailboxId).fetch(
+			"https://mailbox-do/threads?limit=50&state=inbox",
+		);
+		const { threads: inboxThreads } = (await inboxResp.json()) as {
+			threads: Array<{ id: string }>;
+		};
+		const thread = inboxThreads[0];
+		if (!thread) throw new Error("expected the ingested thread in the inbox folder");
+
+		const detailResp = await mailboxStub(mailboxId).fetch(
+			`https://mailbox-do/threads/${thread.id}`,
+		);
+		const { messages } = (await detailResp.json()) as { messages: Array<{ id: string }> };
+		const message = messages[0];
+		if (!message) throw new Error("expected a message in the thread");
+
+		// Archive it, then it should leave inbox and appear in archive.
+		await mailboxStub(mailboxId).fetch(`https://mailbox-do/messages/${message.id}/actions`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: "archive" }),
+		});
+
+		const afterInbox = await mailboxStub(mailboxId).fetch(
+			"https://mailbox-do/threads?limit=50&state=inbox",
+		);
+		const { threads: stillInbox } = (await afterInbox.json()) as {
+			threads: Array<{ id: string }>;
+		};
+		expect(stillInbox.some((t) => t.id === thread.id)).toBe(false);
+
+		const afterArchive = await mailboxStub(mailboxId).fetch(
+			"https://mailbox-do/threads?limit=50&state=archive",
+		);
+		const { threads: archived } = (await afterArchive.json()) as {
+			threads: Array<{ id: string; latest_state?: string }>;
+		};
+		const archivedRow = archived.find((t) => t.id === thread.id);
+		expect(archivedRow).toBeTruthy();
+		expect(archivedRow?.latest_state).toBe("archive");
+	});
+
+	it("search finds messages by body text through the DO search endpoint", async () => {
+		const mailboxId = "mbx_search_body_text";
+		const messageId = "search-body-text@example.com";
+		const bodyNeedle = "bodyneedleomega";
+		const mime = `From: sender@example.com
+To: test@example.com
+Subject: Unrelated searchable subject
+Message-ID: <${messageId}>
+
+This message has a body-only token: ${bodyNeedle}.
+`;
+
+		const ingest = await ingestFixture(mailboxId, mime, messageId, "Unrelated searchable subject");
+		expect(ingest.result.status).toBe("inserted");
+
+		const searchResp = await mailboxStub(mailboxId).fetch(
+			`https://mailbox-do/search?q=${bodyNeedle}&limit=10`,
+		);
+		const { results } = (await searchResp.json()) as { results: Array<{ message_id: string }> };
+
+		expect(results.some((row) => row.message_id === ingest.result.messageLocalId)).toBe(true);
+	});
+
+	it("fetches and updates the same saved draft by id", async () => {
+		const mailboxId = "mbx_existing_draft_edit";
+		const createResp = await mailboxStub(mailboxId).fetch("https://mailbox-do/drafts", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				to: ["reader@example.com"],
+				subject: "Existing draft",
+				bodyText: "Original draft body",
+			}),
+		});
+		const created = (await createResp.json()) as { id: string };
+
+		const readResp = await mailboxStub(mailboxId).fetch(`https://mailbox-do/drafts/${created.id}`);
+		const { draft } = (await readResp.json()) as {
+			draft: { id: string; body_text: string | null };
+		};
+		expect(draft.id).toBe(created.id);
+		expect(draft.body_text).toBe("Original draft body");
+
+		await mailboxStub(mailboxId).fetch(`https://mailbox-do/drafts/${created.id}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ bodyText: "Updated draft body" }),
+		});
+
+		const afterResp = await mailboxStub(mailboxId).fetch(`https://mailbox-do/drafts/${created.id}`);
+		const { draft: after } = (await afterResp.json()) as {
+			draft: { id: string; body_text: string | null };
+		};
+		expect(after.id).toBe(created.id);
+		expect(after.body_text).toBe("Updated draft body");
+	});
 });

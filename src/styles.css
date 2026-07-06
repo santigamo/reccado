@@ -75,8 +75,101 @@
   }
 }
 
+/* ---------------------------------------------------------------------------
+   App theme — the Gmail-style mail client (mailbox routes) uses this flat,
+   dense surface palette instead of the marketing "island/lagoon" look. Same
+   three-layer dark-mode mechanism as above (explicit data-theme + system
+   fallback); only the values differ. Marketing tokens stay untouched.
+--------------------------------------------------------------------------- */
+:root {
+  --app-bg: #f6f8fc;
+  --app-surface: #ffffff;
+  --app-surface-2: #f1f3f4;
+  --app-hover: rgba(32, 33, 36, 0.06);
+  --app-selected: #d3e3fd;
+  --app-selected-strong: #c2e7ff;
+  --app-selected-text: #001d35;
+  --app-border: #e4e7ec;
+  --app-border-strong: #d5d9df;
+  --app-text: #202124;
+  --app-text-soft: #5f6368;
+  --app-text-faint: #80868b;
+  --app-accent: #0b57d0;
+  --app-accent-hover: #0842a0;
+  --app-on-accent: #ffffff;
+  --app-danger: #d93025;
+  --app-shadow: 0 1px 3px rgba(60, 64, 67, 0.15), 0 4px 8px rgba(60, 64, 67, 0.08);
+}
+
+:root[data-theme="dark"] {
+  --app-bg: #131314;
+  --app-surface: #1e1f20;
+  --app-surface-2: #2d2e30;
+  --app-hover: rgba(227, 227, 227, 0.08);
+  --app-selected: #004a77;
+  --app-selected-strong: #00639b;
+  --app-selected-text: #c2e7ff;
+  --app-border: #333438;
+  --app-border-strong: #444649;
+  --app-text: #e3e3e3;
+  --app-text-soft: #9aa0a6;
+  --app-text-faint: #7a7d81;
+  --app-accent: #a8c7fa;
+  --app-accent-hover: #c2ddff;
+  --app-on-accent: #062e6f;
+  --app-danger: #f28b82;
+  --app-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --app-bg: #131314;
+    --app-surface: #1e1f20;
+    --app-surface-2: #2d2e30;
+    --app-hover: rgba(227, 227, 227, 0.08);
+    --app-selected: #004a77;
+    --app-selected-strong: #00639b;
+    --app-selected-text: #c2e7ff;
+    --app-border: #333438;
+    --app-border-strong: #444649;
+    --app-text: #e3e3e3;
+    --app-text-soft: #9aa0a6;
+    --app-text-faint: #7a7d81;
+    --app-accent: #a8c7fa;
+    --app-accent-hover: #c2ddff;
+    --app-on-accent: #062e6f;
+    --app-danger: #f28b82;
+    --app-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+}
+
 * {
   box-sizing: border-box;
+}
+
+/* The mail client paints its own opaque background over the marketing aurora. */
+.app-surface-root {
+  background: var(--app-bg);
+  color: var(--app-text);
+}
+
+/* Slim, theme-aware scrollbars for the dense list/reading panes. */
+.app-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--app-border-strong) transparent;
+}
+.app-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.app-scroll::-webkit-scrollbar-thumb {
+  background-color: var(--app-border-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+.app-scroll::-webkit-scrollbar-thumb:hover {
+  background-color: var(--app-text-faint);
 }
 
 html,
@@ -174,222 +267,6 @@ pre code {
   backdrop-filter: blur(4px);
 }
 
-.feature-card {
-  background: linear-gradient(165deg, color-mix(in oklab, var(--surface-strong) 93%, white 7%), var(--surface));
-  box-shadow:
-    0 1px 0 var(--inset-glint) inset,
-    0 18px 34px rgba(30, 90, 72, 0.1),
-    0 4px 14px rgba(23, 58, 64, 0.06);
-}
-
-.feature-card:hover {
-  transform: translateY(-2px);
-  border-color: color-mix(in oklab, var(--lagoon-deep) 35%, var(--line));
-}
-
-.demo-page {
-  width: min(1080px, calc(100% - 2rem));
-  margin-inline: auto;
-  padding-block: clamp(2.25rem, 6vw, 4.5rem);
-  color: var(--sea-ink);
-}
-
-.demo-page-wide {
-  width: min(1280px, calc(100% - 2rem));
-}
-
-.demo-center {
-  min-height: calc(100vh - 13rem);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.demo-panel,
-.demo-card {
-  border: 1px solid var(--line);
-  background: linear-gradient(165deg, var(--surface-strong), var(--surface));
-  box-shadow:
-    0 1px 0 var(--inset-glint) inset,
-    0 18px 34px rgba(30, 90, 72, 0.1),
-    0 4px 14px rgba(23, 58, 64, 0.06);
-  backdrop-filter: blur(4px);
-}
-
-.demo-panel {
-  border-radius: 1.25rem;
-  padding: clamp(1.25rem, 4vw, 2rem);
-}
-
-.demo-card {
-  border-radius: 1rem;
-  padding: 1rem;
-}
-
-.demo-title {
-  margin: 0;
-  color: var(--sea-ink);
-  font-size: clamp(1.75rem, 4vw, 2.75rem);
-  line-height: 1.05;
-  font-weight: 800;
-  letter-spacing: 0;
-}
-
-.demo-section-title {
-  margin: 0;
-  color: var(--sea-ink);
-  font-size: 1rem;
-  font-weight: 700;
-}
-
-.demo-muted {
-  color: var(--sea-ink-soft);
-}
-
-.demo-input,
-.demo-select,
-.demo-textarea {
-  width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 0.75rem;
-  background: color-mix(in oklab, var(--surface-strong) 88%, white 12%);
-  color: var(--sea-ink);
-  outline: none;
-  transition: border-color 180ms ease, box-shadow 180ms ease, background-color 180ms ease;
-}
-
-.demo-input,
-.demo-select {
-  padding: 0.7rem 0.9rem;
-}
-
-.demo-input-fit {
-  width: auto;
-}
-
-.demo-textarea {
-  min-height: 7rem;
-  padding: 0.8rem 0.9rem;
-  resize: vertical;
-}
-
-.demo-input:focus,
-.demo-select:focus,
-.demo-textarea:focus {
-  border-color: color-mix(in oklab, var(--lagoon-deep) 58%, var(--line));
-  box-shadow: 0 0 0 3px color-mix(in oklab, var(--lagoon) 24%, transparent);
-}
-
-.demo-button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  border: 1px solid color-mix(in oklab, var(--lagoon-deep) 34%, var(--line));
-  border-radius: 0.85rem;
-  background: color-mix(in oklab, var(--lagoon) 22%, var(--surface-strong));
-  color: var(--sea-ink);
-  padding: 0.72rem 1rem;
-  font-size: 0.9rem;
-  font-weight: 700;
-  line-height: 1;
-  cursor: pointer;
-}
-
-.demo-button:hover {
-  transform: translateY(-1px);
-  background: color-mix(in oklab, var(--lagoon) 30%, var(--surface-strong));
-}
-
-.demo-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-  transform: none;
-}
-
-.demo-button-secondary {
-  border-color: var(--line);
-  background: color-mix(in oklab, var(--surface-strong) 74%, transparent);
-  color: var(--sea-ink-soft);
-}
-
-.demo-button-danger {
-  border-color: rgba(196, 71, 71, 0.28);
-  background: rgba(196, 71, 71, 0.1);
-  color: #9f3030;
-}
-
-.demo-list-item {
-  border: 1px solid var(--line);
-  border-radius: 0.9rem;
-  background: color-mix(in oklab, var(--chip-bg) 82%, transparent);
-  padding: 0.9rem 1rem;
-}
-
-.demo-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  border: 1px solid var(--chip-line);
-  border-radius: 999px;
-  background: var(--chip-bg);
-  color: var(--sea-ink-soft);
-  padding: 0.35rem 0.65rem;
-  font-size: 0.75rem;
-  font-weight: 700;
-}
-
-.demo-alert {
-  border: 1px solid rgba(193, 126, 42, 0.3);
-  border-radius: 1rem;
-  background: rgba(193, 126, 42, 0.1);
-  color: var(--sea-ink);
-  padding: 1rem;
-}
-
-.demo-alert-danger {
-  border-color: rgba(196, 71, 71, 0.3);
-  background: rgba(196, 71, 71, 0.1);
-}
-
-.demo-code-block {
-  border: 1px solid var(--line);
-  border-radius: 1rem;
-  background: color-mix(in oklab, var(--chip-bg) 88%, transparent);
-  color: var(--sea-ink);
-  padding: 1rem;
-}
-
-.demo-table-shell {
-  overflow-x: auto;
-  border: 1px solid var(--line);
-  border-radius: 1rem;
-  background: color-mix(in oklab, var(--surface-strong) 78%, transparent);
-}
-
-.demo-table {
-  width: 100%;
-  border-collapse: collapse;
-  color: var(--sea-ink);
-}
-
-.demo-table th,
-.demo-table td {
-  border-bottom: 1px solid var(--line);
-  padding: 0.75rem 1rem;
-  text-align: left;
-}
-
-.demo-table th {
-  background: color-mix(in oklab, var(--chip-bg) 88%, transparent);
-  color: var(--sea-ink);
-  font-weight: 700;
-}
-
-.demo-table tr:hover td {
-  background: color-mix(in oklab, var(--lagoon) 8%, transparent);
-}
-
 button,
 .island-shell,
 a {
@@ -440,11 +317,6 @@ a {
   .nav-link::after {
     bottom: -4px;
   }
-}
-
-.site-footer {
-  border-top: 1px solid var(--line);
-  background: color-mix(in oklab, var(--header-bg) 84%, transparent 16%);
 }
 
 .rise-in {

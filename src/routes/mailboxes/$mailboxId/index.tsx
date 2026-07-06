@@ -1,214 +1,168 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { Inbox, Trash2 } from "lucide-react";
+import type { ReactElement } from "react";
+import { useMemo } from "react";
+import { ThreadListItem } from "#/components/mail/ThreadListItem";
+import { CenteredSpinner, EmptyState, ErrorState } from "#/components/ui/Feedback";
+import { IconButton } from "#/components/ui/IconButton";
+import type { Draft, ThreadRow } from "#/lib/mail";
+import { cancelDraft, folderByKey, formatMailDate, moveThread, parseAddressList } from "#/lib/mail";
+import { useDrafts, useThreads } from "#/lib/use-mail";
 
 export const Route = createFileRoute("/mailboxes/$mailboxId/")({
-	component: MailboxInboxPage,
+	component: MailboxThreadListPage,
 });
 
-type Thread = {
-	id: string;
-	subject_norm: string | null;
-	last_message_at: string;
-	unread_count: number;
-	latest_subject?: string | null;
-};
-
-type Message = {
-	id: string;
-	subject: string | null;
-	from_addr: string;
-	snippet: string | null;
-	body_text: string | null;
-	received_at: string;
-	is_read: number;
-};
-
-function MailboxInboxPage() {
+function MailboxThreadListPage(): ReactElement {
 	const { mailboxId } = Route.useParams();
-	const [threads, setThreads] = useState<Thread[]>([]);
-	const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
-	const [messages, setMessages] = useState<Message[]>([]);
-	const [search, setSearch] = useState("");
-	const [searchResults, setSearchResults] = useState<Array<{ message_id: string }>>([]);
-	const [status, setStatus] = useState<string | null>(null);
+	const search = Route.useSearch();
+	const navigate = useNavigate({ from: Route.fullPath });
+	const folder = folderByKey(search.folder);
 
-	const wsUrl = useMemo(() => {
-		const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-		return `${protocol}//${window.location.host}/api/mailboxes/${mailboxId}/ws`;
-	}, [mailboxId]);
+	// Both hooks are called unconditionally (Rules of Hooks) — only the one
+	// matching the active folder's `kind` is actually rendered from below.
+	const q = search.q?.trim();
+	const threads = useThreads(mailboxId, folder, folder.kind === "threads" ? q : undefined);
+	const drafts = useDrafts(mailboxId);
 
-	useEffect(() => {
-		fetch(`/api/mailboxes/${mailboxId}/threads?limit=50`)
-			.then(async (response) => response.json())
-			.then((data) => setThreads((data as { threads: Thread[] }).threads ?? []))
-			.catch(() => setStatus("Failed to load threads"));
-	}, [mailboxId]);
-
-	useEffect(() => {
-		if (!selectedThreadId) return;
-		fetch(`/api/mailboxes/${mailboxId}/threads/${selectedThreadId}`)
-			.then(async (response) => response.json())
-			.then((data) => setMessages((data as { messages: Message[] }).messages ?? []))
-			.catch(() => setStatus("Failed to load thread"));
-	}, [mailboxId, selectedThreadId]);
-
-	useEffect(() => {
-		const ws = new WebSocket(wsUrl);
-		ws.onmessage = (event) => {
-			try {
-				const payload = JSON.parse(String(event.data)) as { type?: string };
-				if (payload.type === "message.created") {
-					setStatus("New message received");
-					fetch(`/api/mailboxes/${mailboxId}/threads?limit=50`)
-						.then(async (response) => response.json())
-						.then((data) => setThreads((data as { threads: Thread[] }).threads ?? []));
-				}
-			} catch {
-				// ignore
-			}
-		};
-		ws.onopen = () =>
-			ws.send(
-				JSON.stringify({
-					v: 1,
-					type: "ping",
-					id: "1",
-					mailboxId,
-					ts: new Date().toISOString(),
-					payload: {},
-				}),
-			);
-		return () => ws.close();
-	}, [mailboxId, wsUrl]);
-
-	async function runSearch() {
-		if (!search.trim()) return;
-		const response = await fetch(
-			`/api/mailboxes/${mailboxId}/search?q=${encodeURIComponent(search)}&limit=20`,
+	const filteredDrafts = useMemo(() => {
+		if (!q) return drafts.data;
+		const needle = q.toLowerCase();
+		return drafts.data.filter((d) =>
+			`${parseAddressList(d.to_json).join(" ")} ${d.subject ?? ""} ${d.body_text ?? ""}`
+				.toLowerCase()
+				.includes(needle),
 		);
-		const data = (await response.json()) as { results: Array<{ message_id: string }> };
-		setSearchResults(data.results ?? []);
+	}, [drafts.data, q]);
+
+	function openThread(threadId: string) {
+		navigate({
+			to: "/mailboxes/$mailboxId/$threadId",
+			params: { mailboxId, threadId },
+			search: (prev) => ({ folder: prev.folder, q: prev.q }),
+		});
+	}
+
+	function openDraft(draft: Draft) {
+		navigate({
+			search: (prev) => ({
+				...prev,
+				compose: true,
+				draftId: draft.id,
+				to: undefined,
+				subject: undefined,
+				threadId: undefined,
+			}),
+		});
+	}
+
+	async function handleArchive(thread: ThreadRow) {
+		await moveThread(mailboxId, thread.id, "archive");
+		threads.refetch();
+	}
+
+	async function handleTrash(thread: ThreadRow) {
+		const restoring = folder.state === "archive" || folder.state === "trash";
+		await moveThread(mailboxId, thread.id, restoring ? "restore_inbox" : "trash");
+		threads.refetch();
+	}
+
+	async function handleToggleRead(thread: ThreadRow) {
+		await moveThread(
+			mailboxId,
+			thread.id,
+			thread.latest_is_read === 0 ? "mark_read" : "mark_unread",
+		);
+		threads.refetch();
+	}
+
+	async function handleDiscardDraft(draft: Draft) {
+		await cancelDraft(mailboxId, draft.id);
+		drafts.refetch();
+	}
+
+	if (folder.kind === "drafts") {
+		if (drafts.loading) return <CenteredSpinner />;
+		if (drafts.error) return <ErrorState message={drafts.error} onRetry={drafts.refetch} />;
+		if (filteredDrafts.length === 0) {
+			return (
+				<EmptyState
+					icon={<Inbox className="h-10 w-10" />}
+					title={q ? "No matching drafts" : `No ${folder.label.toLowerCase()} messages`}
+				/>
+			);
+		}
+		return (
+			<div className="h-full overflow-y-auto app-scroll">
+				{filteredDrafts.map((d) => {
+					const recipients = parseAddressList(d.to_json).join(", ") || "(no recipients)";
+					return (
+						<div
+							key={d.id}
+							className="group flex h-12 w-full min-w-0 items-center border-b border-[var(--app-border)] transition-colors hover:bg-[var(--app-hover)]"
+						>
+							{/* Real <button> for the open portion; the discard icon is a sibling
+							    button so it never nests inside another button (invalid HTML). */}
+							<button
+								type="button"
+								onClick={() => openDraft(d)}
+								className="flex h-full min-w-0 flex-1 items-center gap-3 px-4 text-left text-sm outline-none"
+							>
+								<span className="w-44 shrink-0 truncate text-[var(--app-text-soft)]">
+									{recipients}
+								</span>
+								<span className="min-w-0 flex-1 truncate text-[var(--app-text)]">
+									{d.subject ?? "(no subject)"}
+								</span>
+								<span className="shrink-0 rounded-full bg-[var(--app-danger)] px-2 py-0.5 text-[11px] font-medium text-white">
+									Draft
+								</span>
+								<span className="w-16 shrink-0 text-right text-xs text-[var(--app-text-faint)]">
+									{formatMailDate(d.updated_at)}
+								</span>
+							</button>
+							<IconButton
+								title="Discard draft"
+								size="sm"
+								className="mr-4"
+								onClick={(event) => {
+									event.stopPropagation();
+									void handleDiscardDraft(d);
+								}}
+							>
+								<Trash2 className="h-4 w-4" />
+							</IconButton>
+						</div>
+					);
+				})}
+			</div>
+		);
+	}
+
+	if (threads.loading) return <CenteredSpinner />;
+	if (threads.error) return <ErrorState message={threads.error} onRetry={threads.refetch} />;
+	if (threads.data.length === 0) {
+		return (
+			<EmptyState
+				icon={<Inbox className="h-10 w-10" />}
+				title={q ? "No matching messages" : `No ${folder.label.toLowerCase()} messages`}
+			/>
+		);
 	}
 
 	return (
-		<main className="page-wrap px-4 pb-8 pt-14">
-			<section className="island-shell rounded-2xl p-4">
-				<div className="mb-4 flex items-start justify-between gap-3">
-					<div>
-						<h1 className="text-2xl font-bold text-[var(--sea-ink)]">Inbox</h1>
-						<p className="text-sm text-[var(--sea-ink-soft)]">{mailboxId}</p>
-					</div>
-					<Link
-						to="/mailboxes/$mailboxId/compose"
-						params={{ mailboxId }}
-						className="shrink-0 rounded-lg bg-[var(--lagoon-deep)] px-4 py-2 text-sm text-white no-underline hover:opacity-90"
-					>
-						New message
-					</Link>
-				</div>
-				{status ? <p className="mb-3 text-sm text-[var(--lagoon-deep)]">{status}</p> : null}
-				<div className="mb-4 flex gap-2">
-					<input
-						className="flex-1 rounded-lg border px-3 py-2"
-						placeholder="Search mailbox"
-						value={search}
-						onChange={(event) => setSearch(event.target.value)}
-					/>
-					<button
-						type="button"
-						className="rounded-lg bg-[var(--lagoon-deep)] px-4 py-2 text-white"
-						onClick={runSearch}
-					>
-						Search
-					</button>
-				</div>
-				{searchResults.length > 0 ? (
-					<div className="mb-4 rounded-lg border p-3 text-sm">
-						Search hits: {searchResults.map((row) => row.message_id).join(", ")}
-					</div>
-				) : null}
-				<div className="grid gap-4 md:grid-cols-2">
-					<div className="rounded-xl border bg-white/60 p-3">
-						<h2 className="mb-2 font-semibold">Threads</h2>
-						<ul className="space-y-2">
-							{threads.map((thread) => (
-								<li key={thread.id}>
-									<button
-										type="button"
-										className="w-full rounded-lg border px-3 py-2 text-left hover:bg-white"
-										onClick={() => setSelectedThreadId(thread.id)}
-									>
-										<div className="font-medium">
-											{thread.latest_subject ?? thread.subject_norm ?? "(no subject)"}
-										</div>
-										<div className="text-xs text-[var(--sea-ink-soft)]">
-											{thread.unread_count} unread ·{" "}
-											{new Date(thread.last_message_at).toLocaleString()}
-										</div>
-									</button>
-								</li>
-							))}
-						</ul>
-					</div>
-					<div className="rounded-xl border bg-white/60 p-3">
-						<h2 className="mb-2 font-semibold">Messages</h2>
-						{messages.map((message) => (
-							<article key={message.id} className="mb-4 border-b pb-4">
-								<h3 className="font-semibold">{message.subject ?? "(no subject)"}</h3>
-								<p className="text-sm text-[var(--sea-ink-soft)]">
-									{message.from_addr} · {new Date(message.received_at).toLocaleString()}
-								</p>
-								<p className="mt-2 whitespace-pre-wrap text-sm">
-									{message.body_text ?? message.snippet}
-								</p>
-								<div className="mt-2 flex gap-2">
-									<Link
-										to="/mailboxes/$mailboxId/compose"
-										params={{ mailboxId }}
-										search={{
-											to: message.from_addr,
-											subject: message.subject
-												? /^re:/i.test(message.subject)
-													? message.subject
-													: `Re: ${message.subject}`
-												: "",
-											threadId: selectedThreadId ?? "",
-										}}
-										className="rounded border px-2 py-1 text-xs no-underline"
-									>
-										Reply
-									</Link>
-									<button
-										type="button"
-										className="rounded border px-2 py-1 text-xs"
-										onClick={async () => {
-											await fetch(`/api/mailboxes/${mailboxId}/messages/${message.id}/actions`, {
-												method: "POST",
-												headers: { "content-type": "application/json" },
-												body: JSON.stringify({ action: "archive" }),
-											});
-											setStatus("Archived message");
-										}}
-									>
-										Archive
-									</button>
-									<a
-										className="rounded border px-2 py-1 text-xs no-underline"
-										href={`/api/mailboxes/${mailboxId}/messages/${message.id}/raw`}
-										target="_blank"
-										rel="noreferrer"
-									>
-										Raw
-									</a>
-								</div>
-							</article>
-						))}
-						{selectedThreadId && messages.length === 0 ? (
-							<p className="text-sm text-[var(--sea-ink-soft)]">No messages in thread.</p>
-						) : null}
-					</div>
-				</div>
-			</section>
-		</main>
+		<div className="h-full overflow-y-auto app-scroll">
+			{threads.data.map((thread) => (
+				<ThreadListItem
+					key={thread.id}
+					thread={thread}
+					folder={folder}
+					onOpen={() => openThread(thread.id)}
+					onArchive={() => void handleArchive(thread)}
+					onTrash={() => void handleTrash(thread)}
+					onToggleRead={() => void handleToggleRead(thread)}
+				/>
+			))}
+		</div>
 	);
 }

@@ -50,15 +50,19 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
-		threadListQuerySchema.parse({
+		const query = threadListQuerySchema.parse({
 			limit: c.req.query("limit"),
 			cursor: c.req.query("cursor"),
 			q: c.req.query("q"),
 			label: c.req.query("label"),
+			state: c.req.query("state"),
 		});
 		const stub = await mailboxStub(c.env, mailboxId);
 		const url = new URL("https://mailbox-do/threads");
-		url.searchParams.set("limit", c.req.query("limit") ?? "25");
+		url.searchParams.set("limit", String(query.limit));
+		if (query.state) {
+			url.searchParams.set("state", query.state);
+		}
 		return stub.fetch(url.toString());
 	});
 
@@ -159,6 +163,14 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch("https://mailbox-do/drafts");
+	});
+
+	api.get("/api/mailboxes/:mailboxId/drafts/:draftId", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const stub = await mailboxStub(c.env, mailboxId);
+		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}`);
 	});
 
 	api.post("/api/mailboxes/:mailboxId/drafts", async (c) => {

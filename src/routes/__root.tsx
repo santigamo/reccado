@@ -1,5 +1,5 @@
 import { TanStackDevtools } from "@tanstack/react-devtools";
-import { createRootRoute, HeadContent, Scripts } from "@tanstack/react-router";
+import { createRootRoute, HeadContent, Scripts, useRouterState } from "@tanstack/react-router";
 import { TanStackRouterDevtoolsPanel } from "@tanstack/react-router-devtools";
 import Footer from "../components/Footer";
 import Header from "../components/Header";
@@ -46,9 +46,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
 				<HeadContent />
 			</head>
 			<body className="font-sans antialiased [overflow-wrap:anywhere] selection:bg-[rgba(79,184,178,0.24)]">
-				<Header />
-				{children}
-				<Footer />
+				<Chrome>{children}</Chrome>
 				<TanStackDevtools
 					config={{
 						position: "bottom-right",
@@ -63,5 +61,26 @@ function RootDocument({ children }: { children: React.ReactNode }) {
 				<Scripts />
 			</body>
 		</html>
+	);
+}
+
+/**
+ * The mail client (a specific mailbox: /mailboxes/:id and its children) is a
+ * full-viewport app with its own chrome, so the marketing Header/Footer are
+ * hidden there. Everything else — landing, About, the mailbox picker — keeps
+ * the site chrome.
+ */
+function Chrome({ children }: { children: React.ReactNode }) {
+	const pathname = useRouterState({ select: (s) => s.location.pathname });
+	const isMailApp = pathname.startsWith("/mailboxes/");
+	if (isMailApp) {
+		return <>{children}</>;
+	}
+	return (
+		<>
+			<Header />
+			{children}
+			<Footer />
+		</>
 	);
 }

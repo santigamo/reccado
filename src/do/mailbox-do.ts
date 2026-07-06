@@ -97,13 +97,62 @@ function readSendMarker(value: unknown): {
 // just supply the DO-bound dependencies. Behavior is unchanged from before
 // this extraction.
 
-function listThreads(sql: SqlStorage, limit: number) {
+// States a thread row can be filtered/represented by. `draft` lives in the
+// separate outbound_drafts table, so it is never a valid message-list filter.
+const THREAD_LIST_STATES = ["inbox", "archive", "trash", "sent"] as const;
+export type ThreadListState = (typeof THREAD_LIST_STATES)[number];
+
+export function isThreadListState(value: string | null | undefined): value is ThreadListState {
+	return value != null && (THREAD_LIST_STATES as readonly string[]).includes(value);
+}
+
+// Columns the Gmail-style thread list needs: enough to render a full row
+// (sender, subject, snippet, time, attachment/unread affordances) without a
+// second round-trip per thread. `latest_*` describe the representative message
+// of the thread — overall newest for the unfiltered ("All mail") view, or the
+// newest message *in the requested folder* when a state filter is applied, so a
+// Sent/Archive/Trash row previews the right message.
+const THREAD_LIST_COLUMNS = `
+  t.id, t.subject_norm, t.last_message_at, t.message_count, t.unread_count,
+  t.created_at, t.updated_at,
+  lm.subject AS latest_subject,
+  lm.from_addr AS latest_from,
+  lm.snippet AS latest_snippet,
+  lm.received_at AS latest_received_at,
+  lm.has_attachments AS latest_has_attachments,
+  lm.is_read AS latest_is_read,
+  lm.direction AS latest_direction,
+  lm.state AS latest_state`;
+
+function listThreads(sql: SqlStorage, limit: number, state?: ThreadListState) {
+	if (state) {
+		// The JOIN's correlated subquery only resolves for threads that actually
+		// have a message in this state, so it doubles as the folder filter — a
+		// thread with no message in `state` is dropped. Order by the folder
+		// message's time so the folder view sorts by folder activity.
+		return sql
+			.exec(
+				`SELECT ${THREAD_LIST_COLUMNS}
+          FROM threads t
+          JOIN messages lm ON lm.id = (
+            SELECT m.id FROM messages m
+            WHERE m.thread_id = t.id AND m.state = ?
+            ORDER BY m.received_at DESC LIMIT 1
+          )
+          ORDER BY lm.received_at DESC
+          LIMIT ?`,
+				state,
+				limit,
+			)
+			.toArray();
+	}
 	return sql
 		.exec(
-			`SELECT t.*, (
-          SELECT m.subject FROM messages m WHERE m.thread_id = t.id ORDER BY m.received_at DESC LIMIT 1
-        ) AS latest_subject
+			`SELECT ${THREAD_LIST_COLUMNS}
         FROM threads t
+        JOIN messages lm ON lm.id = (
+          SELECT m.id FROM messages m WHERE m.thread_id = t.id ORDER BY m.received_at DESC LIMIT 1
+        )
         ORDER BY t.last_message_at DESC
         LIMIT ?`,
 			limit,
@@ -156,6 +205,13 @@ function applyMessageAction(sql: SqlStorage, messageId: string | undefined, acti
 
 function listDrafts(sql: SqlStorage) {
 	return sql.exec("SELECT * FROM outbound_drafts ORDER BY updated_at DESC").toArray();
+}
+
+function getDraft(sql: SqlStorage, draftId: string | undefined) {
+	if (!draftId) throw new Error("draftId required");
+	const draft = sql.exec("SELECT * FROM outbound_drafts WHERE id = ?", draftId).toArray()[0];
+	if (!draft) throw new Error("draft not found");
+	return draft;
 }
 
 function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
@@ -497,8 +553,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			return Response.json({ results: searchMessages(this.ctx.storage.sql, q, limit) });
 		}
 		if (url.pathname === "/threads" && request.method === "GET") {
+			const stateParam = url.searchParams.get("state");
+			const state = isThreadListState(stateParam) ? stateParam : undefined;
 			return Response.json({
-				threads: this.listThreads(Number(url.searchParams.get("limit") ?? "25")),
+				threads: this.listThreads(Number(url.searchParams.get("limit") ?? "25"), state),
 			});
 		}
 		if (url.pathname.startsWith("/threads/") && request.method === "GET") {
@@ -525,6 +583,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 		if (url.pathname === "/drafts" && request.method === "GET") {
 			return Response.json({ drafts: this.listDrafts() });
+		}
+		if (url.pathname.match(/^\/drafts\/[^/]+$/) && request.method === "GET") {
+			const draftId = url.pathname.split("/")[2];
+			return Response.json({ draft: this.getDraft(draftId) });
 		}
 		if (url.pathname === "/drafts" && request.method === "POST") {
 			const body = await request.json();
@@ -875,8 +937,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		return result;
 	}
 
-	private listThreads(limit: number) {
-		return listThreads(this.ctx.storage.sql, limit);
+	private listThreads(limit: number, state?: ThreadListState) {
+		return listThreads(this.ctx.storage.sql, limit, state);
 	}
 
 	private getThread(threadId: string | undefined) {
@@ -903,6 +965,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
 	private listDrafts() {
 		return listDrafts(this.ctx.storage.sql);
+	}
+
+	private getDraft(draftId: string | undefined) {
+		return getDraft(this.ctx.storage.sql, draftId);
 	}
 
 	private createDraft(body: Record<string, unknown>) {

@@ -57,6 +57,8 @@ export const threadListQuerySchema = z.object({
 	cursor: z.string().optional(),
 	q: z.string().optional(),
 	label: z.string().optional(),
+	// Folder filter. `draft` is excluded — drafts live in outbound_drafts, not messages.
+	state: z.enum(["inbox", "archive", "trash", "sent"]).optional(),
 });
 
 export const adminMailboxActionSchema = z.object({
