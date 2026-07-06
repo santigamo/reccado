@@ -48,7 +48,7 @@ export function MessageItem({
 				type="button"
 				onClick={() => setOpen(true)}
 				className={cn(
-					"mb-3 flex w-full items-center gap-3 rounded-xl border bg-[var(--app-surface)] px-4 py-3 text-left transition-colors hover:bg-[var(--app-hover)]",
+					"mb-3 flex w-full items-center gap-3 rounded-2xl border bg-[var(--app-surface)] px-4 py-3 text-left transition-colors hover:bg-[var(--app-hover)]",
 					cardBorder,
 				)}
 			>
@@ -74,7 +74,7 @@ export function MessageItem({
 	const toList = parseAddressList(message.to_json);
 
 	return (
-		<div className={cn("mb-3 rounded-xl border bg-[var(--app-surface)]", cardBorder)}>
+		<div className={cn("mb-3 rounded-2xl border bg-[var(--app-surface)]", cardBorder)}>
 			<button
 				type="button"
 				onClick={() => setOpen(false)}

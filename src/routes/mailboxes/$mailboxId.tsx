@@ -110,7 +110,7 @@ function MailboxShell() {
 						className="absolute inset-0 bg-black/30 lg:hidden"
 						onClick={() => setMobileNavOpen(false)}
 					/>
-					<div className="relative h-full w-64 max-w-[80%] bg-[var(--app-bg)] lg:w-64 lg:max-w-none">
+					<div className="glass relative h-full w-64 max-w-[80%] border-r border-[var(--glass-border)] lg:w-64 lg:max-w-none">
 						<Sidebar
 							mailboxId={mailboxId}
 							activeFolder={activeFolder}
@@ -119,9 +119,10 @@ function MailboxShell() {
 					</div>
 				</div>
 
-				{/* Main column */}
-				<div className="flex min-w-0 flex-1 flex-col">
-					<header className="flex h-16 shrink-0 items-center gap-2 px-2 sm:gap-3 sm:px-4">
+				{/* Main column — padded so the floating glass toolbar and the opaque
+				    content card both read as surfaces over the aurora, not edge-to-edge. */}
+				<div className="flex min-w-0 flex-1 flex-col gap-3 p-3">
+					<header className="glass flex h-16 shrink-0 items-center gap-2 rounded-2xl border border-[var(--glass-border)] px-2 sm:gap-3 sm:px-4">
 						<button
 							type="button"
 							aria-label="Menu"
@@ -131,7 +132,7 @@ function MailboxShell() {
 							<Menu className="h-5 w-5" />
 						</button>
 
-						<div className="flex h-12 max-w-2xl flex-1 items-center gap-2 rounded-full bg-[var(--app-surface-2)] px-4 focus-within:bg-[var(--app-surface)] focus-within:shadow-[var(--app-shadow)]">
+						<div className="flex h-11 max-w-2xl flex-1 items-center gap-2 rounded-full bg-[color-mix(in_oklab,var(--app-surface)_38%,transparent)] px-4 focus-within:bg-[var(--app-surface)] focus-within:shadow-[var(--app-shadow)]">
 							<Search className="h-5 w-5 shrink-0 text-[var(--app-text-soft)]" />
 							<input
 								value={search.q ?? ""}
@@ -160,11 +161,12 @@ function MailboxShell() {
 						>
 							<RefreshCw className="h-5 w-5" />
 						</button>
-						<ThemeToggle />
+						<ThemeToggle variant="plain" />
 					</header>
 
-					{/* Content surface — rounded Gmail-style panel */}
-					<div className="min-h-0 flex-1 overflow-hidden rounded-tl-2xl border-t border-l border-[var(--app-border)] bg-[var(--app-surface)] lg:rounded-tl-2xl">
+					{/* Content surface — the content layer stays opaque per Liquid Glass
+					    rules; only the chrome around it (sidebar, toolbar) is glass. */}
+					<div className="min-h-0 flex-1 overflow-hidden rounded-2xl border border-[var(--app-border)] bg-[var(--app-surface)] shadow-[var(--glass-shadow)]">
 						<Outlet />
 					</div>
 				</div>

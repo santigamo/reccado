@@ -174,12 +174,12 @@ export function ComposeModal({
 	return (
 		<div
 			className={cn(
-				"fixed bottom-0 right-6 z-50 flex max-h-[72vh] w-[min(92vw,512px)] flex-col overflow-hidden rounded-t-xl border border-[var(--app-border)] bg-[var(--app-surface)] shadow-[var(--app-shadow)]",
+				"glass-strong fixed bottom-0 right-6 z-50 flex max-h-[72vh] w-[min(92vw,512px)] flex-col overflow-hidden rounded-t-2xl border border-[var(--glass-border)]",
 				"max-sm:inset-x-2 max-sm:right-2",
 			)}
 		>
 			{/* Title bar */}
-			<div className="flex h-11 shrink-0 items-center justify-between rounded-t-xl bg-[var(--app-surface-2)] px-4">
+			<div className="flex h-11 shrink-0 items-center justify-between border-b border-[var(--glass-border)] px-4">
 				<span className="truncate text-sm font-medium text-[var(--app-text)]">
 					{isReply ? "Reply" : "New message"}
 				</span>

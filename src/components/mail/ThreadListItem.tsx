@@ -79,7 +79,7 @@ export function ThreadListItem({
 					>
 						{subject}
 					</span>
-					{snippet ? <span className="text-[var(--app-text-faint)]"> — {snippet}</span> : null}
+					{snippet ? <span className="text-[var(--app-text-faint)]"> · {snippet}</span> : null}
 				</span>
 
 				{thread.latest_has_attachments === 1 ? (

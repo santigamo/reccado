@@ -86,19 +86,36 @@
   --app-surface: #ffffff;
   --app-surface-2: #f1f3f4;
   --app-hover: rgba(32, 33, 36, 0.06);
-  --app-selected: #d3e3fd;
-  --app-selected-strong: #c2e7ff;
-  --app-selected-text: #001d35;
+  --app-selected: color-mix(in oklab, var(--lagoon) 18%, white);
+  --app-selected-strong: color-mix(in oklab, var(--lagoon) 32%, white);
+  --app-selected-text: var(--sea-ink);
   --app-border: #e4e7ec;
   --app-border-strong: #d5d9df;
   --app-text: #202124;
   --app-text-soft: #5f6368;
   --app-text-faint: #80868b;
-  --app-accent: #0b57d0;
-  --app-accent-hover: #0842a0;
+  --app-accent: #1f6b71;
+  --app-accent-hover: #17565b;
   --app-on-accent: #ffffff;
   --app-danger: #d93025;
   --app-shadow: 0 1px 3px rgba(60, 64, 67, 0.15), 0 4px 8px rgba(60, 64, 67, 0.08);
+
+  /* Liquid Glass material — functional layer only (sidebar, toolbars, compose
+     chrome, floating buttons). Never applied to content-layer surfaces
+     (thread rows, message cards) per Apple HIG. */
+  --glass-bg: rgba(255, 255, 255, 0.46);
+  --glass-bg-strong: rgba(255, 255, 255, 0.68);
+  --glass-border: rgba(255, 255, 255, 0.65);
+  --glass-highlight: rgba(255, 255, 255, 0.95);
+  --glass-shadow: 0 12px 40px rgba(23, 58, 64, 0.22), 0 2px 8px rgba(23, 58, 64, 0.1);
+  --glass-tint-accent: rgba(79, 184, 178, 0.28);
+
+  /* Stronger-than-marketing aurora, specifically for behind the glass shell —
+     glass needs real color/contrast to blur and refract, or it just reads as
+     a flat translucent gray. */
+  --app-aurora-a: rgba(79, 184, 178, 0.6);
+  --app-aurora-b: rgba(47, 106, 74, 0.38);
+  --app-aurora-c: rgba(246, 130, 31, 0.22);
 }
 
 :root[data-theme="dark"] {
@@ -106,19 +123,30 @@
   --app-surface: #1e1f20;
   --app-surface-2: #2d2e30;
   --app-hover: rgba(227, 227, 227, 0.08);
-  --app-selected: #004a77;
-  --app-selected-strong: #00639b;
-  --app-selected-text: #c2e7ff;
+  --app-selected: color-mix(in oklab, var(--lagoon-deep) 28%, black);
+  --app-selected-strong: color-mix(in oklab, var(--lagoon-deep) 42%, black);
+  --app-selected-text: var(--kicker);
   --app-border: #333438;
   --app-border-strong: #444649;
   --app-text: #e3e3e3;
   --app-text-soft: #9aa0a6;
   --app-text-faint: #7a7d81;
-  --app-accent: #a8c7fa;
-  --app-accent-hover: #c2ddff;
-  --app-on-accent: #062e6f;
+  --app-accent: #60d7cf;
+  --app-accent-hover: #7fe2da;
+  --app-on-accent: #062723;
   --app-danger: #f28b82;
   --app-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.4);
+
+  --glass-bg: rgba(18, 32, 36, 0.46);
+  --glass-bg-strong: rgba(14, 26, 29, 0.7);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-highlight: rgba(255, 255, 255, 0.16);
+  --glass-shadow: 0 12px 40px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+  --glass-tint-accent: rgba(96, 215, 207, 0.22);
+
+  --app-aurora-a: rgba(96, 215, 207, 0.4);
+  --app-aurora-b: rgba(110, 200, 154, 0.28);
+  --app-aurora-c: rgba(246, 130, 31, 0.16);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -127,19 +155,30 @@
     --app-surface: #1e1f20;
     --app-surface-2: #2d2e30;
     --app-hover: rgba(227, 227, 227, 0.08);
-    --app-selected: #004a77;
-    --app-selected-strong: #00639b;
-    --app-selected-text: #c2e7ff;
+    --app-selected: color-mix(in oklab, var(--lagoon-deep) 28%, black);
+    --app-selected-strong: color-mix(in oklab, var(--lagoon-deep) 42%, black);
+    --app-selected-text: var(--kicker);
     --app-border: #333438;
     --app-border-strong: #444649;
     --app-text: #e3e3e3;
     --app-text-soft: #9aa0a6;
     --app-text-faint: #7a7d81;
-    --app-accent: #a8c7fa;
-    --app-accent-hover: #c2ddff;
-    --app-on-accent: #062e6f;
+    --app-accent: #60d7cf;
+    --app-accent-hover: #7fe2da;
+    --app-on-accent: #062723;
     --app-danger: #f28b82;
     --app-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.4);
+
+    --glass-bg: rgba(18, 32, 36, 0.46);
+    --glass-bg-strong: rgba(14, 26, 29, 0.7);
+    --glass-border: rgba(255, 255, 255, 0.1);
+    --glass-highlight: rgba(255, 255, 255, 0.16);
+    --glass-shadow: 0 12px 40px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+    --glass-tint-accent: rgba(96, 215, 207, 0.22);
+
+    --app-aurora-a: rgba(96, 215, 207, 0.4);
+    --app-aurora-b: rgba(110, 200, 154, 0.28);
+    --app-aurora-c: rgba(246, 130, 31, 0.16);
   }
 }
 
@@ -147,10 +186,130 @@
   box-sizing: border-box;
 }
 
-/* The mail client paints its own opaque background over the marketing aurora. */
+/* The mail client keeps a faint version of the marketing aurora behind it so
+   the glass functional layer (sidebar, floating toolbar, compose window) has
+   something to blur and refract. Content-layer surfaces (thread list, message
+   cards) stay opaque on top of it — see .glass below for the rule on where
+   translucency is and isn't allowed. */
 .app-surface-root {
-  background: var(--app-bg);
+  /* A flat or corner-only background gives backdrop-filter almost nothing to
+     blur, so the glass panels just look like plain translucent gray — this
+     needs to be an actual colored, varied surface across the whole viewport,
+     not a subtle marketing-style vignette. */
+  position: relative;
+  background:
+    radial-gradient(900px 640px at 10% 4%, var(--app-aurora-a), transparent 70%),
+    radial-gradient(820px 640px at 90% 92%, var(--app-aurora-b), transparent 70%),
+    radial-gradient(700px 560px at 60% 30%, var(--app-aurora-c), transparent 72%),
+    linear-gradient(
+      135deg,
+      color-mix(in oklab, var(--lagoon) 24%, var(--app-bg)) 0%,
+      color-mix(in oklab, var(--palm) 16%, var(--app-bg)) 50%,
+      color-mix(in oklab, var(--lagoon-deep) 20%, var(--app-bg)) 100%
+    );
   color: var(--app-text);
+}
+
+/* The "liquid" in Liquid Glass: two soft color blobs that drift very slowly
+   behind the glass panels, so the blur/saturation the panels pick up shifts
+   gently over time instead of sitting static. Transform + opacity only (GPU
+   compositable), sunk behind normal content via z-index on a positioned
+   parent, off by default under reduced motion. */
+.app-surface-root::before,
+.app-surface-root::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  border-radius: 999px;
+  filter: blur(90px);
+  pointer-events: none;
+}
+
+.app-surface-root::before {
+  top: -15%;
+  left: -8%;
+  width: 46vw;
+  height: 46vw;
+  background: var(--app-aurora-a);
+  animation: aurora-drift-a 46s ease-in-out infinite alternate;
+}
+
+.app-surface-root::after {
+  bottom: -20%;
+  right: -8%;
+  width: 42vw;
+  height: 42vw;
+  background: var(--app-aurora-b);
+  animation: aurora-drift-b 54s ease-in-out infinite alternate;
+}
+
+@keyframes aurora-drift-a {
+  from {
+    transform: translate(0, 0) scale(1);
+  }
+  to {
+    transform: translate(7vw, 9vh) scale(1.12);
+  }
+}
+
+@keyframes aurora-drift-b {
+  from {
+    transform: translate(0, 0) scale(1);
+  }
+  to {
+    transform: translate(-6vw, -7vh) scale(1.1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-surface-root::before,
+  .app-surface-root::after {
+    animation: none;
+  }
+}
+
+/* Liquid Glass — the translucent functional-layer material. Regular variant:
+   blurs and saturates whatever scrolls behind it so nav/toolbar/compose
+   controls stay legible over the aurora. Do not apply to content-layer
+   elements (thread rows, message bodies, cards). Note: blur only reads as
+   "glass" when there's something colorful/moving behind it to distort — a
+   flat background makes this look like a plain translucent panel. */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(28px) saturate(1.8);
+  -webkit-backdrop-filter: blur(28px) saturate(1.8);
+  box-shadow: var(--glass-shadow), inset 0 1px 0 var(--glass-highlight);
+}
+
+/* Border is applied per-element via Tailwind (border-[var(--glass-border)])
+   since sidebar/toolbar/modal each need a different subset of edges. */
+
+/* Same material, higher opacity — for text-dense glass surfaces (compose
+   window) that need more contrast than the sidebar/toolbar. Use instead of
+   .glass, not alongside it. */
+.glass-strong {
+  background: var(--glass-bg-strong);
+  backdrop-filter: blur(28px) saturate(1.8);
+  -webkit-backdrop-filter: blur(28px) saturate(1.8);
+  box-shadow: var(--glass-shadow), inset 0 1px 0 var(--glass-highlight);
+}
+
+/* Thinner variant for glass sitting on top of an already-opaque content card
+   (e.g. a sticky in-thread toolbar) rather than over the open aurora. */
+.glass-thin {
+  background: color-mix(in oklab, var(--app-surface) 85%, transparent);
+  backdrop-filter: blur(14px) saturate(1.3);
+  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .glass-strong,
+  .glass-thin {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: var(--app-surface);
+  }
 }
 
 /* Slim, theme-aware scrollbars for the dense list/reading panes. */

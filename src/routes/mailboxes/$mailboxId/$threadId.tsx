@@ -94,7 +94,7 @@ function ThreadPage() {
 
 	return (
 		<div className="flex h-full flex-col">
-			<header className="sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b border-[var(--app-border)] bg-[var(--app-surface)] px-4">
+			<header className="glass-thin sticky top-0 z-10 flex h-14 shrink-0 items-center gap-2 border-b border-[var(--app-border)] px-4">
 				<IconButton title="Back to inbox" className="lg:hidden" onClick={backToList}>
 					<ArrowLeft className="h-5 w-5" />
 				</IconButton>

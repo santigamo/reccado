@@ -27,19 +27,20 @@ export function Sidebar({
 	const currentMailbox = mailboxes.find((m) => m.mailbox_id === mailboxId);
 
 	return (
-		<div className="flex h-full flex-col gap-1 overflow-y-auto app-scroll bg-[var(--app-bg)] pb-3">
+		<div className="flex h-full flex-col gap-1 overflow-y-auto app-scroll pb-3">
 			{/* Brand */}
 			<div className="flex items-center gap-2 px-3 py-4">
-				<span className="h-2 w-2 shrink-0 rounded-full bg-[var(--app-accent)]" />
+				<span className="h-2 w-2 shrink-0 rounded-full bg-[linear-gradient(135deg,var(--lagoon),var(--palm))]" />
 				<span className="text-lg font-medium tracking-tight text-[var(--app-text)]">Reccado</span>
 			</div>
 
-			{/* Compose */}
+			{/* Compose — a tinted-glass "prominent" pill: translucent enough to
+			    pick up the sidebar's blur, opaque enough to keep the label legible. */}
 			<div className="px-3 pb-2">
 				<button
 					type="button"
 					onClick={onCompose}
-					className="flex h-12 w-full items-center gap-3 rounded-2xl bg-[var(--app-accent)] px-4 text-sm font-medium text-[var(--app-on-accent)] shadow-[var(--app-shadow)] transition-colors hover:brightness-95"
+					className="flex h-12 w-full items-center gap-3 rounded-full border border-[var(--glass-border)] bg-[color-mix(in_oklab,var(--app-accent)_90%,transparent)] px-4 text-sm font-medium text-[var(--app-on-accent)] shadow-[var(--glass-shadow)] backdrop-blur-md transition hover:brightness-95 active:scale-[0.98]"
 				>
 					<Pencil className="h-5 w-5 shrink-0" />
 					<span>Compose</span>
@@ -58,7 +59,7 @@ export function Sidebar({
 							params={{ mailboxId }}
 							search={(prev) => ({ ...prev, folder: f.key, q: undefined })}
 							className={cn(
-								"flex h-9 items-center gap-4 rounded-r-full px-4 text-sm transition-colors",
+								"flex h-9 items-center gap-4 rounded-r-full px-4 text-sm transition active:scale-[0.98]",
 								active
 									? "bg-[var(--app-selected)] font-medium text-[var(--app-selected-text)]"
 									: "text-[var(--app-text-soft)] hover:bg-[var(--app-hover)]",

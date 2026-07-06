@@ -17,7 +17,7 @@ export function IconButton({
 			title={title}
 			aria-label={title}
 			className={cn(
-				"inline-flex shrink-0 items-center justify-center rounded-full text-[var(--app-text-soft)] transition-colors hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] disabled:cursor-not-allowed disabled:opacity-40",
+				"inline-flex shrink-0 items-center justify-center rounded-full text-[var(--app-text-soft)] transition hover:bg-[var(--app-hover)] hover:text-[var(--app-text)] active:scale-[0.9] disabled:cursor-not-allowed disabled:opacity-40 disabled:active:scale-100",
 				size === "sm" ? "h-8 w-8" : "h-9 w-9",
 				className,
 			)}

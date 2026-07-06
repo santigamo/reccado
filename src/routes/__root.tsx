@@ -65,14 +65,14 @@ function RootDocument({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * The mail client (a specific mailbox: /mailboxes/:id and its children) is a
- * full-viewport app with its own chrome, so the marketing Header/Footer are
- * hidden there. Everything else — landing, About, the mailbox picker — keeps
- * the site chrome.
+ * The mail client — the mailbox picker and any specific mailbox
+ * (/mailboxes and /mailboxes/:id) — is a full-viewport app with its own
+ * glass chrome, so the marketing Header/Footer are hidden there. Only the
+ * landing page and About keep the site chrome.
  */
 function Chrome({ children }: { children: React.ReactNode }) {
 	const pathname = useRouterState({ select: (s) => s.location.pathname });
-	const isMailApp = pathname.startsWith("/mailboxes/");
+	const isMailApp = pathname.startsWith("/mailboxes");
 	if (isMailApp) {
 		return <>{children}</>;
 	}
