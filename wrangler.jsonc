@@ -131,7 +131,7 @@
 					// filled in for you. The all-zero UUID is a valid-format placeholder
 					// (kept parseable because local `vitest` uses `environment: "dev"`);
 					// remote dev deploys still need a real id.
-					"database_id": "00000000-0000-0000-0000-000000000000",
+					"database_id": "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
 					"migrations_dir": "migrations/d1"
 				}
 			],
