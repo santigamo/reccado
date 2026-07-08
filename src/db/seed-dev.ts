@@ -60,6 +60,7 @@ export async function seedDevData(
 			primary_address: "test@example.com",
 			display_name: "Dev Test Mailbox",
 			status: "active",
+			owner_email: "dev@local",
 		});
 	}
 
@@ -91,6 +92,7 @@ export async function seedDevData(
 				primary_address: "inbox@mail.example.com",
 				display_name: "Mail Domain Inbox",
 				status: "active",
+				owner_email: "dev@local",
 			});
 		}
 		const secondAlias = await lookupActiveAlias(db, "inbox@mail.example.com");

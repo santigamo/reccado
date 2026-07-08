@@ -9,11 +9,12 @@ import {
 } from "#/db/d1";
 import migration1 from "../../migrations/d1/0001_initial.sql?raw";
 import migration2 from "../../migrations/d1/0002_message_index.sql?raw";
+import migration3 from "../../migrations/d1/0003_mailbox_owner.sql?raw";
 
 // The pool's D1 binding starts empty; the dev migrations aren't applied
 // automatically by vitest-pool-workers, so we apply them once for this file.
 async function applyMigrations(): Promise<void> {
-	const statements = [migration1, migration2]
+	const statements = [migration1, migration2, migration3]
 		.join("\n")
 		.split(";")
 		.map((statement) => statement.trim())
@@ -49,6 +50,7 @@ async function seedMailbox(suffix: string): Promise<string> {
 		primary_address: `${suffix}@mailbox.routing.test`,
 		display_name: null,
 		status: "active",
+		owner_email: null,
 	});
 	return mailboxId;
 }

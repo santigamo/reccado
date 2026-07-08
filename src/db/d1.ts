@@ -12,6 +12,7 @@ export type MailboxRow = {
 	primary_address: string;
 	display_name: string | null;
 	status: "active" | "disabled";
+	owner_email: string | null;
 	created_at: string;
 	updated_at: string;
 };
@@ -87,6 +88,30 @@ export async function listMailboxes(db: D1Database): Promise<MailboxRow[]> {
 	return result.results ?? [];
 }
 
+export async function listMailboxesByOwner(
+	db: D1Database,
+	ownerEmail: string,
+): Promise<MailboxRow[]> {
+	const result = await db
+		.prepare(
+			"SELECT * FROM mailboxes WHERE owner_email = ? AND status = 'active' ORDER BY created_at ASC",
+		)
+		.bind(ownerEmail.trim().toLowerCase())
+		.all<MailboxRow>();
+	return result.results ?? [];
+}
+
+export async function getMailboxForOwner(
+	db: D1Database,
+	mailboxId: string,
+	ownerEmail: string,
+): Promise<MailboxRow | null> {
+	return db
+		.prepare("SELECT * FROM mailboxes WHERE mailbox_id = ? AND owner_email = ? AND status = 'active'")
+		.bind(mailboxId, ownerEmail.trim().toLowerCase())
+		.first<MailboxRow>();
+}
+
 export async function getMailbox(db: D1Database, mailboxId: string): Promise<MailboxRow | null> {
 	return db
 		.prepare("SELECT * FROM mailboxes WHERE mailbox_id = ?")
@@ -101,10 +126,18 @@ export async function insertMailbox(
 	const now = nowIso();
 	await db
 		.prepare(
-			`INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		)
-		.bind(row.mailbox_id, row.primary_address, row.display_name, row.status, now, now)
+		.bind(
+			row.mailbox_id,
+			row.primary_address,
+			row.display_name,
+			row.status,
+			row.owner_email ? row.owner_email.trim().toLowerCase() : null,
+			now,
+			now,
+		)
 		.run();
 }
 

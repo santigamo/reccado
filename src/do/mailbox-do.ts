@@ -15,7 +15,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 1;
+const MAILBOX_SCHEMA_VERSION = 2;
 
 // Minimal runtime validation for the /ingest payload. Defined locally (rather than
 // imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
@@ -215,8 +215,50 @@ function getDraft(sql: SqlStorage, draftId: string | undefined) {
 }
 
 function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
-	const id = crypto.randomUUID();
+	const idempotencyKey = (body.idempotencyKey as string | undefined) ?? null;
 	const now = new Date().toISOString();
+
+	// Idempotent insert: if an idempotencyKey is provided and a draft with that
+	// key already exists, INSERT OR IGNORE skips the insert and we return the
+	// existing draft. The partial unique index (WHERE idempotency_key IS NOT NULL)
+	// ensures NULL keys don't dedup.
+	if (idempotencyKey) {
+		const id = crypto.randomUUID();
+		const result = sql.exec(
+			`INSERT OR IGNORE INTO outbound_drafts
+       (id, thread_id, to_json, cc_json, bcc_json, subject, body_text, body_html, status, created_by, created_at, updated_at, idempotency_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)`,
+			id,
+			(body.threadId as string | null) ?? null,
+			JSON.stringify(body.to ?? []),
+			JSON.stringify(body.cc ?? []),
+			JSON.stringify(body.bcc ?? []),
+			body.subject,
+			body.bodyText ?? null,
+			body.bodyHtml ?? null,
+			(body.createdBy as string | undefined) ?? "user",
+			now,
+			now,
+			idempotencyKey,
+		);
+		if (result.rowsWritten === 0) {
+			// Duplicate — fetch and return the existing draft.
+			const existing = sql
+				.exec<{ id: string }>(
+					"SELECT id FROM outbound_drafts WHERE idempotency_key = ?",
+					idempotencyKey,
+				)
+				.toArray()[0];
+			if (existing) {
+				return { id: existing.id, status: "draft", duplicate: true };
+			}
+			// Unexpected: zero rows written but no existing draft. Treat as internal error.
+			throw new Error("draft_idempotency_conflict_unresolved");
+		}
+		return { id, status: "draft", duplicate: false };
+	}
+
+	const id = crypto.randomUUID();
 	sql.exec(
 		`INSERT INTO outbound_drafts
        (id, thread_id, to_json, cc_json, bcc_json, subject, body_text, body_html, status, created_by, created_at, updated_at)
@@ -480,15 +522,15 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		// The legacy PRAGMA/ALTER migration scan below is only needed once per DO
 		// (it rebuilds/backfills pre-thread_id-era tables). Re-running it on every
 		// cold start is wasted work — gate it behind the persisted schema version.
-		const alreadyMigrated = this.hasAppliedSchemaVersion(MAILBOX_SCHEMA_VERSION);
-		if (!alreadyMigrated) {
+		const currentVersion = this.getAppliedSchemaVersion();
+		if (currentVersion < 1) {
 			// Must run before MAILBOX_SCHEMA_SQL: it renames a pre-existing legacy
 			// "messages" table out of the way so the CREATE TABLE IF NOT EXISTS below
 			// can create the current schema instead of leaving the legacy table in place.
 			this.renameLegacyMessagesBeforeSchema();
 		}
 		this.ctx.storage.sql.exec(MAILBOX_SCHEMA_SQL);
-		if (!alreadyMigrated) {
+		if (currentVersion < 1) {
 			try {
 				this.rebuildLegacyMessagesTable();
 				this.migrateLegacySchema();
@@ -497,20 +539,41 @@ export class MailboxDurableObject extends DurableObject<Env> {
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}
-			this.ctx.storage.sql.exec(
-				"INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-				MAILBOX_SCHEMA_VERSION,
-				new Date().toISOString(),
-			);
 		}
+		// v2: add idempotency_key to outbound_drafts for MCP draft dedup.
+		if (currentVersion < 2) {
+			this.migrateDraftIdempotency();
+		}
+		this.ctx.storage.sql.exec(
+			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+			MAILBOX_SCHEMA_VERSION,
+			new Date().toISOString(),
+		);
 	}
 
-	private hasAppliedSchemaVersion(version: number): boolean {
-		if (!this.tableExists("schema_migrations")) return false;
+	private getAppliedSchemaVersion(): number {
+		if (!this.tableExists("schema_migrations")) return 0;
 		const row = this.ctx.storage.sql
-			.exec<{ version: number }>("SELECT version FROM schema_migrations WHERE version = ?", version)
+			.exec<{ max_version: number }>("SELECT COALESCE(MAX(version), 0) AS max_version FROM schema_migrations")
 			.toArray()[0];
-		return Boolean(row);
+		return row?.max_version ?? 0;
+	}
+
+	private migrateDraftIdempotency(): void {
+		// Guard ALTER TABLE against partial-failure reruns: check if the column
+		// already exists before adding it (avoids duplicate-column error).
+		const columns = this.columnNames("outbound_drafts");
+		if (!columns.has("idempotency_key")) {
+			this.ctx.storage.sql.exec(
+				"ALTER TABLE outbound_drafts ADD COLUMN idempotency_key TEXT",
+			);
+		}
+		// CREATE UNIQUE INDEX IF NOT EXISTS is inherently idempotent.
+		this.ctx.storage.sql.exec(
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_idempotency
+       ON outbound_drafts(idempotency_key)
+       WHERE idempotency_key IS NOT NULL`,
+		);
 	}
 
 	async fetch(request: Request): Promise<Response> {

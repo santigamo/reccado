@@ -22,7 +22,11 @@ import {
 	isAbortTimeoutError,
 	isLocalRequest,
 } from "../lib/runtime-config";
-import { assertMailboxAccess, type getAuthContext, requireAuth } from "./auth";
+import {
+	assertMailboxAccess,
+	type getAuthContext,
+	requireAuth,
+} from "./auth";
 import { registerAdminRoutes, registerMailboxRoutes } from "./mailbox-routes";
 import {
 	createAliasSchema,
@@ -131,6 +135,50 @@ export function createApiApp(): Hono<ApiBindings> {
 		return next();
 	});
 
+	// MCP endpoint: dedicated middleware (does NOT inherit /api/* middleware).
+	// Security headers already applied via the global api.use("*") above.
+	// MCP auth: fail-closed if ACCESS_ALLOWED_EMAILS is unset (503),
+	// 403 if authenticated identity is not in the allowlist.
+	// OPTIONS (CORS preflight) bypasses auth — the MCP transport handles it.
+	api.use("/mcp", async (c, next) => {
+		if (c.req.method === "OPTIONS") {
+			return next();
+		}
+		try {
+			const auth = await requireAuth(c.req.raw, c.env);
+			c.set("auth", auth);
+		} catch (error) {
+			if (error instanceof Response) {
+				return error;
+			}
+			throw error;
+		}
+		// MCP fail-closed: require explicit allowlist.
+		const { requireMcpAuth } = await import("../mcp/auth-import");
+		try {
+			requireMcpAuth(c.get("auth")!, c.env);
+		} catch (error) {
+			if (error instanceof Response) {
+				return error;
+			}
+			throw error;
+		}
+		return next();
+	});
+
+	// MCP CSRF: Origin check for state-changing POST requests.
+	// Non-browser MCP clients (Claude Desktop, MCP Inspector) omit Origin — allow those.
+	// Browser-origin POSTs with a mismatched Origin are rejected.
+	api.use("/mcp", async (c, next) => {
+		if (c.req.method === "POST") {
+			const origin = c.req.header("Origin");
+			if (origin && origin !== new URL(c.req.url).origin) {
+				return c.json({ error: "origin_mismatch" }, 403);
+			}
+		}
+		return next();
+	});
+
 	api.get("/api/health", async (c) => {
 		const access = getAccessConfigStatus(c.env);
 		const authOk = access.ok && (access.mode !== "local-dev-bypass" || isLocalRequest(c.req.raw));
@@ -195,6 +243,7 @@ export function createApiApp(): Hono<ApiBindings> {
 	});
 
 	api.post("/api/mailboxes", async (c) => {
+		const auth = c.get("auth")!;
 		const body = createMailboxSchema.parse(await c.req.json());
 		const mailboxId = await mailboxIdFromPrimaryAddress(c.env, body.primaryAddress);
 		const existing = await getMailbox(c.env.INDEX_DB, mailboxId);
@@ -207,6 +256,7 @@ export function createApiApp(): Hono<ApiBindings> {
 			primary_address: primaryAddress,
 			display_name: body.displayName ?? null,
 			status: "active",
+			owner_email: auth.email,
 		});
 		const mailbox = await getMailbox(c.env.INDEX_DB, mailboxId);
 		return c.json({ mailbox, created: true }, 201);
@@ -374,6 +424,12 @@ export function createApiApp(): Hono<ApiBindings> {
 
 	registerMailboxRoutes(api);
 	registerAdminRoutes(api);
+
+	// MCP endpoint: forward all methods (GET/POST/OPTIONS) to the MCP handler.
+	api.all("/mcp", async (c) => {
+		const { mcpHandler } = await import("../mcp/handler");
+		return mcpHandler(c.req.raw, c.env, c.executionCtx as ExecutionContext);
+	});
 
 	api.onError((error, c) => {
 		if (error instanceof ZodError) {

@@ -127,6 +127,19 @@ if (!address.endsWith(`@${domain}`)) {
 const displayName = args["display-name"]?.trim() || address.split("@")[0] || "Inbox";
 const zoneId = args["zone-id"]?.trim() || "zone-placeholder";
 
+// Resolve owner email: explicit flag > ACCESS_ALLOWED_EMAILS (first entry if single).
+let ownerEmail = args.owner?.trim().toLowerCase() || undefined;
+if (!ownerEmail) {
+	const allowList = readDotEnvValue(".dev.vars", "ACCESS_ALLOWED_EMAILS") || process.env.ACCESS_ALLOWED_EMAILS;
+	if (allowList) {
+		const emails = allowList.split(",").map((e) => e.trim()).filter((e) => e.length > 0);
+		if (emails.length === 1) {
+			ownerEmail = emails[0]?.toLowerCase();
+		}
+	}
+}
+const ownerSql = ownerEmail ? q(ownerEmail) : "NULL";
+
 // Resolve the secret: explicit flag > env > .dev.vars (local only).
 const secret =
 	(args.secret?.trim() || undefined) ??
@@ -155,8 +168,8 @@ const statements = [
 	`INSERT INTO domains (id, domain, zone_id, status, created_at, updated_at)
 VALUES (${q(domainId)}, ${q(domain)}, ${q(zoneId)}, 'active', ${q(now)}, ${q(now)})
 ON CONFLICT(domain) DO NOTHING;`,
-	`INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at)
-VALUES (${q(mailboxId)}, ${q(address)}, ${q(displayName)}, 'active', ${q(now)}, ${q(now)})
+	`INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at)
+VALUES (${q(mailboxId)}, ${q(address)}, ${q(displayName)}, 'active', ${ownerSql}, ${q(now)}, ${q(now)})
 ON CONFLICT(primary_address) DO NOTHING;`,
 	`INSERT INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at)
 SELECT ${q(address)}, ${q(mailboxId)}, id, 'active', ${q(now)}, ${q(now)}

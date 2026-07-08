@@ -41,6 +41,7 @@
 		"setup:cloud": "tsx scripts/setup-cloud.ts",
 		"setup:domain": "tsx scripts/setup-domain.ts",
 		"setup:mailbox": "tsx scripts/setup-mailbox.ts",
+		"setup:mcp-claim": "tsx scripts/setup-mcp-claim.ts",
 		"setup:routing": "tsx scripts/setup-routing.ts",
 		"setup:sending": "tsx scripts/setup-sending.ts",
 		"setup:access": "tsx scripts/setup-access.ts",
@@ -72,6 +73,7 @@
 	},
 	"dependencies": {
 		"@cloudflare/vite-plugin": "^1.42.4",
+		"@modelcontextprotocol/sdk": "^1.29.0",
 		"@tailwindcss/vite": "^4.3.2",
 		"@tanstack/react-devtools": "^0.10.8",
 		"@tanstack/react-router": "^1.170.16",
@@ -79,6 +81,7 @@
 		"@tanstack/react-router-ssr-query": "^1.167.1",
 		"@tanstack/react-start": "^1.168.26",
 		"@tanstack/router-plugin": "^1.132.0",
+		"agents": "^0.17.3",
 		"clsx": "^2.1.1",
 		"hono": "^4.9.6",
 		"lucide-react": "^1.22.0",

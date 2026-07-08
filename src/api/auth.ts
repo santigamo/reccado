@@ -10,11 +10,12 @@ export type AuthContext = {
 	email: string;
 };
 
-type AccessJwtPayload = {
+export type AccessJwtPayload = {
 	sub?: string;
 	email?: string;
 	aud?: string[];
 	exp?: number;
+	iss?: string;
 };
 
 type AccessCertResponse = {
@@ -73,7 +74,7 @@ async function getAccessCerts(teamDomain: string): Promise<AccessCertResponse> {
 	return cachedCerts;
 }
 
-async function verifyAccessJwt(token: string, env: Env): Promise<AccessJwtPayload> {
+export async function verifyAccessJwt(token: string, env: Env): Promise<AccessJwtPayload> {
 	const accessConfig = getAccessConfigStatus(env);
 	if (!accessConfig.configured || accessConfig.mode !== "access-jwt") {
 		throw new Error(accessConfig.reason ?? "Access validation is not configured");
@@ -110,8 +111,26 @@ async function verifyAccessJwt(token: string, env: Env): Promise<AccessJwtPayloa
 		throw new Error("Invalid JWT signature");
 	}
 
-	if (payload.exp && payload.exp * 1000 < Date.now()) {
+	// Issuer validation: must match the team domain's Access issuer URL.
+	const expectedIssuer = `${teamDomain.replace(/\/$/, "")}`;
+	if (!payload.iss) {
+		throw new Error("JWT missing iss");
+	}
+	if (payload.iss !== expectedIssuer && payload.iss !== `${expectedIssuer}/`) {
+		throw new Error("JWT issuer mismatch");
+	}
+
+	// Required exp: reject tokens without exp or with expired exp.
+	if (!payload.exp) {
+		throw new Error("JWT missing exp");
+	}
+	if (payload.exp * 1000 < Date.now()) {
 		throw new Error("JWT expired");
+	}
+
+	// Required email: reject tokens without a usable email claim.
+	if (!payload.email?.trim()) {
+		throw new Error("JWT missing email");
 	}
 
 	const aud = payload.aud ?? [];
@@ -160,7 +179,7 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 	}
 }
 
-function parseAllowedEmails(env: Env): string[] | null {
+export function parseAllowedEmails(env: Env): string[] | null {
 	const raw = env.ACCESS_ALLOWED_EMAILS;
 	if (!raw?.trim()) {
 		return null;
@@ -240,4 +259,40 @@ export function assertMailboxAccess(auth: AuthContext, _mailboxId: string, env: 
 			headers: { "content-type": "application/json" },
 		});
 	}
+}
+
+/**
+ * MCP-specific auth gate: fails closed if ACCESS_ALLOWED_EMAILS is unset or empty.
+ * Unlike the UI (which allows open single-operator mode), the MCP endpoint refuses
+ * to serve any tool call without an explicit allowlist. Returns true if the
+ * authenticated identity is allowed to use MCP tools.
+ */
+export function isMcpAllowed(auth: AuthContext, env: Env): boolean {
+	const allowed = parseAllowedEmails(env);
+	if (!allowed) {
+		return false;
+	}
+	return allowed.includes(auth.email.trim().toLowerCase());
+}
+
+/**
+ * Returns 503 if ACCESS_ALLOWED_EMAILS is unset/empty (MCP misconfigured),
+ * 403 if the authenticated identity is not in the allowlist,
+ * or the AuthContext if allowed. Throws a Response for the Hono middleware to return.
+ */
+export function requireMcpAuth(auth: AuthContext, env: Env): AuthContext {
+	const allowed = parseAllowedEmails(env);
+	if (!allowed) {
+		throw new Response(
+			JSON.stringify({ error: "mcp_not_configured", reason: "ACCESS_ALLOWED_EMAILS is not set" }),
+			{ status: 503, headers: { "content-type": "application/json" } },
+		);
+	}
+	if (!allowed.includes(auth.email.trim().toLowerCase())) {
+		throw new Response(JSON.stringify({ error: "forbidden" }), {
+			status: 403,
+			headers: { "content-type": "application/json" },
+		});
+	}
+	return auth;
 }

@@ -9,6 +9,7 @@ import worker from "#/server";
 import attachmentSmallEml from "../../fixtures/mime/attachment-small.eml?raw";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
+import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
 
 type TestEnv = Env & {
 	INDEX_DB: D1Database;
@@ -35,6 +36,7 @@ async function applyMigration(sql: string): Promise<void> {
 beforeAll(async () => {
 	await applyMigration(migrationInitial as string);
 	await applyMigration(migrationMessageIndex as string);
+	await applyMigration(migrationMailboxOwner as string);
 });
 
 async function fetchWorker(request: Request, workerEnv: Env = env): Promise<Response> {
@@ -165,13 +167,14 @@ describe("attachment download route", () => {
 		// to exist) and ingest a real message+attachment directly through the DO,
 		// mirroring how the queue consumer would in production.
 		await testEnv.INDEX_DB.prepare(
-			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		)
 			.bind(
 				mailboxId,
 				"attachment-route@example.com",
 				null,
 				"active",
+				"dev@local",
 				new Date().toISOString(),
 				new Date().toISOString(),
 			)
@@ -246,13 +249,14 @@ describe("attachment download route", () => {
 	it("returns 404 attachment_not_found for an unknown attachment id on a real message", async () => {
 		const mailboxId = "mbx_security_attachment_missing";
 		await testEnv.INDEX_DB.prepare(
-			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		)
 			.bind(
 				mailboxId,
 				"attachment-missing@example.com",
 				null,
 				"active",
+				"dev@local",
 				new Date().toISOString(),
 				new Date().toISOString(),
 			)
@@ -312,13 +316,14 @@ describe("DO-proxied routes vs. the global security-header middleware", () => {
 	it("GET /messages/:messageId returns the message payload with security headers", async () => {
 		const mailboxId = "mbx_security_do_proxy_bug";
 		await testEnv.INDEX_DB.prepare(
-			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		)
 			.bind(
 				mailboxId,
 				"do-proxy-bug@example.com",
 				null,
 				"active",
+				"dev@local",
 				new Date().toISOString(),
 				new Date().toISOString(),
 			)
@@ -371,13 +376,14 @@ describe("DO-proxied routes vs. the global security-header middleware", () => {
 	it("GET /threads returns the proxied DO response with security headers", async () => {
 		const mailboxId = "mbx_security_do_proxy_bug_threads";
 		await testEnv.INDEX_DB.prepare(
-			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
 		)
 			.bind(
 				mailboxId,
 				"do-proxy-bug-threads@example.com",
 				null,
 				"active",
+				"dev@local",
 				new Date().toISOString(),
 				new Date().toISOString(),
 			)
@@ -412,9 +418,9 @@ describe("setup status diagnostic", () => {
 			.bind("dom_setup_status", "setup-status.example", "zone", now, now)
 			.run();
 		await testEnv.INDEX_DB.prepare(
-			"INSERT OR IGNORE INTO mailboxes (mailbox_id, primary_address, display_name, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+			"INSERT OR IGNORE INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?, ?)",
 		)
-			.bind("mbx_setup_status", "inbox@setup-status.example", "Setup Status", now, now)
+			.bind("mbx_setup_status", "inbox@setup-status.example", "Setup Status", "dev@local", now, now)
 			.run();
 		await testEnv.INDEX_DB.prepare(
 			"INSERT OR IGNORE INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
