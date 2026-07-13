@@ -1,0 +1,24 @@
+From: noreply@labsmobile.com
+To: hello@imsanti.dev
+Subject: [LabsMobile] Accede a tu cuenta
+Message-ID: <multipart-html-only-content-fixture@example.com>
+Date: Mon, 13 Jul 2026 12:16:21 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt-boundary"
+
+--alt-boundary
+Content-Type: text/plain; charset=UTF-8
+
+LabsMobile (https://www.labsmobile.com/es)
+
+
+
+© 2022 LabsMobile. Todos los derechos reservados.
+https://subscriptions.example.com/unsubscribe?m=1.aaaaaaaaaaaaaaaaaaaaaaaa
+
+--alt-boundary
+Content-Type: text/html; charset=UTF-8
+
+<html><head><title></title><style type="text/css">.backdest{padding:3px 1px}</style></head><body><div class="f-fallback"><h1>Código de verificación de LabsMobile</h1><p>Hemos recibido una solicitud para acceder a tu usuario hello@imsanti.dev. Tu código de verificación es:</p><p><span style="font-size:20px"><b>653865</b></span></p><p>El código de verificación tendrá una validez de 30 minutos. No compartas este código con nadie.</p></div></body></html>
+
+--alt-boundary--

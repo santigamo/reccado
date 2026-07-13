@@ -129,12 +129,32 @@ describe("normalizeSubject", () => {
 });
 
 describe("snippetFromText", () => {
-	it("prefers the text body over html when both are present", () => {
-		expect(snippetFromText("plain body", "<p>html body</p>")).toBe("plain body");
+	it("prefers the html body over text when both are present (matches what the client renders)", () => {
+		// multipart/alternative: html is the canonical, rendered representation, so the
+		// preview must reflect it — a near-empty text/plain part must not win.
+		expect(snippetFromText("plain body", "<p>html body</p>")).toBe("html body");
+	});
+
+	it("derives the snippet from html even when text/plain omits the real content", () => {
+		// The LabsMobile 2FA regression: text/plain is present but only carries logo +
+		// footer, while the verification code lives solely in the html part.
+		const text = "LabsMobile (https://www.labsmobile.com/es)\n\n\n© 2022 LabsMobile.";
+		const html = "<h1>Código de verificación</h1><p>Tu código es: <b>653865</b></p>";
+		expect(snippetFromText(text, html)).toContain("653865");
 	});
 
 	it("falls back to stripped html when text is null", () => {
 		expect(snippetFromText(null, "<p>Hello <b>World</b></p>")).toBe("Hello World");
+	});
+
+	it("drops head/style/script blocks when flattening html", () => {
+		const html =
+			"<head><style>.x{color:red}</style></head><body><p>Visible copy</p><script>alert(1)</script></body>";
+		expect(snippetFromText(null, html)).toBe("Visible copy");
+	});
+
+	it("falls back to the text part when html flattens to nothing (image-only email)", () => {
+		expect(snippetFromText("text fallback", '<img src="https://x/y.png">')).toBe("text fallback");
 	});
 
 	it("returns an empty string when both text and html are null", () => {

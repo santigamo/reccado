@@ -78,7 +78,39 @@ export function normalizeSubject(subject: string | null): string | null {
 	return result.toLowerCase() || null;
 }
 
+/**
+ * Flatten HTML to readable plain text for previews: drop the parts that carry no
+ * visible copy (head/style/script), turn tags into spaces, decode the handful of
+ * entities that show up in real mail, strip zero-width padding some senders use to
+ * pad the preview, then collapse whitespace.
+ */
+export function htmlToText(html: string): string {
+	return html
+		.replace(/<(head|style|script|title)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+		.replace(/<!--[\s\S]*?-->/g, " ")
+		.replace(/<[^>]+>/g, " ")
+		.replace(/&nbsp;/gi, " ")
+		.replace(/&lt;/gi, "<")
+		.replace(/&gt;/gi, ">")
+		.replace(/&#39;|&apos;/gi, "'")
+		.replace(/&quot;/gi, '"')
+		.replace(/&amp;/gi, "&")
+		.replace(/[\u200B-\u200D\uFEFF]/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+/**
+ * Build the list-row/snippet preview. When an HTML part exists it is the canonical
+ * representation of a multipart/alternative message (and the one the client now
+ * renders), so we derive the snippet from it — otherwise a sender that ships an
+ * empty-but-present text/plain part (logo + footer only, e.g. LabsMobile 2FA mail)
+ * yields a useless preview with the real body hidden in HTML. Falls back to the
+ * plain-text part when HTML flattens to nothing (image-only emails).
+ */
 export function snippetFromText(text: string | null, html: string | null, max = 200): string {
-	const source = text ?? html?.replace(/<[^>]+>/g, " ") ?? "";
-	return source.replace(/\s+/g, " ").trim().slice(0, max);
+	const fromHtml = html != null ? htmlToText(html) : "";
+	if (fromHtml) return fromHtml.slice(0, max);
+	const fromText = (text ?? "").replace(/\s+/g, " ").trim();
+	return fromText.slice(0, max);
 }

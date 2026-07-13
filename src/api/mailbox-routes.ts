@@ -25,6 +25,35 @@ import {
 	updateDraftSchema,
 } from "./schemas";
 
+// CSP applied to rendered email HTML. `default-src 'none'` denies everything by
+// default (scripts, fetch, frames, forms — no script-src is defined, so scripts
+// fall through to the deny); we then re-allow only what mail needs to display:
+// remote/inline images and inline styles. Kept in sync with the iframe `sandbox`
+// attribute on the client (defense in depth — either alone blocks script execution).
+const EMAIL_HTML_CSP = [
+	"default-src 'none'",
+	"img-src https: http: data:",
+	"style-src 'unsafe-inline'",
+	"font-src https: data:",
+	"media-src https: data:",
+	"form-action 'none'",
+	"frame-ancestors 'self'",
+].join("; ");
+
+// Force links inside the (sandboxed) email frame to open in a new tab rather than
+// replacing the framed document. Injected into the existing <head> when present so
+// it doesn't disturb the email's own base URL (we only set `target`, never `href`).
+function injectBaseTarget(html: string): string {
+	const baseTag = '<base target="_blank" rel="noopener noreferrer">';
+	if (/<head[^>]*>/i.test(html)) {
+		return html.replace(/(<head[^>]*>)/i, `$1${baseTag}`);
+	}
+	if (/<html[^>]*>/i.test(html)) {
+		return html.replace(/(<html[^>]*>)/i, `$1<head>${baseTag}</head>`);
+	}
+	return `${baseTag}${html}`;
+}
+
 function sanitizeAttachmentFilename(
 	filename: string | null | undefined,
 	attachmentId: string,
@@ -88,6 +117,31 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/messages/${c.req.param("messageId")}/raw`);
+	});
+
+	// Sanitized HTML body, meant to be embedded in a sandboxed iframe by the client.
+	// The email HTML is attacker-controlled, so we lock it down at the response edge:
+	// a strict CSP blocks scripts/forms/frames (default-src 'none' + no script-src),
+	// allows only inline styles and remote images so the mail still renders, and a
+	// nosniff header prevents content-type games. A <base target="_blank"> is injected
+	// so links open in a new tab instead of navigating the framed document.
+	api.get("/api/mailboxes/:mailboxId/messages/:messageId/html", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const stub = await mailboxStub(c.env, mailboxId);
+		const upstream = await stub.fetch(`https://mailbox-do/messages/${c.req.param("messageId")}/html`);
+		if (!upstream.ok) return c.json({ error: "html_not_found" }, 404);
+		const html = injectBaseTarget(await upstream.text());
+		return new Response(html, {
+			headers: {
+				"content-type": "text/html; charset=utf-8",
+				"content-security-policy": EMAIL_HTML_CSP,
+				"x-content-type-options": "nosniff",
+				"referrer-policy": "no-referrer",
+				"cache-control": "private, no-store",
+			},
+		});
 	});
 
 	api.get("/api/mailboxes/:mailboxId/messages/:messageId/attachments/:attachmentId", async (c) => {

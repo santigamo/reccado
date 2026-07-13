@@ -7,6 +7,7 @@ import { inboundIdempotencyKey } from "#/lib/idempotency";
 import { rawEmailR2Key } from "#/lib/r2-keys";
 import worker from "#/server";
 import attachmentSmallEml from "../../fixtures/mime/attachment-small.eml?raw";
+import multipartHtmlOnlyContentEml from "../../fixtures/mime/multipart-html-only-content.eml?raw";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
@@ -301,6 +302,84 @@ describe("attachment download route", () => {
 			),
 		);
 		expect(response.status).toBe(404);
+	});
+});
+
+describe("HTML body route", () => {
+	it("serves the sandboxed email HTML with a strict CSP and a base target, exposing the code", async () => {
+		const mailboxId = "mbx_security_html_body";
+		await testEnv.INDEX_DB.prepare(
+			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		)
+			.bind(
+				mailboxId,
+				"html-body-route@example.com",
+				null,
+				"active",
+				"dev@local",
+				new Date().toISOString(),
+				new Date().toISOString(),
+			)
+			.run();
+
+		const rawBytes = new TextEncoder().encode(multipartHtmlOnlyContentEml as string);
+		const rawSha256 = await sha256Hex(rawBytes);
+		const rawR2Key = rawEmailR2Key({ mailboxId, receivedAt: new Date(), rawSha256 });
+		await testEnv.MAIL_OBJECTS.put(rawR2Key, rawBytes);
+		const messageId = "multipart-html-only-content-fixture@example.com";
+		const queueMessage: InboundEmailQueueMessage = {
+			schemaVersion: 1,
+			eventType: "email.received.v1",
+			traceId: crypto.randomUUID(),
+			enqueuedAt: new Date().toISOString(),
+			receivedAt: new Date().toISOString(),
+			mailboxId,
+			domain: "example.com",
+			recipient: "hello@imsanti.dev",
+			sender: "noreply@labsmobile.com",
+			rawR2Key,
+			rawSha256,
+			rawSize: rawBytes.byteLength,
+			messageId,
+			headers: {
+				subject: "[LabsMobile] Accede a tu cuenta",
+				date: null,
+				inReplyTo: null,
+				references: [],
+			},
+			routing: { ruleId: null, action: "store", matchedAlias: "hello@imsanti.dev" },
+			idempotencyKey: inboundIdempotencyKey({ mailboxId, messageId, rawSha256 }),
+		};
+		const ingestResponse = await testEnv.MAILBOX_DO.getByName(mailboxId).fetch(
+			"https://mailbox-do/ingest",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(queueMessage),
+			},
+		);
+		const ingestResult = (await ingestResponse.json()) as { messageLocalId: string };
+
+		const response = await fetchWorker(
+			new Request(
+				`http://localhost/api/mailboxes/${mailboxId}/messages/${ingestResult.messageLocalId}/html`,
+			),
+		);
+		expect(response.status).toBe(200);
+		expect(response.headers.get("content-type")).toContain("text/html");
+		expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+
+		const csp = response.headers.get("content-security-policy") ?? "";
+		expect(csp).toContain("default-src 'none'");
+		expect(csp).not.toContain("script-src"); // no script source is allowed at all
+		// Must NOT set the CSP `sandbox` directive: that would force an opaque origin and
+		// break the client's same-origin iframe height measurement (isolation comes from
+		// the iframe `sandbox` attribute + `default-src 'none'` instead).
+		expect(csp).not.toContain("sandbox");
+
+		const html = await response.text();
+		expect(html).toContain('<base target="_blank"'); // links open in a new tab
+		expect(html).toContain("653865"); // the 2FA code the plain-text part omitted
 	});
 });
 

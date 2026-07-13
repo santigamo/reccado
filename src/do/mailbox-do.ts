@@ -186,6 +186,17 @@ function getRawMessageR2Key(sql: SqlStorage, messageId: string | undefined): str
 	return row?.raw_r2_key ?? null;
 }
 
+function getBodyHtmlR2Key(sql: SqlStorage, messageId: string | undefined): string | null {
+	if (!messageId) return null;
+	const row = sql
+		.exec<{ body_html_r2_key: string | null }>(
+			"SELECT body_html_r2_key FROM messages WHERE id = ?",
+			messageId,
+		)
+		.toArray()[0];
+	return row?.body_html_r2_key ?? null;
+}
+
 function applyMessageAction(sql: SqlStorage, messageId: string | undefined, action: string) {
 	if (!messageId) throw new Error("messageId required");
 	const now = new Date().toISOString();
@@ -633,6 +644,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			if (url.pathname.endsWith("/raw")) {
 				return this.getRawMessage(messageId);
 			}
+			if (url.pathname.endsWith("/html")) {
+				return this.getBodyHtml(messageId);
+			}
 			return Response.json({ message: this.getMessage(messageId) });
 		}
 		if (
@@ -1019,6 +1033,18 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (!object) return new Response("Not found", { status: 404 });
 		return new Response(object.body, {
 			headers: { "content-type": "message/rfc822" },
+		});
+	}
+
+	// Streams the stored HTML body. The API layer sandboxes it (strict CSP,
+	// iframe sandbox) before it reaches the browser; here we just serve bytes.
+	private async getBodyHtml(messageId: string | undefined): Promise<Response> {
+		const r2Key = getBodyHtmlR2Key(this.ctx.storage.sql, messageId);
+		if (!r2Key) return new Response("Not found", { status: 404 });
+		const object = await this.env.MAIL_OBJECTS.get(r2Key);
+		if (!object) return new Response("Not found", { status: 404 });
+		return new Response(object.body, {
+			headers: { "content-type": "text/html; charset=utf-8" },
 		});
 	}
 

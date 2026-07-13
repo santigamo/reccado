@@ -1,6 +1,6 @@
 import { Forward, Paperclip, Reply } from "lucide-react";
 import type { ReactElement } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Avatar } from "#/components/ui/Avatar";
 import { Button } from "#/components/ui/Button";
 import { cn } from "#/lib/cn";
@@ -12,9 +12,73 @@ import {
 	formatBytes,
 	formatFullDate,
 	type Message,
+	messageHtmlUrl,
 	parseAddressList,
 	rawMessageUrl,
 } from "#/lib/mail";
+
+/**
+ * Renders an email's stored HTML body inside a sandboxed, auto-resizing iframe.
+ *
+ * Security: the HTML is attacker-controlled. The `sandbox` attribute omits
+ * `allow-scripts`, so nothing in the email executes; `allow-same-origin` is safe
+ * *because* scripts can't run, and it lets us measure the content height from the
+ * parent. The endpoint also ships a strict CSP (see mailbox-routes.ts) as a second
+ * layer. `allow-popups*` lets injected `<base target="_blank">` links open a tab.
+ */
+function EmailHtmlBody({ src }: { src: string }): ReactElement {
+	const ref = useRef<HTMLIFrameElement>(null);
+	const [height, setHeight] = useState(120);
+
+	useEffect(() => {
+		const iframe = ref.current;
+		if (!iframe) return;
+		let observer: ResizeObserver | undefined;
+
+		const measure = () => {
+			try {
+				const doc = iframe.contentDocument;
+				if (!doc) return;
+				const next = Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0);
+				if (next > 0) setHeight(next);
+			} catch {
+				// Cross-origin (shouldn't happen for our same-origin endpoint) — keep default.
+			}
+		};
+
+		const onLoad = () => {
+			measure();
+			try {
+				const body = iframe.contentDocument?.body;
+				if (body && typeof ResizeObserver !== "undefined") {
+					observer = new ResizeObserver(measure);
+					observer.observe(body);
+				}
+			} catch {
+				// ignore — measurement is best-effort
+			}
+		};
+
+		iframe.addEventListener("load", onLoad);
+		return () => {
+			iframe.removeEventListener("load", onLoad);
+			observer?.disconnect();
+		};
+	}, []);
+
+	return (
+		<iframe
+			ref={ref}
+			src={src}
+			title="Email content"
+			sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+			referrerPolicy="no-referrer"
+			loading="lazy"
+			className="block w-full rounded-lg bg-white"
+			style={{ height, border: 0 }}
+		/>
+	);
+}
 
 /**
  * One message inside an open thread — a collapsed one-line summary row, or an
@@ -105,7 +169,9 @@ export function MessageItem({
 			</button>
 
 			<div className="px-4 py-4">
-				{message.body_text ? (
+				{message.body_html_r2_key ? (
+					<EmailHtmlBody src={messageHtmlUrl(mailboxId, message.id)} />
+				) : message.body_text ? (
 					<p className="whitespace-pre-wrap break-words text-[15px] leading-relaxed text-[var(--app-text)]">
 						{message.body_text}
 					</p>

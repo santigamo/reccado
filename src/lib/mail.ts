@@ -68,6 +68,8 @@ export type Message = {
 	date_header: string | null;
 	received_at: string;
 	body_text: string | null;
+	/** R2 key for the stored HTML body, or null for text-only mail. Presence means the message has an HTML rendering (served via `messageHtmlUrl`). */
+	body_html_r2_key: string | null;
 	has_attachments: number; // 0 | 1
 	is_read: number; // 0 | 1
 	created_at: string;
@@ -344,6 +346,11 @@ export async function searchThreads(
 
 export function rawMessageUrl(mailboxId: string, messageId: string): string {
 	return `${base(mailboxId)}/messages/${encodeURIComponent(messageId)}/raw`;
+}
+
+/** Sandboxed HTML body endpoint — safe to use as the `src` of a sandboxed iframe. */
+export function messageHtmlUrl(mailboxId: string, messageId: string): string {
+	return `${base(mailboxId)}/messages/${encodeURIComponent(messageId)}/html`;
 }
 
 export function attachmentUrl(mailboxId: string, messageId: string, attachmentId: string): string {

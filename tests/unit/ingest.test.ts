@@ -9,6 +9,7 @@ import duplicateAEml from "../../fixtures/mime/duplicate-message-id-a.eml?raw";
 import duplicateBEml from "../../fixtures/mime/duplicate-message-id-b.eml?raw";
 import missingMessageIdEml from "../../fixtures/mime/missing-message-id.eml?raw";
 import multipartAlternativeEml from "../../fixtures/mime/multipart-alternative.eml?raw";
+import multipartHtmlOnlyContentEml from "../../fixtures/mime/multipart-html-only-content.eml?raw";
 
 type TestEnv = Env & { MAIL_OBJECTS: R2Bucket; MAILBOX_DO: DurableObjectNamespace };
 
@@ -220,6 +221,38 @@ describe("mailbox DO ingest", () => {
 		expect(htmlObject).not.toBeNull();
 		const html = await htmlObject?.text();
 		expect(html).toContain("HTML part of multipart alternative");
+	});
+
+	it("derives the snippet from html and serves it when text/plain omits the real content", async () => {
+		// Regression: a multipart/alternative 2FA email whose text/plain part carries
+		// only logo + footer, with the verification code living solely in the html part.
+		// The list snippet must surface the code, and the html body must be servable so
+		// the client can render it (previously the UI showed only the empty text body).
+		const mailboxId = "mbx_ingest_html_only_content";
+
+		const { result } = await ingestFixture(
+			mailboxId,
+			multipartHtmlOnlyContentEml as string,
+			"multipart-html-only-content-fixture@example.com",
+			"[LabsMobile] Accede a tu cuenta",
+		);
+		expect(result.status).toBe("inserted");
+		expect(result.parseStatus).toBe("parsed");
+		// The snippet — used for the list-row preview — now reflects the html body.
+		expect(result.snippet).toContain("653865");
+		expect(result.snippet).toContain("Código de verificación");
+
+		const message = await getDoMessage(mailboxId, result.messageLocalId as string);
+		expect(message.body_html_r2_key).toBeTruthy();
+
+		// The DO html endpoint streams the stored body containing the code.
+		const htmlResp = await mailboxStub(mailboxId).fetch(
+			`https://mailbox-do/messages/${result.messageLocalId}/html`,
+		);
+		expect(htmlResp.status).toBe(200);
+		expect(htmlResp.headers.get("content-type")).toContain("text/html");
+		const html = await htmlResp.text();
+		expect(html).toContain("653865");
 	});
 
 	it("persists attachments to R2 and marks has_attachments on the message row", async () => {
