@@ -135,9 +135,14 @@ CREATE TABLE IF NOT EXISTS outbound_drafts (
   idempotency_key TEXT
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_idempotency
-  ON outbound_drafts(idempotency_key)
-  WHERE idempotency_key IS NOT NULL;
+-- NOTE: idx_drafts_idempotency (the partial unique index on
+-- outbound_drafts.idempotency_key) is deliberately NOT created here. This SQL
+-- runs on every DO cold start, but DOs created before schema v2 have an
+-- outbound_drafts table WITHOUT the idempotency_key column (CREATE TABLE IF NOT
+-- EXISTS is a no-op for them). Referencing that column in an index here would
+-- throw "no such column: idempotency_key" in the constructor and brick the DO
+-- before migrateDraftIdempotency() can ALTER TABLE ADD COLUMN. The index is
+-- created by migrateDraftIdempotency() instead, AFTER the column is guaranteed.
 
 -- Reserved, currently unused: scaffolding for the planned "mailbox-local DO alarm
 -- jobs" milestone (see docs/IMPLEMENTATION.md). Nothing inserts rows into this
