@@ -64,3 +64,21 @@ export const threadListQuerySchema = z.object({
 export const adminMailboxActionSchema = z.object({
 	mailboxId: z.string().min(1),
 });
+
+// Transactional API key schemas
+
+export const transactionalApiKeyScopeSchema = z.enum([
+	"transactional:send",
+	"transactional:status",
+	"transactional:templates:use",
+]);
+
+export const createTransactionalApiKeySchema = z.object({
+	environment: z.enum(["test", "live"]),
+	sender: z.string().email(),
+	scopes: z.array(transactionalApiKeyScopeSchema).min(1),
+	templateAllowlist: z.array(z.string()).optional(),
+	recipientPolicy: z.string().optional(),
+	quotaMax: z.number().int().positive().optional(),
+	expiresAt: z.string().datetime().optional(),
+});

@@ -687,6 +687,87 @@ export async function deleteTelegramAction(db: D1Database, token: string): Promi
 	await db.prepare("DELETE FROM telegram_actions WHERE token = ?").bind(token).run();
 }
 
+// --- Transactional API key projections (rebuildable from DO, no hash/secret) ---
+
+export type ApiKeyProjectionRow = {
+	key_id: string;
+	mailbox_id: string;
+	sender: string;
+	display_suffix: string;
+	environment: "test" | "live";
+	scopes_json: string;
+	template_allowlist_json: string | null;
+	recipient_policy: string | null;
+	quota_max: number | null;
+	quota_used: number;
+	expires_at: string | null;
+	status: "active" | "revoked";
+	created_at: string;
+	updated_at: string;
+	revoked_at: string | null;
+};
+
+export async function upsertApiKeyProjection(
+	db: D1Database,
+	row: ApiKeyProjectionRow,
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO transactional_api_keys
+       (key_id, mailbox_id, sender, display_suffix, environment, scopes_json,
+        template_allowlist_json, recipient_policy, quota_max, quota_used, expires_at,
+        status, created_at, updated_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(key_id) DO UPDATE SET
+         status = excluded.status,
+         updated_at = excluded.updated_at,
+         revoked_at = excluded.revoked_at`,
+		)
+		.bind(
+			row.key_id,
+			row.mailbox_id,
+			row.sender,
+			row.display_suffix,
+			row.environment,
+			row.scopes_json,
+			row.template_allowlist_json,
+			row.recipient_policy,
+			row.quota_max,
+			row.quota_used ?? 0,
+			row.expires_at,
+			row.status,
+			row.created_at,
+			row.updated_at,
+			row.revoked_at,
+		)
+		.run();
+}
+
+export async function listApiKeyProjections(
+	db: D1Database,
+	mailboxId: string,
+): Promise<ApiKeyProjectionRow[]> {
+	const result = await db
+		.prepare("SELECT * FROM transactional_api_keys WHERE mailbox_id = ? ORDER BY created_at DESC")
+		.bind(mailboxId)
+		.all<ApiKeyProjectionRow>();
+	return result.results ?? [];
+}
+
+export async function getApiKeyProjection(
+	db: D1Database,
+	keyId: string,
+): Promise<ApiKeyProjectionRow | null> {
+	return db
+		.prepare("SELECT * FROM transactional_api_keys WHERE key_id = ?")
+		.bind(keyId)
+		.first<ApiKeyProjectionRow>();
+}
+
+export async function deleteApiKeyProjection(db: D1Database, keyId: string): Promise<void> {
+	await db.prepare("DELETE FROM transactional_api_keys WHERE key_id = ?").bind(keyId).run();
+}
+
 /** Housekeeping for the cron sweep: expired buttons are dead weight. */
 export async function deleteExpiredTelegramActions(db: D1Database): Promise<number> {
 	const result = await db

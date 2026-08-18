@@ -66,6 +66,13 @@ The key secret is never accepted from or returned to D1. Key operations must be 
 DO operations; D1 stores only searchable metadata and audit projections such as key ID,
 mailbox, status, timestamps, and usage counters.
 
+> **Note on Phase 2 vs. Phase 3 boundaries:** scopes, quota, expiry, and recipient policy
+> are stored (in both DO sqlite and the D1 projection) during Phase 2 but are **not yet
+> enforced** — they will be consumed and enforced by the transactional send endpoint in
+> Phase 3. The D1 projection is **non-authoritative**: a D1 outage or stale projection must
+> never alter the DO's canonical authorization or idempotency decision. DO-local sqlite is the
+> source of truth for key status, hashes, and usage counters.
+
 ## Phase 3 — restricted transactional endpoint
 
 Proposed endpoint:

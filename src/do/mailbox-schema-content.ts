@@ -167,6 +167,38 @@ CREATE TABLE IF NOT EXISTS realtime_events (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS api_keys (
+  key_id TEXT PRIMARY KEY,
+  hash_version INTEGER NOT NULL DEFAULT 1,
+  key_hash TEXT NOT NULL,
+  display_suffix TEXT NOT NULL,
+  environment TEXT NOT NULL CHECK (environment IN ('test', 'live')),
+  mailbox_id TEXT NOT NULL,
+  sender TEXT NOT NULL,
+  scopes_json TEXT NOT NULL DEFAULT '[]',
+  template_allowlist_json TEXT,
+  recipient_policy TEXT,
+  quota_max INTEGER,
+  expires_at TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_mailbox ON api_keys(mailbox_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
+
+CREATE TABLE IF NOT EXISTS api_key_events (
+  id TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('created', 'revoked', 'rotated')),
+  metadata_json TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
   message_id UNINDEXED,
   subject,

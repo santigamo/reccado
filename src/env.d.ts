@@ -24,4 +24,10 @@ declare interface Env {
 	TELEGRAM_CHAT_ID?: string;
 	/** "1" opts into one forum topic per email thread. Unset = plain messages + reply mapping. */
 	TELEGRAM_TOPICS?: string;
+	/**
+	 * HMAC-SHA256 pepper for transactional API key hashing.
+	 * Must be set when transactional API keys are used. Without it,
+	 * API key operations fail closed.
+	 */
+	TRANSACTIONAL_API_KEY_PEPPER?: string;
 }

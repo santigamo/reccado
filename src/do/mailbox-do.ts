@@ -915,6 +915,81 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			await this.runPendingJobs();
 			return Response.json({ ok: true });
 		}
+		// --- Transactional API key routes ---
+		if (url.pathname === "/transactional/api-keys" && request.method === "POST") {
+			const pepper = this.env.TRANSACTIONAL_API_KEY_PEPPER;
+			if (!pepper) {
+				return Response.json({ error: "transactional_api_not_configured" }, { status: 503 });
+			}
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			try {
+				const body = (await request.json()) as Record<string, unknown>;
+				const { createApiKey } = await import("./transactional-key-ops");
+				const result = await createApiKey(this.ctx.storage.sql, pepper, mailboxId, {
+					environment: body.environment as "test" | "live",
+					sender: body.sender as string,
+					scopes: body.scopes as import("../lib/transactional-keys").KeyScope[],
+					templateAllowlist: body.templateAllowlist as string[] | null | undefined,
+					recipientPolicy: body.recipientPolicy as string | null | undefined,
+					quotaMax: body.quotaMax != null ? Number(body.quotaMax) : null,
+					expiresAt: body.expiresAt as string | null | undefined,
+				});
+				return Response.json(result, { status: 201 });
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				const status = msg === "invalid_scopes" ? 400 : 500;
+				return Response.json({ error: msg }, { status });
+			}
+		}
+		if (url.pathname === "/transactional/api-keys" && request.method === "GET") {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const { listApiKeys } = await import("./transactional-key-ops");
+			const keys = listApiKeys(this.ctx.storage.sql, mailboxId);
+			return Response.json({ keys });
+		}
+		if (
+			url.pathname.match(/^\/transactional\/api-keys\/[^/]+\/revoke$/) &&
+			request.method === "POST"
+		) {
+			const keyId = url.pathname.split("/")[3];
+			if (!keyId) return Response.json({ error: "key_id_required" }, { status: 400 });
+			const { revokeApiKey } = await import("./transactional-key-ops");
+			const result = revokeApiKey(this.ctx.storage.sql, keyId);
+			if (!result) return Response.json({ error: "key_not_found" }, { status: 404 });
+			return Response.json({ key: result });
+		}
+		if (
+			url.pathname.match(/^\/transactional\/api-keys\/[^/]+\/rotate$/) &&
+			request.method === "POST"
+		) {
+			const pepper = this.env.TRANSACTIONAL_API_KEY_PEPPER;
+			if (!pepper) {
+				return Response.json({ error: "transactional_api_not_configured" }, { status: 503 });
+			}
+			const keyId = url.pathname.split("/")[3];
+			if (!keyId) return Response.json({ error: "key_id_required" }, { status: 400 });
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			try {
+				const { rotateApiKey } = await import("./transactional-key-ops");
+				const result = await rotateApiKey(this.ctx.storage.sql, pepper, mailboxId, keyId, (fn) =>
+					this.ctx.storage.transactionSync(fn),
+				);
+				if (!result) return Response.json({ error: "key_not_found" }, { status: 404 });
+				return Response.json(result);
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				const status = msg === "key_not_active" ? 400 : 500;
+				return Response.json({ error: msg }, { status });
+			}
+		}
+		if (url.pathname === "/transactional/api-keys/export-projections" && request.method === "GET") {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const { exportApiKeyProjections } = await import("./transactional-key-ops");
+			return Response.json({
+				projections: exportApiKeyProjections(this.ctx.storage.sql, mailboxId),
+			});
+		}
+
 		if (url.pathname === "/debug" && request.method === "GET") {
 			return Response.json(this.debugState());
 		}

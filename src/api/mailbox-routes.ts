@@ -2,9 +2,11 @@ import type { Hono } from "hono";
 import {
 	deleteMessageIndexForMailbox,
 	getMailbox,
+	getMailboxForOwner,
 	insertOpsEvent,
 	listIngestFailures,
 	listOpsEvents,
+	upsertApiKeyProjection,
 	upsertMessageIndex,
 } from "../db/d1";
 import { AppError } from "../lib/errors";
@@ -16,6 +18,7 @@ import {
 	adminMailboxActionSchema,
 	confirmSendSchema,
 	createDraftSchema,
+	createTransactionalApiKeySchema,
 	messageActionSchema,
 	searchQuerySchema,
 	threadListQuerySchema,
@@ -284,6 +287,233 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}/cancel`, {
 			method: "POST",
 		});
+	});
+
+	// --- Transactional API key management (Access-protected, owner-gated) ---
+
+	/**
+	 * Best-effort D1 projection write. Catches and logs failures — D1 is a
+	 * rebuildable index, never the source of truth for API key state.
+	 */
+	async function projectApiKey(
+		env: Env,
+		row: {
+			key_id: string;
+			mailbox_id: string;
+			sender: string;
+			display_suffix: string;
+			environment: string;
+			scopes: string[];
+			template_allowlist: string[] | null;
+			recipient_policy: string | null;
+			status: string;
+			quota_max: number | null;
+			expires_at: string | null;
+			created_at: string;
+			updated_at: string;
+			revoked_at: string | null;
+		},
+	): Promise<void> {
+		try {
+			await upsertApiKeyProjection(env.INDEX_DB, {
+				key_id: row.key_id,
+				mailbox_id: row.mailbox_id,
+				sender: row.sender,
+				display_suffix: row.display_suffix,
+				environment: row.environment as "test" | "live",
+				scopes_json: JSON.stringify(row.scopes),
+				template_allowlist_json: row.template_allowlist
+					? JSON.stringify(row.template_allowlist)
+					: null,
+				recipient_policy: row.recipient_policy,
+				quota_max: row.quota_max,
+				quota_used: 0,
+				expires_at: row.expires_at,
+				status: row.status as "active" | "revoked",
+				created_at: row.created_at,
+				updated_at: row.updated_at,
+				revoked_at: row.revoked_at,
+			});
+		} catch (error) {
+			console.error("api_key_projection_failed", {
+				keyId: row.key_id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	async function enforceMailboxOwnership(
+		env: Env,
+		mailboxId: string,
+		email: string,
+	): Promise<Response | null> {
+		const mailbox = await getMailboxForOwner(env.INDEX_DB, mailboxId, email);
+		if (!mailbox) {
+			return Response.json(
+				{ error: "forbidden" },
+				{ status: 403, headers: { "content-type": "application/json" } },
+			);
+		}
+		return null;
+	}
+
+	api.post("/api/mailboxes/:mailboxId/transactional/api-keys", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
+		if (ownershipError) return ownershipError;
+		const body = createTransactionalApiKeySchema.parse(await c.req.json());
+		const stub = await mailboxStub(c.env, mailboxId);
+		const doResponse = await stub.fetch("https://mailbox-do/transactional/api-keys", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+		if (doResponse.ok) {
+			const data = (await doResponse.json()) as {
+				key?: {
+					keyId?: string;
+					mailboxId?: string;
+					sender?: string;
+					displaySuffix?: string;
+					environment?: string;
+					scopes?: string[];
+					templateAllowlist?: string[] | null;
+					recipientPolicy?: string | null;
+					status?: string;
+					quotaMax?: number | null;
+					expiresAt?: string | null;
+					createdAt?: string;
+					updatedAt?: string;
+					revokedAt?: string | null;
+				};
+				plaintextKey?: string;
+				projection?: unknown;
+			};
+			if (data.projection) {
+				await projectApiKey(c.env, data.projection as Parameters<typeof projectApiKey>[1]);
+			} else if (data.key) {
+				const k = data.key;
+				await projectApiKey(c.env, {
+					key_id: k.keyId!,
+					mailbox_id: k.mailboxId!,
+					sender: k.sender!,
+					display_suffix: k.displaySuffix!,
+					environment: k.environment!,
+					scopes: k.scopes!,
+					template_allowlist: k.templateAllowlist ?? null,
+					recipient_policy: k.recipientPolicy ?? null,
+					status: k.status!,
+					quota_max: k.quotaMax ?? null,
+					expires_at: k.expiresAt ?? null,
+					created_at: k.createdAt!,
+					updated_at: k.updatedAt!,
+					revoked_at: k.revokedAt ?? null,
+				});
+			}
+		}
+		return doResponse;
+	});
+
+	api.get("/api/mailboxes/:mailboxId/transactional/api-keys", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
+		if (ownershipError) return ownershipError;
+		const stub = await mailboxStub(c.env, mailboxId);
+		return stub.fetch("https://mailbox-do/transactional/api-keys", {
+			method: "GET",
+		});
+	});
+
+	api.post("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId/revoke", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
+		if (ownershipError) return ownershipError;
+		const keyId = c.req.param("keyId");
+		const stub = await mailboxStub(c.env, mailboxId);
+		const doResponse = await stub.fetch(
+			`https://mailbox-do/transactional/api-keys/${keyId}/revoke`,
+			{
+				method: "POST",
+			},
+		);
+		if (doResponse.ok) {
+			const data = (await doResponse.json()) as {
+				key?: { key?: Record<string, unknown>; projection?: unknown };
+			};
+			if (data.key?.projection) {
+				await projectApiKey(c.env, data.key.projection as Parameters<typeof projectApiKey>[1]);
+			}
+		}
+		return doResponse;
+	});
+
+	api.post("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId/rotate", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
+		if (ownershipError) return ownershipError;
+		const keyId = c.req.param("keyId");
+		const stub = await mailboxStub(c.env, mailboxId);
+		const doResponse = await stub.fetch(
+			`https://mailbox-do/transactional/api-keys/${keyId}/rotate`,
+			{
+				method: "POST",
+			},
+		);
+		if (doResponse.ok) {
+			const data = (await doResponse.json()) as {
+				key?: {
+					keyId?: string;
+					mailboxId?: string;
+					sender?: string;
+					displaySuffix?: string;
+					environment?: string;
+					scopes?: string[];
+					templateAllowlist?: string[] | null;
+					recipientPolicy?: string | null;
+					status?: string;
+					quotaMax?: number | null;
+					expiresAt?: string | null;
+					createdAt?: string;
+					updatedAt?: string;
+					revokedAt?: string | null;
+				};
+				previousKeyId?: string;
+				previousKeyProjection?: Parameters<typeof projectApiKey>[1];
+			};
+			// Project old (revoked) key
+			if (data.previousKeyProjection) {
+				await projectApiKey(c.env, data.previousKeyProjection);
+			}
+			// Project new (active) key
+			if (data.key) {
+				const k = data.key;
+				await projectApiKey(c.env, {
+					key_id: k.keyId!,
+					mailbox_id: k.mailboxId!,
+					sender: k.sender!,
+					display_suffix: k.displaySuffix!,
+					environment: k.environment!,
+					scopes: k.scopes!,
+					template_allowlist: k.templateAllowlist ?? null,
+					recipient_policy: k.recipientPolicy ?? null,
+					status: k.status!,
+					quota_max: k.quotaMax ?? null,
+					expires_at: k.expiresAt ?? null,
+					created_at: k.createdAt!,
+					updated_at: k.updatedAt!,
+					revoked_at: k.revokedAt ?? null,
+				});
+			}
+		}
+		return doResponse;
 	});
 }
 

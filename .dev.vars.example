@@ -46,3 +46,10 @@ ACCESS_TEAM_DOMAIN=
 #   MAIL_SENDING_DOMAINS       comma-separated domains verified in Cloudflare Email Sending;
 #                              a mailbox on one of them sends as itself, otherwise the reply
 #                              goes out as MAIL_FROM_ADDRESS with Reply-To set
+#
+# --- Transactional API key pepper (optional) -------------------------------
+# The HMAC-SHA256 pepper used to hash transactional API keys. Must be a long,
+# random, secret string. Without it, API key operations fail closed.
+# Set via `wrangler secret put TRANSACTIONAL_API_KEY_PEPPER` in production;
+# leave empty here for local development unless testing key operations.
+TRANSACTIONAL_API_KEY_PEPPER=
