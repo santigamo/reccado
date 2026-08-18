@@ -304,6 +304,7 @@ async function handleCallbackQuery(
 		mailboxId: action.mailbox_id,
 		draftId: action.draft_id,
 		attemptKey: token,
+		approvalMode: "telegram_confirmed",
 	});
 	await deleteTelegramAction(env.INDEX_DB, token);
 

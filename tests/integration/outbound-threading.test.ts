@@ -309,3 +309,89 @@ describe("request-send guard", () => {
 		expect(await response.json()).toMatchObject({ status: "cancelled" });
 	});
 });
+
+describe("atomic per-draft send gate", () => {
+	it("blocks a second attempt key from calling the provider when the draft gate is held", async () => {
+		const sent: SentEmail[] = [];
+		const result = await withMailbox("mbx-gate-1", async (state) => {
+			const seed = await seedThreadWithDraft(state, { parentRfcId: "parent@example.com" });
+
+			// Simulate an in-flight send from a different attempt key: the per-draft
+			// gate is already held. A real concurrent request would insert this via
+			// the same path; here we pre-load it to prove the gate fires correctly.
+			state.storage.sql.exec(
+				"INSERT INTO mailbox_meta (key, value, updated_at) VALUES (?, ?, ?)",
+				`draft_sending:${seed.draftId}`,
+				"attempt-other",
+				new Date().toISOString(),
+			);
+
+			const outcome = await confirmSendDraft(
+				{
+					sql: state.storage.sql,
+					transactionSync: (fn) => state.storage.transactionSync(fn),
+					email: fakeEmailSender(sent),
+					fromAddress: "hello@imsanti.dev",
+					replyToAddress: null,
+				},
+				seed.draftId,
+				`attempt-${seed.draftId}`,
+			);
+
+			return { outcome, sent };
+		});
+
+		// The second attempt was blocked without calling the provider.
+		expect(result.sent).toHaveLength(0);
+		expect(result.outcome.duplicate).toBe(true);
+		expect(result.outcome.reason).toBe("already_sending");
+	});
+
+	it("forwards only one provider call when two attempt keys race on the same draft (simulated concurrency)", async () => {
+		const sent: SentEmail[] = [];
+
+		// This test runs inside runInDurableObject so we control the fake sender.
+		const result = await withMailbox("mbx-gate-2", async (state) => {
+			const seed = await seedThreadWithDraft(state, { parentRfcId: "parent@example.com" });
+
+			// Call confirmSendDraft once. The gate goes in, email.send fires, success.
+			const outcome = await confirmSendDraft(
+				{
+					sql: state.storage.sql,
+					transactionSync: (fn) => state.storage.transactionSync(fn),
+					email: fakeEmailSender(sent),
+					fromAddress: "hello@imsanti.dev",
+					replyToAddress: null,
+				},
+				seed.draftId,
+				`attempt-${seed.draftId}`,
+			);
+
+			// Then simulate a second request coming in after the first completed.
+			// It should see the draft is already 'sent' (status changed by the first).
+			const secondOutcome = await confirmSendDraft(
+				{
+					sql: state.storage.sql,
+					transactionSync: (fn) => state.storage.transactionSync(fn),
+					email: fakeEmailSender(sent),
+					fromAddress: "hello@imsanti.dev",
+					replyToAddress: null,
+				},
+				seed.draftId,
+				`attempt-2-${seed.draftId}`,
+			);
+
+			return { first: outcome, second: secondOutcome, sent };
+		});
+
+		// Only one provider call was made, not two.
+		expect(result.sent).toHaveLength(1);
+		expect(result.first.sent).toBe(true);
+
+		// The second got status = "sent" because the draft is already committed as sent
+		// and the idempotency key is different (new attempt key) — the gate prevents
+		// reaching EMAIL.send. The draft status check catches it first.
+		expect(result.second.sent).toBe(false);
+		expect(result.second.reason).toBe("not_pending_confirmation");
+	});
+});

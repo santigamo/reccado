@@ -6,6 +6,7 @@ import { buildReferences, messageIdHeader, referencesHeader } from "../lib/email
 import { normalizeMessageId } from "../lib/email-metadata";
 import { normalizeSubject } from "../lib/mime";
 import { resolveSenderIdentity } from "../lib/sender-identity";
+import { AmbiguousSendError } from "../lib/errors";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
 import {
 	createRealtimeBroadcaster,
@@ -62,23 +63,72 @@ function extractProviderMessageId(result: unknown): string | null {
 	return typeof value === "string" ? value : null;
 }
 
+/**
+ * Classifies a provider error as ambiguous (the provider may have accepted the
+ * message before the error surfaced) vs. definitely-not-delivered (the provider
+ * explicitly rejected the message). Only known non-delivery signals return false;
+ * everything else — network timeout, DNS failure, unknown error code — is
+ * ambiguous and must NOT be auto-retried. The DO preserves the sent marker
+ * so the same idempotency key cannot retry; the D1 projection records it as
+ * "unknown" (not "failed") so human ops reconciliation is required.
+ */
+function isAmbiguousProviderError(error: unknown): boolean {
+	if (!(error instanceof Error)) return true;
+	const message = error.message.toLowerCase();
+	// Known non-delivery signals — the provider definitely did not accept the message.
+	if (
+		message.includes("permanent") ||
+		message.includes("rejected") ||
+		message.includes("invalid") ||
+		message.includes("not found") ||
+		message.includes("does not exist") ||
+		message.includes("address rejected") ||
+		message.includes("mailbox unavailable") ||
+		message.includes("user unknown") ||
+		message.includes("spam blocked") ||
+		message.includes("policy rejection")
+	) {
+		return false;
+	}
+	// Everything else — timeout, temporary failure, unknown error code — is ambiguous.
+	return true;
+}
+
 function sentMarkerValue(providerMessageId: string | null): string {
 	return JSON.stringify({ status: "sent", providerMessageId });
 }
 
+type SendMarkerStatus = "sending" | "sent" | "failed" | "unknown";
+
 function readSendMarker(value: unknown): {
-	status: "sending" | "sent";
+	status: SendMarkerStatus;
 	providerMessageId: string | null;
+	error?: string;
 } {
 	if (value === "sending") {
 		return { status: "sending", providerMessageId: null };
 	}
-	if (value === "sent") {
-		return { status: "sent", providerMessageId: null };
-	}
 	if (typeof value === "string") {
 		try {
-			const parsed = JSON.parse(value) as { status?: unknown; providerMessageId?: unknown };
+			const parsed = JSON.parse(value) as {
+				status?: unknown;
+				providerMessageId?: unknown;
+				error?: unknown;
+			};
+			if (parsed.status === "unknown") {
+				return {
+					status: "unknown",
+					providerMessageId: null,
+					error: typeof parsed.error === "string" ? parsed.error : undefined,
+				};
+			}
+			if (parsed.status === "failed") {
+				return {
+					status: "failed",
+					providerMessageId: null,
+					error: typeof parsed.error === "string" ? parsed.error : undefined,
+				};
+			}
 			if (parsed.status === "sent") {
 				return {
 					status: "sent",
@@ -90,6 +140,7 @@ function readSendMarker(value: unknown): {
 			// Fall through to treating any unknown persisted marker as a completed send.
 		}
 	}
+	// Legacy "sent" string value or unrecognised JSON — assume the send completed.
 	return { status: "sent", providerMessageId: null };
 }
 
@@ -392,13 +443,30 @@ export async function confirmSendDraft(
 	if (!draft) throw new Error("draft not found");
 
 	const sentMarker = ctx.sql
-		.exec<{ value: string }>(
-			"SELECT value FROM mailbox_meta WHERE key = ?",
-			`send:${idempotencyKey}`,
-		)
+		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", idempotencyKey)
 		.toArray()[0];
 	if (sentMarker) {
 		const marker = readSendMarker(sentMarker.value);
+		if (marker.status === "failed") {
+			return {
+				id: draftId,
+				status: "failed",
+				sent: false,
+				duplicate: true,
+				error: "ambiguous",
+				reason: marker.error ?? "ambiguous",
+			};
+		}
+		if (marker.status === "unknown") {
+			return {
+				id: draftId,
+				status: "unknown",
+				sent: false,
+				duplicate: true,
+				error: "ambiguous",
+				reason: marker.error ?? "unknown",
+			};
+		}
 		return {
 			id: draftId,
 			status: marker.status,
@@ -428,7 +496,7 @@ export async function confirmSendDraft(
 
 	const fromAddress = ctx.fromAddress;
 	const now = new Date().toISOString();
-	const sentKey = `send:${idempotencyKey}`;
+	const sentKey = idempotencyKey;
 	try {
 		ctx.sql.exec(
 			"INSERT INTO mailbox_meta (key, value, updated_at) VALUES (?, 'sending', ?)",
@@ -467,6 +535,31 @@ export async function confirmSendDraft(
 
 	let providerMessageId: string | null = null;
 	try {
+		// Atomic per-draft send gate: only one idempotency key per draft may
+		// proceed to EMAIL.send. A different attempt key targeting the same draft
+		// will fail this INSERT (PRIMARY KEY conflict on mailbox_meta) and return
+		// a duplicate response without calling the provider.
+		try {
+			ctx.sql.exec(
+				"INSERT INTO mailbox_meta (key, value, updated_at) VALUES (?, ?, ?)",
+				`draft_sending:${draftId}`,
+				idempotencyKey,
+				new Date().toISOString(),
+			);
+		} catch {
+			// Another attempt key already claimed the per-draft gate. Clean up our
+			// sentKey marker (left at 'sending') so the reconciliation sweep doesn't
+			// find a stale row.
+			ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", sentKey);
+			return {
+				id: draftId,
+				status: "sent",
+				sent: false,
+				duplicate: true,
+				reason: "already_sending",
+			};
+		}
+
 		const providerResult = await ctx.email.send({
 			from: fromAddress,
 			to,
@@ -480,7 +573,29 @@ export async function confirmSendDraft(
 		});
 		providerMessageId = extractProviderMessageId(providerResult);
 	} catch (error) {
+		// The provider threw but may have accepted the message. The per-draft
+		// gate stays in place so no other attempt key retries. Update the sent
+		// marker to "failed" (the caller's outbound-send.ts maps this to D1
+		// status "unknown", never "failed") — idempotent retries of the same
+		// key see "failed" and return "ambiguous", stopping automatic replay.
+		if (error instanceof AmbiguousSendError || isAmbiguousProviderError(error)) {
+			const errorMsg = error instanceof Error ? error.message : "send_failed";
+			ctx.sql.exec(
+				"UPDATE mailbox_meta SET value = ?, updated_at = ? WHERE key = ?",
+				JSON.stringify({ status: "unknown", error: errorMsg }),
+				new Date().toISOString(),
+				sentKey,
+			);
+			return {
+				id: draftId,
+				status: "failed",
+				sent: false,
+				error: "ambiguous",
+				reason: errorMsg,
+			};
+		}
 		ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", sentKey);
+		ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", `draft_sending:${draftId}`);
 		throw error;
 	}
 
@@ -518,6 +633,8 @@ export async function confirmSendDraft(
 			now,
 			draftId,
 		);
+		// Per-draft send gate cleanup: no longer needed once the send committed.
+		ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", `draft_sending:${draftId}`);
 		// Replying into an existing thread must not try to re-create its row: the
 		// draft carries the thread it belongs to, so this is an upsert that bumps
 		// the counters the thread list renders from.
@@ -774,7 +891,17 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				mailboxAddress?: string | null;
 			};
 			const result = await this.confirmSendDraft(draftId, body.idempotencyKey, body.mailboxAddress);
-			const status = "error" in result ? (result.error === "too_many_recipients" ? 400 : 500) : 200;
+			// Ambiguous provider outcomes are business-level, not transport-level errors.
+			// Return 200 so the caller's confirmDraftSend reaches the "ambiguous" branch
+			// and records D1 status as "unknown" (not "failed"). Any other "error" property
+			// (e.g. draft-not-found, too-many-recipients) remains an HTTP error.
+			const isAmbiguous = result.error === "ambiguous";
+			const status =
+				"error" in result && !isAmbiguous
+					? result.error === "too_many_recipients"
+						? 400
+						: 500
+					: 200;
 			return Response.json(result, { status });
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/cancel$/) && request.method === "POST") {

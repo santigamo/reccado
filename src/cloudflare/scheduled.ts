@@ -19,11 +19,14 @@ async function reconcileStaleOutboundSends(db: D1Database, scheduledTime: number
 
 	for (const send of staleSends) {
 		// We can't be certain whether the underlying provider send actually went out,
-		// so we don't claim "sent". Flip to the terminal "failed" state (unblocking any
-		// idempotency check waiting on this row) and leave a clear ops trail for review.
+		// so we don't claim "sent" or "failed". The outcome is potentially ambiguous
+		// (the provider may have accepted the message before the worker crashed), so
+		// we use "unknown" — the same status that confirmDraftSend writes when the DO
+		// returns an ambiguous provider error. This flags the row for human review
+		// without auto-retrying or falsely marking it as a definitive failure.
 		await updateOutboundSendStatus(db, {
 			idempotencyKey: send.idempotency_key,
-			status: "failed",
+			status: "unknown",
 			errorCode: "stale_sending_timeout_needs_review",
 		});
 		await insertOpsEvent(db, {

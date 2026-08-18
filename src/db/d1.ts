@@ -65,21 +65,22 @@ export type MessageIndexRow = {
 	updated_at: string;
 };
 
+function nowIso(): string {
+	return new Date().toISOString();
+}
+
 export type OutboundSendRow = {
 	id: string;
 	mailbox_id: string;
 	draft_id: string;
 	idempotency_key: string;
-	status: "pending_confirmation" | "sending" | "sent" | "failed" | "cancelled";
+	status: "pending_confirmation" | "sending" | "sent" | "failed" | "cancelled" | "unknown";
 	provider_message_id: string | null;
 	error_code: string | null;
+	approval_mode: "human_confirmed" | "telegram_confirmed" | "preauthorized_transactional";
 	created_at: string;
 	updated_at: string;
 };
-
-function nowIso(): string {
-	return new Date().toISOString();
-}
 
 export async function listMailboxes(db: D1Database): Promise<MailboxRow[]> {
 	const result = await db
@@ -451,17 +452,28 @@ export async function createOutboundSendIfMissing(
 		draft_id: string;
 		idempotency_key: string;
 		status: OutboundSendRow["status"];
+		approval_mode?: OutboundSendRow["approval_mode"];
 	},
-): Promise<void> {
+): Promise<boolean> {
 	const now = nowIso();
-	await db
+	const result = await db
 		.prepare(
 			`INSERT OR IGNORE INTO outbound_sends
-       (id, mailbox_id, draft_id, idempotency_key, status, provider_message_id, error_code, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+       (id, mailbox_id, draft_id, idempotency_key, status, provider_message_id, error_code, approval_mode, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
 		)
-		.bind(row.id, row.mailbox_id, row.draft_id, row.idempotency_key, row.status, now, now)
+		.bind(
+			row.id,
+			row.mailbox_id,
+			row.draft_id,
+			row.idempotency_key,
+			row.status,
+			row.approval_mode ?? "human_confirmed",
+			now,
+			now,
+		)
 		.run();
+	return (result.meta?.changes ?? 0) > 0;
 }
 
 export async function getOutboundSendByIdempotency(

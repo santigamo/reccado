@@ -2,6 +2,7 @@ import {
 	createOutboundSendIfMissing,
 	getMailbox,
 	getOutboundSendByIdempotency,
+	insertOpsEvent,
 	updateOutboundSendStatus,
 	upsertMessageIndex,
 } from "../db/d1";
@@ -39,13 +40,19 @@ type DoSendResult = {
 	rawR2Key?: string;
 	rawSha256?: string;
 	reason?: string;
+	error?: string;
 };
 
 export async function confirmDraftSend(
 	env: Env,
-	input: { mailboxId: string; draftId: string; attemptKey: string },
+	input: {
+		mailboxId: string;
+		draftId: string;
+		attemptKey: string;
+		approvalMode?: "human_confirmed" | "telegram_confirmed" | "preauthorized_transactional";
+	},
 ): Promise<ConfirmDraftSendResult> {
-	const { mailboxId, draftId, attemptKey } = input;
+	const { mailboxId, draftId, attemptKey, approvalMode } = input;
 	const mailbox = await getMailbox(env.INDEX_DB, mailboxId);
 	if (!mailbox) {
 		throw new AppError("Mailbox not found", "mailbox_not_found", 404);
@@ -67,12 +74,63 @@ export async function confirmDraftSend(
 		};
 	}
 
-	await createOutboundSendIfMissing(env.INDEX_DB, {
+	// Atomic D1 gate: INSERT OR IGNORE on the unique idempotency_key.
+	// Only the first caller to INSERT gets true and may proceed to the DO.
+	const created = await createOutboundSendIfMissing(env.INDEX_DB, {
 		id: crypto.randomUUID(),
 		mailbox_id: mailboxId,
 		draft_id: draftId,
 		idempotency_key: idempotencyKey,
 		status: "sending",
+		approval_mode: approvalMode ?? "human_confirmed",
+	});
+
+	if (!created) {
+		// Another caller already holds this idempotency key. Re-fetch to see current status.
+		const existingRow = await getOutboundSendByIdempotency(env.INDEX_DB, idempotencyKey);
+		if (existingRow) {
+			if (existingRow.status === "sent") {
+				return {
+					status: 200,
+					body: {
+						id: draftId,
+						status: "sent",
+						sent: false,
+						duplicate: true,
+						providerMessageId: existingRow.provider_message_id,
+					},
+				};
+			}
+			if (existingRow.status === "sending") {
+				// Another caller has the sending gate. Don't call the DO or overwrite D1.
+				return {
+					status: 200,
+					body: {
+						id: draftId,
+						status: "sending",
+						sent: false,
+						duplicate: true,
+						reason: "already_sending",
+					},
+				};
+			}
+			// For "failed"/"unknown" rows, the caller may retry — fall through to the DO.
+		}
+	}
+
+	// Record the approval provenance event for the D1 ops view.
+	await insertOpsEvent(env.INDEX_DB, {
+		id: crypto.randomUUID(),
+		event_type: "send.confirmed",
+		severity: "info",
+		subject: mailboxId,
+		payload_json: JSON.stringify({
+			draftId,
+			idempotencyKey,
+			approvalMode: approvalMode ?? "human_confirmed",
+		}),
+	}).catch(() => {
+		// Ops event failures must not block sending.
 	});
 
 	let response: Response;
@@ -83,7 +141,7 @@ export async function confirmDraftSend(
 			// The mailbox's own address travels with the request: the DO has no D1
 			// access, and it decides From/Reply-To from this value.
 			body: JSON.stringify({
-				idempotencyKey: attemptKey,
+				idempotencyKey,
 				mailboxAddress: mailbox.primary_address,
 			}),
 		});
@@ -138,6 +196,28 @@ export async function confirmDraftSend(
 			raw_r2_key: result.rawR2Key ?? `sent/${draftId}`, // gitleaks:allow (field name trips generic-api-key; no secret here)
 			raw_sha256: result.rawSha256 ?? idempotencyKey,
 			updated_at: new Date().toISOString(),
+		});
+	} else if (result.error === "ambiguous") {
+		// Ambiguous provider outcome — the provider may have accepted the message.
+		// Record D1 status as "unknown" (not "failed") so ops can reconcile
+		// manually. No automatic re-delivery. Skip the message index to avoid
+		// showing a phantom message row.
+		await updateOutboundSendStatus(env.INDEX_DB, {
+			idempotencyKey,
+			status: "unknown",
+			errorCode: result.reason ?? "ambiguous",
+		});
+		await insertOpsEvent(env.INDEX_DB, {
+			id: crypto.randomUUID(),
+			event_type: "send.ambiguous",
+			severity: "warning",
+			subject: mailboxId,
+			payload_json: JSON.stringify({
+				draftId,
+				idempotencyKey,
+				approvalMode: approvalMode ?? "human_confirmed",
+				reason: result.reason ?? null,
+			}),
 		});
 	} else if (result.duplicate) {
 		await updateOutboundSendStatus(env.INDEX_DB, {
