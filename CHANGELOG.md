@@ -11,6 +11,45 @@ package.
 
 Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox.
 
+### Added
+
+- **Telegram bridge (optional, off by default).** Inbound mail is pushed to a Telegram chat as a
+  preview card (sender, subject, snippet — never the full body, which would put 2FA codes into a
+  cloud chat), and replying to that card drafts an email reply. The reply still goes through the
+  existing draft → request-send → confirm-send flow, now surfaced as inline ✅/✖️ buttons, and
+  through the same send path as the web UI. Threading resolves via `reply_to_message`, or via one
+  forum topic per email thread when `TELEGRAM_TOPICS=1`. The webhook lives outside the `/api/*`
+  perimeter (Telegram can present neither an Access JWT nor an `Origin` header) and authenticates
+  with a constant-time secret-token check plus a Telegram user allowlist; the bridge refuses to
+  start half-configured. See the README for the Cloudflare Access bypass this requires.
+- `MAIL_SENDING_DOMAINS`: mailboxes on a domain verified in Cloudflare Email Sending now reply as
+  themselves instead of as the single global `MAIL_FROM_ADDRESS`.
+- `pnpm setup:telegram` registers the webhook with its secret token (dry-run by default).
+
+### Known limitations
+
+- Telegram replies go to the original sender only (no reply-all) and are sent from the mailbox's
+  primary address even when the mail arrived at an alias.
+- Attachments cannot be sent from Telegram.
+- `request-send` now refuses to move a `sent` or `cancelled` draft back to `pending_confirmation`,
+  so a retried Telegram update can no longer resurrect mail that already went out.
+
+### Fixed
+
+- **Outbound replies now thread.** `confirm-send` sent no `In-Reply-To`/`References`, so a reply
+  appeared as a loose message in the recipient's client; and it minted a fresh thread id per send,
+  so the reply also detached from its own conversation inside Reccado. Replies now reuse the
+  draft's thread, carry the RFC 5322 reply headers, and upsert the thread row instead of inserting
+  a duplicate.
+- Sent messages now store the `Message-ID` Cloudflare assigned (it is a platform-controlled
+  header — a caller-supplied one is rejected as restricted) in the mailbox and the D1 index.
+  Without it, the answer to a reply matched nothing in `resolveThreadId` and forked a new thread on
+  every round trip.
+- Outbound thread subjects are normalized with `normalizeSubject` rather than a raw `toLowerCase`,
+  so `Re:`-prefixed replies no longer defeat subject-based thread matching.
+- A reply sent from a mailbox on an unverified domain now sets `Reply-To` to the mailbox address,
+  so responses come back to the address the human wrote to.
+
 ### Security
 
 - Debug endpoints (`/api/debug/phase0/*`) now fail closed: they are unreachable unless

@@ -29,3 +29,20 @@ CLOUDFLARE_API_TOKEN=
 # Cloudflare Access validation settings (leave empty for local dev; see note above).
 ACCESS_JWT_AUDIENCE=
 ACCESS_TEAM_DOMAIN=
+
+# --- Telegram bridge (optional) --------------------------------------------
+# Deliberately NOT active keys in this file: they are deployed with
+# `wrangler secret put` / `[vars]`, and adding them here would change the
+# generated worker-configuration.d.ts that CI diffs. They are declared as
+# optional in src/env.d.ts. Leave the bot token unset to keep the bridge off.
+#
+#   TELEGRAM_BOT_TOKEN         from @BotFather; unset = bridge disabled
+#   TELEGRAM_WEBHOOK_SECRET    echoed in X-Telegram-Bot-Api-Secret-Token; required with the token
+#   TELEGRAM_ALLOWED_USER_IDS  comma-separated Telegram user ids; required with the token
+#   TELEGRAM_CHAT_ID           chat that receives new-mail cards (send /start to the bot to learn it)
+#   TELEGRAM_TOPICS            "1" for one forum topic per email thread; unset = plain messages
+#
+# --- Outbound sender identity (optional) ------------------------------------
+#   MAIL_SENDING_DOMAINS       comma-separated domains verified in Cloudflare Email Sending;
+#                              a mailbox on one of them sends as itself, otherwise the reply
+#                              goes out as MAIL_FROM_ADDRESS with Reply-To set

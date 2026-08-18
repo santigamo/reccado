@@ -92,6 +92,21 @@ export async function handleInboundQueue(
 					raw_r2_key: body.rawR2Key,
 					status: "processed",
 				});
+				// After the mail is durably indexed, never before: a push that fired on a
+				// message we then failed to store would be a notification for nothing.
+				// notifyInboundMail swallows its own errors so Telegram cannot make the
+				// queue retry an already-ingested message.
+				const { notifyInboundMail } = await import("../telegram/notify");
+				await notifyInboundMail(env, {
+					mailboxId: body.mailboxId,
+					mailboxAddress: body.recipient,
+					messageLocalId: result.messageLocalId,
+					threadId: result.threadId ?? result.messageLocalId,
+					subject: result.subject ?? body.headers.subject,
+					fromAddr: result.fromAddr ?? body.sender,
+					snippet: result.snippet ?? null,
+					hasAttachments: Boolean(result.hasAttachments),
+				});
 			} else if (result.status === "duplicate") {
 				await upsertIngestEvent(env.INDEX_DB, {
 					idempotency_key: body.idempotencyKey,

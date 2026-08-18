@@ -1,4 +1,5 @@
 import {
+	deleteExpiredTelegramActions,
 	insertOpsEvent,
 	listMailboxes,
 	listStaleSendingOutboundSends,
@@ -63,6 +64,9 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 		controller.scheduledTime,
 	);
 
+	// Expired Telegram confirm buttons: harmless but unbounded if never swept.
+	const expiredTelegramActions = await deleteExpiredTelegramActions(env.INDEX_DB);
+
 	await insertOpsEvent(env.INDEX_DB, {
 		id: crypto.randomUUID(),
 		event_type: "cron.backup_sweep",
@@ -73,6 +77,7 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 			scheduledTime: new Date(controller.scheduledTime).toISOString(),
 			mailboxCount: mailboxes.length,
 			reconciledSendCount,
+			expiredTelegramActions,
 		}),
 	});
 
@@ -81,5 +86,6 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 		scheduledTime: new Date(controller.scheduledTime).toISOString(),
 		mailboxCount: mailboxes.length,
 		reconciledSendCount,
+		expiredTelegramActions,
 	});
 }

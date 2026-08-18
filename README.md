@@ -33,6 +33,7 @@ account** — no third-party mail provider, no separate database to operate, no 
   - [1. Provision and deploy (pick one)](#1-provision-and-deploy-pick-one)
   - [2. Wire your domain](#2-wire-your-domain)
   - [3. Verify](#3-verify)
+- [Telegram bridge (optional)](#telegram-bridge-optional)
 - [Configuration](#configuration)
 - [Compatibility](#compatibility)
 - [Troubleshooting](#troubleshooting)
@@ -55,6 +56,9 @@ account** — no third-party mail provider, no separate database to operate, no 
   request-send → confirm-send flow with an idempotency key; nothing sends silently.
 - **Multi-domain routing** — store, forward or reject rules per domain/alias, with isolated
   mailboxes per address.
+- **Telegram bridge (optional)** — new mail arrives as a card in Telegram; replying there builds a
+  properly threaded email (`Re:`, `In-Reply-To`/`References`, quoted original) that still goes
+  through the same confirm-send button. See [Telegram bridge](#telegram-bridge-optional).
 - **Agent-ready (optional)** — an MCP layer is on the roadmap so agents can read, search and
   draft mail, gated by the same human-confirmation invariant as the UI (see
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
@@ -313,6 +317,70 @@ Email Sending and an example routing rule against the account. It exits early as
 D1 id (the repo ships a placeholder) — pass resource names/IDs by env var or CLI flag
 (`CF_VERIFY_D1_ID=<uuid>`, `--worker`, `--r2`, …); see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
+## Telegram bridge (optional)
+
+Off unless `TELEGRAM_BOT_TOKEN` is set. When on, each inbound message is pushed to a Telegram chat
+as a preview card, and replying to that card drafts an email reply.
+
+**Sender, subject and snippet — not the body.** Telegram cloud chats are not end-to-end encrypted,
+and mail routinely carries password resets and 2FA codes. Reading the full message stays an
+explicit act in Reccado.
+
+**Replies keep the human-confirm invariant.** A Telegram reply creates a draft and shows a preview
+with ✅ Enviar / ✖️ Descartar. Nothing leaves the mailbox until the button is pressed, and the send
+runs through the same path as the web UI (`src/lib/outbound-send.ts`), so the D1 ledger and the
+message index stay consistent regardless of which surface confirmed.
+
+**How a reply finds its thread.** Two mechanisms, in order:
+
+1. `reply_to_message` — quote the notification card. Works in any chat, and is the default.
+2. `message_thread_id` — with `TELEGRAM_TOPICS=1` the bot creates one forum topic per email thread
+   and everything in that topic belongs to that conversation. Topics in a private chat with a bot
+   need a recent Bot API (9.3/9.4) and topic mode enabled for the bot, so this is opt-in: if
+   `createForumTopic` fails, Reccado logs a `telegram.topic_unavailable` ops event and falls back
+   to plain messages.
+
+### Setup
+
+```bash
+# 0. apply the D1 migration FIRST — the bridge writes to telegram_links on every
+#    inbound message, and a missing table silently loses every notification
+pnpm d1:migrate:dev     # or d1:migrate:prod
+
+# 1. create a bot with @BotFather, then generate a webhook secret
+openssl rand -hex 32
+
+# 2. set the secrets on the worker
+wrangler secret put TELEGRAM_BOT_TOKEN --env dev
+wrangler secret put TELEGRAM_WEBHOOK_SECRET --env dev
+
+# 3. register the webhook (dry run first)
+pnpm setup:telegram --url https://<your-worker-origin>
+pnpm setup:telegram --url https://<your-worker-origin> --apply
+
+# 4. send /start to the bot — it replies with your chat_id and user_id
+#    set them as TELEGRAM_CHAT_ID and TELEGRAM_ALLOWED_USER_IDS
+```
+
+**If the worker is behind Cloudflare Access, add a Bypass policy for `/telegram/webhook`.**
+Telegram cannot present an Access JWT, so every update would be redirected to the login page. The
+route authenticates itself instead: the `X-Telegram-Bot-Api-Secret-Token` header (compared in
+constant time) plus a Telegram user allowlist. Reccado refuses to start the bridge with a bot token
+but no secret or no allowlist, rather than expose an unauthenticated send-mail endpoint.
+
+### Limits worth knowing
+
+| Limit | Consequence |
+| --- | --- |
+| 4096 characters per message | Long mail is truncated to a preview; open Reccado for the rest. |
+| Bots download ≤20 MB from Telegram | Attaching large files from the phone is not possible (attachments from Telegram are not supported yet — Reccado replies with a note). |
+| ~1 message/second per chat | A burst of newsletters is rate-limited by Telegram, not by Reccado. |
+| 48 hours to edit a message | An untouched confirm card older than that can no longer be updated in place; the button itself expires after 24 h. |
+| Telegram HTML is a small subset | Formatting in a reply (bold, italic, links, code) is converted to minimal email HTML; anything without an email equivalent goes through as plain text. |
+| Reply-to-sender only | A Telegram reply goes to the original sender; CC recipients are dropped. Reply-all lives in the web UI. |
+| Replies come from the mailbox's primary address | Mail that arrived at an alias (`support@`) is answered from the mailbox's primary address (`hello@`). Alias-accurate `From` is not implemented yet. |
+| Text only | Attachments cannot be sent from Telegram (the bot answers with a note); inbound attachments are flagged in the card but stay in Reccado. |
+
 ## Configuration
 
 ### Secrets and vars
@@ -326,6 +394,12 @@ D1 id (the repo ships a placeholder) — pass resource names/IDs by env var or C
 | `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, DNS edit for setup:sending's SPF/DMARC/DKIM/MX records, Email Routing write for catch-all API setup, Access app/policy write for future in-app provisioning). Also enables setup:domain's up-front custom-domain conflict check via the Workers Custom Domains API. | Optional |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates the `/api/debug/phase0/*` introspection endpoints (R2 head, DO schema/state dumps, local email simulation in deployed environments). These endpoints are unreachable unless this token is set, and every request must present it. | Optional (leave unset to disable debug endpoints entirely) |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender address. Must be a verified sender on a domain onboarded to Cloudflare Email Sending. | **Required** |
+| `MAIL_SENDING_DOMAINS` | var | Comma-separated domains verified in Cloudflare Email Sending. A mailbox whose domain is listed replies as itself; anything else goes out as `MAIL_FROM_ADDRESS` with `Reply-To` set to the mailbox. | Optional (recommended once your domain is verified) |
+| `TELEGRAM_BOT_TOKEN` | secret | Bot token from @BotFather. Unset = the Telegram bridge is off entirely and `/telegram/webhook` answers 404. | Optional |
+| `TELEGRAM_WEBHOOK_SECRET` | secret | Shared secret Telegram echoes in `X-Telegram-Bot-Api-Secret-Token`; this is what authenticates the webhook. | **Required** when `TELEGRAM_BOT_TOKEN` is set |
+| `TELEGRAM_ALLOWED_USER_IDS` | var | Comma-separated Telegram user IDs allowed to drive the bot. | **Required** when `TELEGRAM_BOT_TOKEN` is set |
+| `TELEGRAM_CHAT_ID` | var | Chat that receives new-mail cards, and the only chat the bot acts on. | Optional (no notifications without it) |
+| `TELEGRAM_TOPICS` | var | `"1"` creates one forum topic per email thread. Unset = plain messages with reply-based threading. | Optional |
 
 ### Bindings (`wrangler.jsonc`)
 

@@ -22,11 +22,7 @@ import {
 	isAbortTimeoutError,
 	isLocalRequest,
 } from "../lib/runtime-config";
-import {
-	assertMailboxAccess,
-	type getAuthContext,
-	requireAuth,
-} from "./auth";
+import { assertMailboxAccess, type getAuthContext, requireAuth } from "./auth";
 import { registerAdminRoutes, registerMailboxRoutes } from "./mailbox-routes";
 import {
 	createAliasSchema,
@@ -177,6 +173,15 @@ export function createApiApp(): Hono<ApiBindings> {
 			}
 		}
 		return next();
+	});
+
+	// Telegram webhook. Deliberately outside /api/* — see handleTelegramWebhook for
+	// why it cannot use Access or the Origin guard, and what authenticates it instead.
+	// Registered for every method (not just POST) so the handler itself decides —
+	// it answers 404 when the bridge is off, which must win over a router 405.
+	api.all("/telegram/webhook", async (c) => {
+		const { handleTelegramWebhook } = await import("../telegram/webhook");
+		return handleTelegramWebhook(c.req.raw, c.env);
 	});
 
 	api.get("/api/health", async (c) => {

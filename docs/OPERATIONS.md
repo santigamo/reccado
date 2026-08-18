@@ -32,6 +32,12 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 | `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, Email Routing write, Access app/policy write). | Optional |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates `/api/debug/phase0/*` introspection endpoints. Unset = endpoints unreachable. | Optional |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender; must be verified on a domain onboarded to Email Sending. | **Required** |
+| `MAIL_SENDING_DOMAINS` | var | Comma-separated domains verified in Email Sending. A mailbox on a listed domain replies as itself; otherwise the reply goes out as `MAIL_FROM_ADDRESS` with `Reply-To` set to the mailbox. | Optional |
+| `TELEGRAM_BOT_TOKEN` | secret | Enables the Telegram bridge. Unset = `/telegram/webhook` answers 404 and no notifications are sent. | Optional |
+| `TELEGRAM_WEBHOOK_SECRET` | secret | Authenticates the webhook via `X-Telegram-Bot-Api-Secret-Token`, compared in constant time. The bridge refuses to start without it. | **Required** with the bot token |
+| `TELEGRAM_ALLOWED_USER_IDS` | var | Comma-separated Telegram user IDs allowed to drive the bot. The bridge refuses to start without it. | **Required** with the bot token |
+| `TELEGRAM_CHAT_ID` | var | Chat receiving new-mail cards, and the only chat the bot accepts commands from. | Optional |
+| `TELEGRAM_TOPICS` | var | `"1"` creates a forum topic per email thread; unset uses plain messages with reply-based threading. | Optional |
 
 ### Bindings (`wrangler.jsonc`)
 
@@ -235,6 +241,9 @@ all related R2 prefixes.
 | Outbound send failure | Provider rejection, size/recipient-limit violation, or crash mid-send | Inspect `outbound_sends.status`, `error_code`, and provider response context. Retry only after deciding whether the same idempotency key still represents the same logical send. |
 | `outbound_sends` row stuck at `status='sending'` | Crash/interruption mid-send | The hourly cron sweep marks stale sends `failed` with `error_code='stale_sending_timeout_needs_review'`. Treat that as manual-review-required, not proof the message did or did not send. |
 | Access misconfiguration | Route exposed without proper Access enforcement | Treat as a security incident. Block public access first, then fix Access and re-verify with an unauthenticated request. |
+| Telegram webhook receives nothing | Cloudflare Access is intercepting `/telegram/webhook` | Telegram cannot present an Access JWT, so updates are redirected to the login page. Add an Access **Bypass** policy for that path only. Confirm with `getWebhookInfo` — `last_error_message` shows what Telegram received. |
+| `telegram.topic_unavailable` in `ops_events` | `createForumTopic` failed for this chat | Expected when topic mode is not enabled for the bot in that chat. The bridge already fell back to plain messages; replies still work by quoting the notification. Set `TELEGRAM_TOPICS` unset to stop retrying. |
+| `telegram.notify_failed` in `ops_events` | Telegram API error or rate limit while pushing a card | The mail is already ingested and safe — only the notification was lost. Telegram allows roughly one message per second per chat; a burst of mail is the usual cause. |
 | Need to rotate a secret | Routine hygiene or suspected leak | Rotate ordinary secrets with `wrangler secret put`. Do not rotate `MAILBOX_ID_SECRET` without a mailbox-ID migration plan. |
 | Local large-MIME smoke fails around 1 MiB | Local Email Routing tooling limit | Expected local behavior; use a smaller fixture for local smoke and do not infer a production 25 MiB failure from it. |
 

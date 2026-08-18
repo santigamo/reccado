@@ -123,7 +123,11 @@ export default {
 			const { handleLocalEmailSimulation } = await import("./cloudflare/local-email");
 			return handleLocalEmailSimulation(request, env, ctx);
 		}
-		if (url.pathname.startsWith("/api/") || url.pathname === "/mcp") {
+		if (
+			url.pathname.startsWith("/api/") ||
+			url.pathname === "/mcp" ||
+			url.pathname === "/telegram/webhook"
+		) {
 			return api.fetch(request, env, ctx);
 		}
 		const startHandler = (await import("@tanstack/react-start/server-entry")).default;

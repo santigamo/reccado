@@ -107,7 +107,9 @@ export async function getMailboxForOwner(
 	ownerEmail: string,
 ): Promise<MailboxRow | null> {
 	return db
-		.prepare("SELECT * FROM mailboxes WHERE mailbox_id = ? AND owner_email = ? AND status = 'active'")
+		.prepare(
+			"SELECT * FROM mailboxes WHERE mailbox_id = ? AND owner_email = ? AND status = 'active'",
+		)
 		.bind(mailboxId, ownerEmail.trim().toLowerCase())
 		.first<MailboxRow>();
 }
@@ -547,4 +549,137 @@ export async function getSetupStatus(db: D1Database): Promise<SetupStatus> {
 		),
 	]);
 	return { domains, mailboxes, aliases, routingRules, canReceive: receivable > 0 };
+}
+
+// --- Telegram bridge -------------------------------------------------------
+
+export type TelegramLinkRow = {
+	chat_id: string;
+	message_id: number;
+	mailbox_id: string;
+	thread_id: string;
+	message_local_id: string;
+	topic_id: number | null;
+	created_at: string;
+};
+
+export type TelegramActionRow = {
+	token: string;
+	kind: "confirm_send";
+	mailbox_id: string;
+	draft_id: string;
+	telegram_user_id: string;
+	created_at: string;
+	expires_at: string;
+};
+
+export async function insertTelegramLink(
+	db: D1Database,
+	row: Omit<TelegramLinkRow, "created_at">,
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT OR REPLACE INTO telegram_links
+       (chat_id, message_id, mailbox_id, thread_id, message_local_id, topic_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			row.chat_id,
+			row.message_id,
+			row.mailbox_id,
+			row.thread_id,
+			row.message_local_id,
+			row.topic_id,
+			nowIso(),
+		)
+		.run();
+}
+
+/** The thread a Telegram reply refers to, found via the message it quoted. */
+export async function getTelegramLinkByMessage(
+	db: D1Database,
+	chatId: string,
+	messageId: number,
+): Promise<TelegramLinkRow | null> {
+	return db
+		.prepare("SELECT * FROM telegram_links WHERE chat_id = ? AND message_id = ?")
+		.bind(chatId, messageId)
+		.first<TelegramLinkRow>();
+}
+
+/** The thread a Telegram topic belongs to — the newest link posted into that topic. */
+export async function getTelegramLinkByTopic(
+	db: D1Database,
+	chatId: string,
+	topicId: number,
+): Promise<TelegramLinkRow | null> {
+	return db
+		.prepare(
+			`SELECT * FROM telegram_links WHERE chat_id = ? AND topic_id = ?
+       ORDER BY created_at DESC LIMIT 1`,
+		)
+		.bind(chatId, topicId)
+		.first<TelegramLinkRow>();
+}
+
+/** An existing topic for this email thread, so a follow-up lands in the same place. */
+export async function getTelegramTopicForThread(
+	db: D1Database,
+	mailboxId: string,
+	threadId: string,
+): Promise<number | null> {
+	const row = await db
+		.prepare(
+			`SELECT topic_id FROM telegram_links
+       WHERE mailbox_id = ? AND thread_id = ? AND topic_id IS NOT NULL
+       ORDER BY created_at DESC LIMIT 1`,
+		)
+		.bind(mailboxId, threadId)
+		.first<{ topic_id: number }>();
+	return row?.topic_id ?? null;
+}
+
+export async function insertTelegramAction(
+	db: D1Database,
+	row: Omit<TelegramActionRow, "created_at">,
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO telegram_actions
+       (token, kind, mailbox_id, draft_id, telegram_user_id, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			row.token,
+			row.kind,
+			row.mailbox_id,
+			row.draft_id,
+			row.telegram_user_id,
+			nowIso(),
+			row.expires_at,
+		)
+		.run();
+}
+
+export async function getTelegramAction(
+	db: D1Database,
+	token: string,
+): Promise<TelegramActionRow | null> {
+	return db
+		.prepare("SELECT * FROM telegram_actions WHERE token = ?")
+		.bind(token)
+		.first<TelegramActionRow>();
+}
+
+export async function deleteTelegramAction(db: D1Database, token: string): Promise<void> {
+	await db.prepare("DELETE FROM telegram_actions WHERE token = ?").bind(token).run();
+}
+
+/** Housekeeping for the cron sweep: expired buttons are dead weight. */
+export async function deleteExpiredTelegramActions(db: D1Database): Promise<number> {
+	const result = await db
+		.prepare("DELETE FROM telegram_actions WHERE expires_at < ?")
+		.bind(nowIso())
+		.run();
+	return result.meta?.changes ?? 0;
 }

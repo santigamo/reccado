@@ -1,17 +1,14 @@
 import type { Hono } from "hono";
 import {
-	createOutboundSendIfMissing,
 	deleteMessageIndexForMailbox,
 	getMailbox,
-	getOutboundSendByIdempotency,
 	insertOpsEvent,
 	listIngestFailures,
 	listOpsEvents,
-	updateOutboundSendStatus,
 	upsertMessageIndex,
 } from "../db/d1";
 import { AppError } from "../lib/errors";
-import { outboundSendIdempotencyKey } from "../lib/idempotency";
+import { confirmDraftSend } from "../lib/outbound-send";
 import { backupManifestR2Key } from "../lib/r2-keys";
 import { assertMailboxAccess } from "./auth";
 import type { ApiBindings } from "./hono";
@@ -130,7 +127,9 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await mailboxStub(c.env, mailboxId);
-		const upstream = await stub.fetch(`https://mailbox-do/messages/${c.req.param("messageId")}/html`);
+		const upstream = await stub.fetch(
+			`https://mailbox-do/messages/${c.req.param("messageId")}/html`,
+		);
 		if (!upstream.ok) return c.json({ error: "html_not_found" }, 404);
 		const html = injectBaseTarget(await upstream.text());
 		return new Response(html, {
@@ -269,106 +268,12 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		assertMailboxAccess(auth, mailboxId, c.env);
 		const draftId = c.req.param("draftId");
 		const body = confirmSendSchema.parse(await c.req.json());
-		const stub = await mailboxStub(c.env, mailboxId);
-		const outboundIdempotencyKey = outboundSendIdempotencyKey(draftId, body.idempotencyKey);
-		const existingSend = await getOutboundSendByIdempotency(c.env.INDEX_DB, outboundIdempotencyKey);
-		if (existingSend?.status === "sent") {
-			return c.json({
-				id: draftId,
-				status: "sent",
-				sent: false,
-				duplicate: true,
-				providerMessageId: existingSend.provider_message_id,
-			});
-		}
-		await createOutboundSendIfMissing(c.env.INDEX_DB, {
-			id: crypto.randomUUID(),
-			mailbox_id: mailboxId,
-			draft_id: draftId,
-			idempotency_key: outboundIdempotencyKey,
-			status: "sending",
+		const { status, body: result } = await confirmDraftSend(c.env, {
+			mailboxId,
+			draftId,
+			attemptKey: body.idempotencyKey,
 		});
-		let response: Response;
-		try {
-			response = await stub.fetch(`https://mailbox-do/drafts/${draftId}/confirm-send`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify(body),
-			});
-		} catch (error) {
-			await updateOutboundSendStatus(c.env.INDEX_DB, {
-				idempotencyKey: outboundIdempotencyKey,
-				status: "failed",
-				errorCode: error instanceof Error ? error.message.slice(0, 120) : "send_failed",
-			});
-			throw error;
-		}
-		if (response.ok) {
-			const result = (await response.json()) as {
-				sent?: boolean;
-				status?: string;
-				messageLocalId?: string;
-				threadId?: string;
-				duplicate?: boolean;
-				providerMessageId?: string | null;
-				subject?: string | null;
-				fromAddr?: string;
-				toJson?: string;
-				snippet?: string | null;
-				receivedAt?: string;
-				rawR2Key?: string;
-				rawSha256?: string;
-				reason?: string;
-			};
-			if (result.sent && result.messageLocalId) {
-				await updateOutboundSendStatus(c.env.INDEX_DB, {
-					idempotencyKey: outboundIdempotencyKey,
-					status: "sent",
-					providerMessageId: result.providerMessageId ?? outboundIdempotencyKey,
-					errorCode: null,
-				});
-				await upsertMessageIndex(c.env.INDEX_DB, {
-					mailbox_id: mailboxId,
-					message_local_id: result.messageLocalId,
-					thread_id: result.threadId ?? result.messageLocalId,
-					rfc_message_id: null,
-					subject: result.subject ?? null,
-					from_addr: result.fromAddr ?? "noreply@mail.example.com",
-					to_json: result.toJson ?? "[]",
-					snippet: result.snippet ?? null,
-					received_at: result.receivedAt ?? new Date().toISOString(),
-					has_attachments: 0,
-					labels_json: "[]",
-					state: "sent",
-					raw_r2_key: result.rawR2Key ?? `sent/${draftId}`, // gitleaks:allow (field name trips generic-api-key; no secret here)
-					raw_sha256: result.rawSha256 ?? outboundIdempotencyKey,
-					updated_at: new Date().toISOString(),
-				});
-			} else if (result.duplicate) {
-				await updateOutboundSendStatus(c.env.INDEX_DB, {
-					idempotencyKey: outboundIdempotencyKey,
-					status: result.status === "sending" ? "sending" : "sent",
-					providerMessageId:
-						result.status === "sending"
-							? null
-							: (result.providerMessageId ?? outboundIdempotencyKey),
-					errorCode: null,
-				});
-			} else {
-				await updateOutboundSendStatus(c.env.INDEX_DB, {
-					idempotencyKey: outboundIdempotencyKey,
-					status: "failed",
-					errorCode: result.reason ?? "not_sent",
-				});
-			}
-			return Response.json(result, { status: response.status });
-		}
-		await updateOutboundSendStatus(c.env.INDEX_DB, {
-			idempotencyKey: outboundIdempotencyKey,
-			status: "failed",
-			errorCode: `http_${response.status}`,
-		});
-		return response;
+		return Response.json(result, { status });
 	});
 
 	api.post("/api/mailboxes/:mailboxId/drafts/:draftId/cancel", async (c) => {
