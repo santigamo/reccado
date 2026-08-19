@@ -2,8 +2,10 @@
 
 ## Status
 
-- Status: Tier A architecture is implemented in this repository; Tier B remains roadmap-only.
-- Date: 2026-07-01.
+- Status: Tier A architecture plus a minimal MCP endpoint (read/search/draft, no send) and the
+  transactional API MVP are implemented in this repository; the rest of Tier B (EmailAgent,
+  Vectorize/RAG, AI Gateway, long Workflow sagas) remains roadmap-only.
+- Date: 2026-08-19 (updated from 2026-07-01 for the MCP endpoint and transactional API MVP).
 - Source of truth: this repository's current docs and code (`README.md`, `docs/OPERATIONS.md`,
   `SECURITY.md`, `src/*`). Historical validation evidence lives in
   `docs/validation/PHASE0_VALIDATION.md` and `docs/validation/PHASE1_VALIDATION.md`.
@@ -25,9 +27,14 @@ Current repo status:
 - Tier A is the implemented product surface today: inbound Email Routing, mailbox Durable Objects,
   R2 raw storage, Queue ingest, D1 cross-mailbox index, realtime UI, and human-confirmed outbound
   send.
-- Tier B capabilities named in this document (`McpAgent`, MCP endpoint, Vectorize/RAG, AI Gateway
-  model path, long Workflow sagas) are architectural roadmap items, not shipped features in the
-  current repo.
+- A minimal MCP endpoint (`/mcp`, Access + `ACCESS_ALLOWED_EMAILS`) ships read/search/draft tools
+  with no send capability; see `src/mcp/*`.
+- A transactional REST API MVP (`/v1/.../transactional/...`) ships scoped, mailbox-bound API keys
+  for operator-authorized programmatic sends; see `docs/plans/transactional-api.md`,
+  `src/do/transactional-*`, and `docs/OPERATIONS.md`.
+- Tier B capabilities named in this document (`McpAgent`, Vectorize/RAG, AI Gateway model path,
+  long Workflow sagas, EmailAgent drafting) are architectural roadmap items, not shipped features
+  in the current repo.
 
 ## Non-Goals
 
@@ -148,7 +155,8 @@ flowchart LR
 
 ## Outbound Email Flow
 
-1. A user or authorized MCP/agent action creates a draft.
+1. A user or authorized MCP/agent action creates a draft (the shipped MCP endpoint exposes only
+   `draft_reply` — it has no send/cancel tool).
 2. The mailbox Durable Object stores the draft and approval state.
 3. Agent-created drafts require explicit human approval before sending.
 4. On approval, the Durable Object records an outbox attempt with an idempotency key.
@@ -176,6 +184,10 @@ provider returned.
 - Cloudflare API tokens for domain provisioning are narrow and environment-scoped.
 - Secrets live in Cloudflare bindings or deployment secrets, not source files.
 - Audit logs cover identity, mailbox mutations, outbound approvals, MCP calls, and agent drafts.
+- The transactional API is an explicit human-created pre-authorization: an operator-issued,
+  mailbox-bound API key sends template-based mail without a per-message confirm, while the
+  UI/Telegram/MCP paths keep the human-confirm gate. See `SECURITY.md` and
+  `docs/plans/transactional-api.md`.
 
 ## Why Not D1 as Trunk
 

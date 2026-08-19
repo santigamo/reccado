@@ -109,6 +109,42 @@ api.get("/api/mailboxes/:mailboxId/ws", async (c) => {
 	);
 });
 
+// --- Transactional API: template management (Access-protected, under /api/*) ---
+
+api.post("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
+	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
+	const auth = await requireAuth(c.req.raw, c.env);
+	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
+	const mailboxId = c.req.param("mailboxId");
+	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	return stub.fetch("https://mailbox-do/transactional/templates", {
+		method: "POST",
+		body: JSON.stringify(await c.req.json()),
+		headers: { "content-type": "application/json" },
+	});
+});
+
+api.get("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
+	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
+	const auth = await requireAuth(c.req.raw, c.env);
+	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
+	const mailboxId = c.req.param("mailboxId");
+	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	return stub.fetch("https://mailbox-do/transactional/templates");
+});
+
+api.post("/api/mailboxes/:mailboxId/transactional/templates/:templateId/archive", async (c) => {
+	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
+	const auth = await requireAuth(c.req.raw, c.env);
+	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
+	const mailboxId = c.req.param("mailboxId");
+	const templateId = c.req.param("templateId");
+	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	return stub.fetch(`https://mailbox-do/transactional/templates/${templateId}/archive`, {
+		method: "POST",
+	});
+});
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
@@ -130,6 +166,86 @@ export default {
 		) {
 			return api.fetch(request, env, ctx);
 		}
+		// --- Transactional API: external endpoint (outside /api/*, bypasses Access) ---
+		// Auth is handled by the API key in the DO, not Cloudflare Access.
+		// POST /v1/mailboxes/:mailboxId/transactional/messages
+		// GET  /v1/mailboxes/:mailboxId/transactional/messages/:requestId
+		// JSON only, Cache-Control: no-store, body limit, no CORS, no query key.
+		if (url.pathname.startsWith("/v1/")) {
+			const transactionalMatch = url.pathname.match(
+				/^\/v1\/mailboxes\/([^/]+)\/transactional\/messages(\/([^/]+))?$/,
+			);
+			if (!transactionalMatch) {
+				return new Response("Not found", { status: 404 });
+			}
+
+			// Content-Type must be JSON for POST
+			if (
+				request.method === "POST" &&
+				!request.headers.get("content-type")?.startsWith("application/json")
+			) {
+				return new Response("Content-Type must be application/json", { status: 415 });
+			}
+
+			const mailboxId = transactionalMatch[1];
+			if (!mailboxId) return new Response("Bad request", { status: 400 });
+			const requestId = transactionalMatch[3];
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+
+			if (request.method === "POST" && !requestId) {
+				// Body size limit (100KB), including requests without Content-Length.
+				const contentLength = request.headers.get("content-length");
+				if (contentLength && parseInt(contentLength, 10) > 100_000) {
+					return new Response("Request too large", { status: 413 });
+				}
+				const body = await request.arrayBuffer();
+				if (body.byteLength > 100_000) {
+					return new Response("Request too large", { status: 413 });
+				}
+
+				// Send — forward with auth headers intact
+				const headers: Record<string, string> = {
+					Authorization: request.headers.get("Authorization") ?? "",
+					"Idempotency-Key": request.headers.get("Idempotency-Key") ?? "",
+					"content-type": "application/json",
+				};
+				// No Cache-Control for POST
+				const doResponse = await stub.fetch("https://mailbox-do/transactional/send", {
+					method: "POST",
+					headers,
+					body,
+				});
+
+				// Add no-store to response
+				const doBody = await doResponse.text();
+				return new Response(doBody, {
+					status: doResponse.status,
+					headers: { "Cache-Control": "no-store" },
+				});
+			}
+
+			if (request.method === "GET" && requestId) {
+				// Status — forward with auth headers intact
+				const doResponse = await stub.fetch(
+					`https://mailbox-do/transactional/requests/${requestId}`,
+					{
+						method: "GET",
+						headers: {
+							Authorization: request.headers.get("Authorization") ?? "",
+						},
+					},
+				);
+
+				const doBody = await doResponse.text();
+				return new Response(doBody, {
+					status: doResponse.status,
+					headers: { "Cache-Control": "no-store" },
+				});
+			}
+
+			return new Response("Method not allowed", { status: 405 });
+		}
+
 		const startHandler = (await import("@tanstack/react-start/server-entry")).default;
 		return startHandler.fetch(request);
 	},

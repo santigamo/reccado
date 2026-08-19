@@ -51,6 +51,7 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 	const date = new Date(controller.scheduledTime).toISOString().slice(0, 10);
 	const mailboxes = await listMailboxes(env.INDEX_DB);
 
+	let reconciledTransactional = 0;
 	for (const mailbox of mailboxes) {
 		const stub = env.MAILBOX_DO.getByName(mailbox.mailbox_id);
 		const exportResponse = await stub.fetch("https://mailbox-do/export-index");
@@ -60,6 +61,22 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 		await env.MAIL_OBJECTS.put(key, exported, {
 			httpMetadata: { contentType: "application/json" },
 		});
+
+		// Best-effort reconcile stale transactional requests per mailbox DO.
+		// This is fire-and-forget; a single mailbox failure must not block the
+		// rest of the sweep.
+		try {
+			const reconcileResponse = await stub.fetch(
+				"https://mailbox-do/transactional/reconcile-stale",
+				{ method: "POST" },
+			);
+			if (reconcileResponse.ok) {
+				const reconcileResult = (await reconcileResponse.json()) as { reconciled: number };
+				reconciledTransactional += reconcileResult.reconciled;
+			}
+		} catch {
+			// Best-effort — swallow per-mailbox errors.
+		}
 	}
 
 	const reconciledSendCount = await reconcileStaleOutboundSends(
@@ -80,6 +97,7 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 			scheduledTime: new Date(controller.scheduledTime).toISOString(),
 			mailboxCount: mailboxes.length,
 			reconciledSendCount,
+			reconciledTransactional,
 			expiredTelegramActions,
 		}),
 	});
@@ -89,6 +107,7 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 		scheduledTime: new Date(controller.scheduledTime).toISOString(),
 		mailboxCount: mailboxes.length,
 		reconciledSendCount,
+		reconciledTransactional,
 		expiredTelegramActions,
 	});
 }

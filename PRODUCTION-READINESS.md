@@ -3,42 +3,51 @@
 Profile: `app/service`
 Modifiers: `[agent-developed, agent-facing, stateful, integration-heavy, privacy-sensitive, regulated, product-ui]`
 Production claim: self-hostable Cloudflare Tier A inbox for a single operator, running on Workers,
-Durable Objects, R2, D1, Queues, Email Routing, Email Sending, Cron, and Cloudflare Access.
-Audited: 2026-07-01
+Durable Objects, R2, D1, Queues, Email Routing, Email Sending, Cron, and Cloudflare Access, plus a
+read/search/draft MCP endpoint and a Phase-2-MVP transactional REST API for programmatic outbound
+mail behind scoped API keys.
+Audited: 2026-08-19 (updated from 2026-07-01 to reflect the transactional API MVP and MCP endpoint)
 Verdict: `READY-WITH-CAVEATS`
 
 This audit is intentionally narrow about what is in scope today:
 
-- In scope production claim: the shipped Tier A inbox described in `README.md`,
-  `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, and `SECURITY.md`.
-- Out of scope from the claim: Tier B roadmap items such as MCP endpoint, agent tools, RAG,
-  Vectorize, Workers AI, AI Gateway, and Workflow-based long sagas. Those surfaces are mentioned
-  in docs as roadmap only and are not implemented product contracts today.
+- In scope production claim: the shipped Tier A inbox plus the MCP read/search/draft endpoint and
+  the transactional API MVP described in `README.md`, `docs/ARCHITECTURE.md`,
+  `docs/OPERATIONS.md`, and `SECURITY.md`.
+- Out of scope from the claim: Tier B roadmap items such as Workflows-based sagas, EmailAgent
+  drafting, RAG/Vectorize, Workers AI, AI Gateway, and long Workflow sagas. Those surfaces are
+  mentioned in docs as roadmap only and are not implemented product contracts today.
 - Primary consumers today: a human operator self-hosting their own mailbox system behind
-  Cloudflare Access. Agent maintainers are also consumers of the repo because the codebase is
-  explicitly `agent-developed`.
+  Cloudflare Access, MCP clients granted through the explicit `ACCESS_ALLOWED_EMAILS` allowlist,
+  and external applications calling the transactional API with an operator-issued API key. Agent
+  maintainers are also consumers of the repo because the codebase is explicitly `agent-developed`.
 
 ## Surface audited
 
 - Web UI and Hono API served from the Worker (`src/server.ts`, `src/api/*`).
 - Inbound path: Email Routing -> R2 -> Queue -> mailbox Durable Object -> D1 summary index.
-- Outbound path: draft -> `request-send` -> `confirm-send` -> Email Sending binding.
+- Outbound path: draft -> `request-send` -> `confirm-send` -> Email Sending binding (UI/Telegram/MCP).
+- Transactional path: `/v1/.../transactional/messages` (Bearer key + `Idempotency-Key`) ->
+  mailbox Durable Object (auth/quota/idempotency) -> Email Sending binding; status endpoint;
+  Access + owner-gated key/template admin routes; D1 projections.
+- MCP endpoint (`/mcp`): Access + `ACCESS_ALLOWED_EMAILS` allowlist, read/search/draft tools, no
+  send/cancel.
 - Realtime mailbox updates over WebSockets.
-- Scheduled backup/stale-send reconciliation path.
+- Scheduled backup/stale-`outbound_sends`-reconciliation path.
 - Control-plane/admin endpoints documented in `docs/OPERATIONS.md`.
 
 ## Gate summary
 
 | Gate | Applies | Status | Evidence | Owner | Gap |
 | ---- | ------- | ------ | -------- | ----- | --- |
-| 0. Scope & production claim | Required | pass | `README.md`; `docs/ARCHITECTURE.md`; this file narrows the claim to Tier A self-hosting | maintainer | - |
+| 0. Scope & production claim | Required | pass | `README.md`; `docs/ARCHITECTURE.md`; this file narrows the claim to Tier A self-hosting plus the MCP read/search/draft endpoint and the transactional API MVP | maintainer | - |
 | 1. Public face & onboarding | Required | pass | `README.md` includes quickstart, deploy guide, config, compatibility, troubleshooting, and expected outputs | maintainer | - |
 | 2. Documentation & decisions | Required | pass | `docs/ARCHITECTURE.md`, `docs/OPERATIONS.md`, `SECURITY.md`, `CHANGELOG.md`, `AGENTS.md`; this file records the production claim and caveats | maintainer | - |
 | 3. Public contract & interface | Required | partial | `README.md` and `docs/IMPLEMENTATION.md` document major routes/flows; `src/api/*` and `src/do/mailbox-do.ts` define the current surface | maintainer | no dedicated API contract doc or versioning/deprecation policy beyond current repo docs |
 | 4. Packaging contract | N/A | - | private app/service (`package.json` has `"private": true`) | - | - |
 | 5. Deployment contract | Required | partial | `wrangler.jsonc`; `README.md#deploy-your-own`; `docs/OPERATIONS.md`; configurable `pnpm verify:cf`; historical remote validation in `docs/validation/PHASE1_VALIDATION.md` | maintainer | deploy smoke exists as manual evidence, not current automated post-deploy smoke in CI/prod |
 | 6. Code architecture | Required | pass | authoritative DO model and data ownership documented in `docs/ARCHITECTURE.md`; boundaries reflected in `src/cloudflare/*`, `src/do/*`, `src/db/d1.ts` | maintainer | - |
-| 7. Agent surfaces | Required | partial | `AGENTS.md`; `SKILL.md`; human-confirmed send invariant documented in `AGENTS.md` and `SECURITY.md` | maintainer | repo is agent-developed, but product-side agent/MCP interfaces are not implemented yet; no shipped tool schemas/examples |
+| 7. Agent surfaces | Required | partial | `AGENTS.md`; `SKILL.md`; MCP endpoint in `src/mcp/*` with `McpMailboxFacade` closed-operation design and a security test asserting no send tool/path (`tests/integration/mcp-facade-security.test.ts`); human-confirmed send invariant documented in `AGENTS.md` and `SECURITY.md`; `pnpm setup:mcp-claim` | maintainer | MCP surface is minimal (5 tools: list_mailboxes/list_threads/search_messages/read_message/draft_reply); no OAuth flow (Access-JWT only, fails closed without `ACCESS_ALLOWED_EMAILS`); no RAG/agents-drafting (Tier B) shipped |
 | 8. Security & supply chain | Required | partial | `SECURITY.md`; Access auth in `src/api/auth.ts`; CI in `.github/workflows/ci.yml`; `.github/dependabot.yml`; CI secret scan | maintainer | no SBOM/provenance output; branch protection and GitHub secret-scanning settings remain repository policy outside code |
 | 9. Config & secrets | Required | pass | `.dev.vars.example`; `README.md#configuration`; `docs/OPERATIONS.md`; `src/lib/runtime-config.ts`; auth fail-closed behavior documented in `SECURITY.md` | maintainer | - |
 | 10. Testing & verification | Required | partial | `pnpm test`, `pnpm run build`, `pnpm typecheck`, `pnpm lint`; CI local HTTP smoke; historical local/remote validation in `docs/validation/PHASE1_VALIDATION.md` | maintainer | no continuously enforced deployed smoke against a live environment; historical evidence is not the same as current release automation |
@@ -47,7 +56,7 @@ This audit is intentionally narrow about what is in scope today:
 | 13. Data lifecycle | Required | partial | ownership/source-of-truth rules are clear in `docs/ARCHITECTURE.md`; retention/export/delete/restore limitations documented in `docs/OPERATIONS.md`; backups exist in `src/cloudflare/scheduled.ts` | maintainer | lifecycle/deletion/restore are documented but not automated or enforced by repo-managed resources |
 | 14. Privacy & compliance | Required | partial | PII/inbox-data model and admin-access controls in `SECURITY.md` (`ACCESS_ALLOWED_EMAILS` owner allowlist, Access-only admin routes, reliance on Cloudflare platform encryption at rest); retention/export/delete policy and its current gaps spelled out in `docs/OPERATIONS.md:176-224` ("Data lifecycle, retention, privacy, and current limitations" and "Manual delete/export/restore reality"); only Cloudflare-native services (R2, D1, DO, Email Routing/Sending) are in the data path per `docs/ARCHITECTURE.md` | maintainer | `docs/OPERATIONS.md:193-197` states plainly there is "no user-facing export job," "no end-user delete workflow [that] guarantees removal of all raw MIME, attachment blobs, D1 rows," and "no documented trash-retention timer or legal-hold model"; export/delete are manual, unverified-by-fixture procedures (`docs/OPERATIONS.md:214-224`), not automated or tested — required for `regulated`'s formal compliance bar |
 | 15. Automation, release & change control | Required | partial | `.github/workflows/ci.yml` runs separated lint/format-check/typecheck/test/build/local-HTTP-smoke steps plus `wrangler deploy --dry-run --outdir .wrangler/dry-run`, a generated-artifact drift check, and a `secret-scan` job (`gitleaks/gitleaks-action@v2`); Node matrix pins the `engines` floor and current (`22.12.0`, `24`); `pnpm install --frozen-lockfile` and `packageManager: pnpm@11.1.1` pin the install; `.github/dependabot.yml` schedules weekly `npm` and `github-actions` updates | maintainer | CI has no deploy/promotion job — `pnpm run deploy`/`deploy:dev` are manual local scripts with no CI environment gate, protected-environment approval, or rollback automation; branch protection and required-checks enforcement are GitHub repo settings, not verifiable from committed code |
-| 16. Public credibility & repository hygiene | Required | partial | root layout is legible (`src/`, `docs/`, `tests/`, `migrations/`, `scripts/`, `fixtures/`); `package.json` scripts follow the expected `dev`/`build`/`test`/`typecheck`/`lint`/`format`/`deploy`/`smoke:*` naming; `README.md` badges are live (CI workflow badge, MIT license, edge/runtime, "Status: Phase 1 complete"); `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE` (MIT) all present; `SECURITY.md`'s "Supported versions" section states the maintenance posture honestly (pre-1.0, `main`-only, no LTS branch, best-effort response) | maintainer | `CONTRIBUTING.md` invites external contributions but there are no GitHub issue/PR templates, labels, or `CODEOWNERS` in `.github/` (only `dependabot.yml` and `workflows/ci.yml` exist); no `CODE_OF_CONDUCT.md` |
+| 16. Public credibility & repository hygiene | Required | partial | root layout is legible (`src/`, `docs/`, `tests/`, `migrations/`, `scripts/`, `fixtures/`); `package.json` scripts follow the expected `dev`/`build`/`test`/`typecheck`/`lint`/`format`/`deploy`/`smoke:*` naming; `README.md` badges are live (CI workflow badge, MIT license, edge/runtime, "Status: Tier A + transactional API"); `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `LICENSE` (MIT) all present; `SECURITY.md`'s "Supported versions" section states the maintenance posture honestly (pre-1.0, `main`-only, no LTS branch, best-effort response) | maintainer | `CONTRIBUTING.md` invites external contributions but there are no GitHub issue/PR templates, labels, or `CODEOWNERS` in `.github/` (only `dependabot.yml` and `workflows/ci.yml` exist); no `CODE_OF_CONDUCT.md` |
 | 17. Product UI quality | Required | partial | `src/routes/mailboxes/index.tsx:16-50` implements explicit loading/empty/error states (`error` state rendered, empty-mailbox-list message) for the mailbox list view; compose flow (`src/routes/mailboxes/$mailboxId/compose.tsx:86,94`) disables send actions until a draft exists | maintainer | the primary mailbox/thread view (`src/routes/mailboxes/$mailboxId/index.tsx`) has no loading or error state around its `threads`/`messages`/search `fetch` calls (lines 40-62) — a failed fetch just leaves empty lists with no user-visible signal; accessibility attributes (`aria-*`, `role=`) appear only 3 times across all of `src/components` and `src/routes`; there is no Playwright, visual-regression, or a11y test anywhere in the repo (`tests/` is exclusively Vitest unit/integration specs) and CI runs no UI/browser checks |
 
 ## Why the verdict is `READY-WITH-CAVEATS`
@@ -75,12 +84,19 @@ are still incomplete:
    settings remain outside the committed app code.
 4. Deployed smoke is historical/manual rather than continuously enforced. That is good evidence for
    the build history, but weak evidence for an ongoing production claim.
-5. The repo is `agent-facing` by modifier because the product intent includes agents, but the
-   actual MCP/agent product surface is not implemented. Tier B remains roadmap-only and must not
-   be advertised as shipped.
-6. CI (`.github/workflows/ci.yml`) verifies build/test/typecheck/lint/dry-run-deploy but has no
+5. The repo is `agent-facing` by modifier: an MCP endpoint with read/search/draft tools is shipped
+   and covered by a send-path security test, but the surface is minimal (five tools, Access-JWT-only,
+   no OAuth flow) and the broader Tier B agent/RAG surface remains roadmap-only and must not be
+   advertised as shipped.
+6. The transactional API is an MVP with real operational gaps: its stale-request reconciliation
+   helper exists only as a DO function (not wired to cron/endpoint), there is no real
+   bounce/complaint/suppression integration, and test keys cannot be exercised end-to-end without a
+   simulated delivery sink. These keep Phase 3–4 hardening incomplete; sending on its production
+   path is deliberately restricted (template allowlist, recipient policy, quota, `unknown` → no
+   auto-retry).
+7. CI (`.github/workflows/ci.yml`) verifies build/test/typecheck/lint/dry-run-deploy but has no
    deploy/promotion/rollback job; deploy remains a manual local script (Gate 15).
-7. The repo is `product-ui` by modifier because it ships a TanStack Start web UI, but UI quality
+8. The repo is `product-ui` by modifier because it ships a TanStack Start web UI, but UI quality
    evidence is thin: the primary mailbox/thread view has no loading/error state around its data
    fetches, accessibility attributes are sparse, and there are no Playwright/visual/a11y tests
    (Gate 17).
@@ -90,8 +106,10 @@ are still incomplete:
 Use this narrower production claim in repo-facing docs and audits:
 
 > Reccado is a self-hostable, single-operator Tier A inbox for Cloudflare. It supports inbound
-> email, mailbox storage/search, realtime UI, and human-confirmed outbound send. Agent/MCP/RAG
-> capabilities are planned but not implemented in the current repo.
+> email, mailbox storage/search, realtime UI, and human-confirmed outbound send (UI/Telegram/MCP),
+> a read/search/draft MCP endpoint (no send), and a scoped, template-based transactional REST API
+> for operator-authorized programmatic sends. Tier B agent/RAG capabilities are planned but not
+> implemented in the current repo.
 
 ## Highest-priority gaps
 
@@ -103,8 +121,12 @@ Use this narrower production claim in repo-facing docs and audits:
    validation.
 4. Add SBOM/provenance or an explicitly waived alternative proportional to a public, regulated,
    self-hosted service.
-5. Keep Tier B claims explicitly roadmap-only until MCP/agent surfaces ship with tool contracts,
-   auth scopes, and validation evidence.
-6. Add a loading/error state to the primary mailbox/thread view (`src/routes/mailboxes/$mailboxId/index.tsx`)
+5. Close the transactional-API hardening gaps: wire `reconcileStaleTransactionalRequests` into the
+   cron or an operator endpoint, add bounce/complaint/suppression handling, and provide a
+   simulated/test deliverability for `environment=test` keys before growing send volume.
+6. Keep Tier B claims explicitly roadmap-only until the remaining agent/RAG surfaces ship with tool
+   contracts, auth scopes, and validation evidence (the current MCP endpoint is shipped and
+   minimal).
+7. Add a loading/error state to the primary mailbox/thread view (`src/routes/mailboxes/$mailboxId/index.tsx`)
    and at least a minimal Playwright/a11y smoke, proportional to the newly declared `product-ui`
    modifier (Gate 17).

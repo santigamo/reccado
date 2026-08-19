@@ -990,6 +990,218 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			});
 		}
 
+		// --- Transactional send route ---
+		if (url.pathname === "/transactional/send" && request.method === "POST") {
+			const pepper = this.env.TRANSACTIONAL_API_KEY_PEPPER;
+			if (!pepper) {
+				return Response.json({ error: "transactional_api_not_configured" }, { status: 503 });
+			}
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const authHeader = request.headers.get("Authorization");
+			const idempotencyKeyHeader = request.headers.get("Idempotency-Key");
+			let body: unknown;
+			try {
+				body = await request.json();
+			} catch {
+				return Response.json({ error: "invalid_json" }, { status: 400 });
+			}
+			const identity = resolveSenderIdentity(this.env, this.resolveMailboxAddress(null));
+			const { handleTransactionalSend, fireTransactionalOpsEvent, makeTransactionalRequestLogRow } =
+				await import("./transactional-send-ops");
+			const { insertOpsEvent, upsertTransactionalRequestLog } = await import("../db/d1");
+			const result = await handleTransactionalSend(
+				{
+					sql: this.ctx.storage.sql,
+					transactionSync: (fn) => this.ctx.storage.transactionSync(fn),
+					email: this.env.EMAIL,
+					fromAddress: identity.from,
+				},
+				pepper,
+				{
+					mailboxId,
+					authHeader,
+					idempotencyKeyHeader,
+					body,
+				},
+			);
+
+			// Fire-and-forget: write ops event to D1 (best-effort, never blocks response).
+			// Only logs categories/ids/status/mailbox/keyId — never Authorization, key,
+			// variables, body, or raw provider errors.
+			const opsEvent = fireTransactionalOpsEvent(mailboxId, result.keyId ?? "", result);
+			// Silent catch — D1 unavailability must not break the HTTP response.
+			this.ctx.waitUntil(
+				insertOpsEvent(this.env.INDEX_DB, {
+					id: crypto.randomUUID(),
+					event_type: opsEvent.event_type,
+					severity: opsEvent.severity,
+					subject: opsEvent.subject,
+					payload_json: opsEvent.payload_json,
+				}).catch(() => {}),
+			);
+
+			// Fire-and-forget: write D1 projection for sent/permanent/unknown outcomes
+			if (
+				result.requestId &&
+				(result.status === "sent" ||
+					result.status === "permanent_failure" ||
+					result.status === "unknown")
+			) {
+				const dbRow = this.ctx.storage.sql
+					.exec<{
+						request_id: string;
+						key_id: string;
+						status: string;
+						to_addr: string;
+						template_id: string | null;
+						sender: string;
+						provider_message_id: string | null;
+						error_code: string | null;
+						created_at: string;
+						updated_at: string;
+					}>(
+						"SELECT request_id, key_id, status, to_addr, template_id, sender, provider_message_id, error_code, created_at, updated_at FROM transactional_requests WHERE request_id = ?",
+						result.requestId,
+					)
+					.toArray()[0];
+				if (dbRow) {
+					const logRow = makeTransactionalRequestLogRow(mailboxId, dbRow);
+					this.ctx.waitUntil(
+						upsertTransactionalRequestLog(this.env.INDEX_DB, logRow).catch(() => {}),
+					);
+				}
+			}
+
+			const status =
+				result.status === "rejected"
+					? result.error === "missing_authorization"
+						? 401
+						: result.error === "idempotency_key_required"
+							? 400
+							: 403
+					: result.status === "idempotency_conflict"
+						? 409
+						: 200;
+
+			return Response.json(result, { status });
+		}
+
+		// --- Transactional reconcile-stale route (admin-only, never public API-key) ---
+		if (url.pathname === "/transactional/reconcile-stale" && request.method === "POST") {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const { reconcileStaleTransactionalRequests } = await import("./transactional-send-ops");
+			// Default stale threshold: 30 minutes — pending/sending requests older than this
+			// are assumed to be crashed/interrupted DO sagas rather than work still in flight.
+			const olderThanIso = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+			const result = reconcileStaleTransactionalRequests(this.ctx.storage.sql, olderThanIso);
+			return Response.json({ mailboxId, ...result });
+		}
+
+		// --- Transactional status route ---
+		if (url.pathname.match(/^\/transactional\/requests\/[^/]+$/) && request.method === "GET") {
+			const requestId = url.pathname.split("/")[3];
+			if (!requestId) return Response.json({ error: "request_id_required" }, { status: 400 });
+			const pepper = this.env.TRANSACTIONAL_API_KEY_PEPPER;
+			if (!pepper) {
+				return Response.json({ error: "transactional_api_not_configured" }, { status: 503 });
+			}
+			const authHeader = request.headers.get("Authorization");
+			if (!authHeader?.startsWith("Bearer ")) {
+				return Response.json({ error: "missing_authorization" }, { status: 401 });
+			}
+			const rawKey = authHeader.slice("Bearer ".length).trim();
+			if (!rawKey) {
+				return Response.json({ error: "missing_authorization" }, { status: 401 });
+			}
+			const { parseApiKey } = await import("../lib/transactional-keys");
+			const parsed = parseApiKey(rawKey);
+			if (!parsed) {
+				return Response.json({ error: "invalid_api_key" }, { status: 403 });
+			}
+			const { getTransactionalRequestStatus, getApiKeyRecord } = await import(
+				"./transactional-send-ops"
+			);
+			const record = getApiKeyRecord(this.ctx.storage.sql, parsed.keyId);
+			if (!record) {
+				return Response.json({ error: "invalid_api_key" }, { status: 403 });
+			}
+			if (record.status === "revoked") {
+				return Response.json({ error: "key_revoked" }, { status: 403 });
+			}
+			if (!record.scopes.includes("transactional:status")) {
+				return Response.json({ error: "insufficient_scope" }, { status: 403 });
+			}
+			const statusRecord = getTransactionalRequestStatus(
+				this.ctx.storage.sql,
+				requestId,
+				parsed.keyId,
+			);
+			if (!statusRecord) {
+				return Response.json({ error: "not_found" }, { status: 404 });
+			}
+			return Response.json({ requestId, ...statusRecord });
+		}
+
+		// --- Template CRUD routes ---
+		if (url.pathname === "/transactional/templates" && request.method === "POST") {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			try {
+				const body = (await request.json()) as {
+					id: string;
+					subject: string;
+					body_text?: string | null;
+					body_html?: string | null;
+				};
+				if (!body.id || !body.subject) {
+					return Response.json({ error: "id_and_subject_required" }, { status: 400 });
+				}
+				if (body.id.includes("..") || body.id.includes("/") || body.id.includes("\\")) {
+					return Response.json({ error: "invalid_template_id" }, { status: 400 });
+				}
+				if (body.subject.includes("\r") || body.subject.includes("\n")) {
+					return Response.json({ error: "subject_contains_newline" }, { status: 400 });
+				}
+				if (body.body_text && body.body_text.length > 100_000) {
+					return Response.json({ error: "body_text_too_long" }, { status: 400 });
+				}
+				if (body.body_html && body.body_html.length > 100_000) {
+					return Response.json({ error: "body_html_too_long" }, { status: 400 });
+				}
+				const { createTemplate } = await import("./transactional-send-ops");
+				createTemplate(this.ctx.storage.sql, mailboxId, {
+					id: body.id!,
+					subject: body.subject!,
+					body_text: body.body_text ?? null,
+					body_html: body.body_html ?? null,
+				});
+				return Response.json({ ok: true, id: body.id }, { status: 201 });
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				// UNIQUE constraint violation on id
+				if (msg.includes("UNIQUE")) {
+					return Response.json({ error: "template_id_already_exists" }, { status: 409 });
+				}
+				return Response.json({ error: msg }, { status: 500 });
+			}
+		}
+		if (url.pathname === "/transactional/templates" && request.method === "GET") {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const { listTemplates } = await import("./transactional-send-ops");
+			return Response.json({ templates: listTemplates(this.ctx.storage.sql, mailboxId) });
+		}
+		if (
+			url.pathname.match(/^\/transactional\/templates\/[^/]+\/archive$/) &&
+			request.method === "POST"
+		) {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const templateId = url.pathname.split("/")[3];
+			const { archiveTemplate } = await import("./transactional-send-ops");
+			const archived = templateId
+				? archiveTemplate(this.ctx.storage.sql, mailboxId, templateId)
+				: false;
+			if (!archived) return Response.json({ error: "template_not_found" }, { status: 404 });
+			return Response.json({ ok: true });
+		}
 		if (url.pathname === "/debug" && request.method === "GET") {
 			return Response.json(this.debugState());
 		}

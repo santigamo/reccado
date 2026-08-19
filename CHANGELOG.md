@@ -9,7 +9,41 @@ package.
 
 ## [Unreleased]
 
-Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox.
+Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox, plus the
+transactional API MVP (Phase 2 of the `docs/plans/transactional-api.md` plan) and the MCP
+read/search/draft endpoint.
+
+### Added
+
+- **Transactional API (Phase 2 — MVP).** External REST API at `/v1/mailboxes/:id/transactional/messages`
+  for programmatic outbound sending with:
+  - HMAC-authenticated API keys (`rck_<env>_<id>_<secret>`) with scopes
+    (`transactional:send`, `transactional:status`, `transactional:templates:use`),
+    per-key quotas and rate limits, template allowlists, and recipient policies.
+  - API key management (create, list, revoke, rotate) via the DO's internal routes.
+  - DO-authoritative auth and state — D1 is only a rebuildable projection.
+  - Atomic idempotency via `(key_id, client_idempotency_key)` with payload hash verification.
+    Same payload returns original result; different payload returns `409 Conflict`.
+    Request record is inserted BEFORE the provider call at status `pending`.
+  - Template CRUD (create, list, archive) per mailbox, with variable interpolation
+    (HTML-escaped for `body_html`, literal for text), variable validation (missing/unknown),
+    and subject CR/LF rejection.
+  - Provider outcome classification: `sent`, `permanent_failure` (definitely not delivered),
+    `unknown` (ambiguous — preserved for human review, never auto-retried).
+  - Status endpoint (`GET /v1/mailboxes/:id/transactional/messages/:requestId`)
+    scoped to `transactional:status`.
+  - Quota enforcement with atomic per-key minute and daily counters in the DO
+    (no D1 dependency for quota decisions).
+  - Rejection: missing/invalid auth, expired/revoked keys, wrong mailbox, insufficient scope,
+    missing template, template not allowlisted, missing/unknown variables, CR/LF in subject,
+    quota exceeded, recipient policy deny, test keys in production send path.
+  - Security: `Cache-Control: no-store` on all responses, JSON-only content-type check,
+    body size limit (100 KB), no CORS, no Access dependency, no Reply-To/headers from client.
+  - `TRANSACTIONAL_API_KEY_PEPPER` secret required to enable transactional features.
+  - Test keys (`environment=test`) are rejected in the production send path — they must not
+    silently send real email without a test/simulation sink.
+  - Provider error messages are NEVER stored; only stable error categories
+    (`ambiguous`, `permanent_failure`) are persisted.
 
 ### Added
 
@@ -25,6 +59,12 @@ Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox.
 - `MAIL_SENDING_DOMAINS`: mailboxes on a domain verified in Cloudflare Email Sending now reply as
   themselves instead of as the single global `MAIL_FROM_ADDRESS`.
 - `pnpm setup:telegram` registers the webhook with its secret token (dry-run by default).
+- **MCP endpoint (`/mcp`) — read/search/draft only.** Access-authenticated (requires
+  `ACCESS_ALLOWED_EMAILS`, fails closed with `503` when unset). Exposes `list_mailboxes`,
+  `list_threads`, `search_messages`, `read_message`, and `draft_reply`; there is deliberately no
+  send/cancel tool (`src/mcp/*`, with a closed-operation `McpMailboxFacade` and a security test
+  asserting no send path is reachable). `pnpm setup:mcp-claim` backfills `mailboxes.owner_email`
+  for pre-existing mailboxes so MCP can serve them.
 
 ### Known limitations
 
@@ -33,6 +73,19 @@ Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox.
 - Attachments cannot be sent from Telegram.
 - `request-send` now refuses to move a `sent` or `cancelled` draft back to `pending_confirmation`,
   so a retried Telegram update can no longer resurrect mail that already went out.
+
+### Known limitations (transactional API)
+
+- No bounce/complaint/suppression list integration. Provider rejections are classified as
+  `permanent_failure` or `unknown`, but there is no automated suppression or bounce processing.
+- Test keys (`environment=test`) are rejected in the production send path. A simulated/test sink
+  for test-mode delivery does not exist yet; test keys only work for creation/listing/revocation
+  operations.
+- Stale transactional-request reconciliation (`reconcileStaleTransactionalRequests` in
+  `src/do/transactional-send-ops.ts`, which flips stuck `pending`/`sending` rows to
+  `unknown` / `stale_reconciled`) is implemented as a DO helper but is **not yet wired** into the
+  hourly cron or an operator endpoint. A crash mid-send can leave a `transactional_requests` row at
+  `pending` until an operator resolves it manually.
 
 ### Fixed
 
@@ -71,16 +124,27 @@ Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox.
   `X-Frame-Options: DENY`, `Referrer-Policy`) and an Origin-check CSRF defense on mutating
   `/api/*` routes.
 - Added stale outbound-send reconciliation in the scheduled (Cron) handler: `outbound_sends` rows
-  stuck in `sending` past a timeout are flipped to `failed` with a clear `ops_events` trail
-  instead of blocking idempotent retries indefinitely.
+  stuck in `sending` past a timeout are flipped to `unknown` with
+  `error_code='stale_sending_timeout_needs_review'` and a clear `ops_events` trail instead of
+  blocking idempotent retries indefinitely (manual review required).
 
 ### Tooling & docs
 
 - Added `PRODUCTION-READINESS.md` to declare the current production claim honestly and record the
   remaining gaps that still keep Reccado at `READY-WITH-CAVEATS` rather than an unqualified
   production-ready status.
-- Updated `docs/ARCHITECTURE.md` status language so it reflects the current repo state: Tier A is
-  implemented, while Tier B agent/MCP/RAG capabilities remain roadmap items.
+- Updated `docs/ARCHITECTURE.md` status language so it reflects the current repo state: Tier A and
+  the minimal MCP read/search/draft endpoint are implemented, while the rest of Tier B
+  (Workflows, EmailAgent drafting, RAG/Vectorize, AI Gateway) remains roadmap-only.
+- Docs now reflect the actual state of the transactional API (Phases 2–4 of
+  `docs/plans/transactional-api.md`): HMAC/pepper API keys, Access+owner-gated admin routes,
+  versioned template CRUD, `POST/GET /v1/.../transactional/...` with Bearer +
+  `Idempotency-Key` + scopes/limits/quota, test-key rejection for sending, `unknown` → no
+  auto-retry, non-authoritative D1 projections, log redaction, no CORS/query/cookies, and the
+  explicit gap of no real bounce/complaint/suppression integration and no wired stale-request
+  reconciliation. `SECURITY.md`, `README.md`, `docs/OPERATIONS.md`, `AGENTS.md`, and
+  `PRODUCTION-READINESS.md` were updated; the MCP/UI/Telegram human-confirm gate is unchanged and
+  Tier B (Workflows, EmailAgent, RAG) is not claimed as implemented.
 - Added Biome for linting/formatting (`pnpm lint`, `pnpm format`, `pnpm format:check`) and a
   combined `pnpm check` (typecheck + lint + test) script; wired into CI alongside a Worker
   bundle dry-run deploy check and a check that generated artifacts

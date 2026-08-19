@@ -776,3 +776,60 @@ export async function deleteExpiredTelegramActions(db: D1Database): Promise<numb
 		.run();
 	return result.meta?.changes ?? 0;
 }
+
+// --- Transactional request projections (rebuildable from DO, no body/secret) ---
+
+export type TransactionalRequestLogRow = {
+	request_id: string;
+	key_id: string;
+	mailbox_id: string;
+	status: string;
+	to_addr: string;
+	template_id: string | null;
+	sender: string;
+	provider_message_id: string | null;
+	error_code: string | null;
+	created_at: string;
+	updated_at: string;
+};
+
+export async function upsertTransactionalRequestLog(
+	db: D1Database,
+	row: TransactionalRequestLogRow,
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT OR REPLACE INTO transactional_request_log
+       (request_id, key_id, mailbox_id, status, to_addr, template_id,
+        sender, provider_message_id, error_code, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			row.request_id,
+			row.key_id,
+			row.mailbox_id,
+			row.status,
+			row.to_addr,
+			row.template_id,
+			row.sender,
+			row.provider_message_id,
+			row.error_code,
+			row.created_at,
+			row.updated_at,
+		)
+		.run();
+}
+
+export async function listTransactionalRequestLogs(
+	db: D1Database,
+	keyId: string,
+	limit = 50,
+): Promise<TransactionalRequestLogRow[]> {
+	const result = await db
+		.prepare(
+			"SELECT * FROM transactional_request_log WHERE key_id = ? ORDER BY created_at DESC LIMIT ?",
+		)
+		.bind(keyId, limit)
+		.all<TransactionalRequestLogRow>();
+	return result.results ?? [];
+}

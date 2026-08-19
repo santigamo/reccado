@@ -1,6 +1,6 @@
 ---
 name: reccado-self-host
-description: Self-host Reccado (a serverless email inbox running entirely on Cloudflare Workers, Durable Objects, R2, D1 and Queues) into a user's own Cloudflare account, and operate it safely afterward. Use this skill when a user asks to deploy, self-host, set up, or configure Reccado on their own Cloudflare account/domain, or when wiring up the future MCP/agent layer for mailbox access.
+description: Self-host Reccado (a serverless email inbox running entirely on Cloudflare Workers, Durable Objects, R2, D1 and Queues) into a user's own Cloudflare account, and operate it safely afterward. Use this skill when a user asks to deploy, self-host, set up, or configure Reccado on their own Cloudflare account/domain, or when wiring up the MCP/agent layer (read/search/draft) or the transactional API for mailbox access.
 ---
 
 # Reccado: self-host runbook for AI coding agents
@@ -8,8 +8,8 @@ description: Self-host Reccado (a serverless email inbox running entirely on Clo
 Reccado is a self-hosted, full-serverless email inbox: Workers + Durable Objects (one per
 mailbox) + R2 + D1 + Queues, with a Hono API and a TanStack Start UI. There is no managed
 multi-tenant version — every install lives in the operator's own Cloudflare account. This skill
-is the runbook for (a) deploying a fresh instance and (b) the future MCP/agent layer that will
-let agents read and draft mail against a running instance.
+is the runbook for (a) deploying a fresh instance and (b) operating the MCP/agent layer that lets
+agents read, search and draft mail against a running instance (read-only + draft; never send).
 
 Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)
 before making changes beyond what this runbook covers — they are the source of truth for design
@@ -23,8 +23,12 @@ confirmation step.**
 
 In this codebase that confirmation is the `request-send` → `confirm-send` flow
 (`POST /api/mailboxes/{mailboxId}/drafts/{draftId}/request-send` then
-`.../confirm-send`), each gated by its own idempotency key. If you are building or extending the
-MCP/agent layer:
+`.../confirm-send`), each gated by its own idempotency key. The shipped MCP endpoint has no
+send/cancel tool at all, so this invariant holds by construction there. The one deliberate
+exception to per-message confirmation is the transactional REST API, where an operator-created,
+mailbox-bound API key is itself the pre-authorization — see `SECURITY.md` and
+`docs/OPERATIONS.md`; that surface is not available to agents via MCP. If you are building or
+extending the MCP/agent layer:
 
 - Agent-facing tools may create and edit drafts (`drafts.create`, `drafts.update`) and may call
   `request-send` to stage a draft for confirmation.
@@ -249,21 +253,27 @@ If you use the manual path, you own the two sharp edges the scripted flow is des
   with no seed fingerprint recorded) and point here. This overwrites the secret and reseeds
   atomically; never do this after go-live, since it changes every existing mailbox's derived id.
 
-## Part B — MCP / agent layer (stub — not yet implemented)
+## Part B — MCP / agent layer (implemented: read/search/draft only)
 
-The MCP endpoint (`/mcp`) is on the roadmap (`docs/ARCHITECTURE.md` Tier B, `docs/IMPLEMENTATION.md`
-Milestone 2.3) and does not exist in this codebase yet. When it lands, this section should be
-expanded with: tool list and scopes (read/search/draft vs. send), the chosen auth model (Access
-vs. OAuth 2.1), and connection instructions for MCP clients. Until then:
+The MCP endpoint (`/mcp`) is implemented and behind the same Cloudflare Access perimeter as
+`/api/*`, plus a fail-closed `ACCESS_ALLOWED_EMAILS` allowlist (`503` if unset). It exposes five
+tools — `list_mailboxes`, `list_threads`, `search_messages`, `read_message`, `draft_reply` — via a
+closed-operation `McpMailboxFacade` (`src/mcp/*`) that deliberately makes send, cancel, raw,
+attachment-download, admin, and debug paths unreachable. A security test
+(`tests/integration/mcp-facade-security.test.ts`) asserts there is no registered send tool and no
+imported send path. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
+`mailboxes.owner_email` for pre-existing mailboxes so the owner-scoped MCP lookups can serve them.
 
-- Do not fabricate an `/mcp` endpoint or claim MCP support exists.
-- If asked to wire up agent access to a Reccado mailbox today, the only safe integration point is
-  the authenticated HTTP API (`/api/mailboxes/*`) for read/search/draft operations, with the send
-  invariant from the top of this document still applying in full — no automated `confirm-send`.
-- Treat any future MCP tool design as needing read/search/draft scopes separate from a send scope,
-  and assume the send scope should not be grantable to non-human callers at all (per
-  `docs/ARCHITECTURE.md`: "MCP scopes should separate read, search, draft, label, and send" and
-  "The agent may draft and summarize, but it may not send without human confirmation").
+Practical constraints:
+
+- No OAuth flow: MCP identity comes from the Access JWT; the client must present a valid
+  `CF-Access-JWT-Assertion`. For browser-based MCP clients behind Access this is wired through the
+  Access session; non-browser clients need an Access-issued assertion or an Access-gated tunnel.
+- The tool set is intentionally minimal (read/search/draft). Expanding it is future work: tool
+  list and scopes (read/search/draft vs. send), the chosen auth model (Access vs. OAuth 2.1), and
+  connection instructions for MCP clients should all be expanded here when it lands.
+- Keep the draft-only boundary: do not add a send/cancel tool; the human-confirm invariant from
+  the top of this document applies in full — no automated `confirm-send`.
 
 ## Verification checklist
 

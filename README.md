@@ -4,14 +4,14 @@
 
 <h3>The edge-native inbox — self-hosted email on Cloudflare, for your own domains</h3>
 
-<p>Receive, store, thread, search and send email from your own domains, running <strong>entirely on Cloudflare</strong> (Workers · Durable Objects · R2 · D1 · Queues) — with an <strong>MCP layer</strong> on the roadmap so agents can read, triage and draft your mail.</p>
+<p>Receive, store, thread, search and send email from your own domains, running <strong>entirely on Cloudflare</strong> (Workers · Durable Objects · R2 · D1 · Queues) — with an <strong>MCP endpoint</strong> for agents (read/search/draft, no send) and a <strong>transactional REST API</strong> for programmatic outbound mail behind scoped API keys.</p>
 
 [![CI](https://github.com/santigamo/reccado/actions/workflows/ci.yml/badge.svg)](https://github.com/santigamo/reccado/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-F38020.svg)](./LICENSE)
 [![Edge: Cloudflare Workers](https://img.shields.io/badge/edge-Cloudflare%20Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
 [![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
 [![Built with Hono](https://img.shields.io/badge/built%20with-Hono-E36002?logo=hono&logoColor=white)](https://hono.dev)
-[![Status: Phase 1 complete](https://img.shields.io/badge/status-Phase%201%20complete-F38020)](CHANGELOG.md)
+[![Status: Tier A + transactional API](https://img.shields.io/badge/status-Tier%20A%20%2B%20transactional%20API-F38020)](CHANGELOG.md)
 
 <br>
 
@@ -23,6 +23,8 @@
 
 **Reccado is a self-hosted, full-serverless email inbox that runs entirely on your own Cloudflare
 account** — no third-party mail provider, no separate database to operate, no servers to patch.
+It ships a realtime inbox UI, an MCP endpoint for agents (read/search/draft only — sending stays
+human-confirmed), and a scoped transactional REST API for programmatic outbound mail.
 
 ## Table of contents
 
@@ -34,6 +36,7 @@ account** — no third-party mail provider, no separate database to operate, no 
   - [2. Wire your domain](#2-wire-your-domain)
   - [3. Verify](#3-verify)
 - [Telegram bridge (optional)](#telegram-bridge-optional)
+- [Transactional API (optional)](#transactional-api-optional)
 - [Configuration](#configuration)
 - [Compatibility](#compatibility)
 - [Troubleshooting](#troubleshooting)
@@ -59,9 +62,15 @@ account** — no third-party mail provider, no separate database to operate, no 
 - **Telegram bridge (optional)** — new mail arrives as a card in Telegram; replying there builds a
   properly threaded email (`Re:`, `In-Reply-To`/`References`, quoted original) that still goes
   through the same confirm-send button. See [Telegram bridge](#telegram-bridge-optional).
-- **Agent-ready (optional)** — an MCP layer is on the roadmap so agents can read, search and
-  draft mail, gated by the same human-confirmation invariant as the UI (see
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)).
+- **Agent-ready** — an MCP endpoint (`/mcp`, Access + `ACCESS_ALLOWED_EMAILS` allowlist) exposes
+  read/search/draft tools for agents; there is deliberately **no send tool** (drafts still go
+  through the human confirm gate). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+- **Transactional API (scoped, pre-authorized)** — external apps can send transactional mail
+  through `POST /v1/mailboxes/:id/transactional/messages` with HMAC-hashed, mailbox-bound API keys
+  (`rck_<env>_<id>_<secret>`, scopes, template allowlist, recipient policy, quotas, mandatory
+  `Idempotency-Key`). This is the one deliberate exception to the human-confirm rule: the
+  operator-created key is the authorization. Test keys never send real mail. See
+  [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-api-current-state).
 
 ## How it works
 
@@ -381,6 +390,64 @@ but no secret or no allowlist, rather than expose an unauthenticated send-mail e
 | Replies come from the mailbox's primary address | Mail that arrived at an alias (`support@`) is answered from the mailbox's primary address (`hello@`). Alias-accurate `From` is not implemented yet. |
 | Text only | Attachments cannot be sent from Telegram (the bot answers with a note); inbound attachments are flagged in the card but stay in Reccado. |
 
+## Transactional API (optional)
+
+Off unless `TRANSACTIONAL_API_KEY_PEPPER` is set. An explicit, operator-created pre-authorization
+exception to the human-confirm rule: external apps use mailbox-bound API keys to send
+template-based mail through the same Email Sending engine.
+
+**Enable:**
+
+```bash
+openssl rand -hex 32                     # generate a pepper once
+wrangler secret put TRANSACTIONAL_API_KEY_PEPPER --env dev
+pnpm d1:migrate:dev                      # applies 0006/0007 projections (transactional_api_keys, transactional_request_log)
+```
+
+Rotating the pepper invalidates every existing transactional key — re-issue keys after rotation.
+Template and key management stay behind Cloudflare Access (plus a `mailboxes.owner_email`
+ownership check):
+
+```text
+POST/GET /api/mailboxes/{mailboxId}/transactional/templates
+POST      /api/mailboxes/{mailboxId}/transactional/templates/{templateId}/archive
+POST      /api/mailboxes/{mailboxId}/transactional/api-keys            # returns plaintext key once
+GET       /api/mailboxes/{mailboxId}/transactional/api-keys
+POST      /api/mailboxes/{mailboxId}/transactional/api-keys/{keyId}/revoke
+POST      /api/mailboxes/{mailboxId}/transactional/api-keys/{keyId}/rotate
+```
+
+Sending is the one path that deliberately bypasses Access — the key is the auth:
+
+```bash
+curl -sS -X POST 'https://inbox.<you.com>/v1/mailboxes/<mailboxId>/transactional/messages' \
+  -H 'Authorization: Bearer rck_<env>_<id>_<secret>' \
+  -H 'Idempotency-Key: <your-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{"template":"welcome","to":"user@example.com","variables":{"name":"Ada"}}'
+
+curl -sS 'https://inbox.<you.com>/v1/mailboxes/<mailboxId>/transactional/messages/<requestId>' \
+  -H 'Authorization: Bearer rck_<env>_<id>_<secret>'
+```
+
+Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-api-current-state)):
+
+- Keys are `rck_<test|live>_<keyId>_<secret>`, stored only as an HMAC hash; scoped to a mailbox +
+  sender with `transactional:send` / `transactional:status` / `transactional:templates:use`,
+  template allowlist, recipient policy, optional daily quota and expiry.
+- `Idempotency-Key` is mandatory; same key + same payload replays the original result, different
+  payload → `409`. Request records are reserved (with quota) at `pending` before the provider call.
+- Outcomes: `sent`, `permanent_failure`, `unknown` (ambiguous, never auto-retried — review
+  manually), `accepted`, `rejected`, `duplicate`, `idempotency_conflict`. Provider error messages
+  are never stored.
+- **Test keys never send real mail** — the production send path rejects them until a simulated/test
+  sink exists.
+- **Not implemented:** bounce/complaint/suppression integration; a simulated delivery sink;
+  wiring stale transactional-request reconciliation into the cron (a crash mid-send can leave a row
+  at `pending`).
+- Hardening: JSON-only, 100 KB body cap, `Cache-Control: no-store`, no CORS, no cookies, no
+  query-param credentials.
+
 ## Configuration
 
 ### Secrets and vars
@@ -390,7 +457,8 @@ but no secret or no allowlist, rather than expose an unauthenticated send-mail e
 | `MAILBOX_ID_SECRET` | secret | HMAC key used to derive stable, privacy-preserving mailbox IDs from email addresses. Never rotate without a mailbox-ID migration plan — rotating it changes every mailbox ID. | **Required** |
 | `ACCESS_JWT_AUDIENCE` | secret | Cloudflare Access application audience (`aud`) tag, used to validate the `CF-Access-JWT-Assertion` header on every API request. | **Required** for any non-`localhost` deployment (auth fails closed without it) |
 | `ACCESS_TEAM_DOMAIN` | secret | Your Cloudflare Zero Trust team domain (`https://<your-team>.cloudflareaccess.com`), used to fetch the JWKS that validates the Access JWT. | **Required** for any non-`localhost` deployment |
-| `ACCESS_ALLOWED_EMAILS` | secret | Optional comma-separated owner allowlist enforced in addition to Cloudflare Access, for an extra app-level check beyond the Access policy. | Optional |
+| `ACCESS_ALLOWED_EMAILS` | secret | Optional comma-separated owner allowlist enforced in addition to Cloudflare Access, for an extra app-level check beyond the Access policy. **Required** for the MCP endpoint (it fails closed with `503` when unset). | Optional (recommended) |
+| `TRANSACTIONAL_API_KEY_PEPPER` | secret | HMAC-SHA256 pepper that hashes transactional API keys (`rck_*`). Key ops and the `/v1/.../transactional/*` send/status endpoints fail closed (`503`) without it. Rotating it invalidates all existing transactional keys. | Required to enable the transactional API |
 | `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, DNS edit for setup:sending's SPF/DMARC/DKIM/MX records, Email Routing write for catch-all API setup, Access app/policy write for future in-app provisioning). Also enables setup:domain's up-front custom-domain conflict check via the Workers Custom Domains API. | Optional |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates the `/api/debug/phase0/*` introspection endpoints (R2 head, DO schema/state dumps, local email simulation in deployed environments). These endpoints are unreachable unless this token is set, and every request must present it. | Optional (leave unset to disable debug endpoints entirely) |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender address. Must be a verified sender on a domain onboarded to Cloudflare Email Sending. | **Required** |
@@ -408,7 +476,7 @@ but no secret or no allowlist, rather than expose an unauthenticated send-mail e
 | `MAILBOX_DO` | Durable Object (`MailboxDurableObject`, SQLite storage) | Canonical per-mailbox state: messages, threads, labels, FTS, drafts, outbox, idempotency, realtime WebSocket sessions. | **Required** |
 | `MAIL_OBJECTS` | R2 bucket | Raw inbound MIME, parsed HTML bodies, attachments, backup manifests/exports. | **Required** |
 | `INBOUND_EMAIL_QUEUE` | Queue producer + consumer | Metadata-only transport from the Email Routing handler to the mailbox Durable Object, with a configured `dead_letter_queue` for poison messages. | **Required** |
-| `INDEX_DB` | D1 database | Cross-mailbox/control-plane index: `domains`, `mailboxes`, `aliases`, `routing_rules`, `message_index`, `ingest_events`, `outbound_sends`, `ops_events`. Rebuildable from the Durable Objects, not authoritative. | **Required** |
+| `INDEX_DB` | D1 database | Cross-mailbox/control-plane index: `domains`, `mailboxes`, `aliases`, `routing_rules`, `message_index`, `ingest_events`, `outbound_sends`, `ops_events`, plus transactional projections (`transactional_api_keys`, `transactional_request_log`). Rebuildable from the Durable Objects, not authoritative. | **Required** |
 | `EMAIL` | Email Sending (`send_email`) | Outbound mail via `env.EMAIL.send()` after explicit human confirmation. | **Required** for outbound sending |
 | `triggers.crons` | Cron Trigger | Periodic backup sweep (writes per-mailbox manifests to R2 and an `ops_events` row). | **Required** for scheduled backups |
 

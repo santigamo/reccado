@@ -78,19 +78,81 @@ an explicit trade-off, not an oversight. It means:
 
 ### Outbound sending requires human confirmation
 
-Outbound mail always goes through an explicit `request-send` → `confirm-send` flow gated by an
-idempotency key; there is no code path (UI, API, or — once it exists — MCP/agent) that sends mail
-from a single unconfirmed call. This is treated as a hard invariant; see `AGENTS.md` and
-`docs/ARCHITECTURE.md`.
+Outbound mail from the **UI, Telegram, and the MCP endpoint** always goes through an explicit
+`request-send` → `confirm-send` flow gated by an idempotency key; there is no code path on those
+surfaces that sends mail from a single unconfirmed call. This is treated as a hard invariant; see
+`AGENTS.md` and `docs/ARCHITECTURE.md`.
+
+The **transactional API** is the one deliberate exception: an operator explicitly creates a
+mailbox-bound API key (an explicit, human-created pre-authorization), and sends made with that key
+happen without a per-message confirm step. The key itself is the authorization boundary — possession
+of the pre-authorized credential is what permits the send. Test-environment keys
+(`environment=test`) are rejected in the production send path, and the key can only send to its own
+mailbox with its bound sender, template allowlist, recipient policy, and quota. This does not weaken
+the UI/Telegram/MCP confirmation gate, and the MCP tool set has no send or cancel capability.
+
+### Transactional API keys (HMAC + pepper)
+
+Transactional API keys are formatted `rck_<environment>_<key-id>_<random-secret>` (256-bit random
+secret). The plaintext key is shown once at creation and never stored: the Durable Object persists
+`HMAC-SHA256(pepper, keyId + ":" + secret)` bound to the server-side `TRANSACTIONAL_API_KEY_PEPPER`
+Worker secret, and verification runs a constant-time comparison. Without the pepper all
+transactional key operations and the send/status endpoints fail closed (`503`).
+
+- Keys are mailbox-scoped and sender-scoped, with scopes
+  (`transactional:send`, `transactional:status`, `transactional:templates:use`), a template
+  allowlist (null/empty = no template may be sent), a recipient policy (glob patterns,
+  `!`-prefix deny rules take precedence), an optional per-key daily quota, and expiration.
+- Key management (create, list, revoke, rotate) lives under `/api/mailboxes/:mailboxId/transactional/*`
+  behind Cloudflare Access **and** an explicit mailbox-ownership check (`owner_email` on the D1
+  mailbox row).
+- All authorization, quota, and idempotency decisions are made in the mailbox Durable Object. D1
+  (`transactional_api_keys`, `transactional_request_log`) is only a rebuildable, non-authoritative
+  projection that never carries the key hash, plaintext, or request bodies/variables.
+
+### Transactional endpoint hardening
+
+The external endpoint (`POST`/`GET /v1/mailboxes/:mailboxId/transactional/...`) is the only path
+outside the `/api/*` Access perimeter and authenticates via the API key `Bearer` header:
+
+- JSON-only content type on POST, body size limited to 100 KB (by `content-length`), responses carry
+  `Cache-Control: no-store`.
+- No CORS (`Access-Control-Allow-Origin` is never emitted), no cookie-based auth, and the key is
+  never accepted from a query string.
+- `Idempotency-Key` (max 255 chars) is mandatory; the same key + same payload hash returns the
+  original result, and the same key + different payload returns `409`. The request row is reserved
+  atomically (with quota charged) at status `pending` *before* the provider call.
+- Provider failures are classified into `permanent_failure` (definitely not delivered) or `unknown`
+  (ambiguous). `unknown` is never auto-retried. Raw provider error messages are **never** stored or
+  logged — only stable error categories.
+- Ops events and D1 projections redact: Authorization header/plaintext key, idempotency key, request
+  body, variables, payload hash, and raw provider errors. Recipient addresses and template ids are
+  treated as mailbox metadata and appear only where the existing inbox-surface model already
+  exposes them (mailbox Durable Object; D1 request-log projection).
+- The status endpoint (`GET .../messages/:requestId`) requires a valid key with `transactional:status`
+  in the same mailbox. The request ID is not separately bound to the key; any key with the status
+  scope in a mailbox can read that mailbox's request statuses.
+
+### Known boundary (not implemented)
+
+There is **no bounce/complaint/suppression-list integration**. Provider rejections are classified as
+`permanent_failure` or `unknown`, but there is no automated suppression, bounce processing, or
+complaint feedback. A stale-request reconciliation helper exists in the Durable Object
+(`reconcileStaleTransactionalRequests`: flips stuck `pending`/`sending` rows to status `unknown`
+with `error_code='stale_reconciled'`), but it is **not yet wired** to any endpoint or the hourly
+cron; the cron currently reconciles only the UI/Telegram `outbound_sends` D1 ledger. Treat
+transactional send outcomes marked `unknown` as manual-review-required.
 
 ### Secrets
 
 `MAILBOX_ID_SECRET`, `ACCESS_JWT_AUDIENCE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_ALLOWED_EMAILS`,
-`CLOUDFLARE_API_TOKEN`, and `PHASE0_DEBUG_TOKEN` are Cloudflare Worker secrets (`wrangler secret
-put`), never committed to the repository. `.dev.vars*` is gitignored except `.dev.vars.example`,
-which documents names and placeholder values only. Never rotate `MAILBOX_ID_SECRET` after go-live
-without a mailbox-ID migration plan — it's the HMAC key every mailbox ID is derived from, and
-rotating it changes every mailbox ID in the system.
+`CLOUDFLARE_API_TOKEN`, `PHASE0_DEBUG_TOKEN`, and `TRANSACTIONAL_API_KEY_PEPPER` are Cloudflare
+Worker secrets (`wrangler secret put`), never committed to the repository. `.dev.vars*` is
+gitignored except `.dev.vars.example`, which documents names and placeholder values only. Never
+rotate `MAILBOX_ID_SECRET` after go-live without a mailbox-ID migration plan — it's the HMAC key
+every mailbox ID is derived from, and rotating it changes every mailbox ID in the system.
+`TRANSACTIONAL_API_KEY_PEPPER` is the HMAC key that hashes transactional API key material: rotating
+it breaks every existing transactional key (re-issue keys after a rotation).
 
 ## Supply-chain posture
 

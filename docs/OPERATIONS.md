@@ -9,13 +9,18 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 ## Operational contract
 
 - The mailbox Durable Object is the canonical mailbox state. D1 is a rebuildable control-plane and
-  cross-mailbox index, not the source of truth.
+  cross-mailbox index, not the source of truth. This extends to transactional state: API keys,
+  quotas, idempotency, and transactional request records are DO-authoritative; D1 holds only
+  non-authoritative projections.
 - Queue payloads stay metadata-only. Raw MIME, parsed HTML bodies that spill out of SQLite, and
   attachments live in R2.
 - Inbound processing must remain idempotent across Email Routing retries, Queue retries, and any
   manual replay.
-- Outbound sending still requires explicit human confirmation through `request-send` then
-  `confirm-send`; there is no fully automated send path.
+- Outbound sending from the UI, Telegram, and the MCP endpoint still requires explicit human
+  confirmation through `request-send` then `confirm-send`; there is no fully automated send path on
+  those surfaces. The transactional API is the one deliberate exception: an operator-created,
+  mailbox-bound API key is an explicit pre-authorization, and sends made with it skip the
+  per-message confirm step (see `SECURITY.md`).
 - This runbook documents what exists now. Where restore, replay, retention enforcement, or alerting
   automation is not implemented, that is called out explicitly rather than implied.
 
@@ -30,6 +35,7 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 | `ACCESS_TEAM_DOMAIN` | secret | Zero Trust team domain (`https://<team>.cloudflareaccess.com`) used to fetch the Access JWKS. | **Required** (non-local) |
 | `ACCESS_ALLOWED_EMAILS` | secret | Comma-separated owner allowlist enforced on top of Access. Unset = every Access-authenticated identity is treated as the single operator. | Optional, recommended for shared Access orgs |
 | `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, Email Routing write, Access app/policy write). | Optional |
+| `TRANSACTIONAL_API_KEY_PEPPER` | secret | HMAC-SHA256 pepper for transactional API key hashing. Without it, transactional key operations and the `/v1/.../transactional/...` send/status endpoints fail closed (`503`). Rotation invalidates every existing transactional key. | **Required** to enable the transactional API |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates `/api/debug/phase0/*` introspection endpoints. Unset = endpoints unreachable. | Optional |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender; must be verified on a domain onboarded to Email Sending. | **Required** |
 | `MAIL_SENDING_DOMAINS` | var | Comma-separated domains verified in Email Sending. A mailbox on a listed domain replies as itself; otherwise the reply goes out as `MAIL_FROM_ADDRESS` with `Reply-To` set to the mailbox. | Optional |
@@ -47,12 +53,61 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 | `MAIL_OBJECTS` | R2 bucket | `inbox-mcp-raw-dev` | Raw inbound MIME, parsed HTML bodies, attachments, backup manifests. |
 | `INBOUND_EMAIL_QUEUE` | Queue producer + consumer | `inbox-mcp-inbound-dev` (DLQ: `inbox-mcp-inbound-dlq-dev`) | Metadata-only inbound transport; `max_batch_size: 5`, `max_batch_timeout: 2`, `max_retries: 3`. |
 | `INDEX_DB` | D1 database | `inbox-mcp-index-dev` | Cross-mailbox/control-plane index (see data model below). |
-| `EMAIL` | Email Sending (`send_email`) | n/a | Outbound `env.EMAIL.send()`, only after `confirm-send`. |
-| `triggers.crons` | Cron Trigger | `0 * * * *` (hourly, maintainer dev) | Backup sweep + stale outbound-send reconciliation. |
+| `EMAIL` | Email Sending (`send_email`) | n/a | Outbound `env.EMAIL.send()`, only after `confirm-send` (UI/Telegram/MCP) or a validated transactional API-key send. |
+| `triggers.crons` | Cron Trigger | `0 * * * *` (hourly, maintainer dev) | Backup sweep + stale `outbound_sends` reconciliation + expired Telegram action sweep. Transactional stale-request reconciliation is **not** wired into this cron yet. |
 
 Replace maintainer example names with your own. The verifier and migration commands are now
 parameterized; self-hosters should pass their resource names by env vars/CLI args rather than
 editing the repository.
+
+## Transactional API (current state)
+
+The transactional API is implemented as a Phase 2 MVP on top of the Tier A mailbox core. It is an
+explicit, operator-created pre-authorization exception to the normal human-confirmed send path;
+the UI, Telegram, and MCP surfaces still require `request-send` → `confirm-send`.
+
+### Surface
+
+- `POST /v1/mailboxes/:mailboxId/transactional/messages` — send; body
+  `{ "template": "<id>", "to": "<addr>", "variables": {...} }`; requires `Authorization: Bearer
+  <api-key>` and `Idempotency-Key` (mandatory).
+- `GET /v1/mailboxes/:mailboxId/transactional/messages/:requestId` — request status; key must carry
+  `transactional:status`.
+- `/api/mailboxes/:mailboxId/transactional/api-keys` (create/list) and
+  `.../api-keys/:keyId/revoke`, `.../rotate` — Access-protected with an explicit mailbox-ownership
+  check (D1 `mailboxes.owner_email`).
+- `/api/mailboxes/:mailboxId/transactional/templates` (create/list) and
+  `.../templates/:templateId/archive` — versioned per-mailbox templates; Access-protected with
+  ownership check.
+
+### Key format and auth
+
+Keys are `rck_<env>_<key-id>_<secret>` (`env` ∈ `test|live`); the plaintext secret (256-bit) is
+shown once at creation. Only the keyed hash
+`HMAC-SHA256(TRANSACTIONAL_API_KEY_PEPPER, keyId + ":" + secret)` is stored in the mailbox DO;
+keys carry scopes, a template allowlist (null/empty = nothing sendable), a recipient policy,
+optional daily quota, and optional expiry. All auth decisions are DO-authoritative — D1 is never
+consulted for authorization, quota, or idempotency.
+
+### Guarantees and current limits
+
+- Same `(key, Idempotency-Key)` + same payload → original result; different payload → `409`.
+  The request row is inserted (and quota charged) at `pending` before the provider call.
+- Test keys (`environment=test`) are rejected in the production send path with
+  `test_key_not_allowed_in_production_send`. Test keys work for create/list/revoke/rotate only;
+  there is no simulated/test delivery sink.
+- Provider outcomes: `sent`, `permanent_failure` (definitely not delivered), `unknown`
+  (ambiguous — never auto-retried), `accepted` (pending), `rejected`, `idempotency_conflict`,
+  `duplicate`. Raw provider error messages are never stored.
+- D1 projections (`transactional_api_keys`, `transactional_request_log`) are rebuildable and
+  redact the key hash, plaintext, request body, variables, payload hash, and idempotency key.
+- **Not implemented:** bounce/complaint/suppression integration; a simulated delivery sink for
+  test keys; wiring `reconcileStaleTransactionalRequests` (exists in the DO, marks stale
+  `pending`/`sending` rows `unknown`/`stale_reconciled`) into the hourly cron or an operator
+  endpoint. Without that wiring, a crash mid-send can leave a `pending` row until an operator
+  resolves it.
+- The `/v1/...` routes are the only path outside the Access perimeter: JSON-only, 100 KB body cap,
+  `Cache-Control: no-store`, no CORS, no cookies, no query-param credentials.
 
 ## Readiness before a deploy
 
@@ -166,14 +221,19 @@ email/webhook alerts, or Cloudflare Alert Policies.
 Tables (see `src/do/mailbox-schema-content.ts`): `schema_migrations`, `mailbox_meta`,
 `ingest_events`, `threads`, `messages`, `message_headers`, `attachments`, `labels`,
 `message_labels`, `contacts`, `rules`, `outbound_drafts`, `jobs`, `realtime_events`, plus the
-`message_fts` FTS5 virtual table.
+`message_fts` FTS5 virtual table. Transactional state also lives here: `api_keys`, `api_key_events`,
+`api_key_usage` (per-minute rate and daily quota counters), `templates`, and
+`transactional_requests` (with the `(key_id, client_idempotency_key)` unique idempotency index and
+`mailbox_meta` send markers).
 
 ### D1 (`INDEX_DB`) — rebuildable index and ops log
 
 - Provisioning/routing catalog: `domains`, `mailboxes`, `aliases`, `routing_rules`
 - Cross-mailbox message summary: `message_index`
 - Ingest audit mirror: `ingest_events`
-- Outbound send audit: `outbound_sends`
+- Outbound send audit: `outbound_sends` (UI/Telegram/MCP confirm-send ledger)
+- Transactional projections: `transactional_api_keys`, `transactional_request_log` (keys/requests;
+  redacted; non-authoritative)
 - Operational log: `ops_events`
 
 If D1 and the Durable Object disagree, the Durable Object wins. Repair D1 with
@@ -239,7 +299,9 @@ all related R2 prefixes.
 | D1 unavailable | D1 outage or quota exhaustion | The mailbox Durable Object remains authoritative. Restore D1 service, then reindex affected mailboxes. |
 | Durable Object parse failure | MIME parser error on malformed/unusual message | Message row remains with `parse_status='failed'` and the raw R2 key preserved. Review the failure in `ops_events`. |
 | Outbound send failure | Provider rejection, size/recipient-limit violation, or crash mid-send | Inspect `outbound_sends.status`, `error_code`, and provider response context. Retry only after deciding whether the same idempotency key still represents the same logical send. |
-| `outbound_sends` row stuck at `status='sending'` | Crash/interruption mid-send | The hourly cron sweep marks stale sends `failed` with `error_code='stale_sending_timeout_needs_review'`. Treat that as manual-review-required, not proof the message did or did not send. |
+| `outbound_sends` row stuck at `status='sending'` | Crash/interruption mid-send | The hourly cron sweep marks stale sends `unknown` with `error_code='stale_sending_timeout_needs_review'` and an `outbound_send.stale_reconciled` ops event. Treat that as manual-review-required, not proof the message did or did not send. |
+| Transactional request stuck at `pending` | Crash mid-send in the transactional path | `reconcileStaleTransactionalRequests` exists in the DO (marks rows `unknown` / `stale_reconciled`) but is not yet wired to cron or an endpoint. Until then, resolve manually after reviewing `transactional_request_log` / DO state and the provider console. |
+| Transactional send returns `unknown` | Provider outcome is ambiguous (may have accepted before erroring) | Not auto-retried by design. Treat as manual-review-required; never re-send blindly with the same idempotency key. |
 | Access misconfiguration | Route exposed without proper Access enforcement | Treat as a security incident. Block public access first, then fix Access and re-verify with an unauthenticated request. |
 | Telegram webhook receives nothing | Cloudflare Access is intercepting `/telegram/webhook` | Telegram cannot present an Access JWT, so updates are redirected to the login page. Add an Access **Bypass** policy for that path only. Confirm with `getWebhookInfo` — `last_error_message` shows what Telegram received. |
 | `telegram.topic_unavailable` in `ops_events` | `createForumTopic` failed for this chat | Expected when topic mode is not enabled for the bot in that chat. The bridge already fell back to plain messages; replies still work by quoting the notification. Set `TELEGRAM_TOPICS` unset to stop retrying. |
@@ -281,13 +343,18 @@ issue as unresolved.
 All require an authenticated, authorized Access identity:
 
 - `GET /api/admin/ops-events` — recent operational events (rejections, forwards, conflicts,
-  backups, reindexes, stale-send reconciliations).
+  backups, reindexes, stale-send reconciliations, transactional request outcomes).
 - `GET /api/admin/dlq` — recent ingest failures recorded in D1. This is not a direct Cloudflare
   DLQ browser.
 - `POST /api/admin/reindex` — rebuild a mailbox's `message_index` rows in D1 from Durable Object
   state.
 - `POST /api/admin/backups/run` — trigger the same backup-manifest export path used by the hourly
   cron sweep.
+
+Transactional key management (create/list/revoke/rotate) and template CRUD are
+`/api/mailboxes/:mailboxId/transactional/*` routes behind the same Access perimeter plus a
+`mailboxes.owner_email` ownership check; the external send/status endpoints are
+`/v1/mailboxes/:mailboxId/transactional/*` and use API-key auth instead.
 
 ## Evidence expectations for ops changes
 

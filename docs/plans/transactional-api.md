@@ -18,14 +18,14 @@ Telegram, MCP, or agents.
   idempotency, and canonical outbound state. D1 is a rebuildable projection and audit index.
 - API keys use a bearer header, are shown only once, and are stored as a keyed hash with a
   Worker secret; plaintext keys never enter logs or persistent storage.
-- The proposed key format is `rck_test_<key-id>_<random-secret>` or
+- The key format is `rck_test_<key-id>_<random-secret>` or
   `rck_live_<key-id>_<random-secret>`, with a versioned HMAC pepper so rotation does not
   require storing plaintext secrets.
 - Initial scopes are separate rather than a generic `send`: `transactional:send`,
   `transactional:status`, and, if needed, `transactional:templates:use`.
 - Administrative key creation, rotation, and revocation remain behind Cloudflare Access.
-- The transactional endpoint must use the shared outbound engine and must never call
-  `EMAIL.send()` from a second path.
+- The transactional endpoint uses the mailbox DO's canonical outbound dispatch and does not
+  use the D1-backed human-confirmation orchestrator.
 - A provider error with an uncertain delivery outcome is `unknown`, not `failed`, and must
   not be retried automatically with the same or a newly generated key.
 - The system cannot reliably distinguish an application from a script or agent holding the
@@ -59,23 +59,21 @@ Add mailbox-owned Durable Object state for:
   provider identifier, and provenance.
 
 Add Access-protected administrative routes for create, list, revoke, and rotate. Add only
-rebuildable D1 projections and audit records. The next D1 migration must follow the current
-local `0004_telegram.sql` migration and therefore use `0005_*`.
+rebuildable D1 projections and audit records. D1 migrations `0006_*` and `0007_*` contain only
+rebuildable key and request projections.
 
 The key secret is never accepted from or returned to D1. Key operations must be mailbox-owned
 DO operations; D1 stores only searchable metadata and audit projections such as key ID,
 mailbox, status, timestamps, and usage counters.
 
-> **Note on Phase 2 vs. Phase 3 boundaries:** scopes, quota, expiry, and recipient policy
-> are stored (in both DO sqlite and the D1 projection) during Phase 2 but are **not yet
-> enforced** — they will be consumed and enforced by the transactional send endpoint in
-> Phase 3. The D1 projection is **non-authoritative**: a D1 outage or stale projection must
-> never alter the DO's canonical authorization or idempotency decision. DO-local sqlite is the
-> source of truth for key status, hashes, and usage counters.
+> **Implementation note:** scopes, expiry, recipient policy, template allowlists, quotas,
+> idempotency, and request state are enforced by the mailbox DO. D1 remains a non-authoritative
+> projection: an outage or stale projection never alters the DO's authorization or idempotency
+> decision.
 
-## Phase 3 — restricted transactional endpoint
+## Phase 3 — restricted transactional endpoint (implemented)
 
-Proposed endpoint:
+Endpoint:
 
 ```text
 POST /v1/mailboxes/:mailboxId/transactional/messages
@@ -108,11 +106,11 @@ exactly-once delivery cannot be claimed unless the provider supplies a compatibl
 or reconciliation mechanism; Reccado must expose this limitation rather than hiding it behind
 automatic retries.
 
-## Phase 4 — operational hardening
+## Phase 4 — operational hardening (implemented with provider limitations)
 
-Add per-key and per-mailbox rate limits in the DO, revocation and rotation tests, alerts for
-abuse and unknown outcomes, stale-send reconciliation, and explicit handling for bounces,
-complaints, and suppression lists before increasing volume or allowing arbitrary content.
+Per-key rate limits and quotas, revocation and rotation tests, redacted ops events, and
+DO-local stale-send reconciliation are implemented. Bounces, complaints, and suppression lists
+remain an explicit production limitation because no provider event integration exists yet.
 
 ## Acceptance criteria
 
@@ -135,6 +133,8 @@ complaints, and suppression lists before increasing volume or allowing arbitrary
 
 ## Current implementation gate
 
-Do not implement API-key routes until Phase 1 is complete and independently reviewed.
-The existing Telegram/threading work is committed separately in `34132ed`; the unrelated
-deletion of `untitled.md` remains outside that commit.
+Phases 1–4 are implemented and locally validated. The API-key endpoint is a deliberate
+preauthorization exception and does not weaken the human-confirmation boundary for UI,
+Telegram, MCP, or agents. Provider delivery is not claimed exactly-once; `unknown` outcomes
+are not automatically retried. The existing Telegram/threading work is committed separately
+in `34132ed`; the unrelated deletion of `untitled.md` remains outside these commits.

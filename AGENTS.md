@@ -111,7 +111,19 @@ actual repo state, fix this section rather than trusting it blindly.
 ### Current baseline
 
 - Phase 1 (Tier A inbox) is senior-validated; see `docs/validation/PHASE1_VALIDATION.md` for the historical
-  record. Phase 2 (Tier B: Workflows, EmailAgent, MCP endpoint, RAG) has not started.
+  record. The transactional API MVP (Phase 2 of `docs/plans/transactional-api.md` — HMAC/pepper API
+  keys, Access + owner-gated key/template admin, `POST/GET /v1/.../transactional/...` with Bearer
+  auth, mandatory `Idempotency-Key`, scopes, quotas, limits, test-key rejection for sending,
+  `unknown` → no auto-retry, redacted logs, non-authoritative D1 projections) is implemented in
+  `src/lib/transactional-*`, `src/do/transactional-*`, D1 migrations `0006`/`0007`, and covered by
+  `tests/unit/transactional-*.test.ts` + `tests/integration/transactional-*.test.ts`. The
+  MCP endpoint (`/mcp`, Access + `ACCESS_ALLOWED_EMAILS`, read/search/draft only) is implemented in
+  `src/mcp/*` (no send tool). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
+  Gateway) has not started — do not claim it.
+- Transactional API current gaps (Phases 3–4 not fully closed): no real
+  bounce/complaint/suppression integration; no simulated delivery sink for test keys;
+  `reconcileStaleTransactionalRequests` exists in the DO but is not wired into the hourly cron or an
+  operator endpoint, so a crash mid-send can leave a `pending` row pending manual review.
 - A security-hardening pass on top of Phase 1 is current/recent work: debug endpoints fail closed
   by default, attachment/raw downloads get hardened response headers, dev-data seeding requires
   explicit opt-in, an optional `ACCESS_ALLOWED_EMAILS` owner allowlist exists, inbound size is
@@ -120,8 +132,9 @@ actual repo state, fix this section rather than trusting it blindly.
 - Cloudflare Access **is** configured for the maintainer's dev environment (`ACCESS_JWT_AUDIENCE`
   / `ACCESS_TEAM_DOMAIN` secrets set); auth fails closed outside `localhost` when those are unset.
 - D1 **is** in the inbound/outbound hot path as the cross-mailbox index (`message_index`,
-  `ingest_events`, `outbound_sends`, `ops_events` are written on every ingest/send) — it is not
-  authoritative (the mailbox Durable Object is), but it is no longer merely "bound and unused."
+  `ingest_events`, `outbound_sends`, `ops_events` are written on every ingest/send; transactional
+  key/request projections are written on admin ops and send outcomes) — it is not authoritative
+  (the mailbox Durable Object is), but it is no longer merely "bound and unused."
 - Do not re-run a full Cloudflare-resource preflight unless the assigned task actually touches
   Cloudflare resources or auth. Do not advance beyond the assigned spike/milestone/task —
   validation gates are blocking.

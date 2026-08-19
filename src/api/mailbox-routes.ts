@@ -515,6 +515,37 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		}
 		return doResponse;
 	});
+
+	api.post("/api/mailboxes/:mailboxId/transactional/reconcile-stale", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
+		if (ownershipError) return ownershipError;
+		const stub = await mailboxStub(c.env, mailboxId);
+		const doResponse = await stub.fetch("https://mailbox-do/transactional/reconcile-stale", {
+			method: "POST",
+		});
+		if (!doResponse.ok) {
+			return c.json({ error: "reconcile_failed" }, 500);
+		}
+		const result = (await doResponse.json()) as {
+			mailboxId: string;
+			reconciled: number;
+			stillSending: number;
+		};
+		await insertOpsEvent(c.env.INDEX_DB, {
+			id: crypto.randomUUID(),
+			event_type: "transactional.reconcile_stale",
+			severity: "info",
+			subject: mailboxId,
+			payload_json: JSON.stringify({
+				reconciled: result.reconciled,
+				stillSending: result.stillSending,
+			}),
+		});
+		return c.json(result);
+	});
 }
 
 export function registerAdminRoutes(api: Hono<ApiBindings>): void {

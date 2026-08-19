@@ -199,6 +199,47 @@ CREATE TABLE IF NOT EXISTS api_key_events (
 
 CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id);
 
+CREATE TABLE IF NOT EXISTS api_key_usage (
+  key_id TEXT NOT NULL,
+  window_key TEXT NOT NULL,
+  value INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (key_id, window_key)
+);
+
+CREATE TABLE IF NOT EXISTS templates (
+  id TEXT PRIMARY KEY,
+  mailbox_id TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body_text TEXT,
+  body_html TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_templates_mailbox ON templates(mailbox_id, status);
+
+CREATE TABLE IF NOT EXISTS transactional_requests (
+  request_id TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL,
+  client_idempotency_key TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'duplicate', 'rejected', 'failed', 'unknown')),
+  to_addr TEXT NOT NULL,
+  template_id TEXT,
+  variables_json TEXT,
+  sender TEXT NOT NULL,
+  provider_message_id TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_txn_idempotency ON transactional_requests(key_id, client_idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_txn_status ON transactional_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_txn_key_lookup ON transactional_requests(key_id, created_at);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
   message_id UNINDEXED,
   subject,
