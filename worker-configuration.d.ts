@@ -6,6 +6,7 @@ interface __BaseEnv_Env {
 	INDEX_DB: D1Database;
 	EMAIL: SendEmail;
 	INBOUND_EMAIL_QUEUE: Queue;
+	EMAIL_EVENTS_QUEUE: Queue;
 	MAIL_FROM_ADDRESS: "noreply@mail.example.com";
 	PHASE0_DEBUG_TOKEN: string;
 	MAILBOX_ID_SECRET: string;

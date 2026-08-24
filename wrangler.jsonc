@@ -45,6 +45,10 @@
 			{
 				"binding": "INBOUND_EMAIL_QUEUE",
 				"queue": "inbox-mcp-inbound"
+			},
+			{
+				"binding": "EMAIL_EVENTS_QUEUE",
+				"queue": "inbox-mcp-email-events"
 			}
 		],
 		"consumers": [
@@ -52,6 +56,13 @@
 				"queue": "inbox-mcp-inbound",
 				"dead_letter_queue": "inbox-mcp-inbound-dlq",
 				"max_batch_size": 5,
+				"max_batch_timeout": 2,
+				"max_retries": 3
+			},
+			{
+				"queue": "inbox-mcp-email-events",
+				"dead_letter_queue": "inbox-mcp-email-events-dlq",
+				"max_batch_size": 10,
 				"max_batch_timeout": 2,
 				"max_retries": 3
 			}
@@ -110,6 +121,10 @@
 					{
 						"binding": "INBOUND_EMAIL_QUEUE",
 						"queue": "inbox-mcp-inbound-dev"
+					},
+					{
+						"binding": "EMAIL_EVENTS_QUEUE",
+						"queue": "inbox-mcp-email-events-dev"
 					}
 				],
 				"consumers": [
@@ -117,6 +132,13 @@
 						"queue": "inbox-mcp-inbound-dev",
 						"dead_letter_queue": "inbox-mcp-inbound-dlq-dev",
 						"max_batch_size": 5,
+						"max_batch_timeout": 2,
+						"max_retries": 3
+					},
+					{
+						"queue": "inbox-mcp-email-events-dev",
+						"dead_letter_queue": "inbox-mcp-email-events-dlq-dev",
+						"max_batch_size": 10,
 						"max_batch_timeout": 2,
 						"max_retries": 3
 					}

@@ -199,6 +199,18 @@ export async function handleTransactionalSend(
 		};
 	}
 
+	// 18a. Check local suppression list before sending
+	const { isRecipientSuppressed } = await import("./mailbox-suppressions");
+	const suppressionCheck = isRecipientSuppressed(ctx.sql, to);
+	if (suppressionCheck.suppressed) {
+		return {
+			status: "rejected",
+			requestId: "",
+			keyId: activeKeyId,
+			error: "recipient_suppressed",
+		};
+	}
+
 	// 19. Compute payload hash for idempotency
 	const payloadHash = await transactionalPayloadHash({
 		keyId: parsed.keyId,
@@ -740,6 +752,8 @@ export function makeTransactionalRequestLogRow(
 		sender: string;
 		provider_message_id: string | null;
 		error_code: string | null;
+		delivery_status: string | null;
+		delivery_event_at: string | null;
 		created_at: string;
 		updated_at: string;
 	},
@@ -753,6 +767,8 @@ export function makeTransactionalRequestLogRow(
 	sender: string;
 	provider_message_id: string | null;
 	error_code: string | null;
+	delivery_status: string | null;
+	delivery_event_at: string | null;
 	created_at: string;
 	updated_at: string;
 } {
@@ -766,6 +782,8 @@ export function makeTransactionalRequestLogRow(
 		sender: row.sender,
 		provider_message_id: row.provider_message_id,
 		error_code: row.error_code,
+		delivery_status: row.delivery_status ?? null,
+		delivery_event_at: row.delivery_event_at ?? null,
 		created_at: row.created_at,
 		updated_at: row.updated_at,
 	};
@@ -809,6 +827,8 @@ export function getTransactionalRequestStatus(
 	providerMessageId: string | null;
 	createdAt: string;
 	errorCode: string | null;
+	deliveryStatus: string | null;
+	deliveryEventAt: string | null;
 } | null {
 	const row =
 		sql
@@ -817,8 +837,10 @@ export function getTransactionalRequestStatus(
 				provider_message_id: string | null;
 				created_at: string;
 				error_code: string | null;
+				delivery_status: string | null;
+				delivery_event_at: string | null;
 			}>(
-				"SELECT status, provider_message_id, created_at, error_code FROM transactional_requests WHERE request_id = ? AND key_id = ?",
+				"SELECT status, provider_message_id, created_at, error_code, delivery_status, delivery_event_at FROM transactional_requests WHERE request_id = ? AND key_id = ?",
 				requestId,
 				keyId,
 			)
@@ -829,5 +851,7 @@ export function getTransactionalRequestStatus(
 		providerMessageId: row.provider_message_id,
 		createdAt: row.created_at,
 		errorCode: row.error_code,
+		deliveryStatus: row.delivery_status,
+		deliveryEventAt: row.delivery_event_at,
 	};
 }

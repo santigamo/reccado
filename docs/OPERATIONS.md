@@ -54,7 +54,7 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 | `INBOUND_EMAIL_QUEUE` | Queue producer + consumer | `inbox-mcp-inbound-dev` (DLQ: `inbox-mcp-inbound-dlq-dev`) | Metadata-only inbound transport; `max_batch_size: 5`, `max_batch_timeout: 2`, `max_retries: 3`. |
 | `INDEX_DB` | D1 database | `inbox-mcp-index-dev` | Cross-mailbox/control-plane index (see data model below). |
 | `EMAIL` | Email Sending (`send_email`) | n/a | Outbound `env.EMAIL.send()`, only after `confirm-send` (UI/Telegram/MCP) or a validated transactional API-key send. |
-| `triggers.crons` | Cron Trigger | `0 * * * *` (hourly, maintainer dev) | Backup sweep + stale `outbound_sends` reconciliation + expired Telegram action sweep. Transactional stale-request reconciliation is **not** wired into this cron yet. |
+| `triggers.crons` | Cron Trigger | `0 * * * *` (hourly, maintainer dev) | Backup sweep + stale `outbound_sends` and transactional-request reconciliation + expired Telegram action sweep. |
 
 Replace maintainer example names with your own. The verifier and migration commands are now
 parameterized; self-hosters should pass their resource names by env vars/CLI args rather than
@@ -62,7 +62,7 @@ editing the repository.
 
 ## Transactional API (current state)
 
-The transactional API is implemented as a Phase 2 MVP on top of the Tier A mailbox core. It is an
+The transactional API is implemented on top of the Tier A mailbox core. It is an
 explicit, operator-created pre-authorization exception to the normal human-confirmed send path;
 the UI, Telegram, and MCP surfaces still require `request-send` → `confirm-send`.
 
@@ -101,11 +101,23 @@ consulted for authorization, quota, or idempotency.
   `duplicate`. Raw provider error messages are never stored.
 - D1 projections (`transactional_api_keys`, `transactional_request_log`) are rebuildable and
   redact the key hash, plaintext, request body, variables, payload hash, and idempotency key.
-- **Not implemented:** bounce/complaint/suppression integration; a simulated delivery sink for
-  test keys; wiring `reconcileStaleTransactionalRequests` (exists in the DO, marks stale
-  `pending`/`sending` rows `unknown`/`stale_reconciled`) into the hourly cron or an operator
-  endpoint. Without that wiring, a crash mid-send can leave a `pending` row until an operator
-  resolves it.
+- Cloudflare Email Sending lifecycle events are consumed through the
+  `inbox-mcp-email-events` Queue. Hard bounces and complaints create a mailbox-DO suppression;
+  suppressed recipients are rejected before quota reservation or provider dispatch. Soft
+  bounces and deferred events update delivery state without suppressing. Cloudflare's own
+  account suppression list remains upstream authoritative; the DO list is the local
+  application-enforcement mirror and is never automatically unsuppressed.
+- Configure one Email Sending event subscription per sending domain in Cloudflare Dashboard:
+  **Queues → `inbox-mcp-email-events` → Subscriptions → Subscribe to events → Email Sending**;
+  select the sending domain and `message.delivered`, `message.deferred`, `message.bounced`,
+  `message.rejected`, `message.complained`, and `message.failed`. Repeat for the dev queue and
+  dev sending domain. The currently installed Wrangler CLI does not yet expose
+  `email.sending` in `queues subscription create`, so do not use its generic command with an
+  unsupported source. The event queue has a configured DLQ; unresolved or invalid events are
+  retried rather than silently acknowledged.
+- Access-protected suppression administration is available at
+  `/api/mailboxes/:mailboxId/suppressions` and `/suppressions/remove`. Provider-originated
+  hard-bounce/complaint entries require explicit override to remove.
 - The `/v1/...` routes are the only path outside the Access perimeter: JSON-only, 100 KB body cap,
   `Cache-Control: no-store`, no CORS, no cookies, no query-param credentials.
 

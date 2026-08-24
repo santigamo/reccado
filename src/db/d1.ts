@@ -789,6 +789,8 @@ export type TransactionalRequestLogRow = {
 	sender: string;
 	provider_message_id: string | null;
 	error_code: string | null;
+	delivery_status: string | null;
+	delivery_event_at: string | null;
 	created_at: string;
 	updated_at: string;
 };
@@ -801,8 +803,8 @@ export async function upsertTransactionalRequestLog(
 		.prepare(
 			`INSERT OR REPLACE INTO transactional_request_log
        (request_id, key_id, mailbox_id, status, to_addr, template_id,
-        sender, provider_message_id, error_code, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sender, provider_message_id, error_code, delivery_status, delivery_event_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
 		.bind(
 			row.request_id,
@@ -814,8 +816,74 @@ export async function upsertTransactionalRequestLog(
 			row.sender,
 			row.provider_message_id,
 			row.error_code,
+			row.delivery_status ?? null,
+			row.delivery_event_at ?? null,
 			row.created_at,
 			row.updated_at,
+		)
+		.run();
+}
+
+/**
+ * Looks up a transactional request log by provider_message_id.
+ * Used by the email-events queue consumer to resolve mailbox DO from delivery events.
+ * Returns null if the projection is absent (event may race the write).
+ */
+export async function lookupTransactionalRequestByProviderMessageId(
+	db: D1Database,
+	providerMessageId: string,
+): Promise<{ request_id: string; mailbox_id: string; to_addr: string; sender: string } | null> {
+	return db
+		.prepare(
+			"SELECT request_id, mailbox_id, to_addr, sender FROM transactional_request_log WHERE provider_message_id = ?",
+		)
+		.bind(providerMessageId)
+		.first<{ request_id: string; mailbox_id: string; to_addr: string; sender: string }>();
+}
+
+export async function updateTransactionalRequestDeliveryProjection(
+	db: D1Database,
+	requestId: string,
+	deliveryStatus: string,
+	deliveryEventAt: string,
+): Promise<void> {
+	await db
+		.prepare(
+			"UPDATE transactional_request_log SET delivery_status = ?, delivery_event_at = ?, updated_at = ? WHERE request_id = ?",
+		)
+		.bind(deliveryStatus, deliveryEventAt, new Date().toISOString(), requestId)
+		.run();
+}
+
+/**
+ * Upserts a suppression projection to D1 (best-effort, non-authoritative mirror).
+ */
+export async function upsertSuppressionProjection(
+	db: D1Database,
+	row: {
+		email: string;
+		mailbox_id: string;
+		reason: "hard_bounce" | "complaint" | "manual" | "provider_rejected";
+		source_event_id: string | null;
+		created_at: string;
+		updated_at: string;
+		expires_at: string | null;
+	},
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT OR REPLACE INTO recipient_suppressions
+       (email, mailbox_id, reason, source_event_id, created_at, updated_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			row.email.trim().toLowerCase(),
+			row.mailbox_id,
+			row.reason,
+			row.source_event_id,
+			row.created_at,
+			row.updated_at,
+			row.expires_at,
 		)
 		.run();
 }

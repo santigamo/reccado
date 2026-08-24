@@ -10,10 +10,16 @@ package.
 ## [Unreleased]
 
 Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox, plus the
-transactional API MVP (Phase 2 of the `docs/plans/transactional-api.md` plan) and the MCP
+transactional API (Phases 2–4 of the `docs/plans/transactional-api.md` plan) and the MCP
 read/search/draft endpoint.
 
 ### Added
+
+- **Cloudflare Email Sending lifecycle integration.** Email Sending event subscriptions feed the
+  `inbox-mcp-email-events` Queue. Delivery, deferred, bounce, rejection, complaint, and failure
+  events update canonical transactional delivery state; hard bounces and complaints create
+  mailbox-DO suppressions that block future sends. Events are idempotent and unresolved/poison
+  messages retry to the configured DLQ.
 
 - **Transactional API (Phase 2 — MVP).** External REST API at `/v1/mailboxes/:id/transactional/messages`
   for programmatic outbound sending with:
@@ -76,16 +82,15 @@ read/search/draft endpoint.
 
 ### Known limitations (transactional API)
 
-- No bounce/complaint/suppression list integration. Provider rejections are classified as
-  `permanent_failure` or `unknown`, but there is no automated suppression or bounce processing.
+- Cloudflare Email Sending event subscriptions must be configured separately for each sending
+  domain; Wrangler queue bindings alone do not create the subscription. Cloudflare's account
+  suppression list remains upstream authoritative; Reccado's DO suppression list is a local
+  enforcement mirror and does not automatically unsuppress recipients.
 - Test keys (`environment=test`) are rejected in the production send path. A simulated/test sink
   for test-mode delivery does not exist yet; test keys only work for creation/listing/revocation
   operations.
-- Stale transactional-request reconciliation (`reconcileStaleTransactionalRequests` in
-  `src/do/transactional-send-ops.ts`, which flips stuck `pending`/`sending` rows to
-  `unknown` / `stale_reconciled`) is implemented as a DO helper but is **not yet wired** into the
-  hourly cron or an operator endpoint. A crash mid-send can leave a `transactional_requests` row at
-  `pending` until an operator resolves it manually.
+- Stale transactional-request reconciliation remains manual-review-oriented: it flips stuck
+  `pending`/`sending` rows to `unknown` and never retries delivery automatically.
 
 ### Fixed
 
@@ -141,8 +146,8 @@ read/search/draft endpoint.
   versioned template CRUD, `POST/GET /v1/.../transactional/...` with Bearer +
   `Idempotency-Key` + scopes/limits/quota, test-key rejection for sending, `unknown` → no
   auto-retry, non-authoritative D1 projections, log redaction, no CORS/query/cookies, and the
-  explicit gap of no real bounce/complaint/suppression integration and no wired stale-request
-  reconciliation. `SECURITY.md`, `README.md`, `docs/OPERATIONS.md`, `AGENTS.md`, and
+  Cloudflare Email Sending event subscription setup and no simulated delivery sink for test keys.
+  `SECURITY.md`, `README.md`, `docs/OPERATIONS.md`, `AGENTS.md`, and
   `PRODUCTION-READINESS.md` were updated; the MCP/UI/Telegram human-confirm gate is unchanged and
   Tier B (Workflows, EmailAgent, RAG) is not claimed as implemented.
 - Added Biome for linting/formatting (`pnpm lint`, `pnpm format`, `pnpm format:check`) and a

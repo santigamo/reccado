@@ -254,6 +254,11 @@ export default {
 		return handleEmail(message, env, ctx);
 	},
 	async queue(batch: MessageBatch<InboundEmailQueueMessage>, env: Env, ctx: ExecutionContext) {
+		const queueName = batch.queue;
+		if (queueName === "inbox-mcp-email-events" || queueName === "inbox-mcp-email-events-dev") {
+			const { handleEmailEventsQueue } = await import("./cloudflare/email-events-consumer");
+			return handleEmailEventsQueue(batch as MessageBatch<unknown>, env, ctx);
+		}
 		const { handleInboundQueue } = await import("./cloudflare/queue-consumer");
 		return handleInboundQueue(batch, env, ctx);
 	},

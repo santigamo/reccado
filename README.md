@@ -442,9 +442,11 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
   are never stored.
 - **Test keys never send real mail** — the production send path rejects them until a simulated/test
   sink exists.
-- **Not implemented:** bounce/complaint/suppression integration; a simulated delivery sink;
-  wiring stale transactional-request reconciliation into the cron (a crash mid-send can leave a row
-  at `pending`).
+- Cloudflare Email Sending events are consumed through a Queue; hard bounces and complaints
+  create mailbox-local suppressions that block future transactional sends. Configure the
+  per-domain Email Sending event subscription in Cloudflare Dashboard; test keys still have no
+  simulated delivery sink and are rejected for sending.
+- Stale transactional requests are reconciled hourly to `unknown` and never retried automatically.
 - Hardening: JSON-only, 100 KB body cap, `Cache-Control: no-store`, no CORS, no cookies, no
   query-param credentials.
 

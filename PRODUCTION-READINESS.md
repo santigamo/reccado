@@ -88,12 +88,12 @@ are still incomplete:
    and covered by a send-path security test, but the surface is minimal (five tools, Access-JWT-only,
    no OAuth flow) and the broader Tier B agent/RAG surface remains roadmap-only and must not be
    advertised as shipped.
-6. The transactional API is an MVP with real operational gaps: its stale-request reconciliation
-   helper exists only as a DO function (not wired to cron/endpoint), there is no real
-   bounce/complaint/suppression integration, and test keys cannot be exercised end-to-end without a
-   simulated delivery sink. These keep Phase 3–4 hardening incomplete; sending on its production
-   path is deliberately restricted (template allowlist, recipient policy, quota, `unknown` → no
-   auto-retry).
+6. The transactional API remains deliberately restricted (template allowlist, recipient policy,
+   quota, `unknown` → no auto-retry). Stale-request reconciliation is wired to cron and an
+   operator endpoint. Cloudflare Email Sending bounce/complaint events are integrated through
+   Queues and mailbox-DO suppressions, but each sending domain's event subscription must still be
+   configured before production use; test keys have no simulated delivery sink and are rejected
+   for sending.
 7. CI (`.github/workflows/ci.yml`) verifies build/test/typecheck/lint/dry-run-deploy but has no
    deploy/promotion/rollback job; deploy remains a manual local script (Gate 15).
 8. The repo is `product-ui` by modifier because it ships a TanStack Start web UI, but UI quality
@@ -121,9 +121,9 @@ Use this narrower production claim in repo-facing docs and audits:
    validation.
 4. Add SBOM/provenance or an explicitly waived alternative proportional to a public, regulated,
    self-hosted service.
-5. Close the transactional-API hardening gaps: wire `reconcileStaleTransactionalRequests` into the
-   cron or an operator endpoint, add bounce/complaint/suppression handling, and provide a
-   simulated/test deliverability for `environment=test` keys before growing send volume.
+5. Complete transactional-API operations before growing send volume: configure and validate the
+   per-domain Cloudflare Email Sending event subscriptions in dev, and provide a simulated/test
+   deliverability sink for `environment=test` keys.
 6. Keep Tier B claims explicitly roadmap-only until the remaining agent/RAG surfaces ship with tool
    contracts, auth scopes, and validation evidence (the current MCP endpoint is shipped and
    minimal).

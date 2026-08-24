@@ -17,7 +17,8 @@ async function applyD1Migrations(db: D1Database): Promise<void> {
 	const m3 = await import("../../migrations/d1/0003_mailbox_owner.sql?raw");
 	const m6 = await import("../../migrations/d1/0006_transactional_api_keys.sql?raw");
 	const m7 = await import("../../migrations/d1/0007_transactional_requests.sql?raw");
-	for (const raw of [m1.default, m2.default, m3.default, m6.default, m7.default]) {
+	const m8 = await import("../../migrations/d1/0008_email_events_suppressions.sql?raw");
+	for (const raw of [m1.default, m2.default, m3.default, m6.default, m7.default, m8.default]) {
 		const statements = (raw as string)
 			.split(";")
 			.map((s) => s.trim())
@@ -369,6 +370,8 @@ describe("Transactional send flow", () => {
 				sender: "sender@test.com",
 				provider_message_id: "<msg@cloudflare.email>",
 				error_code: null,
+				delivery_status: null,
+				delivery_event_at: null,
 				created_at: now,
 				updated_at: now,
 			});
@@ -466,6 +469,158 @@ describe("Transactional send flow", () => {
 			const bOwnStatus = await getStatus(mailboxId, keyB, "nonexistent-request");
 			expect(bOwnStatus.status).toBe(404);
 			expect(bOwnStatus.json.error).toBe("not_found");
+		});
+	});
+
+	describe("Cloudflare Email Sending delivery events", () => {
+		it("suppresses hard-bounced recipients and processes event replays idempotently", async () => {
+			const mailboxId = "mbx_delivery_hard_bounce";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const first = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "delivery-1", {
+				template: "t",
+				to: "hard-bounce@example.com",
+			});
+			expect(first.status).toBe(200);
+			const providerMessageId = first.json.providerMessageId as string;
+			const event = {
+				event: {
+					event_id: "cf-event-hard-bounce-1",
+					event_type: "cf.email.sending.message.bounced",
+					provider_message_id: providerMessageId,
+					to: "hard-bounce@example.com",
+					from: "sender@test.com",
+					timestamp: new Date().toISOString(),
+					bounce_type: "hard",
+				},
+				requestId: first.json.requestId,
+			};
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			const firstEvent = await stub.fetch("https://mailbox-do/transactional/delivery-event", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(event),
+			});
+			expect(firstEvent.status).toBe(200);
+			const status = await getStatus(mailboxId, plaintextKey, first.json.requestId as string);
+			expect(status.status).toBe(200);
+			expect(status.json.deliveryStatus).toBe("bounced");
+			expect(status.json.deliveryEventAt).toBeTruthy();
+
+			const replay = await stub.fetch("https://mailbox-do/transactional/delivery-event", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(event),
+			});
+			expect(replay.status).toBe(200);
+			const replayBody = (await replay.json()) as { idempotent?: boolean };
+			expect(replayBody.idempotent).toBe(true);
+
+			const invalidReplay = await stub.fetch("https://mailbox-do/transactional/delivery-event", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					...event,
+					event: { ...event.event, event_type: "invalid.event" },
+				}),
+			});
+			expect(invalidReplay.status).toBe(400);
+
+			const blocked = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "delivery-2", {
+				template: "t",
+				to: "hard-bounce@example.com",
+			});
+			expect(blocked.status).toBe(403);
+			expect(blocked.json.error).toBe("recipient_suppressed");
+		});
+
+		it("does not suppress deferred or soft-bounced recipients", async () => {
+			const mailboxId = "mbx_delivery_soft_bounce";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+			const first = await sendTransactional(
+				mailboxId,
+				`Bearer ${plaintextKey}`,
+				"delivery-soft-1",
+				{
+					template: "t",
+					to: "temporary@example.com",
+				},
+			);
+			expect(first.status).toBe(200);
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			const event = {
+				event: {
+					event_id: "cf-event-soft-bounce-1",
+					event_type: "cf.email.sending.message.bounced",
+					provider_message_id: first.json.providerMessageId,
+					to: "temporary@example.com",
+					from: "sender@test.com",
+					timestamp: new Date().toISOString(),
+					bounce_type: "soft",
+				},
+				requestId: first.json.requestId,
+			};
+			const response = await stub.fetch("https://mailbox-do/transactional/delivery-event", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(event),
+			});
+			expect(response.status).toBe(200);
+
+			const second = await sendTransactional(
+				mailboxId,
+				`Bearer ${plaintextKey}`,
+				"delivery-soft-2",
+				{
+					template: "t",
+					to: "temporary@example.com",
+				},
+			);
+			expect(second.status).toBe(200);
+		});
+
+		it("rejects an event whose sender does not match the canonical request", async () => {
+			const mailboxId = "mbx_delivery_mismatch";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+			const first = await sendTransactional(
+				mailboxId,
+				`Bearer ${plaintextKey}`,
+				"delivery-mismatch-1",
+				{
+					template: "t",
+					to: "mismatch@example.com",
+				},
+			);
+			expect(first.status).toBe(200);
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			const response = await stub.fetch("https://mailbox-do/transactional/delivery-event", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					event: {
+						event_id: "cf-event-mismatch-1",
+						event_type: "cf.email.sending.message.complained",
+						provider_message_id: first.json.providerMessageId,
+						to: "mismatch@example.com",
+						from: "attacker@example.com",
+						timestamp: new Date().toISOString(),
+					},
+					requestId: first.json.requestId,
+				}),
+			});
+			expect(response.status).toBe(404);
 		});
 	});
 });

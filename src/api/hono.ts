@@ -23,7 +23,11 @@ import {
 	isLocalRequest,
 } from "../lib/runtime-config";
 import { assertMailboxAccess, type getAuthContext, requireAuth } from "./auth";
-import { registerAdminRoutes, registerMailboxRoutes } from "./mailbox-routes";
+import {
+	registerAdminRoutes,
+	registerMailboxRoutes,
+	registerMailboxSuppressionRoutes,
+} from "./mailbox-routes";
 import {
 	createAliasSchema,
 	createDomainSchema,
@@ -428,6 +432,7 @@ export function createApiApp(): Hono<ApiBindings> {
 	});
 
 	registerMailboxRoutes(api);
+	registerMailboxSuppressionRoutes(api);
 	registerAdminRoutes(api);
 
 	// MCP endpoint: forward all methods (GET/POST/OPTIONS) to the MCP handler.

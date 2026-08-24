@@ -548,6 +548,43 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	});
 }
 
+export function registerMailboxSuppressionRoutes(api: Hono<ApiBindings>): void {
+	// Suppression list — owner-gated via mailboxId path param
+	api.get("/api/mailboxes/:mailboxId/suppressions", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const mailbox = await getMailboxForOwner(c.env.INDEX_DB, mailboxId, auth.email);
+		if (!mailbox) return c.json({ error: "forbidden" }, 403);
+		const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+		return stub.fetch("https://mailbox-do/transactional/suppressions");
+	});
+
+	api.post("/api/mailboxes/:mailboxId/suppressions/remove", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const mailbox = await getMailboxForOwner(c.env.INDEX_DB, mailboxId, auth.email);
+		if (!mailbox) return c.json({ error: "forbidden" }, 403);
+		const body = (await c.req.json()) as {
+			email: string;
+			allowProviderRemoval?: boolean;
+		};
+		if (!body.email) {
+			return c.json({ error: "email_required" }, 400);
+		}
+		const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+		return stub.fetch("https://mailbox-do/transactional/suppressions", {
+			method: "DELETE",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				email: body.email,
+				allowProviderRemoval: body.allowProviderRemoval ?? false,
+			}),
+		});
+	});
+}
+
 export function registerAdminRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/admin/ops-events", async (c) => {
 		return c.json({ events: await listOpsEvents(c.env.INDEX_DB) });

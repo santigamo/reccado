@@ -129,19 +129,21 @@ outside the `/api/*` Access perimeter and authenticates via the API key `Bearer`
   body, variables, payload hash, and raw provider errors. Recipient addresses and template ids are
   treated as mailbox metadata and appear only where the existing inbox-surface model already
   exposes them (mailbox Durable Object; D1 request-log projection).
-- The status endpoint (`GET .../messages/:requestId`) requires a valid key with `transactional:status`
-  in the same mailbox. The request ID is not separately bound to the key; any key with the status
-  scope in a mailbox can read that mailbox's request statuses.
+- The status endpoint (`GET .../messages/:requestId`) requires a valid key with
+  `transactional:status` and binds the request to the same key and mailbox.
 
-### Known boundary (not implemented)
+### Delivery events and suppression
 
-There is **no bounce/complaint/suppression-list integration**. Provider rejections are classified as
-`permanent_failure` or `unknown`, but there is no automated suppression, bounce processing, or
-complaint feedback. A stale-request reconciliation helper exists in the Durable Object
-(`reconcileStaleTransactionalRequests`: flips stuck `pending`/`sending` rows to status `unknown`
-with `error_code='stale_reconciled'`), but it is **not yet wired** to any endpoint or the hourly
-cron; the cron currently reconciles only the UI/Telegram `outbound_sends` D1 ledger. Treat
-transactional send outcomes marked `unknown` as manual-review-required.
+Cloudflare Email Sending lifecycle events are consumed through a Queue event subscription. The
+mailbox Durable Object validates the provider message ID, sender, recipient, and event ID before
+applying the event. Hard bounces and complaints create local suppressions; deferred, soft-bounce,
+and delivery-failure events update delivery state without suppressing. Suppressed recipients are
+blocked before transactional dispatch. Cloudflare's account suppression list remains upstream
+authoritative, and provider-originated local suppressions require an explicit override to remove.
+Event logs omit subjects, bodies, SMTP responses, provider reasons, variables, and credentials.
+
+Transactional send outcomes marked `unknown` remain manual-review-required. The stale-request
+reconciliation helper is wired to the hourly cron and an Access-protected operator endpoint.
 
 ### Secrets
 

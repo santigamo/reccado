@@ -111,7 +111,7 @@ actual repo state, fix this section rather than trusting it blindly.
 ### Current baseline
 
 - Phase 1 (Tier A inbox) is senior-validated; see `docs/validation/PHASE1_VALIDATION.md` for the historical
-  record. The transactional API MVP (Phase 2 of `docs/plans/transactional-api.md` — HMAC/pepper API
+  record. The transactional API (Phases 2–4 of `docs/plans/transactional-api.md` — HMAC/pepper API
   keys, Access + owner-gated key/template admin, `POST/GET /v1/.../transactional/...` with Bearer
   auth, mandatory `Idempotency-Key`, scopes, quotas, limits, test-key rejection for sending,
   `unknown` → no auto-retry, redacted logs, non-authoritative D1 projections) is implemented in
@@ -119,11 +119,13 @@ actual repo state, fix this section rather than trusting it blindly.
   `tests/unit/transactional-*.test.ts` + `tests/integration/transactional-*.test.ts`. The
   MCP endpoint (`/mcp`, Access + `ACCESS_ALLOWED_EMAILS`, read/search/draft only) is implemented in
   `src/mcp/*` (no send tool). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
-  Gateway) has not started — do not claim it.
-- Transactional API current gaps (Phases 3–4 not fully closed): no real
-  bounce/complaint/suppression integration; no simulated delivery sink for test keys;
-  `reconcileStaleTransactionalRequests` exists in the DO but is not wired into the hourly cron or an
-  operator endpoint, so a crash mid-send can leave a `pending` row pending manual review.
+  Gateway) has not started — do not claim it. Cloudflare Email Sending lifecycle events are
+  consumed by the `inbox-mcp-email-events` Queue and hard-bounce/complaint suppressions are
+  enforced in the mailbox DO; the per-domain Email Sending event subscription still requires
+  Cloudflare Dashboard configuration.
+- Transactional API current gap: no simulated delivery sink for test keys; test keys are rejected
+  by the production send path. `reconcileStaleTransactionalRequests` is wired into the hourly
+  cron and an Access-protected operator endpoint, and unknown outcomes remain manual-review-only.
 - A security-hardening pass on top of Phase 1 is current/recent work: debug endpoints fail closed
   by default, attachment/raw downloads get hardened response headers, dev-data seeding requires
   explicit opt-in, an optional `ACCESS_ALLOWED_EMAILS` owner allowlist exists, inbound size is

@@ -20,7 +20,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 2;
+const MAILBOX_SCHEMA_VERSION = 3;
 
 // Minimal runtime validation for the /ingest payload. Defined locally (rather than
 // imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
@@ -761,6 +761,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 2) {
 			this.migrateDraftIdempotency();
 		}
+		// v3: add delivery_status/delivery_event_at to transactional_requests
+		// (the new tables recipient_suppressions and transactional_delivery_events
+		// are handled by CREATE TABLE IF NOT EXISTS in MAILBOX_SCHEMA_SQL).
+		if (currentVersion < 3) {
+			this.migrateDeliveryEventColumns();
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -791,6 +797,20 @@ export class MailboxDurableObject extends DurableObject<Env> {
        ON outbound_drafts(idempotency_key)
        WHERE idempotency_key IS NOT NULL`,
 		);
+	}
+
+	private migrateDeliveryEventColumns(): void {
+		const columns = this.columnNames("transactional_requests");
+		if (!columns.has("delivery_status")) {
+			this.ctx.storage.sql.exec(
+				"ALTER TABLE transactional_requests ADD COLUMN delivery_status TEXT",
+			);
+		}
+		if (!columns.has("delivery_event_at")) {
+			this.ctx.storage.sql.exec(
+				"ALTER TABLE transactional_requests ADD COLUMN delivery_event_at TEXT",
+			);
+		}
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -1057,10 +1077,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 						sender: string;
 						provider_message_id: string | null;
 						error_code: string | null;
+						delivery_status: string | null;
+						delivery_event_at: string | null;
 						created_at: string;
 						updated_at: string;
 					}>(
-						"SELECT request_id, key_id, status, to_addr, template_id, sender, provider_message_id, error_code, created_at, updated_at FROM transactional_requests WHERE request_id = ?",
+						"SELECT request_id, key_id, status, to_addr, template_id, sender, provider_message_id, error_code, delivery_status, delivery_event_at, created_at, updated_at FROM transactional_requests WHERE request_id = ?",
 						result.requestId,
 					)
 					.toArray()[0];
@@ -1216,6 +1238,35 @@ export class MailboxDurableObject extends DurableObject<Env> {
 					{ error: error instanceof Error ? error.message : String(error) },
 					{ status: 500 },
 				);
+			}
+		}
+
+		// --- Email Sending delivery event route (internal, no public API) ---
+		if (url.pathname === "/transactional/delivery-event" && request.method === "POST") {
+			return this.handleDeliveryEvent(request);
+		}
+
+		// --- Suppression admin routes (internal, Access-protected via API layer) ---
+		if (url.pathname === "/transactional/suppressions" && request.method === "GET") {
+			const { listSuppressions } = await import("./mailbox-suppressions");
+			return Response.json({ suppressions: listSuppressions(this.ctx.storage.sql) });
+		}
+		if (url.pathname === "/transactional/suppressions" && request.method === "DELETE") {
+			try {
+				const body = (await request.json()) as {
+					email: string;
+					allowProviderRemoval?: boolean;
+				};
+				const { removeSuppression } = await import("./mailbox-suppressions");
+				const removed = removeSuppression(
+					this.ctx.storage.sql,
+					body.email,
+					body.allowProviderRemoval ?? false,
+				);
+				return Response.json({ removed });
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				return Response.json({ error: msg }, { status: 400 });
 			}
 		}
 		return new Response("Not found", { status: 404 });
@@ -1664,5 +1715,107 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
 	private debugState() {
 		return debugState(this.ctx.storage.sql);
+	}
+
+	/**
+	 * Handles a delivery event from the Email Sending lifecycle event subscription.
+	 *
+	 * Validation:
+	 * 1. Validates the event schema.
+	 * 2. Checks eventId idempotency — if already recorded, returns 200 (already processed).
+	 * 3. Finds the canonical DO request by provider_message_id.
+	 * 4. Validates sender and recipient match exactly.
+	 * 5. If no match found via provider_message_id, falls back to requestId lookup.
+	 * 6. Unmatched events return 404 (triggers queue retry/DLQ).
+	 */
+	private async handleDeliveryEvent(request: Request): Promise<Response> {
+		let json: unknown;
+		try {
+			json = await request.json();
+		} catch {
+			return Response.json({ error: "invalid_json" }, { status: 400 });
+		}
+		if (typeof json !== "object" || json === null) {
+			return Response.json({ error: "invalid_payload" }, { status: 400 });
+		}
+		const body = json as { event?: unknown; requestId?: unknown };
+		const { classifyEmailEvent, emailSendingEventSchema } = await import(
+			"../cloudflare/email-events"
+		);
+		const { handleDeliveryEvent: processDeliveryEvent } = await import("./mailbox-suppressions");
+		const parsed = emailSendingEventSchema.safeParse(body.event);
+		if (!parsed.success) {
+			return Response.json({ error: "invalid_event_schema" }, { status: 400 });
+		}
+		const event = parsed.data;
+		const requestId = typeof body.requestId === "string" ? body.requestId : null;
+		const processEvent = (resolvedRequestId: string): Response => {
+			const classification = classifyEmailEvent(event);
+			processDeliveryEvent(this.ctx.storage.sql, event, classification, resolvedRequestId);
+			return Response.json({
+				ok: true,
+				deliveryStatus: classification.deliveryStatus,
+				suppressed: classification.suppress,
+			});
+		};
+
+		// Idempotency check: if event_id already recorded, return 200 (already processed)
+		const existingEvent = this.ctx.storage.sql
+			.exec<{ event_id: string }>(
+				"SELECT event_id FROM transactional_delivery_events WHERE event_id = ?",
+				event.event_id,
+			)
+			.toArray()[0];
+		if (existingEvent) {
+			return Response.json({ ok: true, idempotent: true });
+		}
+
+		// Validate the event against the stored transactional request.
+		// Find the request by provider_message_id.
+		const requestRow = this.ctx.storage.sql
+			.exec<{
+				request_id: string;
+				to_addr: string;
+				sender: string;
+			}>(
+				"SELECT request_id, to_addr, sender FROM transactional_requests WHERE provider_message_id = ?",
+				event.provider_message_id,
+			)
+			.toArray()[0];
+
+		if (!requestRow) {
+			// If we have a requestId from D1, try that too
+			if (requestId) {
+				const rowByRequestId = this.ctx.storage.sql
+					.exec<{
+						request_id: string;
+						to_addr: string;
+						sender: string;
+					}>(
+						"SELECT request_id, to_addr, sender FROM transactional_requests WHERE request_id = ?",
+						requestId,
+					)
+					.toArray()[0];
+				if (
+					rowByRequestId &&
+					rowByRequestId.sender.toLowerCase() === event.from.toLowerCase() &&
+					rowByRequestId.to_addr.toLowerCase() === event.to.toLowerCase()
+				) {
+					return processEvent(rowByRequestId.request_id);
+				}
+			}
+			// Unknown event — return 404 (triggers queue retry/DLQ)
+			return Response.json({ error: "request_not_found" }, { status: 404 });
+		}
+
+		// Validate sender and recipient match
+		if (requestRow.sender.toLowerCase() !== event.from.toLowerCase()) {
+			return Response.json({ error: "sender_mismatch" }, { status: 404 });
+		}
+		if (requestRow.to_addr.toLowerCase() !== event.to.toLowerCase()) {
+			return Response.json({ error: "recipient_mismatch" }, { status: 404 });
+		}
+
+		return processEvent(requestRow.request_id);
 	}
 }

@@ -232,6 +232,8 @@ CREATE TABLE IF NOT EXISTS transactional_requests (
   sender TEXT NOT NULL,
   provider_message_id TEXT,
   error_code TEXT,
+  delivery_status TEXT,
+  delivery_event_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -248,4 +250,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
   snippet,
   body_text
 );
+
+-- Suppression list: local mirror of Cloudflare account-level suppression.
+-- The DO is authoritative for send decisions; D1 indexes are projections.
+CREATE TABLE IF NOT EXISTS recipient_suppressions (
+  email TEXT PRIMARY KEY,
+  reason TEXT NOT NULL CHECK (reason IN ('hard_bounce', 'complaint', 'manual', 'provider_rejected')),
+  source_event_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  expires_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_suppressions_created ON recipient_suppressions(created_at);
+
+-- Delivery event log from Email Sending lifecycle events.
+-- Rows are inserted idempotently by event_id.
+CREATE TABLE IF NOT EXISTS transactional_delivery_events (
+  event_id TEXT PRIMARY KEY,
+  request_id TEXT,
+  provider_message_id TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  terminal INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tde_provider_message ON transactional_delivery_events(provider_message_id);
+CREATE INDEX IF NOT EXISTS idx_tde_request ON transactional_delivery_events(request_id);
 `;
