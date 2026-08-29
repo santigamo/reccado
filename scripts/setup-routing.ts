@@ -367,11 +367,9 @@ if (catchAll) {
 		"- Catch-all note: Cloudflare supports catch-all -> Worker via API; Wrangler currently rejects that specific rule client-side, so this script uses the REST API for `--catch-all`.",
 	);
 }
+console.log(`- Seed the mailbox that receives it (if not done):`);
 console.log(
-	`- Seed the mailbox that receives it (if not done); pass the secret via env, not argv:`,
-);
-console.log(
-	`    MAILBOX_ID_SECRET=<your-secret> pnpm setup:mailbox --domain ${resolvedDomain} --address ${address}` +
+	`    pnpm setup:mailbox --domain ${resolvedDomain} --address ${address}` +
 		`${targetEnv ? ` --env ${targetEnv}` : ""} --apply`,
 );
 console.log(`\nRe-check anytime:  pnpm doctor --env ${targetEnv ?? "production"} --cloud\n`);

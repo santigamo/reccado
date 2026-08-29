@@ -1,8 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * `pnpm setup:mailbox` — seeds the D1 control-plane rows a mailbox needs to actually
- * receive mail (domain + mailbox + alias, optionally a catch-all routing rule), deriving
- * the `mailbox_id` with the SAME MAILBOX_ID_SECRET the Worker uses so the ids line up.
+ * receive mail (domain + mailbox + alias, optionally a catch-all routing rule).
  *
  * This is the step that turns "deployed" into "an inbox that receives": `resolveRoutingForRecipient`
  * stores mail for a recipient as soon as an active alias + active domain exist (src/db/d1.ts).
@@ -11,23 +10,22 @@
  * execute` command). Pass `--apply` to run it. The SQL uses conflict-safe inserts/upserts and
  * resolves the live domain row by name, so it is idempotent and safe to re-run.
  *
- * The secret coupling (important): the Worker's MAILBOX_ID_SECRET is write-only in Cloudflare,
- * so for a REMOTE seed you must supply the same value — the CLI cannot read it back, and a
- * mismatched secret derives a mailbox id the Worker will never route to. Prefer passing it via
- * the MAILBOX_ID_SECRET env var (not `--secret`, which would land in shell history / process
- * listings). Locally it is read from `.dev.vars`.
+ * `mailbox_id` is random and assigned by the INSERT, with D1 as the only source of truth. A
+ * re-run for an address that already exists is a no-op (UNIQUE(primary_address) + DO NOTHING),
+ * and the alias/rule rows read the stored `mailbox_id` back out of `mailboxes` rather than
+ * assuming the candidate id this run generated — so repeats converge instead of forking.
  *
  * Usage:
  *   pnpm setup:mailbox --domain example.com --address inbox@example.com            # local dry run
  *   pnpm setup:mailbox --domain example.com --address inbox@example.com --local --apply
- *   MAILBOX_ID_SECRET=<secret> pnpm setup:mailbox --domain example.com \
- *     --address inbox@example.com --env dev --catch-all --apply                    # remote
+ *   pnpm setup:mailbox --domain example.com --address inbox@example.com \
+ *     --env dev --catch-all --apply                                                # remote
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalPrimaryAddress, deriveMailboxId } from "../src/lib/mailbox-id";
+import { canonicalPrimaryAddress, generateMailboxId } from "../src/lib/mailbox-id";
 
 type WranglerBlock = {
 	d1_databases?: Array<{ binding: string; database_name: string }>;
@@ -130,9 +128,13 @@ const zoneId = args["zone-id"]?.trim() || "zone-placeholder";
 // Resolve owner email: explicit flag > ACCESS_ALLOWED_EMAILS (first entry if single).
 let ownerEmail = args.owner?.trim().toLowerCase() || undefined;
 if (!ownerEmail) {
-	const allowList = readDotEnvValue(".dev.vars", "ACCESS_ALLOWED_EMAILS") || process.env.ACCESS_ALLOWED_EMAILS;
+	const allowList =
+		readDotEnvValue(".dev.vars", "ACCESS_ALLOWED_EMAILS") || process.env.ACCESS_ALLOWED_EMAILS;
 	if (allowList) {
-		const emails = allowList.split(",").map((e) => e.trim()).filter((e) => e.length > 0);
+		const emails = allowList
+			.split(",")
+			.map((e) => e.trim())
+			.filter((e) => e.length > 0);
 		if (emails.length === 1) {
 			ownerEmail = emails[0]?.toLowerCase();
 		}
@@ -140,23 +142,8 @@ if (!ownerEmail) {
 }
 const ownerSql = ownerEmail ? q(ownerEmail) : "NULL";
 
-// Resolve the secret: explicit flag > env > .dev.vars (local only).
-const secret =
-	(args.secret?.trim() || undefined) ??
-	process.env.MAILBOX_ID_SECRET ??
-	readDotEnvValue(".dev.vars", "MAILBOX_ID_SECRET");
-if (!secret) {
-	console.error(
-		"setup:mailbox: no MAILBOX_ID_SECRET available.\n" +
-			"  Local: run `pnpm dev` once to generate .dev.vars, or set MAILBOX_ID_SECRET.\n" +
-			"  Remote: MAILBOX_ID_SECRET=<value> pnpm setup:mailbox ... (the exact secret you set on\n" +
-			"  the Worker) — it is write-only in Cloudflare and the mailbox id must match what the\n" +
-			"  Worker derives. Prefer the env var over --secret so it stays out of shell history.",
-	);
-	process.exit(1);
-}
-
-const mailboxId = await deriveMailboxId(secret, address);
+// Only used if this address has no mailbox yet; the SQL below discards it on conflict.
+const candidateMailboxId = generateMailboxId();
 const domainId = `dom_${domain.replace(/[^a-z0-9]+/g, "_")}`;
 const now = new Date().toISOString();
 const generatedConfigPath = `wrangler.generated.${envLabel}.json`;
@@ -169,12 +156,13 @@ const statements = [
 VALUES (${q(domainId)}, ${q(domain)}, ${q(zoneId)}, 'active', ${q(now)}, ${q(now)})
 ON CONFLICT(domain) DO NOTHING;`,
 	`INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at)
-VALUES (${q(mailboxId)}, ${q(address)}, ${q(displayName)}, 'active', ${ownerSql}, ${q(now)}, ${q(now)})
+VALUES (${q(candidateMailboxId)}, ${q(address)}, ${q(displayName)}, 'active', ${ownerSql}, ${q(now)}, ${q(now)})
 ON CONFLICT(primary_address) DO NOTHING;`,
 	`INSERT INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at)
-SELECT ${q(address)}, ${q(mailboxId)}, id, 'active', ${q(now)}, ${q(now)}
-FROM domains
-WHERE domain = ${q(domain)}
+SELECT ${q(address)}, m.mailbox_id, d.id, 'active', ${q(now)}, ${q(now)}
+FROM mailboxes m
+JOIN domains d ON d.domain = ${q(domain)}
+WHERE m.primary_address = ${q(address)}
 ON CONFLICT(alias_address) DO UPDATE SET
 	mailbox_id = excluded.mailbox_id,
 	domain_id = excluded.domain_id,
@@ -184,9 +172,10 @@ ON CONFLICT(alias_address) DO UPDATE SET
 if (catchAll) {
 	statements.push(
 		`INSERT INTO routing_rules (id, domain_id, pattern, priority, action, mailbox_id, forward_to_json, reject_reason, enabled, created_at, updated_at)
-SELECT ${q(`rule_${domainId}_catchall`)}, id, '*', 100, 'store', ${q(mailboxId)}, '[]', NULL, 1, ${q(now)}, ${q(now)}
-FROM domains
-WHERE domain = ${q(domain)}
+SELECT ${q(`rule_${domainId}_catchall`)}, d.id, '*', 100, 'store', m.mailbox_id, '[]', NULL, 1, ${q(now)}, ${q(now)}
+FROM mailboxes m
+JOIN domains d ON d.domain = ${q(domain)}
+WHERE m.primary_address = ${q(address)}
 ON CONFLICT(id) DO UPDATE SET
 	domain_id = excluded.domain_id,
 	pattern = excluded.pattern,
@@ -200,8 +189,9 @@ ON CONFLICT(id) DO UPDATE SET
 	);
 }
 const sql =
-	`-- Reccado mailbox seed for ${address} (mailbox_id=${mailboxId}). Idempotent.\n` +
-	`-- Domains are resolved by name at execution time, so an existing domains.id is reused.\n` +
+	`-- Reccado mailbox seed for ${address}. Idempotent.\n` +
+	`-- Domains are resolved by name and the mailbox_id by primary_address at execution time, so\n` +
+	`-- existing rows are reused and ${candidateMailboxId} is only used if this address is new.\n` +
 	`${statements.join("\n")}\n`;
 
 // Resolve the D1 execute target.
@@ -234,6 +224,7 @@ if (local) {
 }
 
 let existingDomainId: string | undefined;
+let existingMailboxId: string | undefined;
 if (apply) {
 	const [domainLookup, mailboxLookup] = runD1Query(
 		execArgs,
@@ -244,26 +235,19 @@ SELECT mailbox_id FROM mailboxes WHERE primary_address = ${q(address)} LIMIT 1;`
 		typeof domainLookup?.results?.[0]?.id === "string"
 			? (domainLookup.results[0].id as string)
 			: undefined;
-	const existingMailboxId =
+	existingMailboxId =
 		typeof mailboxLookup?.results?.[0]?.mailbox_id === "string"
 			? (mailboxLookup.results[0].mailbox_id as string)
 			: undefined;
-	if (existingMailboxId && existingMailboxId !== mailboxId) {
-		console.error(
-			"setup:mailbox: an existing mailbox row already owns this primary address with a different mailbox_id.\n" +
-				`  address:              ${address}\n` +
-				`  existing mailbox_id:  ${existingMailboxId}\n` +
-				`  derived mailbox_id:   ${mailboxId}\n` +
-				"  This usually means MAILBOX_ID_SECRET does not match the deployed Worker secret.\n" +
-				"  Cloudflare secrets are write-only, so reuse the original secret value before seeding.",
-		);
-		process.exit(1);
-	}
 }
 
 console.log(`\nReccado setup:mailbox\n`);
 console.log(`  address:     ${address}`);
-console.log(`  mailbox_id:  ${mailboxId}`);
+console.log(
+	`  mailbox_id:  ${existingMailboxId ?? candidateMailboxId}${
+		existingMailboxId ? " (existing row, reused)" : " (candidate; assigned only if new)"
+	}`,
+);
 console.log(
 	`  domain:      ${domain} (${existingDomainId ?? domainId}${existingDomainId ? ", existing row" : ", preferred id"})`,
 );
@@ -282,8 +266,8 @@ if (!apply) {
 		`Command that would run:\n  $ pnpm wrangler ${execArgs.join(" ")} --file <tmp.sql>\n`,
 	);
 	console.log(
-		"Reminder: MAILBOX_ID_SECRET must exactly match the deployed Worker secret. If this address was\n" +
-			"seeded before and you no longer have that secret value, derive/reuse it before applying.\n",
+		"Note: a dry run does not read D1, so it prints a fresh candidate id. If this address is\n" +
+			"already seeded, --apply keeps the stored mailbox_id and changes nothing.\n",
 	);
 	console.log("Dry run only. Re-run with --apply to execute.\n");
 	process.exit(0);
@@ -293,4 +277,14 @@ const dir = mkdtempSync(join(tmpdir(), "reccado-setup-mailbox-"));
 const sqlPath = join(dir, "seed.sql");
 writeFileSync(sqlPath, sql, "utf8");
 execFileSync("pnpm", ["wrangler", ...execArgs, `--file=${sqlPath}`], { stdio: "inherit" });
-console.log(`\nSeeded ${address} → ${mailboxId} into ${targetLabel}.`);
+
+// Read the id back rather than reporting the candidate: on conflict the INSERT kept the stored one.
+const [seeded] = runD1Query(
+	execArgs,
+	`SELECT mailbox_id FROM mailboxes WHERE primary_address = ${q(address)} LIMIT 1;`,
+);
+const seededMailboxId =
+	typeof seeded?.results?.[0]?.mailbox_id === "string"
+		? (seeded.results[0].mailbox_id as string)
+		: candidateMailboxId;
+console.log(`\nSeeded ${address} → ${seededMailboxId} into ${targetLabel}.`);

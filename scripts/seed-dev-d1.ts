@@ -3,12 +3,11 @@ import { execSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deriveDevTestMailboxId } from "../src/db/seed-dev";
+import { DEV_TEST_MAILBOX_ID } from "../src/db/seed-dev";
 
-const secret = process.env.MAILBOX_ID_SECRET ?? "dev-mailbox-id-secret-v1";
-process.env.MAILBOX_ID_SECRET = secret;
-
-const mailboxId = await deriveDevTestMailboxId();
+// Fixed, not generated: `pnpm dev`'s debug endpoint and the smoke scripts resolve the same
+// constant, so the seeded row has to carry exactly that id.
+const mailboxId = DEV_TEST_MAILBOX_ID;
 
 function seedSql(now: string): string {
 	return `
@@ -35,13 +34,7 @@ if (process.argv.includes("--apply-local")) {
 
 	console.log(JSON.stringify({ mailboxId, seeded: true }, null, 2));
 } else {
-	console.log(
-		JSON.stringify(
-			{ mailboxId, secretUsed: secret === "dev-mailbox-id-secret-v1" ? "default-dev" : "env" },
-			null,
-			2,
-		),
-	);
+	console.log(JSON.stringify({ mailboxId }, null, 2));
 
 	if (process.argv.includes("--sql")) {
 		console.log(seedSql(new Date().toISOString()));
