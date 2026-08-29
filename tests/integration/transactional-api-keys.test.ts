@@ -7,6 +7,7 @@ import {
 	insertMailbox,
 	getApiKeyProjection,
 } from "#/db/d1";
+import { splitSqlStatements } from "../helpers/migrations";
 
 type TestEnv = Env & {
 	INDEX_DB: D1Database;
@@ -28,10 +29,7 @@ async function applyD1Migrations(db: D1Database): Promise<void> {
 	const m3 = await import("../../migrations/d1/0003_mailbox_owner.sql?raw");
 	const m6 = await import("../../migrations/d1/0006_transactional_api_keys.sql?raw");
 	for (const raw of [m1.default, m2.default, m3.default, m6.default]) {
-		const statements = (raw as string)
-			.split(";")
-			.map((s) => s.trim())
-			.filter(Boolean);
+		const statements = splitSqlStatements(raw as string);
 		for (const statement of statements) {
 			await db.prepare(statement).run();
 		}

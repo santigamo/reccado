@@ -11,6 +11,7 @@ import multipartHtmlOnlyContentEml from "../../fixtures/mime/multipart-html-only
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
+import { splitSqlStatements } from "../helpers/migrations";
 
 type TestEnv = Env & {
 	INDEX_DB: D1Database;
@@ -25,10 +26,7 @@ const testEnv = env as unknown as TestEnv;
 // the multi-line CREATE TABLE statements in the migration files are split and run
 // individually via prepare().run() instead.
 async function applyMigration(sql: string): Promise<void> {
-	const statements = sql
-		.split(";")
-		.map((statement) => statement.trim())
-		.filter(Boolean);
+	const statements = splitSqlStatements(sql);
 	for (const statement of statements) {
 		await testEnv.INDEX_DB.prepare(statement).run();
 	}

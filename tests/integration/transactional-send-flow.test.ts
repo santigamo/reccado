@@ -2,6 +2,7 @@ import { describe, expect, it, beforeAll } from "vitest";
 import { env as testEnv } from "cloudflare:workers";
 import type { TransactionalApiKeyRecord } from "#/lib/transactional-keys";
 import { upsertTransactionalRequestLog, listTransactionalRequestLogs } from "#/db/d1";
+import { splitSqlStatements } from "../helpers/migrations";
 
 type TestEnv = Env & {
 	INDEX_DB: D1Database;
@@ -19,10 +20,7 @@ async function applyD1Migrations(db: D1Database): Promise<void> {
 	const m7 = await import("../../migrations/d1/0007_transactional_requests.sql?raw");
 	const m8 = await import("../../migrations/d1/0008_email_events_suppressions.sql?raw");
 	for (const raw of [m1.default, m2.default, m3.default, m6.default, m7.default, m8.default]) {
-		const statements = (raw as string)
-			.split(";")
-			.map((s) => s.trim())
-			.filter(Boolean);
+		const statements = splitSqlStatements(raw as string);
 		for (const statement of statements) {
 			await db.prepare(statement).run();
 		}

@@ -10,15 +10,12 @@ import {
 import migration1 from "../../migrations/d1/0001_initial.sql?raw";
 import migration2 from "../../migrations/d1/0002_message_index.sql?raw";
 import migration3 from "../../migrations/d1/0003_mailbox_owner.sql?raw";
+import { splitSqlStatements } from "../helpers/migrations";
 
 // The pool's D1 binding starts empty; the dev migrations aren't applied
 // automatically by vitest-pool-workers, so we apply them once for this file.
 async function applyMigrations(): Promise<void> {
-	const statements = [migration1, migration2, migration3]
-		.join("\n")
-		.split(";")
-		.map((statement) => statement.trim())
-		.filter(Boolean);
+	const statements = splitSqlStatements([migration1, migration2, migration3].join("\n"));
 	for (const statement of statements) {
 		await env.INDEX_DB.prepare(statement).run();
 	}

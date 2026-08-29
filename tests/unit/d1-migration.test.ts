@@ -4,35 +4,25 @@ import { insertMailbox, listMailboxesByOwner } from "#/db/d1";
 import migration1 from "../../migrations/d1/0001_initial.sql?raw";
 import migration2 from "../../migrations/d1/0002_message_index.sql?raw";
 import migration3 from "../../migrations/d1/0003_mailbox_owner.sql?raw";
-
-async function applyMigrations(): Promise<void> {
-	const statements = [migration1, migration2, migration3]
-		.join("\n")
-		.split(";")
-		.map((s) => s.trim())
-		.filter(Boolean);
-	for (const statement of statements) {
-		await env.INDEX_DB.prepare(statement).run();
-	}
-}
+import { applyMigrations } from "../helpers/migrations";
 
 describe("D1 migration 0003_mailbox_owner", () => {
 	beforeAll(async () => {
-		await applyMigrations();
+		await applyMigrations(env.INDEX_DB, migration1, migration2, migration3);
 	});
 
 	it("adds owner_email column to mailboxes table", async () => {
-		const result = await env.INDEX_DB
-			.prepare("PRAGMA table_info(mailboxes)")
-			.all<{ name: string }>();
+		const result = await env.INDEX_DB.prepare("PRAGMA table_info(mailboxes)").all<{
+			name: string;
+		}>();
 		const columns = result.results.map((r) => r.name);
 		expect(columns).toContain("owner_email");
 	});
 
 	it("creates idx_mailboxes_owner index", async () => {
-		const result = await env.INDEX_DB
-			.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_mailboxes_owner'")
-			.first<{ name: string }>();
+		const result = await env.INDEX_DB.prepare(
+			"SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_mailboxes_owner'",
+		).first<{ name: string }>();
 		expect(result?.name).toBe("idx_mailboxes_owner");
 	});
 
@@ -44,8 +34,7 @@ describe("D1 migration 0003_mailbox_owner", () => {
 			.bind(mailboxId, "null-owner@example.com", new Date().toISOString(), new Date().toISOString())
 			.run();
 
-		const row = await env.INDEX_DB
-			.prepare("SELECT owner_email FROM mailboxes WHERE mailbox_id = ?")
+		const row = await env.INDEX_DB.prepare("SELECT owner_email FROM mailboxes WHERE mailbox_id = ?")
 			.bind(mailboxId)
 			.first<{ owner_email: string | null }>();
 		expect(row?.owner_email).toBeNull();
