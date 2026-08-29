@@ -1,3 +1,5 @@
+import { generateMailboxId } from "../lib/mailbox-id";
+
 export type DomainRow = {
 	id: string;
 	domain: string;
@@ -82,6 +84,41 @@ export type OutboundSendRow = {
 	updated_at: string;
 };
 
+/**
+ * Shared PATCH primitive for the control-plane tables: writes only the columns present in
+ * `fields` and stamps `updated_at`. The SET clause has to be assembled at runtime because
+ * `COALESCE(?, col)` cannot express "write NULL here", which display_name and reject_reason both
+ * need; table/column names come from the typed wrappers below and never from request data, and
+ * every value is still bound. `undefined` means "leave alone", so a caller can pass an optional
+ * field straight through without accidentally nulling it.
+ *
+ * Returns false when no row matched — that is the signal the API turns into a 404. SQLite counts
+ * every row the WHERE clause matched, not only the ones whose values actually changed, so a
+ * repeated no-op PATCH still reports true.
+ */
+async function updateRowFields(
+	db: D1Database,
+	table: string,
+	keyColumn: string,
+	keyValue: string,
+	fields: Record<string, string | number | null | undefined>,
+): Promise<boolean> {
+	const columns = Object.keys(fields).filter((column) => fields[column] !== undefined);
+	if (columns.length === 0) {
+		const existing = await db
+			.prepare(`SELECT 1 AS found FROM ${table} WHERE ${keyColumn} = ?`)
+			.bind(keyValue)
+			.first<{ found: number }>();
+		return existing !== null;
+	}
+	const assignments = columns.map((column) => `${column} = ?`).join(", ");
+	const result = await db
+		.prepare(`UPDATE ${table} SET ${assignments}, updated_at = ? WHERE ${keyColumn} = ?`)
+		.bind(...columns.map((column) => fields[column] ?? null), nowIso(), keyValue)
+		.run();
+	return (result.meta?.changes ?? 0) > 0;
+}
+
 export async function listMailboxes(db: D1Database): Promise<MailboxRow[]> {
 	const result = await db
 		.prepare("SELECT * FROM mailboxes ORDER BY created_at ASC")
@@ -122,18 +159,28 @@ export async function getMailbox(db: D1Database, mailboxId: string): Promise<Mai
 		.first<MailboxRow>();
 }
 
+/**
+ * Creates the mailbox for `primary_address` and returns the id it actually ends up with.
+ *
+ * `mailbox_id` is optional: omit it and a random one is assigned here. Because ids are no longer
+ * derived from the address, UNIQUE(primary_address) is the only thing keeping a re-run from
+ * minting a second mailbox for the same address — hence DO NOTHING plus a read-back, which makes
+ * provisioning idempotent and returns the *stored* id, not the one this call proposed.
+ */
 export async function insertMailbox(
 	db: D1Database,
-	row: Omit<MailboxRow, "created_at" | "updated_at">,
-): Promise<void> {
+	row: Omit<MailboxRow, "mailbox_id" | "created_at" | "updated_at"> & { mailbox_id?: string },
+): Promise<string> {
 	const now = nowIso();
+	const mailboxId = row.mailbox_id ?? generateMailboxId();
 	await db
 		.prepare(
 			`INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(primary_address) DO NOTHING`,
 		)
 		.bind(
-			row.mailbox_id,
+			mailboxId,
 			row.primary_address,
 			row.display_name,
 			row.status,
@@ -142,6 +189,26 @@ export async function insertMailbox(
 			now,
 		)
 		.run();
+	const stored = await db
+		.prepare("SELECT mailbox_id FROM mailboxes WHERE primary_address = ?")
+		.bind(row.primary_address)
+		.first<{ mailbox_id: string }>();
+	return stored?.mailbox_id ?? mailboxId;
+}
+
+/**
+ * There is deliberately no `deleteMailbox`. The messages live in the mailbox's Durable Object and
+ * in R2, and every `message_index` row carries `mailbox_id`; dropping the mailbox row would orphan
+ * all of it with nothing left pointing at the data and no way back. Decommissioning is
+ * `status = 'disabled'`, which already removes the mailbox from `listMailboxesByOwner` /
+ * `getMailboxForOwner` and therefore from MCP.
+ */
+export async function updateMailbox(
+	db: D1Database,
+	mailboxId: string,
+	fields: { display_name?: string | null; status?: MailboxRow["status"] },
+): Promise<boolean> {
+	return updateRowFields(db, "mailboxes", "mailbox_id", mailboxId, fields);
 }
 
 export async function listDomains(db: D1Database): Promise<DomainRow[]> {
@@ -169,6 +236,20 @@ export async function insertDomain(
 		)
 		.bind(row.id, row.domain, row.zone_id, row.status, now, now)
 		.run();
+}
+
+/**
+ * Also no `deleteDomain`: `aliases.domain_id` and `routing_rules.domain_id` are foreign keys into
+ * this row. Setting `status` to anything but 'active' already stops the domain from accepting
+ * mail — `resolveRoutingForRecipient` rejects it with `unknown_domain` — without breaking the
+ * rows that point at it.
+ */
+export async function updateDomain(
+	db: D1Database,
+	id: string,
+	fields: { status?: DomainRow["status"] },
+): Promise<boolean> {
+	return updateRowFields(db, "domains", "id", id, fields);
 }
 
 export async function listAliases(db: D1Database): Promise<AliasRow[]> {
@@ -206,6 +287,59 @@ export async function insertAlias(
 		)
 		.bind(row.alias_address, row.mailbox_id, row.domain_id, row.status, now, now)
 		.run();
+}
+
+export async function getAlias(db: D1Database, aliasAddress: string): Promise<AliasRow | null> {
+	return db
+		.prepare("SELECT * FROM aliases WHERE alias_address = ?")
+		.bind(aliasAddress.trim().toLowerCase())
+		.first<AliasRow>();
+}
+
+/**
+ * Idempotent alias insert, mirroring `insertMailbox`: DO NOTHING plus a read-back, so re-running
+ * provisioning converges on the stored row instead of failing on the PRIMARY KEY. `created` is
+ * false when the address was already claimed — possibly by a *different* mailbox, which callers
+ * must check before treating the returned alias as their own.
+ */
+export async function insertAliasIfMissing(
+	db: D1Database,
+	row: Omit<AliasRow, "created_at" | "updated_at">,
+): Promise<{ alias: AliasRow | null; created: boolean }> {
+	const now = nowIso();
+	const result = await db
+		.prepare(
+			`INSERT INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(alias_address) DO NOTHING`,
+		)
+		.bind(row.alias_address, row.mailbox_id, row.domain_id, row.status, now, now)
+		.run();
+	return {
+		alias: await getAlias(db, row.alias_address),
+		created: (result.meta?.changes ?? 0) > 0,
+	};
+}
+
+export async function updateAlias(
+	db: D1Database,
+	aliasAddress: string,
+	fields: { mailbox_id?: string; domain_id?: string; status?: AliasRow["status"] },
+): Promise<boolean> {
+	return updateRowFields(db, "aliases", "alias_address", aliasAddress.trim().toLowerCase(), fields);
+}
+
+/**
+ * Hard delete, unlike mailboxes and domains: `alias_address` is the primary key, so keeping a
+ * disabled row around would leave the address permanently claimed and block re-pointing it at
+ * another mailbox — which is the usual reason for removing it. Nothing references the row.
+ */
+export async function deleteAlias(db: D1Database, aliasAddress: string): Promise<boolean> {
+	const result = await db
+		.prepare("DELETE FROM aliases WHERE alias_address = ?")
+		.bind(aliasAddress.trim().toLowerCase())
+		.run();
+	return (result.meta?.changes ?? 0) > 0;
 }
 
 export async function listRoutingRules(
@@ -252,6 +386,44 @@ export async function insertRoutingRule(
 		.run();
 }
 
+export async function getRoutingRule(db: D1Database, id: string): Promise<RoutingRuleRow | null> {
+	return db.prepare("SELECT * FROM routing_rules WHERE id = ?").bind(id).first<RoutingRuleRow>();
+}
+
+export async function updateRoutingRule(
+	db: D1Database,
+	id: string,
+	fields: {
+		pattern?: string;
+		priority?: number;
+		action?: RoutingRuleRow["action"];
+		mailbox_id?: string | null;
+		forward_to_json?: string;
+		reject_reason?: string | null;
+		enabled?: number;
+	},
+): Promise<boolean> {
+	return updateRowFields(db, "routing_rules", "id", id, fields);
+}
+
+/** Hard delete: a routing rule is pure configuration, with no rows or stored data depending on it. */
+export async function deleteRoutingRule(db: D1Database, id: string): Promise<boolean> {
+	const result = await db.prepare("DELETE FROM routing_rules WHERE id = ?").bind(id).run();
+	return (result.meta?.changes ?? 0) > 0;
+}
+
+/**
+ * One indexed primary-key read on the ingest path, to keep a mailbox's own status
+ * authoritative over the routing rows that point at it.
+ */
+async function mailboxIsActive(db: D1Database, mailboxId: string): Promise<boolean> {
+	const row = await db
+		.prepare("SELECT status FROM mailboxes WHERE mailbox_id = ?")
+		.bind(mailboxId)
+		.first<{ status: string }>();
+	return row?.status === "active";
+}
+
 export async function resolveRoutingForRecipient(
 	db: D1Database,
 	recipient: string,
@@ -263,6 +435,19 @@ export async function resolveRoutingForRecipient(
 	const canonical = recipient.trim().toLowerCase();
 	const alias = await lookupActiveAlias(db, canonical);
 	if (alias) {
+		// A disabled mailbox stops accepting mail outright instead of falling through
+		// to the domain's catch-all. Quietly diverting someone's mail into a different
+		// mailbox because theirs was disabled is a far worse surprise than a bounce —
+		// and without this check `DELETE /api/mailboxes/:id` would be a lie: the row
+		// says disabled while the mail keeps arriving.
+		if (!(await mailboxIsActive(db, alias.mailbox_id))) {
+			return {
+				action: "reject",
+				reason: "mailbox_disabled",
+				ruleId: null,
+				matchedAlias: alias.alias_address,
+			};
+		}
 		return {
 			action: "store",
 			mailboxId: alias.mailbox_id,
@@ -310,6 +495,14 @@ export async function resolveRoutingForRecipient(
 			};
 		}
 		if (rule.action === "store" && rule.mailbox_id) {
+			if (!(await mailboxIsActive(db, rule.mailbox_id))) {
+				return {
+					action: "reject",
+					reason: "mailbox_disabled",
+					ruleId: rule.id,
+					matchedAlias: canonical,
+				};
+			}
 			return {
 				action: "store",
 				mailboxId: rule.mailbox_id,
@@ -617,38 +810,6 @@ export async function getTelegramLinkByMessage(
 		.prepare("SELECT * FROM telegram_links WHERE chat_id = ? AND message_id = ?")
 		.bind(chatId, messageId)
 		.first<TelegramLinkRow>();
-}
-
-/** The thread a Telegram topic belongs to — the newest link posted into that topic. */
-export async function getTelegramLinkByTopic(
-	db: D1Database,
-	chatId: string,
-	topicId: number,
-): Promise<TelegramLinkRow | null> {
-	return db
-		.prepare(
-			`SELECT * FROM telegram_links WHERE chat_id = ? AND topic_id = ?
-       ORDER BY created_at DESC LIMIT 1`,
-		)
-		.bind(chatId, topicId)
-		.first<TelegramLinkRow>();
-}
-
-/** An existing topic for this email thread, so a follow-up lands in the same place. */
-export async function getTelegramTopicForThread(
-	db: D1Database,
-	mailboxId: string,
-	threadId: string,
-): Promise<number | null> {
-	const row = await db
-		.prepare(
-			`SELECT topic_id FROM telegram_links
-       WHERE mailbox_id = ? AND thread_id = ? AND topic_id IS NOT NULL
-       ORDER BY created_at DESC LIMIT 1`,
-		)
-		.bind(mailboxId, threadId)
-		.first<{ topic_id: number }>();
-	return row?.topic_id ?? null;
 }
 
 export async function insertTelegramAction(

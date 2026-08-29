@@ -4,24 +4,11 @@ import { describe, expect, it } from "vitest";
 import migrationInitial from "../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../migrations/d1/0002_message_index.sql?raw";
 import worker from "../src/server";
+import { applyMigrations } from "./helpers/migrations";
 
 type TestEnv = Env & { INDEX_DB: D1Database };
 
 const testEnv = env as unknown as TestEnv;
-
-// The vitest-pool-workers D1 binding starts schema-less: it does not auto-apply
-// migrations/d1/*.sql. D1Database#exec() only accepts one statement per line, so
-// the multi-line CREATE TABLE statements in the migration files are split and run
-// individually via prepare().run() instead. Mirrors tests/integration/api-security.test.ts.
-async function applyMigration(sql: string): Promise<void> {
-	const statements = sql
-		.split(";")
-		.map((statement) => statement.trim())
-		.filter(Boolean);
-	for (const statement of statements) {
-		await testEnv.INDEX_DB.prepare(statement).run();
-	}
-}
 
 async function fetchHealth(url: string): Promise<Response> {
 	const request = new Request(url);
@@ -59,8 +46,11 @@ describe("health route", () => {
 	});
 
 	it("reports indexDb.ok:true and overall readiness ready when the D1 schema is present", async () => {
-		await applyMigration(migrationInitial as string);
-		await applyMigration(migrationMessageIndex as string);
+		await applyMigrations(
+			testEnv.INDEX_DB,
+			migrationInitial as string,
+			migrationMessageIndex as string,
+		);
 
 		const response = await fetchHealth("http://localhost/api/health");
 
@@ -89,6 +79,15 @@ describe("health route", () => {
 					ok: true,
 					configured: false,
 					reason: "CLOUDFLARE_API_TOKEN is not set.",
+				},
+				telegram: {
+					ok: true,
+					configured: false,
+					mode: "off",
+					reason: "Telegram bridge is disabled until TELEGRAM_BOT_TOKEN is set.",
+					missing: [],
+					webhookUrl: null,
+					pendingUpdateCount: null,
 				},
 			},
 		});

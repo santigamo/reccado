@@ -1,11 +1,18 @@
 import { Hono } from "hono";
 import { ZodError } from "zod";
 import {
+	type AliasRow,
+	deleteAlias,
+	deleteRoutingRule,
+	type DomainRow,
+	getAlias,
 	getDomainById,
 	getDomainByName,
 	getMailbox,
+	getRoutingRule,
 	getSetupStatus,
 	insertAlias,
+	insertAliasIfMissing,
 	insertDomain,
 	insertMailbox,
 	insertRoutingRule,
@@ -13,6 +20,10 @@ import {
 	listDomains,
 	listMailboxes,
 	listRoutingRules,
+	updateAlias,
+	updateDomain,
+	updateMailbox,
+	updateRoutingRule,
 } from "../db/d1";
 import { AppError } from "../lib/errors";
 import { mailboxIdFromPrimaryAddress } from "../lib/mailbox-id";
@@ -33,6 +44,10 @@ import {
 	createDomainSchema,
 	createMailboxSchema,
 	createRoutingRuleSchema,
+	updateAliasSchema,
+	updateDomainSchema,
+	updateMailboxSchema,
+	updateRoutingRuleSchema,
 } from "./schemas";
 
 export type ApiBindings = {
@@ -78,6 +93,86 @@ async function checkIndexDbHealth(indexDb: D1Database): Promise<IndexDbHealth> {
 					: "D1 query against INDEX_DB failed with an unknown error.",
 		};
 	}
+}
+
+type PrimaryAliasOutcome = {
+	alias: AliasRow | null;
+	aliasCreated: boolean;
+	/** Human-readable explanation of why no alias exists, or null when one does. */
+	aliasReason: string | null;
+};
+
+/**
+ * Mail only reaches a mailbox through an alias: `resolveRoutingForRecipient` matches the exact
+ * alias first and only then falls back to the domain's routing rules (src/db/d1.ts). A mailbox
+ * created without one therefore receives nothing — or, worse, its mail lands in whatever mailbox
+ * the domain's catch-all rule points at, which looks like it half-works. `pnpm setup:mailbox`
+ * always seeds the alias; POST /api/mailboxes used not to, so this closes that gap.
+ *
+ * Deliberately non-fatal: the endpoint already accepts addresses on domains that are not
+ * registered yet and the UI calls it that way, so a 400 here would break existing callers. The
+ * mailbox is created regardless and `aliasReason` says why mail will not arrive yet.
+ */
+async function ensurePrimaryAlias(
+	db: D1Database,
+	mailboxId: string,
+	primaryAddress: string,
+): Promise<PrimaryAliasOutcome> {
+	const domainName = primaryAddress.split("@")[1];
+	if (!domainName) {
+		return { alias: null, aliasCreated: false, aliasReason: "Address has no domain part." };
+	}
+	const existing = await getAlias(db, primaryAddress);
+	if (existing) {
+		if (existing.mailbox_id !== mailboxId) {
+			// Re-pointing it would silently divert another mailbox's mail. Report, don't steal.
+			return {
+				alias: existing,
+				aliasCreated: false,
+				aliasReason: `Alias ${primaryAddress} already routes to mailbox ${existing.mailbox_id}; it was left untouched.`,
+			};
+		}
+		if (existing.status !== "active") {
+			// Converge on the state a first-time create would have produced: a re-POST of an
+			// address is a provisioning request, so it re-enables its own alias.
+			await updateAlias(db, primaryAddress, { status: "active" });
+			return { alias: { ...existing, status: "active" }, aliasCreated: false, aliasReason: null };
+		}
+		return { alias: existing, aliasCreated: false, aliasReason: null };
+	}
+	const domain = await getDomainByName(db, domainName);
+	if (!domain) {
+		return {
+			alias: null,
+			aliasCreated: false,
+			aliasReason: `Domain ${domainName} is not registered. Register it with POST /api/domains, then repeat this request to create the alias.`,
+		};
+	}
+	if (domain.status !== "active") {
+		return {
+			alias: null,
+			aliasCreated: false,
+			aliasReason: `Domain ${domainName} is registered but ${domain.status}. Activate it, then repeat this request to create the alias.`,
+		};
+	}
+	const inserted = await insertAliasIfMissing(db, {
+		alias_address: primaryAddress,
+		mailbox_id: mailboxId,
+		domain_id: domain.id,
+		status: "active",
+	});
+	return { alias: inserted.alias, aliasCreated: inserted.created, aliasReason: null };
+}
+
+/**
+ * Resolves the `:domain` path segment by name first — matching the older
+ * GET /api/domains/:domain/status route — and then by id, so a caller holding a row from
+ * GET /api/domains does not have to re-derive the name. A registered domain name always contains
+ * a dot and ids are opaque UUIDs, so the two key spaces cannot collide.
+ */
+async function findDomainByParam(db: D1Database, param: string): Promise<DomainRow | null> {
+	const trimmed = param.trim();
+	return (await getDomainByName(db, trimmed.toLowerCase())) ?? (await getDomainById(db, trimmed));
 }
 
 export function createApiApp(): Hono<ApiBindings> {
@@ -126,6 +221,23 @@ export function createApiApp(): Hono<ApiBindings> {
 		try {
 			const auth = await requireAuth(c.req.raw, c.env);
 			c.set("auth", auth);
+			// Learn the hostname we are served on from a request that already cleared
+			// Access. It is the one input the cron needs to keep the Telegram webhook
+			// registered, and gating it on authentication is what stops a forged Host
+			// header from redirecting the operator's notifications.
+			//
+			// Isolated from the auth try/catch below on purpose: bookkeeping must never
+			// be able to turn an authenticated request into a 500, and c.executionCtx
+			// throws outright in contexts that have none.
+			try {
+				c.executionCtx.waitUntil(
+					import("../db/runtime-config").then(({ recordDeploymentOrigin }) =>
+						recordDeploymentOrigin(c.env.INDEX_DB, c.req.url).catch(() => undefined),
+					),
+				);
+			} catch {
+				// No execution context to defer onto; the next request will record it.
+			}
 		} catch (error) {
 			if (error instanceof Response) {
 				return error;
@@ -147,6 +259,23 @@ export function createApiApp(): Hono<ApiBindings> {
 		try {
 			const auth = await requireAuth(c.req.raw, c.env);
 			c.set("auth", auth);
+			// Learn the hostname we are served on from a request that already cleared
+			// Access. It is the one input the cron needs to keep the Telegram webhook
+			// registered, and gating it on authentication is what stops a forged Host
+			// header from redirecting the operator's notifications.
+			//
+			// Isolated from the auth try/catch below on purpose: bookkeeping must never
+			// be able to turn an authenticated request into a 500, and c.executionCtx
+			// throws outright in contexts that have none.
+			try {
+				c.executionCtx.waitUntil(
+					import("../db/runtime-config").then(({ recordDeploymentOrigin }) =>
+						recordDeploymentOrigin(c.env.INDEX_DB, c.req.url).catch(() => undefined),
+					),
+				);
+			} catch {
+				// No execution context to defer onto; the next request will record it.
+			}
 		} catch (error) {
 			if (error instanceof Response) {
 				return error;
@@ -197,6 +326,10 @@ export function createApiApp(): Hono<ApiBindings> {
 				: "Cloudflare Access validation is not configured for non-localhost requests.";
 		const cloudflareApiConfigured = Boolean(c.env.CLOUDFLARE_API_TOKEN?.trim());
 		const indexDbHealth = await checkIndexDbHealth(c.env.INDEX_DB);
+		const { getTelegramStatus } = await import("../telegram/status");
+		// A bridge that is on but not delivering has to be visible somewhere a human
+		// or a script actually looks; that it never was is why it stayed broken.
+		const telegram = indexDbHealth.ok ? await getTelegramStatus(c.env).catch(() => null) : null;
 		const dependencyStates = {
 			auth: {
 				ok: authOk,
@@ -214,6 +347,18 @@ export function createApiApp(): Hono<ApiBindings> {
 				ok: true,
 				configured: cloudflareApiConfigured,
 				reason: cloudflareApiConfigured ? null : "CLOUDFLARE_API_TOKEN is not set.",
+			},
+			telegram: {
+				// An intentionally disabled bridge is healthy; a half-configured one is not.
+				ok: telegram?.ok ?? true,
+				configured: telegram ? telegram.mode !== "off" : false,
+				mode: telegram?.mode ?? "unknown",
+				reason: telegram?.reason ?? null,
+				missing: telegram?.missing ?? [],
+				webhookUrl: telegram?.webhookUrl ?? null,
+				// The other side of a failing webhook: a count that climbs while the
+				// error message stays generic. Null until the cron has looked once.
+				pendingUpdateCount: telegram?.pendingUpdateCount ?? null,
 			},
 		};
 		const readinessOk = authOk && indexDbHealth.ok;
@@ -257,18 +402,32 @@ export function createApiApp(): Hono<ApiBindings> {
 		const mailboxId = await mailboxIdFromPrimaryAddress(c.env, body.primaryAddress);
 		const existing = await getMailbox(c.env.INDEX_DB, mailboxId);
 		if (existing) {
-			return c.json({ mailbox: existing, created: false });
+			// Converge rather than no-op: the domain may have been registered since the first call,
+			// in which case this repeat is the request that finally makes the mailbox reachable.
+			const aliasState = await ensurePrimaryAlias(
+				c.env.INDEX_DB,
+				existing.mailbox_id,
+				existing.primary_address,
+			);
+			return c.json({ mailbox: existing, created: false, ...aliasState });
 		}
 		const primaryAddress = body.primaryAddress.trim().toLowerCase();
-		await insertMailbox(c.env.INDEX_DB, {
+		// insertMailbox is ON CONFLICT(primary_address) DO NOTHING and returns the *stored* id, so a
+		// concurrent create for the same address lands on one row instead of forking.
+		const storedMailboxId = await insertMailbox(c.env.INDEX_DB, {
 			mailbox_id: mailboxId,
 			primary_address: primaryAddress,
 			display_name: body.displayName ?? null,
 			status: "active",
 			owner_email: auth.email,
 		});
-		const mailbox = await getMailbox(c.env.INDEX_DB, mailboxId);
-		return c.json({ mailbox, created: true }, 201);
+		const mailbox = await getMailbox(c.env.INDEX_DB, storedMailboxId);
+		const aliasState = await ensurePrimaryAlias(
+			c.env.INDEX_DB,
+			storedMailboxId,
+			mailbox?.primary_address ?? primaryAddress,
+		);
+		return c.json({ mailbox, created: true, ...aliasState }, 201);
 	});
 
 	api.get("/api/mailboxes/:mailboxId", async (c) => {
@@ -280,6 +439,37 @@ export function createApiApp(): Hono<ApiBindings> {
 			return c.json({ error: "mailbox_not_found" }, 404);
 		}
 		return c.json({ mailbox });
+	});
+
+	api.patch("/api/mailboxes/:mailboxId", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const body = updateMailboxSchema.parse(await c.req.json());
+		const updated = await updateMailbox(c.env.INDEX_DB, mailboxId, {
+			display_name: body.displayName,
+			status: body.status,
+		});
+		if (!updated) {
+			throw new AppError("Mailbox not found", "mailbox_not_found", 404);
+		}
+		return c.json({ mailbox: await getMailbox(c.env.INDEX_DB, mailboxId) });
+	});
+
+	// Soft delete, and the only kind offered. A mailbox's messages live in its Durable Object and
+	// in R2, and every message_index row carries its mailbox_id — dropping the row would orphan all
+	// of that with nothing left pointing at the data and no way back. `status = 'disabled'` is the
+	// reversible equivalent: it takes the mailbox out of listMailboxesByOwner/getMailboxForOwner,
+	// so MCP and the UI stop serving it, while the archive stays reachable if it is re-enabled.
+	api.delete("/api/mailboxes/:mailboxId", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const updated = await updateMailbox(c.env.INDEX_DB, mailboxId, { status: "disabled" });
+		if (!updated) {
+			throw new AppError("Mailbox not found", "mailbox_not_found", 404);
+		}
+		return c.json({ mailbox: await getMailbox(c.env.INDEX_DB, mailboxId), deleted: "soft" });
 	});
 
 	api.get("/api/domains", async (c) => {
@@ -301,6 +491,30 @@ export function createApiApp(): Hono<ApiBindings> {
 			status: "active",
 		});
 		return c.json({ domain: await getDomainByName(c.env.INDEX_DB, domain), created: true }, 201);
+	});
+
+	api.patch("/api/domains/:domain", async (c) => {
+		const body = updateDomainSchema.parse(await c.req.json());
+		const domain = await findDomainByParam(c.env.INDEX_DB, c.req.param("domain"));
+		if (!domain) {
+			throw new AppError("Domain not found", "domain_not_found", 404);
+		}
+		await updateDomain(c.env.INDEX_DB, domain.id, { status: body.status });
+		return c.json({ domain: await getDomainById(c.env.INDEX_DB, domain.id) });
+	});
+
+	// Soft delete. aliases.domain_id and routing_rules.domain_id are foreign keys into this row, so
+	// a hard delete would break or orphan every alias and rule on the domain. It is also
+	// unnecessary: resolveRoutingForRecipient rejects any recipient whose domain is not 'active'
+	// with `unknown_domain`, so flipping the status already produces the intended effect — the
+	// domain stops accepting mail — while keeping its configuration intact for a later re-enable.
+	api.delete("/api/domains/:domain", async (c) => {
+		const domain = await findDomainByParam(c.env.INDEX_DB, c.req.param("domain"));
+		if (!domain) {
+			throw new AppError("Domain not found", "domain_not_found", 404);
+		}
+		await updateDomain(c.env.INDEX_DB, domain.id, { status: "disabled" });
+		return c.json({ domain: await getDomainById(c.env.INDEX_DB, domain.id), deleted: "soft" });
 	});
 
 	api.get("/api/domains/:domain/status", async (c) => {
@@ -389,6 +603,29 @@ export function createApiApp(): Hono<ApiBindings> {
 		return c.json({ alias: { alias_address: aliasAddress, mailbox_id: body.mailboxId } }, 201);
 	});
 
+	api.patch("/api/aliases/:aliasAddress", async (c) => {
+		const body = updateAliasSchema.parse(await c.req.json());
+		const aliasAddress = c.req.param("aliasAddress").trim().toLowerCase();
+		const updated = await updateAlias(c.env.INDEX_DB, aliasAddress, { status: body.status });
+		if (!updated) {
+			throw new AppError("Alias not found", "alias_not_found", 404);
+		}
+		return c.json({ alias: await getAlias(c.env.INDEX_DB, aliasAddress) });
+	});
+
+	// Hard delete, unlike mailboxes and domains. alias_address is the primary key, so a disabled
+	// row would keep the address claimed forever and block re-pointing it at another mailbox —
+	// which is the usual reason for removing an alias in the first place. Nothing references the
+	// row, and the mail it used to route falls back to the domain's routing rules.
+	api.delete("/api/aliases/:aliasAddress", async (c) => {
+		const aliasAddress = c.req.param("aliasAddress").trim().toLowerCase();
+		const deleted = await deleteAlias(c.env.INDEX_DB, aliasAddress);
+		if (!deleted) {
+			throw new AppError("Alias not found", "alias_not_found", 404);
+		}
+		return c.json({ aliasAddress, deleted: "hard" });
+	});
+
 	api.get("/api/routing-rules", async (c) => {
 		const domainId = c.req.query("domainId") ?? undefined;
 		return c.json({ rules: await listRoutingRules(c.env.INDEX_DB, domainId) });
@@ -429,6 +666,58 @@ export function createApiApp(): Hono<ApiBindings> {
 			enabled: body.enabled ? 1 : 0,
 		});
 		return c.json({ id }, 201);
+	});
+
+	api.patch("/api/routing-rules/:ruleId", async (c) => {
+		const body = updateRoutingRuleSchema.parse(await c.req.json());
+		const ruleId = c.req.param("ruleId");
+		const existing = await getRoutingRule(c.env.INDEX_DB, ruleId);
+		if (!existing) {
+			throw new AppError("Routing rule not found", "routing_rule_not_found", 404);
+		}
+		// Validate the rule as it will be *after* the patch, not the fields the patch carries: a
+		// PATCH that only flips `action` to "store" can strand a rule with no mailbox just as easily
+		// as a bad POST can, and such a rule silently never routes.
+		const action = body.action ?? existing.action;
+		const mailboxId = body.mailboxId !== undefined ? body.mailboxId : existing.mailbox_id;
+		const forwardTo = body.forwardTo ?? (JSON.parse(existing.forward_to_json) as string[]);
+		if (action === "store") {
+			if (!mailboxId) {
+				throw new AppError("Store routing rules require mailboxId", "mailbox_id_required", 400);
+			}
+			if (!(await getMailbox(c.env.INDEX_DB, mailboxId))) {
+				throw new AppError("Mailbox not found", "mailbox_not_found", 400);
+			}
+		}
+		if (action === "forward" && forwardTo.length === 0) {
+			throw new AppError(
+				"Forward routing rules require at least one destination",
+				"forward_to_required",
+				400,
+			);
+		}
+		await updateRoutingRule(c.env.INDEX_DB, ruleId, {
+			pattern: body.pattern,
+			priority: body.priority,
+			action: body.action,
+			mailbox_id: body.mailboxId,
+			forward_to_json: body.forwardTo === undefined ? undefined : JSON.stringify(body.forwardTo),
+			reject_reason: body.rejectReason,
+			enabled: body.enabled === undefined ? undefined : body.enabled ? 1 : 0,
+		});
+		return c.json({ rule: await getRoutingRule(c.env.INDEX_DB, ruleId) });
+	});
+
+	// Hard delete: a routing rule is pure configuration. No row references it and no stored data is
+	// keyed by it, so there is nothing to orphan — and leaving disabled rules behind would just
+	// accumulate dead precedence entries in resolveRoutingForRecipient's priority scan.
+	api.delete("/api/routing-rules/:ruleId", async (c) => {
+		const ruleId = c.req.param("ruleId");
+		const deleted = await deleteRoutingRule(c.env.INDEX_DB, ruleId);
+		if (!deleted) {
+			throw new AppError("Routing rule not found", "routing_rule_not_found", 404);
+		}
+		return c.json({ id: ruleId, deleted: "hard" });
 	});
 
 	registerMailboxRoutes(api);
