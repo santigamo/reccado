@@ -64,10 +64,9 @@ invariant instead.
 
 | Name | Kind | Required? | Notes |
 | --- | --- | --- | --- |
-| `MAILBOX_ID_SECRET` | secret | **Required** | HMAC key deriving stable mailbox IDs. Generate a fresh random value per install; never reuse the repo's example value in a real deployment; never rotate after go-live without a migration plan. |
 | `ACCESS_JWT_AUDIENCE` | secret | **Required** for any public deployment | Cloudflare Access application `aud` tag. Auth fails closed without it outside `localhost`. |
 | `ACCESS_TEAM_DOMAIN` | secret | **Required** for any public deployment | `https://<team>.cloudflareaccess.com` for the user's Zero Trust org. |
-| `ACCESS_ALLOWED_EMAILS` | secret | Strongly recommended | Comma-separated owner allowlist on top of Access. Without it, every Access-authenticated identity is treated as the single operator — fine for true single-user installs, risky for shared Access orgs. |
+| `ACCESS_ALLOWED_EMAILS` | secret | Bootstrap only | Comma-separated owner emails, unioned with the D1 owner registry (`owner_identities`). Auth fails closed when both are empty: `/api/*` and `/mcp` answer 503 rather than trusting whoever Access let through. |
 | `CLOUDFLARE_API_TOKEN` | secret | Optional | Least-privilege token for in-app provisioning automation only. Don't request broader scopes than zone read + DNS edit (setup:sending's SPF/DMARC/DKIM/MX records) + Email Routing write + Access app/policy write. Also enables setup:domain's up-front custom-domain conflict check. |
 | `PHASE0_DEBUG_TOKEN` | secret | Optional, dev-only | Gates `/api/debug/phase0/*` introspection endpoints. Leave unset in any deployment the user cares about being airtight — unset means the endpoints are unreachable. |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc`) | **Required** | Verified outbound sender address on a domain onboarded to Email Sending. |
@@ -98,28 +97,21 @@ unless the user explicitly wants the low-level Wrangler sequence.
    - patches the real bindings/ids into `dist/server/wrangler.json`
    - applies remote D1 migrations against the patched built config
    - deploys the Worker from `dist/server/wrangler.json`
-   - generates `MAILBOX_ID_SECRET` only if it is absent
-   - seeds the first mailbox only when that same run generated the secret
+   - seeds the first mailbox via `pnpm setup:mailbox` — the `mailbox_id` is random and assigned by
+     the `INSERT`, so re-running is a no-op (`primary_address` is `UNIQUE`) and no secret has to be
+     carried between runs
    - checks the inbound queue's consumer before deploying, and aborts with the exact
      `wrangler queues consumer remove <queue> <old-worker>` fix if a different Worker (e.g. from a
      rename) is still registered as its consumer
-   - recovers an **orphaned** `MAILBOX_ID_SECRET` — one a prior `--apply` run set but then failed
-     before seeding a mailbox with — via `--reset-secret`, which overwrites it with a fresh value
-     and reseeds atomically in the same run (never run this after go-live; it changes every
-     mailbox id derived from the current secret)
+
+   A Worker with no mailbox row silently drops every inbound message, so `--apply` requires
+   `--domain`/`--address` unless you explicitly opt out with `--skip-seed` (then seed later with
+   `pnpm setup:mailbox --domain <you.com> --address inbox@<you.com> --env dev --apply`).
 
    Important boundary: `setup:cloud` provisions core infra and deploys the Worker. The usable inbox
    path still needs a custom domain, Email Routing/Sending, and Cloudflare Access.
 
-3. **If `MAILBOX_ID_SECRET` already existed, finish mailbox seeding manually**:
-   ```bash
-   MAILBOX_ID_SECRET=<original-secret> pnpm setup:mailbox \
-     --domain <you.com> --address inbox@<you.com> --env dev --apply
-   ```
-   The CLI cannot read the secret back from Cloudflare. If the secret was already set, the script
-   intentionally leaves it alone and prints this command instead of guessing.
-
-4. **Attach a custom domain for the UI/API**:
+3. **Attach a custom domain for the UI/API**:
    ```bash
    pnpm setup:domain --env dev --hostname inbox.<you.com>
    pnpm setup:domain --env dev --hostname inbox.<you.com> --apply
@@ -134,7 +126,7 @@ unless the user explicitly wants the low-level Wrangler sequence.
    `wrangler whoami`), this is checked up front via the Workers Custom Domains API; otherwise it
    falls back to an error-string check around the `wrangler deploy` call.
 
-5. **Wire inbound routing**:
+4. **Wire inbound routing**:
    ```bash
    pnpm setup:routing --domain <you.com> --env dev
    pnpm setup:routing --domain <you.com> --env dev --apply
@@ -148,7 +140,7 @@ unless the user explicitly wants the low-level Wrangler sequence.
    Use separate outbound subdomains per stream, keep inbound and outbound separated, and never send
    bulk or experiments from the apex domain.
 
-6. **Configure outbound sending identity if replies are needed**:
+5. **Configure outbound sending identity if replies are needed**:
    ```bash
    pnpm setup:sending --env dev --domain <you.com>
    pnpm setup:sending --env dev --domain <you.com> --dmarc-rua you@<you.com> --apply
@@ -177,7 +169,7 @@ unless the user explicitly wants the low-level Wrangler sequence.
    Outbound send still requires `request-send` -> `confirm-send`; never add a direct send
    shortcut.
 
-7. **Put Cloudflare Access in front of the custom domain**:
+6. **Put Cloudflare Access in front of the custom domain**:
    ```bash
    pnpm setup:access --env dev --hostname inbox.<you.com>
    pnpm setup:access --env dev --hostname inbox.<you.com> --aud <aud-tag> \
@@ -186,7 +178,7 @@ unless the user explicitly wants the low-level Wrangler sequence.
    That script sets the Worker secrets once you have the `aud` and team domain, but it does not
    create the Access application itself. Follow the dashboard guide it prints.
 
-8. **Verify before calling it done**:
+7. **Verify before calling it done**:
    ```bash
    pnpm doctor --env dev --cloud --url https://inbox.<you.com>
    pnpm smoke:access https://inbox.<you.com>
@@ -205,7 +197,6 @@ pnpm wrangler queues create <your-inbound-queue>
 pnpm wrangler queues create <your-inbound-dlq>
 pnpm wrangler d1 create <your-index-db-name> --location=<closest-region>
 pnpm wrangler d1 migrations apply <your-index-db-name> --remote --env dev
-pnpm wrangler secret put MAILBOX_ID_SECRET --env dev
 pnpm run deploy:dev
 ```
 
@@ -213,8 +204,8 @@ If you use the manual path, you own the two sharp edges the scripted flow is des
 
 - keeping the real D1 id out of the tracked template config while still deploying with the right
   value
-- pairing `MAILBOX_ID_SECRET` with `pnpm setup:mailbox` before you lose access to the original
-  secret value
+- remembering to seed the first mailbox (`pnpm setup:mailbox ... --apply`); a Worker with no
+  mailbox row silently drops every inbound message
 
 ### Known deployment footguns
 
@@ -244,14 +235,9 @@ If you use the manual path, you own the two sharp edges the scripted flow is des
   real D1 id.
 - **Old seed data when seeding a mailbox**: current `setup:mailbox` reuses the existing
   `domains.id` by domain name. If it still fails after manual/older seeds, inspect
-  `mailboxes`, `aliases`, and `routing_rules`; a primary address mapped with a different
-  `mailbox_id` usually means you are using the wrong `MAILBOX_ID_SECRET`.
-- **Secret set, seed failed, secret value lost**: Cloudflare secrets are write-only. If you still
-  have the original `MAILBOX_ID_SECRET`, rerun `setup:mailbox` with it via the environment. If you
-  lost it before go-live, run `pnpm setup:cloud --domain <d> --address inbox@<d> --reset-secret
-  --apply` — `setup:cloud` and `pnpm doctor --cloud` both detect this orphaned state (a secret set
-  with no seed fingerprint recorded) and point here. This overwrites the secret and reseeds
-  atomically; never do this after go-live, since it changes every existing mailbox's derived id.
+  `mailboxes`, `aliases`, and `routing_rules`. D1 is the only source of truth for `mailbox_id`:
+  the id is random and assigned by the insert, and `UNIQUE(primary_address)` is what makes
+  re-seeding the same address a no-op rather than a duplicate.
 
 ## Part B — MCP / agent layer (implemented: read/search/draft only)
 

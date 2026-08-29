@@ -30,20 +30,16 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 
 | Name | Kind | Purpose | Required? |
 | --- | --- | --- | --- |
-| `MAILBOX_ID_SECRET` | secret | HMAC key deriving stable, privacy-preserving mailbox IDs from canonical email addresses (`mbx_` + base32url(HMAC-SHA256)). Never rotate without a mailbox-ID migration plan. | **Required** |
 | `ACCESS_JWT_AUDIENCE` | secret | Cloudflare Access application `aud` tag; validates the `CF-Access-JWT-Assertion` header on every request. Auth fails closed outside `localhost` if unset. | **Required** (non-local) |
 | `ACCESS_TEAM_DOMAIN` | secret | Zero Trust team domain (`https://<team>.cloudflareaccess.com`) used to fetch the Access JWKS. | **Required** (non-local) |
-| `ACCESS_ALLOWED_EMAILS` | secret | Comma-separated owner allowlist enforced on top of Access. Unset = every Access-authenticated identity is treated as the single operator. | Optional, recommended for shared Access orgs |
+| `ACCESS_ALLOWED_EMAILS` | secret | Bootstrap for the D1 owner registry (`owner_identities`); the two are unioned. Both empty = auth fails closed (`503`), never open. | Optional once an owner is registered |
 | `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, Email Routing write, Access app/policy write). | Optional |
 | `TRANSACTIONAL_API_KEY_PEPPER` | secret | HMAC-SHA256 pepper for transactional API key hashing. Without it, transactional key operations and the `/v1/.../transactional/...` send/status endpoints fail closed (`503`). Rotation invalidates every existing transactional key. | **Required** to enable the transactional API |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates `/api/debug/phase0/*` introspection endpoints. Unset = endpoints unreachable. | Optional |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender; must be verified on a domain onboarded to Email Sending. | **Required** |
 | `MAIL_SENDING_DOMAINS` | var | Comma-separated domains verified in Email Sending. A mailbox on a listed domain replies as itself; otherwise the reply goes out as `MAIL_FROM_ADDRESS` with `Reply-To` set to the mailbox. | Optional |
 | `TELEGRAM_BOT_TOKEN` | secret | Enables the Telegram bridge. Unset = `/telegram/webhook` answers 404 and no notifications are sent. | Optional |
-| `TELEGRAM_WEBHOOK_SECRET` | secret | Authenticates the webhook via `X-Telegram-Bot-Api-Secret-Token`, compared in constant time. The bridge refuses to start without it. | **Required** with the bot token |
-| `TELEGRAM_ALLOWED_USER_IDS` | var | Comma-separated Telegram user IDs allowed to drive the bot. The bridge refuses to start without it. | **Required** with the bot token |
-| `TELEGRAM_CHAT_ID` | var | Chat receiving new-mail cards, and the only chat the bot accepts commands from. | Optional |
-| `TELEGRAM_TOPICS` | var | `"1"` creates a forum topic per email thread; unset uses plain messages with reply-based threading. | Optional |
+| `TELEGRAM_ALLOWED_USER_IDS` | var | Bootstrap only, unioned with the Telegram identities in `owner_identities`. The normal path is pairing: while no operator is linked the hourly cron mints a single-use code, you read it from D1 and send `/start <code>`. The bridge no longer refuses to start without this — it could not, since answering `/start` is how anyone gets linked. | Optional |
 
 ### Bindings (`wrangler.jsonc`)
 
@@ -52,9 +48,11 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 | `MAILBOX_DO` | Durable Object, class `MailboxDurableObject`, SQLite storage | n/a (per-mailbox instances) | Canonical mailbox state: messages, threads, FTS, drafts, outbox, idempotency, realtime sessions. |
 | `MAIL_OBJECTS` | R2 bucket | `inbox-mcp-raw-dev` | Raw inbound MIME, parsed HTML bodies, attachments, backup manifests. |
 | `INBOUND_EMAIL_QUEUE` | Queue producer + consumer | `inbox-mcp-inbound-dev` (DLQ: `inbox-mcp-inbound-dlq-dev`) | Metadata-only inbound transport; `max_batch_size: 5`, `max_batch_timeout: 2`, `max_retries: 3`. |
+| `EMAIL_EVENTS_QUEUE` | Queue producer + consumer | `inbox-mcp-email-events-dev` (DLQ: `inbox-mcp-email-events-dlq-dev`) | Cloudflare Email Sending lifecycle events (delivered/deferred/bounced/complained); `max_batch_size: 10`, `max_batch_timeout: 2`, `max_retries: 3`. |
+| `NOTIFY_QUEUE` | Queue producer + consumer | `inbox-mcp-notify-dev` (DLQ: `inbox-mcp-notify-dlq-dev`) | Telegram push cards, off the ingest ack path so a Telegram outage never blocks or retries ingest; `max_batch_size: 5`, `max_batch_timeout: 1`, `max_retries: 5`. |
 | `INDEX_DB` | D1 database | `inbox-mcp-index-dev` | Cross-mailbox/control-plane index (see data model below). |
 | `EMAIL` | Email Sending (`send_email`) | n/a | Outbound `env.EMAIL.send()`, only after `confirm-send` (UI/Telegram/MCP) or a validated transactional API-key send. |
-| `triggers.crons` | Cron Trigger | `0 * * * *` (hourly, maintainer dev) | Backup sweep + stale `outbound_sends` and transactional-request reconciliation + expired Telegram action sweep. |
+| `triggers.crons` | Cron Trigger | `0 * * * *` (hourly, maintainer dev) | Backup sweep + stale `outbound_sends` and transactional-request reconciliation + expired Telegram action sweep + Telegram webhook reconciliation (re-registers the webhook when Telegram's registered URL has drifted from this deployment's origin). |
 
 Replace maintainer example names with your own. The verifier and migration commands are now
 parameterized; self-hosters should pass their resource names by env vars/CLI args rather than
@@ -115,8 +113,9 @@ consulted for authorization, quota, or idempotency.
   `email.sending` in `queues subscription create`, so do not use its generic command with an
   unsupported source. The event queue has a configured DLQ; unresolved or invalid events are
   retried rather than silently acknowledged.
-- Access-protected suppression administration is available at
-  `/api/mailboxes/:mailboxId/suppressions` and `/suppressions/remove`. Provider-originated
+- Owner-gated suppression administration is available at
+  `/api/mailboxes/:mailboxId/suppressions` and
+  `/api/mailboxes/:mailboxId/suppressions/remove`. Provider-originated
   hard-bounce/complaint entries require explicit override to remove.
 - The `/v1/...` routes are the only path outside the Access perimeter: JSON-only, 100 KB body cap,
   `Cache-Control: no-store`, no CORS, no cookies, no query-param credentials.
@@ -315,28 +314,61 @@ all related R2 prefixes.
 | Transactional request stuck at `pending` | Crash mid-send in the transactional path | `reconcileStaleTransactionalRequests` exists in the DO (marks rows `unknown` / `stale_reconciled`) but is not yet wired to cron or an endpoint. Until then, resolve manually after reviewing `transactional_request_log` / DO state and the provider console. |
 | Transactional send returns `unknown` | Provider outcome is ambiguous (may have accepted before erroring) | Not auto-retried by design. Treat as manual-review-required; never re-send blindly with the same idempotency key. |
 | Access misconfiguration | Route exposed without proper Access enforcement | Treat as a security incident. Block public access first, then fix Access and re-verify with an unauthenticated request. |
+| Telegram bot token set but no cards ever arrive | The bridge is configured but not yet delivering: no chat adopted (nobody sent `/start` from an allowlisted account) and/or the worker has not observed its public origin yet, so the hourly `reconcileTelegramWebhook` skips registration | `GET /api/health` → `dependencies.telegram` reports `mode: "partial"` and `missing` names exactly which of the two it is waiting for. Load the authenticated UI once on the real hostname (the origin is only recorded from a request that cleared Access), send `/start` from an allowlisted account, then let the next hourly cron register the webhook. |
 | Telegram webhook receives nothing | Cloudflare Access is intercepting `/telegram/webhook` | Telegram cannot present an Access JWT, so updates are redirected to the login page. Add an Access **Bypass** policy for that path only. Confirm with `getWebhookInfo` — `last_error_message` shows what Telegram received. |
-| `telegram.topic_unavailable` in `ops_events` | `createForumTopic` failed for this chat | Expected when topic mode is not enabled for the bot in that chat. The bridge already fell back to plain messages; replies still work by quoting the notification. Set `TELEGRAM_TOPICS` unset to stop retrying. |
+| `telegram.topic_unavailable` in `ops_events` | `createForumTopic` was refused for this chat | Usually the bot lacks `can_manage_topics` in the supergroup. The bridge already fell back to plain messages and replies still work by quoting the notification, so this is degradation, not breakage. Grant the permission, or leave it — a plain chat is a supported mode, not a misconfiguration. |
+| `telegram.topic_recreated` in `ops_events` | The mailbox's topic was deleted in Telegram | Self-healing: the stale mapping was dropped, the topic recreated and the card re-sent once. Repeated rows for the same mailbox mean someone is deleting topics faster than mail arrives. |
 | `telegram.notify_failed` in `ops_events` | Telegram API error or rate limit while pushing a card | The mail is already ingested and safe — only the notification was lost. Telegram allows roughly one message per second per chat; a burst of mail is the usual cause. |
-| Need to rotate a secret | Routine hygiene or suspected leak | Rotate ordinary secrets with `wrangler secret put`. Do not rotate `MAILBOX_ID_SECRET` without a mailbox-ID migration plan. |
+| Need to rotate a secret | Routine hygiene or suspected leak | Rotate with `wrangler secret put`. Rotating `TELEGRAM_BOT_TOKEN` also rotates the derived webhook secret, so the hourly cron re-registers the webhook on its next run; rotating `TRANSACTIONAL_API_KEY_PEPPER` invalidates every existing transactional key. Mailbox IDs are random rows in D1 and depend on no secret. |
 | Local large-MIME smoke fails around 1 MiB | Local Email Routing tooling limit | Expected local behavior; use a smaller fixture for local smoke and do not infer a production 25 MiB failure from it. |
 
-## DLQ and replay procedure
+## Dead-letter queues
+
+Every queue in this Worker has a dead-letter queue, and every dead-letter queue has a consumer:
+`src/cloudflare/dlq-consumer.ts` writes one `ops_events` row per dead message
+(`event_type='dlq.dead_letter'`, `severity='error'`, `subject` = the queue message id, payload
+`{ queue, attempts, body }`) and acks. Before that consumer existed a message that exhausted its
+retries simply expired with the Queues retention window and left no trace anywhere an operator
+would look. The tombstone is the trace.
+
+Two properties are deliberate:
+
+- **No automatic redelivery.** A DLQ consumer that re-enqueues resurrects exactly the loop the DLQ
+  exists to end. Replay is a human decision, made after the cause is fixed.
+- **The DLQ consumers have no DLQ of their own.** If D1 is down the tombstone write is retried
+  (never acked — a death cannot be recorded in a ledger that is down), and once the retries are
+  spent the message is lost. That is the honest end of the chain; another hop would only move the
+  silence further away.
+
+Duplicate tombstones are possible: if an ack is lost after the insert lands, the message is
+redelivered and the row is written twice. Harmless, and not worth a read per dead message to
+prevent.
+
+### What a dead message means, per queue
+
+| Queue | A dead message means | Replay stance |
+| --- | --- | --- |
+| `inbox-mcp-inbound` (→ `-dlq`) | An accepted email whose raw MIME is in R2 but which is not indexed in the DO or D1: invisible mail. The most serious of the three. | Recoverable but manual. The raw object is intact and the message carries a stable idempotency key, so a re-ingest updates rather than duplicates — but there is no replay endpoint, so it is a deliberate operator action after the cause is fixed. |
+| `inbox-mcp-email-events` (→ `-dlq`) | A lost Email Sending lifecycle event: a delivery/bounce/complaint that never updated `outbound_sends` or the DO suppression list. Local state now disagrees with the provider. | Do not replay stale events blindly — a bounce replayed out of order can suppress a recipient on obsolete information. Cloudflare's account suppression list is upstream authoritative; reconcile against the provider console instead. |
+| `inbox-mcp-notify` (→ `-dlq`) | A Telegram card that never arrived. The mail itself is ingested and safe; only the push was lost. | Usually no replay: a late notification about mail already visible in the UI has little value. Fix the bridge (token, allowlist, chat adoption) and let the next message prove it. |
+
+## Replay procedure
 
 Current limitation first: there is no implemented `POST /api/admin/dlq/replay` endpoint. Replay is
 still a manual Cloudflare operation plus an operator validation pass.
 
 1. Inspect the symptom:
    - check Queue/DLQ counts in Cloudflare;
-   - inspect `GET /api/admin/dlq`;
-   - inspect recent `ops_events` and Worker logs.
+   - query `ops_events` for `event_type='dlq.dead_letter'` (via `GET /api/admin/ops-events`) — the
+     rows carry the queue, attempt count and payload of every dead message;
+   - inspect `GET /api/admin/dlq` and recent Worker logs.
 2. Classify the failure:
    - poison/schema bug;
    - transient dependency failure (D1/R2/provider);
    - auth/config error;
    - malformed but acceptable email that should remain `parse_status='failed'`.
 3. Fix the underlying cause before replaying anything.
-4. Confirm replay safety:
+4. Confirm replay safety, using the per-queue stance above:
    - verify the affected messages already have stable idempotency keys;
    - verify a successful replay would update existing records rather than create duplicate message
      rows.

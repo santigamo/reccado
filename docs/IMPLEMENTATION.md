@@ -418,7 +418,6 @@ Checklist:
 Secrets:
 
 ```sh
-pnpm wrangler secret put MAILBOX_ID_SECRET
 pnpm wrangler secret put CLOUDFLARE_API_TOKEN
 pnpm wrangler secret put ACCESS_JWT_AUDIENCE
 pnpm wrangler secret put ACCESS_TEAM_DOMAIN
@@ -482,12 +481,19 @@ Future binding example:
 
 Mailbox IDs must be stable, privacy-preserving, and valid as Durable Object names.
 
-Canonical input:
+Canonical input and id:
 
 ```text
 primaryAddress = lowercase(trim(localPart)) + "@" + lowercase(trim(domain))
-mailboxId = "mbx_" + base32url(hmacSha256(MAILBOX_ID_SECRET, primaryAddress)).slice(0, 26)
+mailboxId      = "mbx_" + base32url(16 random bytes)   // 26 base32url chars
 ```
+
+The id is generated at insert time and D1 is the only source of truth for it (see
+`src/lib/mailbox-id.ts`). It was previously derived as an HMAC of the primary address under a
+`MAILBOX_ID_SECRET`, so a provisioning run could recompute it offline; nothing at runtime ever
+needed that (ingest resolves the mailbox by D1 lookup), and it made one write-only secret part of
+the identity of every mailbox. The format is unchanged, so pre-existing rows, R2 keys and DO names
+stay valid.
 
 Rules:
 
@@ -495,7 +501,9 @@ Rules:
 - D1 maps aliases to `mailboxId`.
 - One DO instance owns one logical mailbox.
 - Multiple aliases can route to one mailbox.
-- `MAILBOX_ID_SECRET` must not rotate without a migration plan.
+- `UNIQUE(primary_address)` — not a shared secret — is what makes re-provisioning an address
+  idempotent: create-if-missing is `INSERT ... ON CONFLICT(primary_address) DO NOTHING` followed by
+  a re-read.
 
 ### R2 Key Convention
 
@@ -950,14 +958,34 @@ GET  /api/mailboxes/{mailboxId}/ws
 Aliases and routing:
 
 ```text
-GET  /api/domains
-POST /api/domains
-GET  /api/aliases
-POST /api/aliases
-GET  /api/routing-rules
-POST /api/routing-rules
-PATCH /api/routing-rules/{ruleId}
+GET    /api/domains
+POST   /api/domains
+GET    /api/domains/{domain}/status
+PATCH  /api/domains/{domain}          # {domain} accepts the name or the row id
+DELETE /api/domains/{domain}          # soft: status -> disabled
+GET    /api/aliases
+POST   /api/aliases
+PATCH  /api/aliases/{aliasAddress}
+DELETE /api/aliases/{aliasAddress}    # hard: the row is removed
+GET    /api/routing-rules
+POST   /api/routing-rules
+PATCH  /api/routing-rules/{ruleId}
+DELETE /api/routing-rules/{ruleId}    # hard: the row is removed
 ```
+
+**Delete semantics.** Soft where other rows or stored data depend on the identity, hard where the
+row is pure configuration. A mailbox owns messages in its Durable Object and R2 and is referenced
+by `message_index`, so `DELETE` only flips `status` — and `resolveRoutingForRecipient` treats a
+mailbox's own status as authoritative over the alias and rules pointing at it, rejecting with
+`mailbox_disabled` rather than diverting the mail to the domain's catch-all. Domains are soft for
+the same reason: `aliases` and `routing_rules` carry foreign keys to them. Aliases and routing
+rules delete for real — an alias soft-delete would hold its address hostage, since `alias_address`
+is the primary key and freeing it for another mailbox is the usual reason to remove one.
+
+`POST /api/mailboxes` also creates the alias for the mailbox's own primary address when that
+domain is registered and active, and reports `aliasCreated: false` with a reason when it is not,
+rather than failing — a mailbox with no alias silently receives nothing, or worse, has its mail
+swallowed by the domain catch-all.
 
 Outbound:
 
@@ -1519,7 +1547,7 @@ Operational runbook:
 - DO parse failure: keep message row with `parse_status='failed'`, preserve raw R2 key, expose ops event.
 - Outbound send failure: keep `outbound_sends.status='failed'`, show error, require manual retry with same or new idempotency decision.
 - Access misconfiguration: block public API first, then restore allow policies.
-- Secret rotation: rotate Cloudflare API token normally; do not rotate `MAILBOX_ID_SECRET` without a mailbox ID migration plan.
+- Secret rotation: rotate the Cloudflare API token normally. Mailbox IDs are random D1 rows and depend on no secret, so no rotation can invalidate them; rotating `TELEGRAM_BOT_TOKEN` also rotates the derived Telegram webhook secret and the hourly cron re-registers the webhook.
 
 ## Open Questions Requiring Senior Decision
 

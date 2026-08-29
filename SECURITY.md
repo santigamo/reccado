@@ -17,12 +17,19 @@ requests from any hostname other than `localhost`/`127.0.0.1`/`::1` are rejected
 than falling back to an open or trust-the-client mode. Local dev (`localhost`) intentionally
 bypasses Access so you can develop without a Cloudflare account.
 
-On top of Access, an optional `ACCESS_ALLOWED_EMAILS` owner allowlist (comma-separated emails)
-restricts which Access-authenticated identities are actually treated as authorized — useful if
-your Cloudflare Access organization includes people who shouldn't see this particular mailbox.
-Without it, **every** identity that passes your Access policy is treated as the single operator;
-this is intentional default behavior for true single-user installs, but you should set
-`ACCESS_ALLOWED_EMAILS` if your Access org is broader than "just me."
+On top of Access, Reccado keeps its own owner registry in D1 (`owner_identities`) naming exactly
+who is authorized — email identities for the web and MCP perimeters, Telegram identities for the
+bot. `ACCESS_ALLOWED_EMAILS` still works as a bootstrap for the email side, and the two are unioned.
+
+**This fails closed.** With no owner registered and no bootstrap variable, `/api/*` answers `503
+owner_not_configured` and `/mcp` answers `503 mcp_not_configured` — an install that is half
+configured authorizes nobody. The single exception is a loopback request during local development,
+and it stops applying the moment a real owner exists. `/mcp` has no such exception at all, because
+an MCP client acts without a human watching.
+
+This check is defence in depth, not redundancy with Access. The failure it is there for is an
+Access application created for the wrong hostname, where Access does not deny — it simply is not
+there, and the worker's own list is the only thing left standing.
 
 ### Debug endpoints fail closed
 
@@ -147,14 +154,25 @@ reconciliation helper is wired to the hourly cron and an Access-protected operat
 
 ### Secrets
 
-`MAILBOX_ID_SECRET`, `ACCESS_JWT_AUDIENCE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_ALLOWED_EMAILS`,
-`CLOUDFLARE_API_TOKEN`, `PHASE0_DEBUG_TOKEN`, and `TRANSACTIONAL_API_KEY_PEPPER` are Cloudflare
+`ACCESS_JWT_AUDIENCE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_ALLOWED_EMAILS`, `CLOUDFLARE_API_TOKEN`,
+`PHASE0_DEBUG_TOKEN`, `TRANSACTIONAL_API_KEY_PEPPER`, and `TELEGRAM_BOT_TOKEN` are Cloudflare
 Worker secrets (`wrangler secret put`), never committed to the repository. `.dev.vars*` is
-gitignored except `.dev.vars.example`, which documents names and placeholder values only. Never
-rotate `MAILBOX_ID_SECRET` after go-live without a mailbox-ID migration plan — it's the HMAC key
-every mailbox ID is derived from, and rotating it changes every mailbox ID in the system.
+gitignored except `.dev.vars.example`, which documents names and placeholder values only.
 `TRANSACTIONAL_API_KEY_PEPPER` is the HMAC key that hashes transactional API key material: rotating
 it breaks every existing transactional key (re-issue keys after a rotation).
+
+Mailbox IDs are **not** derived from a secret. Each `mailbox_id` is 16 random bytes assigned by the
+`INSERT` that creates the mailbox row, with D1 (`UNIQUE(primary_address)`) as the only source of
+truth; nothing recomputes an ID offline, so no key rotation can invalidate mailbox identity.
+
+The Telegram webhook secret is derived, never configured: it is
+`HMAC-SHA256(TELEGRAM_BOT_TOKEN, "reccado:telegram:webhook-secret:v1")`, recomputed on demand by
+the only two code paths that need it (webhook verification and webhook registration). It is
+deliberately not persisted in D1 — it is what stops a forged update from sending mail as the
+operator, and the allowlist such an update would have to satisfy is itself a D1 row, so storing it
+there would let a single database read escalate from reading mail to sending it. Rotating
+`TELEGRAM_BOT_TOKEN` rotates the webhook secret with it, and the hourly cron re-registers the
+webhook.
 
 ## Supply-chain posture
 

@@ -5,6 +5,13 @@
 > IDs, secrets, and commands below reflect the maintainer's environment at that point in time and
 > may be stale — see [`README.md`](../../README.md), [`docs/OPERATIONS.md`](../OPERATIONS.md), and
 > [`SECURITY.md`](../../SECURITY.md) for current, accurate operating guidance.
+>
+> **Note added 2026-08-28:** the `MAILBOX_ID_SECRET` worker secret referenced throughout this log
+> **no longer exists**. Mailbox ids are no longer derived by HMAC from a secret: they are random
+> and assigned by the `INSERT` that creates the mailbox row, with D1 as the only source of truth
+> (see `src/lib/mailbox-id.ts` and the `Removed` section of [`CHANGELOG.md`](../../CHANGELOG.md)).
+> The evidence below is preserved as it was recorded — do not follow its secret-related steps on a
+> current deployment.
 
 ## Milestone 1.1 - Project Foundation
 

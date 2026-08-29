@@ -60,11 +60,7 @@ async function auditMcpCall(
 	}
 }
 
-export function registerTools(
-	server: McpServer,
-	env: Env,
-	auth: AuthContext,
-): void {
+export function registerTools(server: McpServer, env: Env, auth: AuthContext): void {
 	const facade = new McpMailboxFacade(env, auth);
 
 	server.tool(
@@ -110,7 +106,13 @@ export function registerTools(
 		"List email threads in a mailbox. Returns thread summaries with subject, sender, snippet, and timestamps. Use 'state' to filter by folder (inbox, archive, trash, sent).",
 		{
 			mailboxId: z.string().min(1).describe("The mailbox ID to list threads from"),
-			limit: z.coerce.number().int().min(1).max(50).default(25).describe("Max threads to return (1-50)"),
+			limit: z.coerce
+				.number()
+				.int()
+				.min(1)
+				.max(50)
+				.default(25)
+				.describe("Max threads to return (1-50)"),
 			state: z.enum(["inbox", "archive", "trash", "sent"]).optional().describe("Folder filter"),
 		},
 		async (params) => {
@@ -124,11 +126,7 @@ export function registerTools(
 				return mcpToolError("Rate limit exceeded. Try again in a minute.");
 			}
 			try {
-				const threads = await facade.listThreads(
-					params.mailboxId,
-					params.limit,
-					params.state,
-				);
+				const threads = await facade.listThreads(params.mailboxId, params.limit, params.state);
 				await auditMcpCall(env, auth, "list_threads", params.mailboxId, {
 					result_count: threads.length,
 					latency_ms: Date.now() - start,
@@ -168,11 +166,7 @@ export function registerTools(
 				return mcpToolError("Rate limit exceeded. Try again in a minute.");
 			}
 			try {
-				const results = await facade.searchMessages(
-					params.mailboxId,
-					params.q,
-					params.limit,
-				);
+				const results = await facade.searchMessages(params.mailboxId, params.q, params.limit);
 				await auditMcpCall(env, auth, "search_messages", params.mailboxId, {
 					result_count: results.length,
 					latency_ms: Date.now() - start,
@@ -237,7 +231,12 @@ export function registerTools(
 		"Create a draft email reply. The draft is saved with status 'draft' and must be reviewed and sent by a human via the UI. This tool CANNOT send email. To reply to a message, first call read_message to get the sender's address, then pass it in the 'to' array. Do not include the mailbox's own address in the 'to' array. The idempotencyKey ensures duplicate calls don't create duplicate drafts.",
 		{
 			mailboxId: z.string().min(1).describe("The mailbox ID to create the draft in"),
-			to: z.array(z.string().email()).min(1).describe("Recipient email addresses (required, must not include the mailbox's own address)"),
+			to: z
+				.array(z.string().email())
+				.min(1)
+				.describe(
+					"Recipient email addresses (required, must not include the mailbox's own address)",
+				),
 			subject: z.string().min(1).describe("Email subject (required)"),
 			bodyText: z.string().min(1).describe("Email body text (required)"),
 			threadId: z.string().optional().describe("Optional thread ID for context"),

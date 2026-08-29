@@ -151,11 +151,14 @@ actual repo state, fix this section rather than trusting it blindly.
 - DLQ: `inbox-mcp-inbound-dlq-dev`.
 - D1 database: `inbox-mcp-index-dev`, id `<your-d1-database-id>`.
 - Email Routing rule: `test@example.com -> reccado-dev`.
-- Dev test mailbox: `test@example.com` resolves to a mailbox ID **deterministically derived** as
-  `HMAC-SHA256(MAILBOX_ID_SECRET, "test@example.com")` (see `src/lib/mailbox-id.ts` and
-  `pnpm seed:dev-id`) — it is not a fixed literal. The literal `mbx_test` you'll see in some smoke
-  commands (e.g. `pnpm smoke:ws .../mailboxes/mbx_test/ws`) is just an arbitrary Durable Object
-  name used for WebSocket echo testing and is unrelated to D1-routed mailbox identity.
+- Dev test mailbox: `test@example.com` resolves to the fixed dev-fixture id
+  `DEV_TEST_MAILBOX_ID` (`src/db/seed-dev.ts`, seeded by `pnpm seed:dev-id`), so the dev server,
+  the debug endpoint and the smoke scripts all agree without talking to each other. Real mailbox
+  IDs are **random**, assigned by the `INSERT` that creates the row, with D1 as the only source of
+  truth (`src/lib/mailbox-id.ts`) — nothing derives them from a secret. The literal `mbx_test`
+  you'll see in some smoke commands (e.g. `pnpm smoke:ws .../mailboxes/mbx_test/ws`) is just an
+  arbitrary Durable Object name used for WebSocket echo testing and is unrelated to D1-routed
+  mailbox identity.
 
 ### Fast preflight
 

@@ -13,8 +13,6 @@ This page is the recommended baseline for self-hosters wiring a real domain.
 - **Never** run bulk mail, cold outreach, or experiments from your apex domain.
 - Keep **inbound identity** and **outbound reputation** separated unless you have a very small,
   tightly controlled setup.
-- Treat `MAILBOX_ID_SECRET` as a **root key** for mailbox identity: protect it, do not rotate it
-  casually, and make sure your first mailbox seed succeeds while you still have the value.
 
 ## Recommended domain layout
 
@@ -156,20 +154,6 @@ New sending subdomains need gradual volume and clean list hygiene.
 If a sender subdomain gets a bad reputation, move the risky workload off that stream. Do not drag
 your clean transactional traffic down with it.
 
-## `MAILBOX_ID_SECRET` Is A Root Key
-
-`MAILBOX_ID_SECRET` is not part of SPF, DKIM, or DMARC, but it is still a root key for the install.
-Reccado derives mailbox IDs from it, and Cloudflare makes it write-only once stored as a Worker
-secret.
-
-Operational consequences:
-
-- seed the first mailbox in the same run that generates the secret, or keep the original value
-  available until `pnpm setup:mailbox` succeeds
-- do not rotate it casually; rotation changes mailbox identity
-- if a first-run seed fails and you lose the secret value, treat the environment as tainted and
-  recreate or intentionally rotate it before real mail goes live
-
 ## Minimal launch checklist
 
 Before you declare a domain ready:
@@ -179,7 +163,6 @@ Before you declare a domain ready:
 3. Verify SPF, DKIM, and DMARC for each sending stream you actually use.
 4. Start DMARC at `p=none`, then ratchet up.
 5. Warm up new sender subdomains gradually.
-6. Protect `MAILBOX_ID_SECRET` and finish mailbox seeding while the value is still known.
 
 This is deliberately conservative. Recovering from a bad sender reputation is slower than taking
 an extra hour to separate domains correctly at the start.

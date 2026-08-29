@@ -15,6 +15,28 @@ read/search/draft endpoint.
 
 ### Added
 
+- **Telegram: one forum topic per mailbox, not per email thread.** When the bound chat is a
+  supergroup with forum mode, each mailbox gets a topic named after the mailbox. Previously a
+  topic was created per email thread, named with the email's subject — which let anyone who sent
+  mail write the permanent labels in the operator's Telegram sidebar, and tied topic creation to
+  unbounded inbound volume. Forum support is now detected via `getChat` at `/start` and cached in
+  `runtime_config`, replacing the `TELEGRAM_TOPICS` flag (removed). Replies resolve only through
+  `reply_to_message`: a topic now holds many conversations, so "the newest card in this topic"
+  would answer the wrong email. A deleted topic self-heals — the stale mapping is dropped, the
+  topic recreated, and the card re-sent once.
+
+- **Control-plane API reaches parity with the CLI.** `PATCH` and `DELETE` on mailboxes, domains,
+  aliases and routing rules, and `POST /api/mailboxes` now creates the alias for its own primary
+  address when the domain is registered. Delete is soft where other rows or stored data depend on
+  the identity (mailboxes, domains) and hard where the row is pure configuration (aliases, routing
+  rules). See `docs/IMPLEMENTATION.md` for the reasoning.
+
+- **A disabled mailbox stops receiving mail.** `resolveRoutingForRecipient` now treats a mailbox's
+  own status as authoritative over the alias and routing rows that point at it, rejecting with
+  `mailbox_disabled`. Previously a disabled mailbox kept accepting mail, which would have made
+  `DELETE /api/mailboxes/:id` a lie, and a fall-through to the domain catch-all would have quietly
+  diverted someone's mail into a different mailbox.
+
 - **Cloudflare Email Sending lifecycle integration.** Email Sending event subscriptions feed the
   `inbox-mcp-email-events` Queue. Delivery, deferred, bounce, rejection, complaint, and failure
   events update canonical transactional delivery state; hard bounces and complaints create
@@ -64,7 +86,14 @@ read/search/draft endpoint.
   start half-configured. See the README for the Cloudflare Access bypass this requires.
 - `MAIL_SENDING_DOMAINS`: mailboxes on a domain verified in Cloudflare Email Sending now reply as
   themselves instead of as the single global `MAIL_FROM_ADDRESS`.
-- `pnpm setup:telegram` registers the webhook with its secret token (dry-run by default).
+- The Telegram webhook registers itself: the hourly cron (`reconcileTelegramWebhook`) compares
+  what Telegram believes against this deployment's origin and re-registers on drift. The worker
+  learns that origin by observing a request that already cleared Cloudflare Access, and the
+  webhook secret is an HMAC of the bot token, so no URL and no secret is ever configured by hand.
+- The bot adopts its chat on the first `/start` from an allowlisted user and stores it in D1
+  (`runtime_config`), first writer wins. `/start` now also answers *unauthorized* users with
+  their own user id, so a first-time operator can learn the id they need for
+  `TELEGRAM_ALLOWED_USER_IDS` instead of getting silence.
 - **MCP endpoint (`/mcp`) — read/search/draft only.** Access-authenticated (requires
   `ACCESS_ALLOWED_EMAILS`, fails closed with `503` when unset). Exposes `list_mailboxes`,
   `list_threads`, `search_messages`, `read_message`, and `draft_reply`; there is deliberately no
@@ -91,6 +120,50 @@ read/search/draft endpoint.
   operations.
 - Stale transactional-request reconciliation remains manual-review-oriented: it flips stuck
   `pending`/`sending` rows to `unknown` and never retries delivery automatically.
+
+### Removed
+
+Configuration surface that the system can decide for itself, deleted rather than deprecated. Every
+one of these was a value a human had to invent, store and keep in sync, and every one of them had a
+failure mode where the deployment looked configured and silently did nothing.
+
+- **`MAILBOX_ID_SECRET` (worker secret).** Mailbox ids are no longer an HMAC of the primary
+  address: they are 16 random bytes assigned by the `INSERT` that creates the row
+  (`INSERT ... ON CONFLICT(primary_address) DO NOTHING` + re-read), with D1 as the only source of
+  truth. Nothing at runtime ever recomputed an id — ingest resolves the mailbox by D1 lookup — so
+  the secret only bought offline recomputation at the price of making one write-only value part of
+  the identity of every mailbox. The id format (`mbx_` + 26 base32url chars) is unchanged, so
+  existing rows, R2 keys and Durable Object names stay valid and no migration is required. Gone
+  with it: `wrangler secret put MAILBOX_ID_SECRET`, `setup:cloud --reset-secret`,
+  `setup:mailbox --secret`, the `mailboxSecretFingerprint` field in `.reccado/setup.<env>.json`
+  (the manifest keeps every other field), the `devvars.mailbox-secret`, `cloud.secret.mailbox` and
+  `cloud.mailbox-secret-recovery` doctor checks, and the whole "orphaned secret" / "rotating the
+  secret invalidates every derived mailbox id" class of failure, which can no longer occur.
+- **`TELEGRAM_WEBHOOK_SECRET` (worker secret).** Derived instead of configured:
+  `HMAC-SHA256(TELEGRAM_BOT_TOKEN, "reccado:telegram:webhook-secret:v1")` (`deriveWebhookSecret`,
+  `src/telegram/api.ts`). The only two parties that need this value are the worker and Telegram,
+  so asking a human to invent one, store it as a secret and re-supply it to a script was three
+  manual steps for a number with no human meaning — and the step everyone forgot, which is how the
+  bridge stayed dead in production without a word. It is deliberately not persisted in D1: it is
+  what stops a forged update from sending mail, and the allowlist such an update must satisfy is
+  itself a D1 row. Rotating the bot token now rotates it automatically.
+- **`TELEGRAM_CHAT_ID` (var).** Auto-adopted instead of declared: the first `/start` from an
+  allowlisted user writes the chat to `runtime_config` in D1, first writer wins — a later `/start`
+  from another chat does not move the binding, and the bot says so. The value always arrived inside
+  the update, so the old flow had the bot print the chat id and ask the human to copy it into a
+  config file and redeploy: the system observing a value, telling a human, and asking that human to
+  tell it back.
+- **`scripts/setup-telegram.ts` / `pnpm setup:telegram`.** Replaced by the hourly cron
+  reconciliation (`reconcileTelegramWebhook`, `src/telegram/registration.ts`). Telegram onboarding
+  is now: create the bot and set `TELEGRAM_BOT_TOKEN`, put your user id in
+  `TELEGRAM_ALLOWED_USER_IDS`, deploy, load the authenticated UI once (that is how the worker
+  learns its own public origin — only ever from a request that cleared Access, because the `Host`
+  header is forgeable and that value decides where Telegram delivers), then send `/start`.
+  `GET /api/health` reports `dependencies.telegram` with `mode: off | partial | on` and a `missing`
+  list, so a bridge that is not yet delivering says what it is waiting for.
+
+The allowlist (`TELEGRAM_ALLOWED_USER_IDS`) stays configuration on purpose: declaring whom you
+trust is not derivable, and whoever can drive the bot can send mail as the operator.
 
 ### Fixed
 
@@ -173,10 +246,7 @@ read/search/draft endpoint.
 - `setup:cloud` now checks the inbound queue's consumer before deploying and aborts with the exact
   `wrangler queues consumer remove <queue> <old-worker>` fix if a different Worker (e.g. left over
   from a rename) is still registered as its consumer, instead of letting deploy fail with a
-  generic error. Added `--reset-secret` to recover an **orphaned** `MAILBOX_ID_SECRET` — one a
-  prior `--apply` run set but then failed before seeding a mailbox with — by overwriting it with a
-  fresh value and reseeding atomically in the same run; the orphaned state is detected from a
-  non-sensitive fingerprint recorded in `.reccado/setup.<env>.json`.
+  generic error.
 - `setup:mailbox` resolves the domain row by name and reuses it instead of assuming a fresh insert,
   so reseeding an env with pre-existing (including foreign-key-owning) domain rows is idempotent
   rather than failing.
@@ -198,8 +268,6 @@ read/search/draft endpoint.
   `wrangler email sending dns get`, an open-beta command with no `--json` mode) unless
   `--skip-provider-records` is passed; SPF and DMARC remain exclusively script-owned, so the
   provider's own suggested DMARC record (typically `p=reject`) is never applied.
-- `pnpm doctor --cloud` now reads the setup manifest and warns when it finds an orphaned
-  `MAILBOX_ID_SECRET` (set but never paired with a successful seed), pointing at `--reset-secret`.
 - Aligned the `workers.dev` vs. custom-domain narrative across `doctor`, `setup:domain`, and
   `setup:access`: the `dev` environment keeps `workers_dev: true` only for local-to-cloud smoke
   tests, and Access verification is only ever treated as valid against a custom domain.

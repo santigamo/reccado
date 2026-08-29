@@ -1,11 +1,6 @@
 import type { AuthContext } from "../api/auth";
 import { getMailboxForOwner } from "../db/d1";
-import type {
-	McpDraftResult,
-	McpMessageDto,
-	McpSearchResult,
-	McpThread,
-} from "./types";
+import type { McpDraftResult, McpMessageDto, McpSearchResult, McpThread } from "./types";
 
 const MCP_MAX_BODY_CHARS = 10_000;
 
@@ -83,11 +78,7 @@ export class McpMailboxFacade {
 		return this.env.MAILBOX_DO.getByName(mailboxId);
 	}
 
-	async listThreads(
-		mailboxId: string,
-		limit: number,
-		state?: string,
-	): Promise<McpThread[]> {
+	async listThreads(mailboxId: string, limit: number, state?: string): Promise<McpThread[]> {
 		const stub = await this.resolveMailbox(mailboxId);
 		const url = new URL("https://mailbox-do/threads");
 		url.searchParams.set("limit", String(Math.min(limit, 50)));

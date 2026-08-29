@@ -28,9 +28,11 @@ type WranglerConfig = WranglerBlock & {
 	env?: Record<string, WranglerBlock>;
 };
 
-type D1ExecuteJson = Array<{
-	results: Array<{ mailbox_id: string; primary_address: string; owner_email: string | null }>;
-}> | undefined;
+type D1ExecuteJson =
+	| Array<{
+			results: Array<{ mailbox_id: string; primary_address: string; owner_email: string | null }>;
+	  }>
+	| undefined;
 
 function parseArgs(): { env: string; owner: string | null; apply: boolean; remote: boolean } {
 	const args = process.argv.slice(2);
@@ -59,7 +61,10 @@ function readDevVars(): Record<string, string> {
 		const eqIndex = trimmed.indexOf("=");
 		if (eqIndex === -1) continue;
 		const key = trimmed.slice(0, eqIndex).trim();
-		const value = trimmed.slice(eqIndex + 1).trim().replace(/^["']|["']$/g, "");
+		const value = trimmed
+			.slice(eqIndex + 1)
+			.trim()
+			.replace(/^["']|["']$/g, "");
 		vars[key] = value;
 	}
 	return vars;
@@ -103,7 +108,7 @@ function parseJsonc(content: string): unknown {
 function getD1DatabaseName(envName: string): string {
 	const wranglerPath = join(process.cwd(), "wrangler.jsonc");
 	const config = parseJsonc(readFileSync(wranglerPath, "utf-8")) as WranglerConfig;
-	const block = envName === "production" ? config : config.env?.[envName] ?? config;
+	const block = envName === "production" ? config : (config.env?.[envName] ?? config);
 	const db = block.d1_databases?.find((d) => d.binding === "INDEX_DB");
 	if (!db) {
 		console.error(`ERROR: No INDEX_DB D1 binding found in wrangler.jsonc for env '${envName}'.`);
@@ -112,7 +117,12 @@ function getD1DatabaseName(envName: string): string {
 	return db.database_name;
 }
 
-function d1Execute(envName: string, databaseName: string, sql: string, remote: boolean): D1ExecuteJson {
+function d1Execute(
+	envName: string,
+	databaseName: string,
+	sql: string,
+	remote: boolean,
+): D1ExecuteJson {
 	const tmpDir = mkdtempSync(join(tmpdir(), "mcp-claim-"));
 	const sqlFile = join(tmpDir, "query.sql");
 	writeFileSync(sqlFile, sql);

@@ -200,26 +200,13 @@ pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com>         
 pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com> --apply  # run it
 ```
 
-If `MAILBOX_ID_SECRET` is absent, `setup:cloud --apply` generates it once and immediately uses that
-same value to seed the first mailbox in the same run. If the secret already exists, the script
-leaves it untouched and prints the exact `MAILBOX_ID_SECRET=<value> pnpm setup:mailbox ... --apply`
-command to run yourself, because Cloudflare secrets are write-only and the CLI cannot derive the
-mailbox id without the original value.
-
-If a prior `--apply` run set `MAILBOX_ID_SECRET` but failed before seeding the first mailbox (a
-now-**orphaned** secret — write-only, with no mailbox that uses it), `setup:cloud` detects this
-(no fingerprint recorded in `.reccado/setup.<env>.json`) and points you at `--reset-secret`:
-
-```bash
-pnpm setup:cloud --env dev --domain <you.com> --address inbox@<you.com> --reset-secret --apply
-```
-
-This overwrites `MAILBOX_ID_SECRET` with a fresh value and reseeds the mailbox atomically in the
-same run. **Never run `--reset-secret` after go-live** — it changes the derived `mailbox_id` of
-every mailbox already seeded with the current secret.
+`--apply` also seeds the first mailbox in the same run, because a deployed Worker with no mailbox
+row in D1 accepts no mail. `mailbox_id` is random and assigned by the INSERT, with D1 as the only
+source of truth, so re-running `setup:cloud` (or `setup:mailbox`) for an address that already exists
+is a no-op rather than a second mailbox. Pass `--skip-seed` only when this env is already seeded.
 
 **Manual — run the commands yourself.** This is the escape hatch when you do not want the scripted
-path. The main difference is that you must manage the D1 id and mailbox seed coupling yourself:
+path. The main difference is that you must manage the D1 id and the mailbox seed yourself:
 
 ```bash
 pnpm wrangler r2 bucket create <your-raw-mail-bucket>
@@ -227,14 +214,14 @@ pnpm wrangler queues create <your-inbound-queue>
 pnpm wrangler queues create <your-inbound-dlq>
 pnpm wrangler d1 create <your-index-db-name> --location=weur   # or maintain your own deploy config
 pnpm d1:migrate:dev                                            # D1_DB_NAME_DEV=<db> to override the name
-pnpm wrangler secret put MAILBOX_ID_SECRET --env dev           # + ACCESS_JWT_AUDIENCE / ACCESS_TEAM_DOMAIN (step 2)
+pnpm wrangler secret put ACCESS_JWT_AUDIENCE --env dev         # + ACCESS_TEAM_DOMAIN (step 2)
 pnpm run deploy:dev                                           # build + wrangler deploy --env dev --name reccado-dev
 ```
 
 The Durable Object (`MAILBOX_DO`) needs no create step — Wrangler provisions it from the
-`migrations` block on first deploy. `MAILBOX_ID_SECRET` becomes write-only once set, so pair it with
-`pnpm setup:mailbox` while you still have the value. Drop `--env dev` (and use `deploy` /
-`d1:migrate:prod`) for production. Every secret is documented in [`.dev.vars.example`](.dev.vars.example) and
+`migrations` block on first deploy. Seed the first mailbox with `pnpm setup:mailbox` once D1 is
+migrated. Drop `--env dev` (and use `deploy` / `d1:migrate:prod`) for production. Every secret is
+documented in [`.dev.vars.example`](.dev.vars.example) and
 [Configuration](#configuration); full detail in [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
 ### 2. Wire your domain
@@ -340,14 +327,16 @@ with ✅ Enviar / ✖️ Descartar. Nothing leaves the mailbox until the button 
 runs through the same path as the web UI (`src/lib/outbound-send.ts`), so the D1 ledger and the
 message index stay consistent regardless of which surface confirmed.
 
-**How a reply finds its thread.** Two mechanisms, in order:
+**How a reply finds its thread.** One mechanism: `reply_to_message` — quote the notification card.
+It works in any chat, and it is the only way a reply is resolved.
 
-1. `reply_to_message` — quote the notification card. Works in any chat, and is the default.
-2. `message_thread_id` — with `TELEGRAM_TOPICS=1` the bot creates one forum topic per email thread
-   and everything in that topic belongs to that conversation. Topics in a private chat with a bot
-   need a recent Bot API (9.3/9.4) and topic mode enabled for the bot, so this is opt-in: if
-   `createForumTopic` fails, Reccado logs a `telegram.topic_unavailable` ops event and falls back
-   to plain messages.
+Topics deliberately do *not* identify a conversation. When the bound chat is a supergroup with
+forum mode, Reccado gives each **mailbox** its own topic, named after the mailbox — never after an
+email subject, because a topic name is permanent UI and an email subject is attacker-controlled
+text. A topic therefore holds many conversations, so "the newest card in this topic" is not a
+usable answer to "which email is this reply for": a bare message in a topic gets a nudge to quote
+the card instead. Forum support is detected once (`getChat` at `/start`, cached in
+`runtime_config`), not configured; a plain chat keeps getting plain messages.
 
 ### Setup
 
@@ -356,26 +345,61 @@ message index stay consistent regardless of which surface confirmed.
 #    inbound message, and a missing table silently loses every notification
 pnpm d1:migrate:dev     # or d1:migrate:prod
 
-# 1. create a bot with @BotFather, then generate a webhook secret
-openssl rand -hex 32
-
-# 2. set the secrets on the worker
+# 1. create a bot with @BotFather and set its token on the worker
 wrangler secret put TELEGRAM_BOT_TOKEN --env dev
-wrangler secret put TELEGRAM_WEBHOOK_SECRET --env dev
 
-# 3. register the webhook (dry run first)
-pnpm setup:telegram --url https://<your-worker-origin>
-pnpm setup:telegram --url https://<your-worker-origin> --apply
+# 2. deploy, then load the authenticated UI once
+pnpm run deploy:dev
 
-# 4. send /start to the bot — it replies with your chat_id and user_id
-#    set them as TELEGRAM_CHAT_ID and TELEGRAM_ALLOWED_USER_IDS
+# 3. read the pairing code the deployment minted for itself. While no operator is
+#    linked, the hourly cron keeps exactly one single-use code alive in D1
+wrangler d1 execute inbox-mcp-index-dev --remote --env dev --command \
+  "SELECT code, expires_at FROM owner_pairing_codes WHERE consumed_at IS NULL \
+   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') ORDER BY created_at DESC LIMIT 1"
+
+# 4. send /start <code> from the account you want to authorise. The code is spent
+#    on first use, the account lands in owner_identities, and that chat is adopted
 ```
+
+Who may drive the bot is still your declaration — a Telegram account that can order the bot is
+an account that can send mail as you. What changed is how you write it down: the code says "the
+next account to answer with this, in the next two hours, is me", and the machine observes which
+user id showed up. Nobody's personal id ends up in a committed file, and revoking one is a
+`DELETE` rather than a redeploy. `TELEGRAM_ALLOWED_USER_IDS` still works if it is set, as an
+emergency bootstrap for a deployment you cannot pair.
+
+Only one input is yours: the bot token. Everything else the worker knows, observes for itself, or
+asks you to confirm once with a code.
+
+- **The webhook secret is derived, not configured.** It is an HMAC of the bot token
+  (`deriveWebhookSecret`, `src/telegram/api.ts`), so no human ever invents, stores or re-supplies
+  it, and it rotates with the token.
+- **The webhook URL is reconciled hourly by the cron** (`reconcileTelegramWebhook`,
+  `src/telegram/registration.ts`): it compares what Telegram believes against the truth and
+  re-registers on drift. The worker learns its own public origin by observing a request that
+  already cleared Cloudflare Access — never an unauthenticated one, because the `Host` header is
+  forgeable and that value decides where Telegram delivers.
+- **The chat is adopted, not declared.** The first `/start` from an operator stores the chat in D1
+  (`runtime_config`). First writer wins: a later `/start` from another chat does *not* move the
+  binding, and the bot says so.
+- **The operator is paired, not committed.** Whom you trust is still your decision — whoever drives
+  the bot can send mail as you — but it is recorded in `owner_identities` (D1) by spending a
+  single-use, expiring code, not by putting a personal user id in a file and redeploying. Every
+  link and every rejected attempt is written to `ops_events`.
+- **One owner record, two facets.** The same table holds the emails that pass the web and MCP
+  perimeter and the Telegram accounts that may drive the bot. Two lists answering "who owns this
+  deployment" is how they drift apart.
+
+`GET /api/health` reports `dependencies.telegram` with `mode: off | partial | on` plus a `missing`
+list, so a bridge that is configured but not yet delivering says exactly what it is waiting for.
 
 **If the worker is behind Cloudflare Access, add a Bypass policy for `/telegram/webhook`.**
 Telegram cannot present an Access JWT, so every update would be redirected to the login page. The
 route authenticates itself instead: the `X-Telegram-Bot-Api-Secret-Token` header (compared in
-constant time) plus a Telegram user allowlist. Reccado refuses to start the bridge with a bot token
-but no secret or no allowlist, rather than expose an unauthenticated send-mail endpoint.
+constant time) plus the operator allowlist. An unpaired bridge does answer the route — refusing to
+would make pairing impossible, since `/start <code>` arrives through it — but the secret still
+gates every update, and the only command that does anything for a stranger is the one that spends
+a valid code.
 
 ### Limits worth knowing
 
@@ -456,20 +480,16 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
 
 | Name | Kind | Purpose | Required? |
 | --- | --- | --- | --- |
-| `MAILBOX_ID_SECRET` | secret | HMAC key used to derive stable, privacy-preserving mailbox IDs from email addresses. Never rotate without a mailbox-ID migration plan — rotating it changes every mailbox ID. | **Required** |
 | `ACCESS_JWT_AUDIENCE` | secret | Cloudflare Access application audience (`aud`) tag, used to validate the `CF-Access-JWT-Assertion` header on every API request. | **Required** for any non-`localhost` deployment (auth fails closed without it) |
 | `ACCESS_TEAM_DOMAIN` | secret | Your Cloudflare Zero Trust team domain (`https://<your-team>.cloudflareaccess.com`), used to fetch the JWKS that validates the Access JWT. | **Required** for any non-`localhost` deployment |
-| `ACCESS_ALLOWED_EMAILS` | secret | Optional comma-separated owner allowlist enforced in addition to Cloudflare Access, for an extra app-level check beyond the Access policy. **Required** for the MCP endpoint (it fails closed with `503` when unset). | Optional (recommended) |
+| `ACCESS_ALLOWED_EMAILS` | secret | Bootstrap for the owner registry (`owner_identities` in D1), unioned with it — not the record itself. Enforced in addition to Cloudflare Access, as an app-level check that still stands if the Access app was created for the wrong hostname. With an empty registry **and** this unset, `/api/*` and `/mcp` fail closed (`503`). | Optional once an owner is registered in D1 |
 | `TRANSACTIONAL_API_KEY_PEPPER` | secret | HMAC-SHA256 pepper that hashes transactional API keys (`rck_*`). Key ops and the `/v1/.../transactional/*` send/status endpoints fail closed (`503`) without it. Rotating it invalidates all existing transactional keys. | Required to enable the transactional API |
 | `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, DNS edit for setup:sending's SPF/DMARC/DKIM/MX records, Email Routing write for catch-all API setup, Access app/policy write for future in-app provisioning). Also enables setup:domain's up-front custom-domain conflict check via the Workers Custom Domains API. | Optional |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates the `/api/debug/phase0/*` introspection endpoints (R2 head, DO schema/state dumps, local email simulation in deployed environments). These endpoints are unreachable unless this token is set, and every request must present it. | Optional (leave unset to disable debug endpoints entirely) |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender address. Must be a verified sender on a domain onboarded to Cloudflare Email Sending. | **Required** |
 | `MAIL_SENDING_DOMAINS` | var | Comma-separated domains verified in Cloudflare Email Sending. A mailbox whose domain is listed replies as itself; anything else goes out as `MAIL_FROM_ADDRESS` with `Reply-To` set to the mailbox. | Optional (recommended once your domain is verified) |
 | `TELEGRAM_BOT_TOKEN` | secret | Bot token from @BotFather. Unset = the Telegram bridge is off entirely and `/telegram/webhook` answers 404. | Optional |
-| `TELEGRAM_WEBHOOK_SECRET` | secret | Shared secret Telegram echoes in `X-Telegram-Bot-Api-Secret-Token`; this is what authenticates the webhook. | **Required** when `TELEGRAM_BOT_TOKEN` is set |
-| `TELEGRAM_ALLOWED_USER_IDS` | var | Comma-separated Telegram user IDs allowed to drive the bot. | **Required** when `TELEGRAM_BOT_TOKEN` is set |
-| `TELEGRAM_CHAT_ID` | var | Chat that receives new-mail cards, and the only chat the bot acts on. | Optional (no notifications without it) |
-| `TELEGRAM_TOPICS` | var | `"1"` creates one forum topic per email thread. Unset = plain messages with reply-based threading. | Optional |
+| `TELEGRAM_ALLOWED_USER_IDS` | var | Emergency bootstrap for the Telegram half of the owner registry, unioned with the identities linked in D1. Normally you link an account by sending `/start <pairing code>` instead, which keeps personal user IDs out of the repo. The chat is adopted on first `/start` and the webhook secret is derived from the bot token. | Optional (only to recover a deployment you cannot pair) |
 
 ### Bindings (`wrangler.jsonc`)
 
@@ -520,8 +540,8 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
 | `pnpm setup:sending --apply` only prints DKIM/MX records instead of adding them | No `CLOUDFLARE_API_TOKEN` is set, or `--skip-provider-records` was passed | Set `CLOUDFLARE_API_TOKEN` (DNS edit) and re-run `--apply` to auto-add the provider-generated DKIM TXT + MX records parsed from `wrangler email sending dns get <sending-domain>`. Drop `--skip-provider-records` if you passed it and want the script to manage them after all. |
 | `setup:cloud` aborts because the queue is already consumed by another Worker | Cloudflare can leave the Queue consumer attached to the old Worker name after a rename | Run the exact `pnpm wrangler queues consumer remove <queue> <old-worker>` command that `setup:cloud` prints, then rerun `setup:cloud`. Queues support one Worker consumer, so this is safer than letting deploy fail at trigger registration. |
 | `wrangler --env dev` still uses the placeholder D1 id | `--env` alone still reads the tracked `wrangler.jsonc`, which intentionally keeps the public placeholder id | Use `pnpm setup:cloud`, which patches the built deploy config from `wrangler.generated.dev.json`. Use `pnpm run deploy:dev` only after your Wrangler config path contains a real D1 id; do not assume `--env` swaps in the generated id. |
-| `pnpm setup:mailbox --apply` still fails after you already inserted domain rows manually | Older/manual seed data can contain conflicting mailbox, alias, or routing rows even though the current script reuses the existing `domains.id` by domain name | Inspect `domains`, `mailboxes`, `aliases`, and `routing_rules` for that address. If the same primary address already maps to a different mailbox id, rerun with the original `MAILBOX_ID_SECRET` or intentionally clean the pre-live D1 data before reseeding. |
-| `MAILBOX_ID_SECRET` is set remotely, but the first mailbox seed failed | The secret is orphaned — write-only in Cloudflare, with no mailbox ever seeded using it (a prior `--apply` run failed after `secret put` but before seeding) | `pnpm doctor --cloud` and `setup:cloud` both detect this (no fingerprint in `.reccado/setup.<env>.json`) and point here: rerun `pnpm setup:cloud --domain <d> --address inbox@<d> --reset-secret --apply` to overwrite the secret and reseed atomically. Only do this before go-live — it changes every mailbox id already derived from the current secret. |
+| `pnpm setup:mailbox --apply` still fails after you already inserted domain rows manually | Older/manual seed data can contain conflicting mailbox, alias, or routing rows even though the current script reuses the existing `domains.id` by domain name | Inspect `domains`, `mailboxes`, `aliases`, and `routing_rules` for that address. The script binds the alias and catch-all rule to whatever `mailbox_id` D1 already stores for that `primary_address`, so a stale row is corrected by cleaning the pre-live D1 data, not by rerunning with different inputs. |
+| Telegram bot token is set but no new-mail card ever arrives | The bridge is configured but not yet delivering: no operator is linked, and/or nobody has sent `/start` so no chat is adopted, and/or the worker has not observed its public origin yet, so the cron cannot register the webhook | `GET /api/health` → `dependencies.telegram` reports `mode: "partial"` and lists exactly what is missing. Read the live pairing code out of `owner_pairing_codes` and send `/start <code>`, load the authenticated UI once on the custom domain to teach the worker its origin, then wait for the hourly cron to register the webhook. |
 | Local large-MIME smoke (`pnpm smoke:email:large`) fails around 1 MiB | Cloudflare's local Email Routing test path enforces a much lower size limit (~1 MiB) than the 25 MiB production inbound limit | Expected local-tooling behavior, not a bug — generate a fixture under ~1 MiB for local smoke (`pnpm generate:large-mime`), and trust the documented 25 MiB production limit (see [`docs/validation/PHASE0_VALIDATION.md`](docs/validation/PHASE0_VALIDATION.md)). |
 
 For actual operating procedures, rollback, DLQ handling, and current retention/export limitations,
