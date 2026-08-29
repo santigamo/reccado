@@ -14,6 +14,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as MailboxesIndexRouteImport } from './routes/mailboxes/index'
 import { Route as MailboxesMailboxIdRouteImport } from './routes/mailboxes/$mailboxId'
 import { Route as MailboxesMailboxIdIndexRouteImport } from './routes/mailboxes/$mailboxId/index'
+import { Route as MailboxesMailboxIdKeysRouteImport } from './routes/mailboxes/$mailboxId/keys'
 import { Route as MailboxesMailboxIdComposeRouteImport } from './routes/mailboxes/$mailboxId/compose'
 import { Route as MailboxesMailboxIdThreadIdRouteImport } from './routes/mailboxes/$mailboxId/$threadId'
 
@@ -42,6 +43,11 @@ const MailboxesMailboxIdIndexRoute = MailboxesMailboxIdIndexRouteImport.update({
   path: '/',
   getParentRoute: () => MailboxesMailboxIdRoute,
 } as any)
+const MailboxesMailboxIdKeysRoute = MailboxesMailboxIdKeysRouteImport.update({
+  id: '/keys',
+  path: '/keys',
+  getParentRoute: () => MailboxesMailboxIdRoute,
+} as any)
 const MailboxesMailboxIdComposeRoute =
   MailboxesMailboxIdComposeRouteImport.update({
     id: '/compose',
@@ -62,6 +68,7 @@ export interface FileRoutesByFullPath {
   '/mailboxes/': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
+  '/mailboxes/$mailboxId/keys': typeof MailboxesMailboxIdKeysRoute
   '/mailboxes/$mailboxId/': typeof MailboxesMailboxIdIndexRoute
 }
 export interface FileRoutesByTo {
@@ -70,6 +77,7 @@ export interface FileRoutesByTo {
   '/mailboxes': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
+  '/mailboxes/$mailboxId/keys': typeof MailboxesMailboxIdKeysRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdIndexRoute
 }
 export interface FileRoutesById {
@@ -80,6 +88,7 @@ export interface FileRoutesById {
   '/mailboxes/': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
+  '/mailboxes/$mailboxId/keys': typeof MailboxesMailboxIdKeysRoute
   '/mailboxes/$mailboxId/': typeof MailboxesMailboxIdIndexRoute
 }
 export interface FileRouteTypes {
@@ -91,6 +100,7 @@ export interface FileRouteTypes {
     | '/mailboxes/'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
+    | '/mailboxes/$mailboxId/keys'
     | '/mailboxes/$mailboxId/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -99,6 +109,7 @@ export interface FileRouteTypes {
     | '/mailboxes'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
+    | '/mailboxes/$mailboxId/keys'
     | '/mailboxes/$mailboxId'
   id:
     | '__root__'
@@ -108,6 +119,7 @@ export interface FileRouteTypes {
     | '/mailboxes/'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
+    | '/mailboxes/$mailboxId/keys'
     | '/mailboxes/$mailboxId/'
   fileRoutesById: FileRoutesById
 }
@@ -155,6 +167,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof MailboxesMailboxIdIndexRouteImport
       parentRoute: typeof MailboxesMailboxIdRoute
     }
+    '/mailboxes/$mailboxId/keys': {
+      id: '/mailboxes/$mailboxId/keys'
+      path: '/keys'
+      fullPath: '/mailboxes/$mailboxId/keys'
+      preLoaderRoute: typeof MailboxesMailboxIdKeysRouteImport
+      parentRoute: typeof MailboxesMailboxIdRoute
+    }
     '/mailboxes/$mailboxId/compose': {
       id: '/mailboxes/$mailboxId/compose'
       path: '/compose'
@@ -175,12 +194,14 @@ declare module '@tanstack/react-router' {
 interface MailboxesMailboxIdRouteChildren {
   MailboxesMailboxIdThreadIdRoute: typeof MailboxesMailboxIdThreadIdRoute
   MailboxesMailboxIdComposeRoute: typeof MailboxesMailboxIdComposeRoute
+  MailboxesMailboxIdKeysRoute: typeof MailboxesMailboxIdKeysRoute
   MailboxesMailboxIdIndexRoute: typeof MailboxesMailboxIdIndexRoute
 }
 
 const MailboxesMailboxIdRouteChildren: MailboxesMailboxIdRouteChildren = {
   MailboxesMailboxIdThreadIdRoute: MailboxesMailboxIdThreadIdRoute,
   MailboxesMailboxIdComposeRoute: MailboxesMailboxIdComposeRoute,
+  MailboxesMailboxIdKeysRoute: MailboxesMailboxIdKeysRoute,
   MailboxesMailboxIdIndexRoute: MailboxesMailboxIdIndexRoute,
 }
 

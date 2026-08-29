@@ -1,5 +1,5 @@
-import { Link } from "@tanstack/react-router";
-import { Archive, FileText, Inbox, Mail, Pencil, Send, Trash2 } from "lucide-react";
+import { Link, useLocation } from "@tanstack/react-router";
+import { Archive, FileText, Inbox, KeyRound, Mail, Pencil, Send, Trash2 } from "lucide-react";
 import type { ReactElement } from "react";
 import { cn } from "#/lib/cn";
 import { FOLDERS, type FolderKey } from "#/lib/mail";
@@ -25,6 +25,10 @@ export function Sidebar({
 }): ReactElement {
 	const { data: mailboxes, loading: mailboxesLoading } = useMailboxes();
 	const currentMailbox = mailboxes.find((m) => m.mailbox_id === mailboxId);
+	// Non-folder pages live under the same mailbox shell, so folder highlighting
+	// has to yield to them — otherwise Inbox stays lit on the keys page.
+	const pathname = useLocation({ select: (location) => location.pathname });
+	const onKeysPage = pathname.endsWith("/keys");
 
 	return (
 		<div className="flex h-full flex-col gap-1 overflow-y-auto app-scroll pb-3">
@@ -51,7 +55,7 @@ export function Sidebar({
 			<nav className="flex flex-col gap-0.5 pr-3">
 				{FOLDERS.map((f) => {
 					const Icon = FOLDER_ICONS[f.key];
-					const active = f.key === activeFolder;
+					const active = !onKeysPage && f.key === activeFolder;
 					return (
 						<Link
 							key={f.key}
@@ -71,6 +75,24 @@ export function Sidebar({
 					);
 				})}
 			</nav>
+
+			{/* Mailbox settings — not folders, so they sit under their own divider. */}
+			<div className="mt-3 border-t border-[var(--app-border)] pr-3 pt-3">
+				<Link
+					to="/mailboxes/$mailboxId/keys"
+					params={{ mailboxId }}
+					search={(prev) => prev}
+					className={cn(
+						"flex h-9 items-center gap-4 rounded-r-full px-4 text-sm transition active:scale-[0.98]",
+						onKeysPage
+							? "bg-[var(--app-selected)] font-medium text-[var(--app-selected-text)]"
+							: "text-[var(--app-text-soft)] hover:bg-[var(--app-hover)]",
+					)}
+				>
+					<KeyRound className="h-4 w-4 shrink-0" />
+					<span className="truncate">API keys</span>
+				</Link>
+			</div>
 
 			{/* Mailbox switcher */}
 			<div className="mt-auto border-t border-[var(--app-border)] px-3 pt-3">
