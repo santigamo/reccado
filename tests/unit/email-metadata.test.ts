@@ -10,8 +10,12 @@ describe("normalizeMessageId", () => {
 		expect(normalizeMessageId("  <abc@example.com>  ")).toBe("abc@example.com");
 	});
 
-	it("lowercases the value", () => {
-		expect(normalizeMessageId("<ABC@Example.COM>")).toBe("abc@example.com");
+	// RFC 5322 msg-ids are case-sensitive, and Gmail's look like
+	// <CAHyeH21QU_oLHbS6X8oP9R9iSBKuh2W8-BSCbZ4Zcq8BMKcqZw@mail.gmail.com>. Folding
+	// the case here used to leak into the In-Reply-To we emit, which matched nothing
+	// at the receiver and forked the thread.
+	it("preserves case", () => {
+		expect(normalizeMessageId("<CAHyeH21QU_o@mail.gmail.com>")).toBe("CAHyeH21QU_o@mail.gmail.com");
 	});
 
 	it("strips a lone leading angle bracket without a matching trailing one", () => {
@@ -22,8 +26,8 @@ describe("normalizeMessageId", () => {
 		expect(normalizeMessageId("abc@example.com>")).toBe("abc@example.com");
 	});
 
-	it("leaves a value with no angle brackets unchanged apart from case", () => {
-		expect(normalizeMessageId("ABC@example.com")).toBe("abc@example.com");
+	it("leaves a value with no angle brackets unchanged", () => {
+		expect(normalizeMessageId("ABC@example.com")).toBe("ABC@example.com");
 	});
 
 	it("returns null for null input", () => {
@@ -74,9 +78,9 @@ describe("readReferences", () => {
 		]);
 	});
 
-	it("normalizes each reference id (case + brackets)", () => {
+	it("strips brackets from each reference id without touching its case", () => {
 		const headers = new Headers({ references: "<MSG1@Example.com> MSG2@example.com" });
-		expect(readReferences(headers)).toEqual(["msg1@example.com", "msg2@example.com"]);
+		expect(readReferences(headers)).toEqual(["MSG1@Example.com", "MSG2@example.com"]);
 	});
 
 	it("returns an empty array when the references header is missing", () => {

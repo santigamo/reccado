@@ -1,11 +1,11 @@
 /**
  * RFC 5322 header construction for outbound mail.
  *
- * Reccado stores message-ids in their bare form (no angle brackets, lowercased —
- * see normalizeMessageId in email-metadata.ts) because that is the form the
- * threading lookups compare against. Anything that goes *out* on the wire has to
- * be re-wrapped in angle brackets, so the two representations are kept apart here:
- * `...MessageId` values are bare, `...Header` values are wire-ready.
+ * Reccado stores message-ids in their bare form: no angle brackets, original case
+ * (see normalizeMessageId in email-metadata.ts — msg-ids are case-sensitive, and
+ * the lookups fold case instead of the data). Anything that goes *out* on the wire
+ * has to be re-wrapped in angle brackets, so the two representations are kept apart
+ * here: `...MessageId` values are bare, `...Header` values are wire-ready.
  */
 
 /** Cap on the References chain. RFC 5322 allows any length, but real clients and
@@ -47,7 +47,11 @@ export function buildReferences(
 	parentMessageId: string | null,
 ): string[] {
 	const chain = [...parentReferences];
-	if (parentMessageId && !chain.includes(parentMessageId)) {
+	// Case-insensitive membership: msg-ids keep their original case, and the same id
+	// quoted by two clients can differ only in case — appending it twice would be a
+	// malformed chain.
+	const seen = new Set(chain.map((reference) => reference.toLowerCase()));
+	if (parentMessageId && !seen.has(parentMessageId.toLowerCase())) {
 		chain.push(parentMessageId);
 	}
 	if (chain.length <= MAX_REFERENCES) {

@@ -5,7 +5,10 @@ export function inboundIdempotencyKey(input: {
 	messageId: string | null;
 	rawSha256: string;
 }): string {
-	const normalized = normalizeMessageId(input.messageId);
+	// Folded here, not in normalizeMessageId: keys already written to D1/DO rows are
+	// lowercase, and an id that only differs in case is the same message for dedup
+	// purposes even though it is a different id on the wire.
+	const normalized = normalizeMessageId(input.messageId)?.toLowerCase() ?? null;
 	if (normalized) {
 		return `email:v1:${input.mailboxId}:message-id:${normalized}`;
 	}

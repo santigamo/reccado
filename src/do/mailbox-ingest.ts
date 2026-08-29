@@ -1,5 +1,6 @@
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflare/types";
 import { sha256Hex } from "../lib/crypto";
+import { domainFromAddress } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
 import { normalizeSubject, parseMimeBytes, snippetFromText } from "../lib/mime";
 import { attachmentR2Key, bodyHtmlR2Key, sanitizeFilename } from "../lib/r2-keys";
@@ -17,12 +18,152 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
-function resolveThreadId(
+/**
+ * How far back the subject-only fallback may reach, measured against the
+ * candidate thread's last_message_at. Subject equality is weak evidence: on a
+ * catch-all address "Hola", "Test" and "Factura" recur forever from unrelated
+ * strangers, and without a bound a mail can be welded onto a thread that went
+ * quiet months ago (production had a July mail and an August mail sharing a
+ * thread on the strength of the subject "test"). 30 days is roughly the point
+ * past which a repeated subject is more likely a new conversation than a
+ * continuation of a silent one.
+ */
+const SUBJECT_FALLBACK_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Same-subject threads inspected before giving up. More than a handful in the
+ * window means the subject is generic, which is exactly when merging is wrong. */
+const SUBJECT_FALLBACK_CANDIDATES = 5;
+
+/** Messages read per candidate thread to build its participant set. */
+const PARTICIPANT_SCAN_LIMIT = 50;
+
+function parseAddressList(json: string | null | undefined): string[] {
+	if (!json) return [];
+	try {
+		const parsed = JSON.parse(json);
+		return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * The domains that belong to this mailbox. Derived from the address the mail was
+ * actually routed to (under a catch-all that is always one of ours) plus the
+ * cached primary address, because the DO has no view of the D1 control plane.
+ */
+function mailboxOwnDomains(sql: SqlStorage, deliveredTo: string): Set<string> {
+	const domains = new Set<string>();
+	const delivered = domainFromAddress(deliveredTo.trim().toLowerCase());
+	if (delivered) domains.add(delivered);
+	const primary = sql
+		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = 'primary_address'")
+		.toArray()[0]?.value;
+	const primaryDomain = primary ? domainFromAddress(primary.trim().toLowerCase()) : null;
+	if (primaryDomain) domains.add(primaryDomain);
+	return domains;
+}
+
+/**
+ * "Participants" for the subject fallback = the *counterparties* of a message:
+ * its sender plus its To/Cc, minus every address in the mailbox's own domains.
+ *
+ * Dropping our own addresses is the whole point. With a catch-all they sit on
+ * both sides of every message (as recipient inbound, as sender outbound), so a
+ * naive intersection would be non-empty for any two messages and the check would
+ * wave through exactly the merges it exists to stop. What remains — the humans on
+ * the other end — is what actually distinguishes two conversations that happen to
+ * share a subject, and it is one cheap indexed read per candidate thread.
+ */
+function counterparties(ownDomains: Set<string>, addresses: string[]): Set<string> {
+	const result = new Set<string>();
+	for (const raw of addresses) {
+		const address = raw?.trim().toLowerCase();
+		if (!address?.includes("@")) continue;
+		const domain = domainFromAddress(address);
+		if (domain && ownDomains.has(domain)) continue;
+		result.add(address);
+	}
+	return result;
+}
+
+/**
+ * Subject-based threading, for the many clients that reply without References.
+ * Only accepted when the candidate thread is both recent (window) and demonstrably
+ * about the same people (shared counterparty). Failing either, the caller mints a
+ * new thread, which is the safe direction: a split conversation is a nuisance, a
+ * merged one leaks one stranger's mail into another's thread.
+ */
+function findThreadBySubject(
+	sql: SqlStorage,
+	input: {
+		subjectNorm: string;
+		fromAddr: string;
+		recipients: string[];
+		deliveredTo: string;
+		receivedAt: string;
+	},
+): string | null {
+	const ownDomains = mailboxOwnDomains(sql, input.deliveredTo);
+	const incoming = counterparties(ownDomains, [input.fromAddr, ...input.recipients]);
+	// Nothing but our own addresses on the message: no way to tell conversations
+	// apart, so don't guess.
+	if (incoming.size === 0) return null;
+
+	const receivedAtMs = Date.parse(input.receivedAt);
+	const anchor = Number.isNaN(receivedAtMs) ? Date.now() : receivedAtMs;
+	// Timestamps are stored as ISO-8601 UTC, so lexicographic order is chronological
+	// order and the window is a plain string comparison SQLite can index.
+	const cutoff = new Date(anchor - SUBJECT_FALLBACK_WINDOW_MS).toISOString();
+
+	const candidates = sql
+		.exec<{ id: string }>(
+			`SELECT id FROM threads WHERE subject_norm = ? AND last_message_at >= ?
+       ORDER BY last_message_at DESC LIMIT ?`,
+			input.subjectNorm,
+			cutoff,
+			SUBJECT_FALLBACK_CANDIDATES,
+		)
+		.toArray();
+
+	for (const candidate of candidates) {
+		const rows = sql
+			.exec<{ from_addr: string; to_json: string; cc_json: string }>(
+				`SELECT from_addr, to_json, cc_json FROM messages WHERE thread_id = ?
+         ORDER BY received_at DESC LIMIT ?`,
+				candidate.id,
+				PARTICIPANT_SCAN_LIMIT,
+			)
+			.toArray();
+		for (const row of rows) {
+			const known = counterparties(ownDomains, [
+				row.from_addr,
+				...parseAddressList(row.to_json),
+				...parseAddressList(row.cc_json),
+			]);
+			for (const address of known) {
+				if (incoming.has(address)) return candidate.id;
+			}
+		}
+	}
+	return null;
+}
+
+/**
+ * Exported for tests: which thread an inbound mail joins is the decision that
+ * makes an inbox readable, and it is worth pinning both halves of it — the
+ * header match that is authoritative, and the subject fallback that is a guess.
+ */
+export function resolveThreadId(
 	sql: SqlStorage,
 	input: {
 		inReplyTo: string | null;
 		references: string[];
 		subjectNorm: string | null;
+		fromAddr: string;
+		recipients: string[];
+		deliveredTo: string;
+		receivedAt: string;
 	},
 ): string {
 	const candidates = [input.inReplyTo, ...input.references]
@@ -30,9 +171,14 @@ function resolveThreadId(
 		.filter((value): value is string => Boolean(value));
 
 	for (const rfcId of candidates) {
+		// COLLATE NOCASE rather than lower() on both sides: msg-ids are US-ASCII, which
+		// is precisely what NOCASE folds, and it can use idx_messages_rfc_message_id_nocase
+		// (a lower() expression is unindexable here). Case-insensitivity is what keeps
+		// threading working across the change that stopped lowercasing stored ids —
+		// rows written by earlier versions hold the folded form.
 		const row = sql
 			.exec<{ thread_id: string }>(
-				"SELECT thread_id FROM messages WHERE rfc_message_id = ? LIMIT 1",
+				"SELECT thread_id FROM messages WHERE rfc_message_id = ? COLLATE NOCASE LIMIT 1",
 				rfcId,
 			)
 			.toArray()[0];
@@ -40,13 +186,14 @@ function resolveThreadId(
 	}
 
 	if (input.subjectNorm) {
-		const row = sql
-			.exec<{ id: string }>(
-				"SELECT id FROM threads WHERE subject_norm = ? ORDER BY last_message_at DESC LIMIT 1",
-				input.subjectNorm,
-			)
-			.toArray()[0];
-		if (row) return row.id;
+		const matched = findThreadBySubject(sql, {
+			subjectNorm: input.subjectNorm,
+			fromAddr: input.fromAddr,
+			recipients: input.recipients,
+			deliveredTo: input.deliveredTo,
+			receivedAt: input.receivedAt,
+		});
+		if (matched) return matched;
 	}
 
 	return crypto.randomUUID();
@@ -200,8 +347,9 @@ export async function ingestInboundEmail(
 	let bodyHtmlR2KeyValue: string | null = null;
 	let subject = message.headers.subject;
 	let fromAddr = message.sender;
-	let toJson = JSON.stringify([message.recipient]);
-	let ccJson = "[]";
+	// Kept as arrays, not JSON: thread resolution needs the addresses themselves.
+	let toAddresses: string[] = [message.recipient];
+	let ccAddresses: string[] = [];
 	let inReplyTo: string | null = message.headers.inReplyTo;
 	let referencesJson = JSON.stringify(message.headers.references);
 	const attachments: Array<{
@@ -219,8 +367,8 @@ export async function ingestInboundEmail(
 		const parsed = await parseMimeBytes(rawBytes);
 		subject = parsed.subject ?? subject;
 		fromAddr = parsed.from || fromAddr;
-		toJson = JSON.stringify(parsed.to.length ? parsed.to : [message.recipient]);
-		ccJson = JSON.stringify(parsed.cc);
+		toAddresses = parsed.to.length ? parsed.to : [message.recipient];
+		ccAddresses = parsed.cc;
 		inReplyTo = normalizeMessageId(parsed.inReplyTo) ?? inReplyTo;
 		referencesJson = JSON.stringify(
 			parsed.references.map((ref) => normalizeMessageId(ref)).filter(Boolean),
@@ -259,11 +407,17 @@ export async function ingestInboundEmail(
 		}
 
 		const now = nowIso();
+		const toJson = JSON.stringify(toAddresses);
+		const ccJson = JSON.stringify(ccAddresses);
 		const subjectNorm = normalizeSubject(subject);
 		const threadId = resolveThreadId(ctx.sql, {
 			inReplyTo,
 			references: JSON.parse(referencesJson) as string[],
 			subjectNorm,
+			fromAddr,
+			recipients: [...toAddresses, ...ccAddresses],
+			deliveredTo: message.recipient,
+			receivedAt: message.receivedAt,
 		});
 		const snippet = snippetFromText(bodyText, parsed.html);
 
@@ -392,6 +546,7 @@ export async function ingestInboundEmail(
 
 		parseStatus = "failed";
 		const now = nowIso();
+		const toJson = JSON.stringify(toAddresses);
 		const messageLocalId = crypto.randomUUID();
 		const threadId = crypto.randomUUID();
 		const snippet = snippetFromText(null, null);

@@ -41,6 +41,38 @@ export type SenderEnv = {
 	MAIL_SENDING_DOMAINS?: string;
 };
 
+/**
+ * The mailbox address a reply should claim to come from, given the recipients of
+ * the mail it answers.
+ *
+ * A catch-all route funnels every alias of a domain into one mailbox, so mail to
+ * shop@ is stored in the mailbox whose primary_address is hello@. Answering as
+ * hello@ both confuses the person who wrote to shop@ and hands them the canonical
+ * address they were never given. "Ours" is decided by domain — the mailbox's own
+ * domain plus anything the operator verified in MAIL_SENDING_DOMAINS — because the
+ * DO cannot enumerate aliases of a catch-all. Returns null when no recipient is
+ * ours (a fresh conversation, or a reply to our own outbound mail), and the caller
+ * then keeps primary_address rather than inventing a sender.
+ */
+export function resolveDeliveredAlias(
+	env: SenderEnv,
+	recipients: Array<string | null | undefined>,
+	primaryAddress: string | null | undefined,
+): string | null {
+	const ownDomains = new Set(parseSendingDomains(env.MAIL_SENDING_DOMAINS));
+	const primary = primaryAddress?.trim().toLowerCase() || null;
+	const primaryDomain = primary ? domainFromAddress(primary) : null;
+	if (primaryDomain) ownDomains.add(primaryDomain);
+	if (ownDomains.size === 0) return null;
+	for (const raw of recipients) {
+		const address = raw?.trim().toLowerCase();
+		if (!address?.includes("@")) continue;
+		const domain = domainFromAddress(address);
+		if (domain && ownDomains.has(domain)) return address;
+	}
+	return null;
+}
+
 export function resolveSenderIdentity(
 	env: SenderEnv,
 	mailboxAddress: string | null | undefined,

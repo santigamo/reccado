@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, received_at ASC);
 CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_rfc_message_id ON messages(rfc_message_id);
+-- msg-ids are case-sensitive data compared case-insensitively (see resolveThreadId):
+-- rows written before ids stopped being lowercased still have to match a reply that
+-- quotes the original case. A plain index cannot serve a NOCASE comparison, hence
+-- the second one.
+CREATE INDEX IF NOT EXISTS idx_messages_rfc_message_id_nocase
+  ON messages(rfc_message_id COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS message_headers (
   message_id TEXT NOT NULL,
@@ -122,6 +128,9 @@ CREATE TABLE IF NOT EXISTS rules (
 CREATE TABLE IF NOT EXISTS outbound_drafts (
   id TEXT PRIMARY KEY,
   thread_id TEXT,
+  -- The message this draft answers. A reply is to one message, not to a thread;
+  -- without this the In-Reply-To would point at whatever arrived last.
+  parent_message_id TEXT,
   to_json TEXT NOT NULL,
   cc_json TEXT NOT NULL DEFAULT '[]',
   bcc_json TEXT NOT NULL DEFAULT '[]',

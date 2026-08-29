@@ -5,7 +5,12 @@ import { sha256Hex } from "../lib/crypto";
 import { buildReferences, messageIdHeader, referencesHeader } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
 import { normalizeSubject } from "../lib/mime";
-import { resolveSenderIdentity } from "../lib/sender-identity";
+import {
+	resolveDeliveredAlias,
+	resolveSenderIdentity,
+	type SenderEnv,
+	type SenderIdentity,
+} from "../lib/sender-identity";
 import { AmbiguousSendError } from "../lib/errors";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
 import {
@@ -20,7 +25,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 3;
+const MAILBOX_SCHEMA_VERSION = 4;
 
 // Minimal runtime validation for the /ingest payload. Defined locally (rather than
 // imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
@@ -292,10 +297,11 @@ function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 		const id = crypto.randomUUID();
 		const result = sql.exec(
 			`INSERT OR IGNORE INTO outbound_drafts
-       (id, thread_id, to_json, cc_json, bcc_json, subject, body_text, body_html, status, created_by, created_at, updated_at, idempotency_key)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)`,
+       (id, thread_id, parent_message_id, to_json, cc_json, bcc_json, subject, body_text, body_html, status, created_by, created_at, updated_at, idempotency_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)`,
 			id,
 			(body.threadId as string | null) ?? null,
+			(body.parentMessageId as string | null) ?? null,
 			JSON.stringify(body.to ?? []),
 			JSON.stringify(body.cc ?? []),
 			JSON.stringify(body.bcc ?? []),
@@ -327,10 +333,11 @@ function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 	const id = crypto.randomUUID();
 	sql.exec(
 		`INSERT INTO outbound_drafts
-       (id, thread_id, to_json, cc_json, bcc_json, subject, body_text, body_html, status, created_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
+       (id, thread_id, parent_message_id, to_json, cc_json, bcc_json, subject, body_text, body_html, status, created_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?)`,
 		id,
 		(body.threadId as string | null) ?? null,
+		(body.parentMessageId as string | null) ?? null,
 		JSON.stringify(body.to ?? []),
 		JSON.stringify(body.cc ?? []),
 		JSON.stringify(body.bcc ?? []),
@@ -396,24 +403,104 @@ type ConfirmSendDraftContext = {
 type ParentMessageRow = {
 	rfc_message_id: string | null;
 	references_json: string;
+	to_json: string;
+	cc_json: string;
 };
 
+const PARENT_COLUMNS = "rfc_message_id, references_json, to_json, cc_json";
+
 /**
- * The message a reply should point at: the most recent message in the thread that
- * actually has a Message-ID. Usually the last inbound mail; if we are following up
- * on our own send, our previous outbound message is the correct parent.
+ * The message a reply actually answers — which decides both its In-Reply-To and,
+ * under catch-all routing, the address it goes out as.
+ *
+ * A reply is to one message, not to a thread, so the draft's parent_message_id
+ * wins when it is known: answering an old mail in a long thread has to point at
+ * that mail. Drafts composed from a thread rather than a message (and drafts
+ * created before the column existed) fall back to the previous heuristic — the
+ * newest message in the thread carrying a Message-ID, which is the last inbound
+ * mail, or our own last send when we are following up on ourselves. The same
+ * fallback covers a named parent that never got a Message-ID: threading against
+ * a sibling beats emitting no reply headers at all.
  */
-function findThreadParent(sql: SqlStorage, threadId: string | null): ParentMessageRow | null {
+function findThreadParent(
+	sql: SqlStorage,
+	threadId: string | null,
+	parentMessageId: string | null,
+): ParentMessageRow | null {
+	if (parentMessageId) {
+		const row = sql
+			.exec<ParentMessageRow>(
+				`SELECT ${PARENT_COLUMNS} FROM messages WHERE id = ? LIMIT 1`,
+				parentMessageId,
+			)
+			.toArray()[0];
+		if (row?.rfc_message_id) return row;
+		// No Message-ID and no thread to fall back through: the row is still the right
+		// source for the alias, it just cannot carry reply headers.
+		if (row && !threadId) return row;
+	}
 	if (!threadId) return null;
 	return (
 		sql
 			.exec<ParentMessageRow>(
-				`SELECT rfc_message_id, references_json FROM messages
+				`SELECT ${PARENT_COLUMNS} FROM messages
          WHERE thread_id = ? AND rfc_message_id IS NOT NULL
          ORDER BY received_at DESC LIMIT 1`,
 				threadId,
 			)
 			.toArray()[0] ?? null
+	);
+}
+
+function parseAddressList(json: string | null | undefined): string[] {
+	if (!json) return [];
+	try {
+		const parsed = JSON.parse(json);
+		return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * From/Reply-To for a draft. Exported for tests: with a catch-all route this is
+ * the difference between answering as shop@ and quietly outing the mailbox's
+ * canonical hello@ to someone who never wrote to it.
+ *
+ * The alias is read off the message being answered (its To/Cc), never invented:
+ * when none of the parent's recipients belongs to us — a brand-new conversation,
+ * or a reply to our own outbound mail — this falls back to primary_address, which
+ * is the pre-existing behavior.
+ */
+export function resolveReplyIdentity(
+	env: SenderEnv,
+	sql: SqlStorage,
+	draftId: string | undefined,
+	primaryAddress: string | null,
+): SenderIdentity {
+	const alias = draftId ? resolveDraftAlias(env, sql, draftId, primaryAddress) : null;
+	return resolveSenderIdentity(env, alias ?? primaryAddress);
+}
+
+function resolveDraftAlias(
+	env: SenderEnv,
+	sql: SqlStorage,
+	draftId: string,
+	primaryAddress: string | null,
+): string | null {
+	const draft = sql
+		.exec<{ thread_id: string | null; parent_message_id: string | null }>(
+			"SELECT thread_id, parent_message_id FROM outbound_drafts WHERE id = ?",
+			draftId,
+		)
+		.toArray()[0];
+	if (!draft) return null;
+	const parent = findThreadParent(sql, draft.thread_id, draft.parent_message_id ?? null);
+	if (!parent) return null;
+	return resolveDeliveredAlias(
+		env,
+		[...parseAddressList(parent.to_json), ...parseAddressList(parent.cc_json)],
+		primaryAddress,
 	);
 }
 
@@ -438,6 +525,7 @@ export async function confirmSendDraft(
 			body_text: string | null;
 			body_html: string | null;
 			status: string;
+			parent_message_id?: string | null;
 		}>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
 		.toArray()[0];
 	if (!draft) throw new Error("draft not found");
@@ -514,7 +602,7 @@ export async function confirmSendDraft(
 	// our own would be rejected as a restricted header. So we set the two we may
 	// set and take the sent id back from the provider below.
 	const threadId = draft.thread_id ?? crypto.randomUUID();
-	const parent = findThreadParent(ctx.sql, draft.thread_id);
+	const parent = findThreadParent(ctx.sql, draft.thread_id, draft.parent_message_id ?? null);
 	// Normalize on read rather than trusting whoever wrote the row: stored ids are
 	// meant to be bare, and a stray "<...>" here would emit In-Reply-To: <<id>>,
 	// which threads nowhere. normalizeMessageId is idempotent, so this is free.
@@ -767,6 +855,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 3) {
 			this.migrateDeliveryEventColumns();
 		}
+		// v4: add parent_message_id to outbound_drafts so a reply can point at the
+		// message it answers instead of the newest one in the thread.
+		if (currentVersion < 4) {
+			this.migrateDraftParentMessage();
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -797,6 +890,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
        ON outbound_drafts(idempotency_key)
        WHERE idempotency_key IS NOT NULL`,
 		);
+	}
+
+	private migrateDraftParentMessage(): void {
+		const columns = this.columnNames("outbound_drafts");
+		if (!columns.has("parent_message_id")) {
+			this.ctx.storage.sql.exec("ALTER TABLE outbound_drafts ADD COLUMN parent_message_id TEXT");
+		}
 	}
 
 	private migrateDeliveryEventColumns(): void {
@@ -1657,7 +1757,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		idempotencyKey: string,
 		mailboxAddress?: string | null,
 	): Promise<Record<string, unknown>> {
-		const identity = resolveSenderIdentity(this.env, this.resolveMailboxAddress(mailboxAddress));
+		const identity = resolveReplyIdentity(
+			this.env,
+			this.ctx.storage.sql,
+			draftId,
+			this.resolveMailboxAddress(mailboxAddress),
+		);
 		return confirmSendDraft(
 			{
 				sql: this.ctx.storage.sql,

@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { confirmSendDraft } from "#/do/mailbox-do";
+import { confirmSendDraft, resolveReplyIdentity } from "#/do/mailbox-do";
 
 /**
  * What a reply has to get right to read as a reply: it joins the thread it was
@@ -393,5 +393,317 @@ describe("atomic per-draft send gate", () => {
 		// reaching EMAIL.send. The draft status check catches it first.
 		expect(result.second.sent).toBe(false);
 		expect(result.second.reason).toBe("not_pending_confirmation");
+	});
+});
+
+/**
+ * Catch-all routing means the address a mail was sent to is usually NOT the
+ * mailbox's primary_address, and that the thread's newest message is not
+ * necessarily the one being answered. Both decide what goes on the wire.
+ */
+type ReplySeed = {
+	threadId: string;
+	draftId: string;
+	oldMessageId: string;
+	newMessageId: string;
+};
+
+async function seedThreadForReply(
+	state: DurableObjectState,
+	options: {
+		/** Recipients of the message being answered — the alias lives in here. */
+		parentTo: string[];
+		oldRfcId: string;
+		newRfcId: string;
+		/** What the draft records as the message it answers, if anything. */
+		parentMessageId?: "old" | "new" | null;
+		newTo?: string[];
+	},
+): Promise<ReplySeed> {
+	const sql = state.storage.sql;
+	const threadId = crypto.randomUUID();
+	const oldMessageId = crypto.randomUUID();
+	const newMessageId = crypto.randomUUID();
+	const draftId = crypto.randomUUID();
+	const older = "2026-08-01T10:00:00.000Z";
+	const newer = "2026-08-20T10:00:00.000Z";
+
+	sql.exec(
+		`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
+     VALUES (?, 'consulta', ?, 2, 2, ?, ?)`,
+		threadId,
+		newer,
+		older,
+		newer,
+	);
+	const insertMessage = (
+		id: string,
+		rfcId: string,
+		to: string[],
+		receivedAt: string,
+		references: string[],
+	) => {
+		sql.exec(
+			`INSERT INTO messages
+       (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
+        from_addr, to_json, cc_json, bcc_json, subject, snippet, received_at, raw_r2_key, raw_sha256,
+        raw_size, parse_status, has_attachments, is_read, created_at, updated_at)
+       VALUES (?, ?, ?, ?, NULL, ?, 'inbound', 'inbox', 'cliente@example.com', ?, '[]', '[]',
+               'Consulta', 'hola', ?, 'raw/x', ?, 10, 'parsed', 0, 0, ?, ?)`,
+			id,
+			`ingest:${id}`,
+			threadId,
+			rfcId,
+			JSON.stringify(references),
+			JSON.stringify(to),
+			receivedAt,
+			`sha-${id}`,
+			receivedAt,
+			receivedAt,
+		);
+	};
+	insertMessage(oldMessageId, options.oldRfcId, options.parentTo, older, []);
+	insertMessage(newMessageId, options.newRfcId, options.newTo ?? options.parentTo, newer, [
+		options.oldRfcId,
+	]);
+
+	const parentMessageId =
+		options.parentMessageId === "old"
+			? oldMessageId
+			: options.parentMessageId === "new"
+				? newMessageId
+				: null;
+	sql.exec(
+		`INSERT INTO outbound_drafts
+     (id, thread_id, parent_message_id, to_json, cc_json, bcc_json, subject, body_text, body_html,
+      status, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, '["cliente@example.com"]', '[]', '[]', 'Re: Consulta', 'Te cuento.', NULL,
+             'pending_confirmation', 'telegram:1', ?, ?)`,
+		draftId,
+		threadId,
+		parentMessageId,
+		newer,
+		newer,
+	);
+	return { threadId, draftId, oldMessageId, newMessageId };
+}
+
+const VERIFIED_ENV = {
+	MAIL_FROM_ADDRESS: "noreply@send.imsanti.dev",
+	MAIL_SENDING_DOMAINS: "imsanti.dev",
+};
+const UNVERIFIED_ENV = { MAIL_FROM_ADDRESS: "noreply@send.example.com" };
+
+describe("reply sender identity", () => {
+	it("answers from the alias the original mail was delivered to, not the canonical address", async () => {
+		const sent: SentEmail[] = [];
+		const identity = await withMailbox("mbx-alias-1", async (state) => {
+			const seed = await seedThreadForReply(state, {
+				parentTo: ["shop@imsanti.dev"],
+				oldRfcId: "old@example.com",
+				newRfcId: "new@example.com",
+			});
+			const resolved = resolveReplyIdentity(
+				VERIFIED_ENV,
+				state.storage.sql,
+				seed.draftId,
+				"hello@imsanti.dev",
+			);
+			await confirmSendDraft(
+				{
+					sql: state.storage.sql,
+					transactionSync: (fn) => state.storage.transactionSync(fn),
+					email: fakeEmailSender(sent),
+					fromAddress: resolved.from,
+					replyToAddress: resolved.replyTo,
+				},
+				seed.draftId,
+				`attempt-${seed.draftId}`,
+			);
+			return resolved;
+		});
+
+		expect(identity).toEqual({ from: "shop@imsanti.dev", replyTo: null });
+		expect(sent[0]?.from).toBe("shop@imsanti.dev");
+	});
+
+	it("puts the alias in Reply-To when its domain is not verified for sending", async () => {
+		const identity = await withMailbox("mbx-alias-2", async (state) => {
+			const seed = await seedThreadForReply(state, {
+				parentTo: ["shop@imsanti.dev"],
+				oldRfcId: "old@example.com",
+				newRfcId: "new@example.com",
+			});
+			return resolveReplyIdentity(
+				UNVERIFIED_ENV,
+				state.storage.sql,
+				seed.draftId,
+				"hello@imsanti.dev",
+			);
+		});
+
+		// Never the canonical address: the person wrote to shop@, the reply comes back there.
+		expect(identity).toEqual({
+			from: "noreply@send.example.com",
+			replyTo: "shop@imsanti.dev",
+		});
+	});
+
+	it("keeps the mailbox address when no recipient of the parent belongs to us", async () => {
+		const identity = await withMailbox("mbx-alias-3", async (state) => {
+			const seed = await seedThreadForReply(state, {
+				parentTo: ["otro@example.com"],
+				oldRfcId: "old@example.com",
+				newRfcId: "new@example.com",
+			});
+			return resolveReplyIdentity(
+				VERIFIED_ENV,
+				state.storage.sql,
+				seed.draftId,
+				"hello@imsanti.dev",
+			);
+		});
+
+		expect(identity).toEqual({ from: "hello@imsanti.dev", replyTo: null });
+	});
+
+	it("reads the alias off the message being answered, not the newest in the thread", async () => {
+		const identity = await withMailbox("mbx-alias-4", async (state) => {
+			const seed = await seedThreadForReply(state, {
+				parentTo: ["shop@imsanti.dev"],
+				newTo: ["ventas@imsanti.dev"],
+				oldRfcId: "old@example.com",
+				newRfcId: "new@example.com",
+				parentMessageId: "old",
+			});
+			return resolveReplyIdentity(
+				VERIFIED_ENV,
+				state.storage.sql,
+				seed.draftId,
+				"hello@imsanti.dev",
+			);
+		});
+
+		expect(identity.from).toBe("shop@imsanti.dev");
+	});
+});
+
+describe("reply parent selection", () => {
+	it("points In-Reply-To at the message the draft answers, not the newest one", async () => {
+		const sent: SentEmail[] = [];
+		await withMailbox("mbx-parent-1", async (state) => {
+			const seed = await seedThreadForReply(state, {
+				parentTo: ["hello@imsanti.dev"],
+				oldRfcId: "old@example.com",
+				newRfcId: "new@example.com",
+				parentMessageId: "old",
+			});
+			await confirmSendDraft(
+				{
+					sql: state.storage.sql,
+					transactionSync: (fn) => state.storage.transactionSync(fn),
+					email: fakeEmailSender(sent),
+					fromAddress: "hello@imsanti.dev",
+					replyToAddress: null,
+				},
+				seed.draftId,
+				`attempt-${seed.draftId}`,
+			);
+		});
+
+		expect(sent[0]?.headers?.["In-Reply-To"]).toBe("<old@example.com>");
+		expect(sent[0]?.headers?.References).toBe("<old@example.com>");
+	});
+
+	it("falls back to the newest message with a Message-ID when the draft names no parent", async () => {
+		const sent: SentEmail[] = [];
+		await withMailbox("mbx-parent-2", async (state) => {
+			const seed = await seedThreadForReply(state, {
+				parentTo: ["hello@imsanti.dev"],
+				oldRfcId: "old@example.com",
+				newRfcId: "new@example.com",
+				parentMessageId: null,
+			});
+			await confirmSendDraft(
+				{
+					sql: state.storage.sql,
+					transactionSync: (fn) => state.storage.transactionSync(fn),
+					email: fakeEmailSender(sent),
+					fromAddress: "hello@imsanti.dev",
+					replyToAddress: null,
+				},
+				seed.draftId,
+				`attempt-${seed.draftId}`,
+			);
+		});
+
+		expect(sent[0]?.headers?.["In-Reply-To"]).toBe("<new@example.com>");
+	});
+
+	it("emits In-Reply-To with the parent's exact case", async () => {
+		const sent: SentEmail[] = [];
+		// The real Gmail id from the reported bug: lowercasing it is why the reply
+		// arrived as a new conversation.
+		const gmailId = "CAHyeH21QU_oLHbS6X8oP9R9iSBKuh2W8-BSCbZ4Zcq8BMKcqZw@mail.gmail.com";
+		await withMailbox("mbx-parent-3", async (state) => {
+			const seed = await seedThreadForReply(state, {
+				parentTo: ["hello@imsanti.dev"],
+				oldRfcId: "Root-ID@Mail.Gmail.com",
+				newRfcId: gmailId,
+			});
+			await confirmSendDraft(
+				{
+					sql: state.storage.sql,
+					transactionSync: (fn) => state.storage.transactionSync(fn),
+					email: fakeEmailSender(sent),
+					fromAddress: "hello@imsanti.dev",
+					replyToAddress: null,
+				},
+				seed.draftId,
+				`attempt-${seed.draftId}`,
+			);
+		});
+
+		expect(sent[0]?.headers?.["In-Reply-To"]).toBe(`<${gmailId}>`);
+		expect(sent[0]?.headers?.References).toBe(`<Root-ID@Mail.Gmail.com> <${gmailId}>`);
+	});
+});
+
+describe("draft creation carries the parent", () => {
+	it("persists parentMessageId from the create-draft endpoint", async () => {
+		const stub = testEnv.MAILBOX_DO.getByName("mbx-parent-create");
+		const seed = await runInDurableObject(stub, async (_instance, state) =>
+			seedThreadForReply(state, {
+				parentTo: ["shop@imsanti.dev"],
+				oldRfcId: "old@example.com",
+				newRfcId: "new@example.com",
+			}),
+		);
+
+		const response = await stub.fetch("https://mailbox-do/drafts", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				threadId: seed.threadId,
+				parentMessageId: seed.oldMessageId,
+				to: ["cliente@example.com"],
+				subject: "Re: Consulta",
+				bodyText: "Va.",
+				createdBy: "telegram:1",
+			}),
+		});
+		const created = (await response.json()) as { id: string };
+
+		const stored = await runInDurableObject(
+			stub,
+			async (_instance, state) =>
+				state.storage.sql
+					.exec<{ parent_message_id: string | null }>(
+						"SELECT parent_message_id FROM outbound_drafts WHERE id = ?",
+						created.id,
+					)
+					.toArray()[0],
+		);
+		expect(stored?.parent_message_id).toBe(seed.oldMessageId);
 	});
 });
