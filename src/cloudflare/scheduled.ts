@@ -6,6 +6,8 @@ import {
 	updateOutboundSendStatus,
 } from "../db/d1";
 import { backupManifestR2Key } from "../lib/r2-keys";
+import { reconcileTelegramWebhook } from "../telegram/registration";
+import { sweepTelegramBridge } from "../telegram/sweep";
 
 // Outbound sends stuck at status="sending" for longer than this are assumed to be
 // an interrupted saga (worker crash / DO call that never returned) rather than a
@@ -87,6 +89,28 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 	// Expired Telegram confirm buttons: harmless but unbounded if never swept.
 	const expiredTelegramActions = await deleteExpiredTelegramActions(env.INDEX_DB);
 
+	// Releases a quiet-hours digest and prunes the bridge's ephemeral tables. The
+	// digest also flushes on the next inbound mail, so this is what covers the
+	// morning that happens to be quiet -- the case a mail-triggered flush cannot.
+	const telegramSweep = await sweepTelegramBridge(env);
+
+	// Self-healing webhook registration. Recorded as its own ops event only when it
+	// changed something or failed: an hourly "still fine" row would bury the rows
+	// that matter.
+	const webhook = await reconcileTelegramWebhook(env);
+	if (webhook.status === "registered" || webhook.status === "failed") {
+		await insertOpsEvent(env.INDEX_DB, {
+			id: crypto.randomUUID(),
+			event_type:
+				webhook.status === "registered"
+					? "telegram.webhook_registered"
+					: "telegram.webhook_registration_failed",
+			severity: webhook.status === "registered" ? "info" : "warning",
+			subject: "telegram",
+			payload_json: JSON.stringify(webhook),
+		});
+	}
+
 	await insertOpsEvent(env.INDEX_DB, {
 		id: crypto.randomUUID(),
 		event_type: "cron.backup_sweep",
@@ -99,6 +123,8 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 			reconciledSendCount,
 			reconciledTransactional,
 			expiredTelegramActions,
+			telegramSweep,
+			telegramWebhook: webhook.status,
 		}),
 	});
 
@@ -109,5 +135,7 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 		reconciledSendCount,
 		reconciledTransactional,
 		expiredTelegramActions,
+		telegramSweep,
+		telegramWebhook: webhook.status,
 	});
 }

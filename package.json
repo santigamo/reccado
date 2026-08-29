@@ -43,7 +43,6 @@
 		"setup:mailbox": "tsx scripts/setup-mailbox.ts",
 		"setup:mcp-claim": "tsx scripts/setup-mcp-claim.ts",
 		"setup:routing": "tsx scripts/setup-routing.ts",
-		"setup:telegram": "tsx scripts/setup-telegram.ts",
 		"setup:sending": "tsx scripts/setup-sending.ts",
 		"setup:access": "tsx scripts/setup-access.ts",
 		"smoke:access": "tsx scripts/smoke-access.ts",

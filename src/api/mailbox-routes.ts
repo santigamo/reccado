@@ -12,6 +12,7 @@ import {
 import { AppError } from "../lib/errors";
 import { confirmDraftSend } from "../lib/outbound-send";
 import { backupManifestR2Key } from "../lib/r2-keys";
+import { CARD_STATUS_FOR_ACTION, enqueueTelegramCardRefresh } from "../telegram/cards";
 import { assertMailboxAccess } from "./auth";
 import type { ApiBindings } from "./hono";
 import {
@@ -188,13 +189,28 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
+		const messageId = c.req.param("messageId");
 		const body = messageActionSchema.parse(await c.req.json());
 		const stub = await mailboxStub(c.env, mailboxId);
-		return stub.fetch(`https://mailbox-do/messages/${c.req.param("messageId")}/actions`, {
+		const response = await stub.fetch(`https://mailbox-do/messages/${messageId}/actions`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
 		});
+		// Only after the DO agreed, and never inline: the card that announced this
+		// email in Telegram would otherwise go on claiming it is pending, which is
+		// the reconciliation gap that made two surfaces disagree about the same
+		// inbox. Queued, so the edit waits behind Telegram's per-chat rate limit
+		// instead of this request doing so.
+		if (response.ok) {
+			await enqueueTelegramCardRefresh(c.env, {
+				mailboxId,
+				messageLocalId: messageId,
+				threadId: null,
+				status: CARD_STATUS_FOR_ACTION[body.action],
+			});
+		}
+		return response;
 	});
 
 	api.get("/api/mailboxes/:mailboxId/search", async (c) => {

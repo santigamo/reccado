@@ -6,6 +6,7 @@ import {
 	updateOutboundSendStatus,
 	upsertMessageIndex,
 } from "../db/d1";
+import { enqueueTelegramCardRefresh } from "../telegram/cards";
 import { AppError } from "./errors";
 import { outboundSendIdempotencyKey } from "./idempotency";
 
@@ -197,6 +198,18 @@ export async function confirmDraftSend(
 			raw_sha256: result.rawSha256 ?? idempotencyKey,
 			updated_at: new Date().toISOString(),
 		});
+		// The card that announced this conversation in Telegram still offers to
+		// answer it. Whichever surface just did — this function is the only one that
+		// can send — is the one fact that card is missing. Best effort and never
+		// throwing: a chat bridge must not be able to fail a send that already left.
+		if (result.threadId) {
+			await enqueueTelegramCardRefresh(env, {
+				mailboxId,
+				messageLocalId: null,
+				threadId: result.threadId,
+				status: "replied",
+			});
+		}
 	} else if (result.error === "ambiguous") {
 		// Ambiguous provider outcome — the provider may have accepted the message.
 		// Record D1 status as "unknown" (not "failed") so ops can reconcile

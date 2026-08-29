@@ -4,9 +4,9 @@
  * fix whatever is incomplete, instead of failing opaquely at `pnpm dev` or deploy.
  *
  * Default run is offline and deterministic (toolchain + local dev + config placeholders).
- * Pass `--cloud` to add remote checks (auth, D1 exists + id match, required secrets, and — with
- * `--url` — that Cloudflare Access is protecting the route). Exhaustive R2/queue/Email-Routing
- * binding verification lives in `pnpm verify:cf`.
+ * Pass `--cloud` to add remote checks (auth, D1 exists + id match, every declared Queue exists and
+ * its DLQs are consumed, required secrets, and — with `--url` — that Cloudflare Access is protecting
+ * the route). Exhaustive R2/queue/Email-Routing *binding* wiring lives in `pnpm verify:cf`.
  *
  * Usage:
  *   pnpm doctor                       # local + config checks for the default (production) config
@@ -21,7 +21,6 @@ type Status = "pass" | "warn" | "fail" | "info";
 type Check = { id: string; status: Status; message: string; fix?: string };
 
 const SYMBOL: Record<Status, string> = { pass: "✓", warn: "!", fail: "✗", info: "·" };
-const DEV_SEED_SECRET = "dev-mailbox-id-secret-v1";
 const PROD_D1_PLACEHOLDER = "<your-prod-d1-database-id>";
 const DEV_D1_PLACEHOLDER = "00000000-0000-0000-0000-000000000000";
 const EXAMPLE_FROM = "noreply@mail.example.com";
@@ -194,29 +193,6 @@ if (!existsSync(".dev.vars")) {
 			message: "Access is unset locally — local-dev bypass is active.",
 		});
 	}
-
-	const secret = devVars.get("MAILBOX_ID_SECRET")?.trim();
-	if (!secret) {
-		add({
-			id: "devvars.mailbox-secret",
-			status: "info",
-			message: "MAILBOX_ID_SECRET not in .dev.vars — the seed falls back to its default.",
-		});
-	} else if (secret === DEV_SEED_SECRET) {
-		add({
-			id: "devvars.mailbox-secret",
-			status: "pass",
-			message: "MAILBOX_ID_SECRET matches the dev seed default.",
-		});
-	} else {
-		add({
-			id: "devvars.mailbox-secret",
-			status: "warn",
-			message:
-				"MAILBOX_ID_SECRET differs from the dev seed default; seeded mailbox IDs won't match.",
-			fix: `Set MAILBOX_ID_SECRET=${DEV_SEED_SECRET} in .dev.vars, or re-seed after changing it.`,
-		});
-	}
 }
 
 const migrationFiles = existsSync("migrations/d1")
@@ -244,6 +220,10 @@ type WranglerConfig = {
 	workers_dev?: boolean;
 	routes?: Array<{ pattern: string; custom_domain?: boolean }>;
 	vars?: { MAIL_FROM_ADDRESS?: string };
+	queues?: {
+		producers?: Array<{ binding: string; queue: string }>;
+		consumers?: Array<{ queue: string; dead_letter_queue?: string }>;
+	};
 	d1_databases?: Array<{ binding: string; database_name?: string; database_id: string }>;
 	env?: Record<string, WranglerConfig>;
 };
@@ -360,8 +340,8 @@ if (args.cloud === "true") {
 		});
 	}
 	addAll(checkD1Remote());
+	addAll(checkQueuesRemote());
 	addAll(checkSecretsRemote());
-	addAll(checkSetupManifest());
 	if (args.url) {
 		add(await checkAccessRedirect(args.url));
 	} else {
@@ -374,7 +354,8 @@ if (args.cloud === "true") {
 	add({
 		id: "cloud.bindings",
 		status: "info",
-		message: "Exhaustive binding verification (R2/queues/Email Routing) lives in `pnpm verify:cf`.",
+		message:
+			"Exhaustive binding verification (R2/queues/Email Routing wiring) lives in `pnpm verify:cf`.",
 	});
 }
 
@@ -429,7 +410,296 @@ function checkD1Remote(): Check[] {
 	}
 }
 
-/** Confirms the Worker's remote secrets: MAILBOX_ID_SECRET (required) and the Access pair. */
+type AccountQueue = { name: string; consumers: number };
+
+// `queues list` grew a --json flag after the wrangler this repo pins, so the first
+// page decides which surface to read and the rest follow it: no repeated failures.
+let queueListJson = true;
+
+function runQueueList(page: number): string | null {
+	const argv = ["wrangler", "queues", "list", "--page", String(page)];
+	if (queueListJson) {
+		try {
+			return execFileSync("pnpm", [...argv, "--json"], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+		} catch {
+			queueListJson = false;
+		}
+	}
+	try {
+		return execFileSync("pnpm", argv, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	} catch {
+		return null;
+	}
+}
+
+function parseQueueListJson(raw: string): AccountQueue[] | null {
+	const start = raw.indexOf("[");
+	if (start === -1) return null;
+	try {
+		const parsed = JSON.parse(raw.slice(start)) as unknown;
+		if (!Array.isArray(parsed)) return null;
+		return parsed.map((entry: Record<string, unknown>) => ({
+			name: String(entry.queue_name ?? entry.name ?? ""),
+			consumers: Array.isArray(entry.consumers)
+				? entry.consumers.length
+				: Number(entry.consumers_total_count ?? 0),
+		}));
+	} catch {
+		return null;
+	}
+}
+
+/** Wrangler's box-drawn table: │ id │ name │ created_on │ modified_on │ producers │ consumers │. */
+function parseQueueListTable(raw: string): AccountQueue[] {
+	const rows: AccountQueue[] = [];
+	for (const line of raw.split("\n")) {
+		if (!line.startsWith("│")) continue;
+		const cells = line
+			.split("│")
+			.slice(1, -1)
+			.map((cell) => cell.trim());
+		const name = cells[1];
+		if (cells.length < 6 || !name || name === "name") continue;
+		rows.push({ name, consumers: Number.parseInt(cells[5] ?? "", 10) || 0 });
+	}
+	return rows;
+}
+
+/** Queue name → consumer count for the whole account, or null if it can't be read. */
+function listAccountQueues(): Map<string, number> | null {
+	const byName = new Map<string, number>();
+	// Paginated: a queue that merely sits on page 2 would otherwise be reported as
+	// a missing one, which is a deploy-breaking verdict.
+	for (let page = 1; page <= 10; page += 1) {
+		const raw = runQueueList(page);
+		if (raw === null) return page === 1 ? null : byName;
+		const rows = parseQueueListJson(raw) ?? parseQueueListTable(raw);
+		if (rows.length === 0) break;
+		for (const row of rows) {
+			if (row.name) byName.set(row.name, row.consumers);
+		}
+	}
+	return byName;
+}
+
+/**
+ * Queues are the one binding wrangler never creates for you: deploy fails outright
+ * on a queue the config names and the account lacks, and `pnpm doctor` existed
+ * precisely so that failure arrives here instead. The declared set is the same
+ * union setup:cloud provisions — producers, consumers and their dead-letter queues,
+ * deduplicated — read the same way so the two cannot drift.
+ *
+ * A DLQ with no consumer is not a deploy failure but is worse in production: dead
+ * messages sit there unread until Queues retention drops them (~4 days) and the
+ * evidence of what broke is gone.
+ */
+function checkQueuesRemote(): Check[] {
+	const dlqs = (block?.queues?.consumers ?? [])
+		.map((consumer) => consumer.dead_letter_queue)
+		.filter((name): name is string => Boolean(name));
+	const declared = [
+		...new Set([
+			...(block?.queues?.producers ?? []).map((producer) => producer.queue),
+			...(block?.queues?.consumers ?? []).map((consumer) => consumer.queue),
+			...dlqs,
+		]),
+	].filter(Boolean);
+	if (declared.length === 0) return [];
+
+	const account = listAccountQueues();
+	if (!account) {
+		return [
+			{
+				id: "cloud.queues",
+				status: "warn",
+				message: "Could not list Queues (auth?).",
+				fix: "Run `pnpm wrangler login`, then re-run with --cloud.",
+			},
+		];
+	}
+
+	const out: Check[] = [];
+	const missing = declared.filter((name) => !account.has(name));
+	if (missing.length > 0) {
+		out.push({
+			id: "cloud.queues",
+			status: "fail",
+			message: `Queue(s) declared for ${envLabel} but absent from this account: ${missing.join(", ")} — deploy will fail.`,
+			fix: `pnpm setup:cloud${targetEnv ? ` --env ${targetEnv}` : ""} --domain <d> --address inbox@<d> --apply (or pnpm wrangler queues create ${missing[0]})`,
+		});
+	} else {
+		out.push({
+			id: "cloud.queues",
+			status: "pass",
+			message: `All ${declared.length} queue(s) declared for ${envLabel} exist in the account.`,
+		});
+	}
+
+	// Only DLQs that exist can be judged on their consumers; the missing ones are
+	// already a fail above, and saying "all DLQs have a consumer" about queues that
+	// are not there would be the false reassurance this check exists to remove.
+	const existingDlqs = dlqs.filter((name) => account.has(name));
+	const orphanDlqs = existingDlqs.filter((name) => account.get(name) === 0);
+	if (orphanDlqs.length > 0) {
+		out.push({
+			id: "cloud.queues.dlq",
+			status: "warn",
+			message: `Dead-letter queue(s) with no consumer: ${orphanDlqs.join(", ")} — dead messages expire unread (~4 days) and leave no tombstone.`,
+			fix: `Declare each DLQ under queues.consumers (the tombstone handler), then deploy — a consumer declared but never deployed looks exactly like this from the account side.`,
+		});
+	} else if (existingDlqs.length > 0) {
+		out.push({
+			id: "cloud.queues.dlq",
+			status: "pass",
+			message: `All ${existingDlqs.length} dead-letter queue(s) have a consumer.`,
+		});
+	}
+	return out;
+}
+
+/** Mirrors src/telegram/registration.ts: two minutes of clock-skew tolerance. */
+const TELEGRAM_CLOCK_SKEW_MS = 120_000;
+
+/**
+ * Reads the four facts that decide whether the Telegram bridge actually delivers:
+ * the chat it adopted, the origin it learned to register its webhook on, the
+ * registration it performed, and what Telegram last observed about it. All live
+ * in runtime_config because the worker observes them -- so a bridge that is
+ * configured but mute has somewhere to say so, which is exactly what it lacked
+ * when it sat dead in production for days.
+ *
+ * The last pair catches the mute case the first pair cannot see: a webhook on the
+ * right URL registered with a secret Telegram's updates no longer match, which
+ * answers 401 on every delivery while every other signal reads healthy.
+ */
+function checkTelegramBridge(): Check {
+	let rows: Array<{ key: string; value: string }>;
+	try {
+		const raw = execFileSync(
+			"pnpm",
+			[
+				"wrangler",
+				"d1",
+				"execute",
+				"INDEX_DB",
+				"--remote",
+				"--json",
+				"--command",
+				"SELECT key, value FROM runtime_config WHERE key IN ('telegram.chat_id', 'deployment.origin', 'telegram.webhook_registration', 'telegram.webhook_observation')",
+				...(targetEnv ? ["--env", targetEnv] : []),
+			],
+			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+		);
+		const parsed = JSON.parse(raw.slice(raw.indexOf("["))) as Array<{
+			results: Array<{ key: string; value: string }>;
+		}>;
+		rows = parsed[0]?.results ?? [];
+	} catch {
+		return {
+			id: "cloud.telegram",
+			status: "warn",
+			message: "TELEGRAM_BOT_TOKEN is set but runtime_config could not be read.",
+			fix: `pnpm d1:migrate:${targetEnv ?? "prod"} — the runtime_config table may be missing.`,
+		};
+	}
+	const byKey = new Map(rows.map((row) => [row.key, row.value]));
+
+	// The live pairing code, if the bridge is still waiting for its first operator.
+	// `strftime` and not `datetime('now')`: expires_at is written as toISOString(), and
+	// the two formats differ at character 11 (T vs space) where the space sorts lower —
+	// with datetime() every code would look unexpired forever.
+	let pairingCode: string | null = null;
+	let operatorCount = 0;
+	try {
+		const rawOwners = execFileSync(
+			"pnpm",
+			[
+				"wrangler",
+				"d1",
+				"execute",
+				"INDEX_DB",
+				"--remote",
+				"--json",
+				"--command",
+				"SELECT (SELECT COUNT(*) FROM owner_identities WHERE kind = 'telegram') AS operators, (SELECT code FROM owner_pairing_codes WHERE consumed_at IS NULL AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') ORDER BY created_at DESC LIMIT 1) AS code",
+				...(targetEnv ? ["--env", targetEnv] : []),
+			],
+			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+		);
+		const parsedOwners = JSON.parse(rawOwners.slice(rawOwners.indexOf("["))) as Array<{
+			results: Array<{ operators: number; code: string | null }>;
+		}>;
+		const row = parsedOwners[0]?.results?.[0];
+		operatorCount = row?.operators ?? 0;
+		pairingCode = row?.code ?? null;
+	} catch {
+		// Registry unreadable (migration 0012 not applied yet); the checks below still
+		// report what they can rather than failing the whole doctor run.
+	}
+
+	const missing: string[] = [];
+	if (!byKey.get("deployment.origin")) {
+		missing.push("no deployment origin recorded (load the authenticated UI once)");
+	}
+	if (operatorCount === 0) {
+		missing.push(
+			pairingCode
+				? `no operator linked — send /start ${pairingCode} to the bot`
+				: "no operator linked (the hourly cron mints a pairing code; re-run once it has)",
+		);
+	} else if (!byKey.get("telegram.chat_id")) {
+		missing.push("no chat adopted (send /start to the bot from a linked account)");
+	}
+	if (missing.length > 0) {
+		return {
+			id: "cloud.telegram",
+			status: "warn",
+			message: `Telegram bridge is on but not delivering: ${missing.join("; ")}.`,
+			fix: "Both are one-time actions; the hourly cron registers the webhook afterwards.",
+		};
+	}
+	const registration = parseJsonValue(byKey.get("telegram.webhook_registration"));
+	const observation = parseJsonValue(byKey.get("telegram.webhook_observation"));
+	const registeredAt = Date.parse(String(registration?.registeredAt ?? ""));
+	const lastErrorAt = Date.parse(String(observation?.lastErrorAt ?? ""));
+	// Only the dates are compared; the message is quoted, never parsed -- Telegram
+	// owns that wording and may reword it whenever it likes.
+	if (
+		Number.isFinite(registeredAt) &&
+		Number.isFinite(lastErrorAt) &&
+		lastErrorAt > registeredAt + TELEGRAM_CLOCK_SKEW_MS
+	) {
+		return {
+			id: "cloud.telegram",
+			status: "warn",
+			message: `Telegram is failing to deliver webhook updates since ${observation?.lastErrorAt}: ${observation?.lastErrorMessage ?? "no message reported"} (${observation?.pendingUpdateCount ?? 0} update(s) pending).`,
+			fix: "The hourly cron re-registers the webhook; if the error persists, check that Cloudflare Access has a Bypass policy for /telegram/webhook.",
+		};
+	}
+	return {
+		id: "cloud.telegram",
+		status: "pass",
+		message: `Telegram bridge delivers to chat ${byKey.get("telegram.chat_id")} via ${byKey.get("deployment.origin")}.`,
+	};
+}
+
+/** Runtime-config JSON values, read leniently: a malformed row is not a diagnosis. */
+function parseJsonValue(raw: string | undefined): Record<string, unknown> | null {
+	if (!raw) return null;
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		return typeof parsed === "object" && parsed !== null
+			? (parsed as Record<string, unknown>)
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+/** Confirms the Worker's remote Access secrets. */
 function checkSecretsRemote(): Check[] {
 	let names: Set<string>;
 	try {
@@ -458,16 +728,12 @@ function checkSecretsRemote(): Check[] {
 		];
 	}
 	const out: Check[] = [];
-	out.push(
-		names.has("MAILBOX_ID_SECRET")
-			? { id: "cloud.secret.mailbox", status: "pass", message: "MAILBOX_ID_SECRET is set." }
-			: {
-					id: "cloud.secret.mailbox",
-					status: "fail",
-					message: "MAILBOX_ID_SECRET is not set — mailbox id derivation will fail.",
-					fix: `pnpm setup:cloud${targetEnv ? ` --env ${targetEnv}` : ""} --domain <d> --address inbox@<d> --apply`,
-				},
-	);
+	// The bridge is optional, so its absence is a pass, not a warning. What used to
+	// be invisible -- a bot token set but nothing ever delivered -- is what this
+	// reports, by reading the state the worker records about itself.
+	if (names.has("TELEGRAM_BOT_TOKEN")) {
+		out.push(checkTelegramBridge());
+	}
 	const missingAccess = ["ACCESS_JWT_AUDIENCE", "ACCESS_TEAM_DOMAIN"].filter((n) => !names.has(n));
 	out.push(
 		missingAccess.length === 0
@@ -480,40 +746,6 @@ function checkSecretsRemote(): Check[] {
 				},
 	);
 	return out;
-}
-
-function checkSetupManifest(): Check[] {
-	const manifestPath = `.reccado/setup.${targetEnv ?? "production"}.json`;
-	if (!existsSync(manifestPath)) return [];
-
-	try {
-		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-			mailbox?: { address?: string } | null;
-			mailboxSecretFingerprint?: string | null;
-		};
-		if (manifest.mailboxSecretFingerprint && !manifest.mailbox?.address) {
-			return [
-				{
-					id: "cloud.mailbox-secret-recovery",
-					status: "warn",
-					message: `Setup manifest ${manifestPath} records a generated MAILBOX_ID_SECRET but no seeded mailbox.`,
-					fix:
-						"If you still have the original secret, seed now with `MAILBOX_ID_SECRET=<saved-secret> pnpm setup:mailbox --domain <your-domain> --address inbox@<your-domain> --apply`. If you lost it and this env is still disposable, delete the secret (`pnpm wrangler secret delete MAILBOX_ID_SECRET" +
-						`${targetEnv ? ` --env ${targetEnv}` : ""}` +
-						"`) and rerun `pnpm setup:cloud --domain <d> --address inbox@<d> --apply`.",
-				},
-			];
-		}
-	} catch {
-		return [
-			{
-				id: "cloud.mailbox-secret-recovery",
-				status: "warn",
-				message: `Could not read ${manifestPath}.`,
-			},
-		];
-	}
-	return [];
 }
 
 /**

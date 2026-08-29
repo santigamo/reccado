@@ -58,13 +58,19 @@ function buildMessage(body: InboundEmailQueueMessage, attempts = 1) {
 function buildEnv(opts: {
 	db: { prepare: ReturnType<typeof vi.fn> };
 	doFetch: () => Promise<Response> | Response;
+	notifySend?: () => Promise<unknown>;
 }): Env {
 	const stub = { fetch: vi.fn(opts.doFetch) };
 	return {
 		INDEX_DB: { prepare: opts.db.prepare },
 		MAIL_OBJECTS: { head: vi.fn().mockResolvedValue({ key: "raw-object-exists" }) },
 		MAILBOX_DO: { getByName: vi.fn(() => stub) },
+		NOTIFY_QUEUE: { send: vi.fn(opts.notifySend ?? (async () => undefined)) },
 	} as unknown as Env;
+}
+
+function notifySendMock(env: Env): ReturnType<typeof vi.fn> {
+	return (env as unknown as { NOTIFY_QUEUE: { send: ReturnType<typeof vi.fn> } }).NOTIFY_QUEUE.send;
 }
 
 async function run(message: ReturnType<typeof buildMessage>, env: Env): Promise<void> {
@@ -244,5 +250,105 @@ describe("queue consumer", () => {
 		const opsEventCalls = callsFor(db.calls, "INSERT INTO ops_events");
 		expect(opsEventCalls).toHaveLength(1);
 		expect(opsEventCalls[0]?.args[1]).toBe("ingest.terminal_failure");
+	});
+	it("enqueues the Telegram push instead of calling Telegram inline", async () => {
+		const db = createMockDb();
+		const body = buildBody();
+		const message = buildMessage(body);
+		const result: MailboxIngestResult = {
+			status: "inserted",
+			mailboxId: body.mailboxId,
+			messageCount: 1,
+			idempotencyKey: body.idempotencyKey,
+			messageLocalId: "msg_local_1",
+			rawR2Key: body.rawR2Key,
+			threadId: "thread_1",
+			subject: "Hi",
+			snippet: "hello there",
+			fromAddr: body.sender,
+			hasAttachments: true,
+		};
+		const env = buildEnv({
+			db,
+			doFetch: () => new Response(JSON.stringify(result), { status: 200 }),
+		});
+		const send = notifySendMock(env);
+
+		await run(message, env);
+
+		// The point of the split: ingest hands the push to a queue and acks, so
+		// Telegram's latency and per-chat rate limit never sit on this path.
+		expect(send).toHaveBeenCalledTimes(1);
+		expect(send).toHaveBeenCalledWith({
+			schemaVersion: 1,
+			eventType: "mail.notify.v1",
+			notification: {
+				mailboxId: body.mailboxId,
+				mailboxAddress: body.recipient,
+				messageLocalId: "msg_local_1",
+				threadId: "thread_1",
+				subject: "Hi",
+				fromAddr: body.sender,
+				snippet: "hello there",
+				hasAttachments: true,
+			},
+		});
+		expect(message.ack).toHaveBeenCalledTimes(1);
+		expect(message.retry).not.toHaveBeenCalled();
+	});
+
+	it("does not enqueue a notification for a duplicate delivery", async () => {
+		const db = createMockDb();
+		const body = buildBody();
+		const message = buildMessage(body);
+		const result: MailboxIngestResult = {
+			status: "duplicate",
+			mailboxId: body.mailboxId,
+			messageCount: 1,
+			idempotencyKey: body.idempotencyKey,
+			messageLocalId: "msg_local_existing",
+			rawR2Key: body.rawR2Key,
+		};
+		const env = buildEnv({
+			db,
+			doFetch: () => new Response(JSON.stringify(result), { status: 200 }),
+		});
+
+		await run(message, env);
+
+		expect(notifySendMock(env)).not.toHaveBeenCalled();
+	});
+
+	it("still acks the ingested mail when enqueuing the notification fails", async () => {
+		const db = createMockDb();
+		const body = buildBody();
+		const message = buildMessage(body);
+		const result: MailboxIngestResult = {
+			status: "inserted",
+			mailboxId: body.mailboxId,
+			messageCount: 1,
+			idempotencyKey: body.idempotencyKey,
+			messageLocalId: "msg_local_1",
+			rawR2Key: body.rawR2Key,
+			threadId: "thread_1",
+			fromAddr: body.sender,
+		};
+		const env = buildEnv({
+			db,
+			doFetch: () => new Response(JSON.stringify(result), { status: 200 }),
+			notifySend: async () => {
+				throw new Error("queue unavailable");
+			},
+		});
+
+		await run(message, env);
+
+		// The mail is already stored; re-delivering it to reindex would cost more
+		// than the lost push, so the enqueue failure is recorded, not thrown.
+		expect(message.ack).toHaveBeenCalledTimes(1);
+		expect(message.retry).not.toHaveBeenCalled();
+		const opsEventCalls = callsFor(db.calls, "INSERT INTO ops_events");
+		expect(opsEventCalls).toHaveLength(1);
+		expect(opsEventCalls[0]?.args[1]).toBe("notify.enqueue_failed");
 	});
 });

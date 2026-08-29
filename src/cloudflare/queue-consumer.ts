@@ -1,5 +1,9 @@
 import { insertOpsEvent, upsertIngestEvent, upsertMessageIndex } from "../db/d1";
-import type { InboundEmailQueueMessage, MailboxIngestResult } from "./types";
+import type {
+	InboundEmailQueueMessage,
+	InboundNotificationQueueMessage,
+	MailboxIngestResult,
+} from "./types";
 import { inboundEmailQueueMessageSchema } from "./types";
 
 const MAX_RETRIES = 3;
@@ -94,19 +98,43 @@ export async function handleInboundQueue(
 				});
 				// After the mail is durably indexed, never before: a push that fired on a
 				// message we then failed to store would be a notification for nothing.
-				// notifyInboundMail swallows its own errors so Telegram cannot make the
-				// queue retry an already-ingested message.
-				const { notifyInboundMail } = await import("../telegram/notify");
-				await notifyInboundMail(env, {
-					mailboxId: body.mailboxId,
-					mailboxAddress: body.recipient,
-					messageLocalId: result.messageLocalId,
-					threadId: result.threadId ?? result.messageLocalId,
-					subject: result.subject ?? body.headers.subject,
-					fromAddr: result.fromAddr ?? body.sender,
-					snippet: result.snippet ?? null,
-					hasAttachments: Boolean(result.hasAttachments),
-				});
+				// Only the enqueue happens here — Telegram's latency and its ~1 msg/s
+				// per chat used to sit between a stored email and its ack, so a burst of
+				// mail throttled ingest itself. A failed enqueue still cannot break
+				// ingest: the mail is already stored, and re-delivering it to reindex
+				// would be the more expensive mistake.
+				try {
+					await env.NOTIFY_QUEUE.send({
+						schemaVersion: 1,
+						eventType: "mail.notify.v1",
+						notification: {
+							mailboxId: body.mailboxId,
+							mailboxAddress: body.recipient,
+							messageLocalId: result.messageLocalId,
+							threadId: result.threadId ?? result.messageLocalId,
+							subject: result.subject ?? body.headers.subject,
+							fromAddr: result.fromAddr ?? body.sender,
+							snippet: result.snippet ?? null,
+							hasAttachments: Boolean(result.hasAttachments),
+						},
+					} satisfies InboundNotificationQueueMessage);
+				} catch (error) {
+					console.error("notify.enqueue_failed", {
+						messageId: message.id,
+						mailboxId: body.mailboxId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					await insertOpsEvent(env.INDEX_DB, {
+						id: crypto.randomUUID(),
+						event_type: "notify.enqueue_failed",
+						severity: "warning",
+						subject: result.messageLocalId,
+						payload_json: JSON.stringify({
+							mailboxId: body.mailboxId,
+							error: error instanceof Error ? error.message : String(error),
+						}),
+					}).catch(() => undefined);
+				}
 			} else if (result.status === "duplicate") {
 				await upsertIngestEvent(env.INDEX_DB, {
 					idempotency_key: body.idempotencyKey,

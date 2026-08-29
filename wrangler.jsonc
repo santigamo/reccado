@@ -49,6 +49,10 @@
 			{
 				"binding": "EMAIL_EVENTS_QUEUE",
 				"queue": "inbox-mcp-email-events"
+			},
+			{
+				"binding": "NOTIFY_QUEUE",
+				"queue": "inbox-mcp-notify"
 			}
 		],
 		"consumers": [
@@ -65,6 +69,47 @@
 				"max_batch_size": 10,
 				"max_batch_timeout": 2,
 				"max_retries": 3
+			},
+			{
+				"queue": "inbox-mcp-notify",
+				"dead_letter_queue": "inbox-mcp-notify-dlq",
+				// Telegram takes about one message per second per chat, so a large
+				// batch would spend most of its invocation being rate-limited; five
+				// keeps a burst moving without stalling the consumer. The 1s timeout
+				// is the point of the queue — a notification that waits to fill a
+				// batch is a notification that arrived late. max_retries is higher
+				// than ingest's because the failures here are Telegram outages and
+				// 429s, which pass, and a dropped push is a signal the operator
+				// never gets back.
+				"max_batch_size": 5,
+				"max_batch_timeout": 1,
+				"max_retries": 5
+			},
+			// The three dead-letter queues are consumed by the same terminal
+			// tombstone handler: a dead message must land somewhere durable and
+			// named instead of evaporating when Queues retention expires. These
+			// entries deliberately declare no dead_letter_queue of their own —
+			// this is the end of the line, and a DLQ for the DLQ would only move
+			// the silence one hop away. Batches are large and unhurried because
+			// nothing downstream is waiting; the retries exist only to ride out a
+			// D1 blip while writing the record.
+			{
+				"queue": "inbox-mcp-inbound-dlq",
+				"max_batch_size": 10,
+				"max_batch_timeout": 5,
+				"max_retries": 5
+			},
+			{
+				"queue": "inbox-mcp-email-events-dlq",
+				"max_batch_size": 10,
+				"max_batch_timeout": 5,
+				"max_retries": 5
+			},
+			{
+				"queue": "inbox-mcp-notify-dlq",
+				"max_batch_size": 10,
+				"max_batch_timeout": 5,
+				"max_retries": 5
 			}
 		]
 	},
@@ -91,8 +136,14 @@
 			// Dev keeps workers.dev available for smoke tests. Cloudflare Access still
 			// needs a custom domain; use `pnpm setup:domain` for the protected UI.
 			"workers_dev": true,
+			// Who may drive the bot is still a trust declaration a human makes — but a
+			// personal Telegram user id committed to a public repository, changeable
+			// only by redeploy, was a bad way to write one down. The declaration moved
+			// to owner_identities in D1, made by sending `/start <pairing code>`.
+			// TELEGRAM_ALLOWED_USER_IDS survives as an emergency bootstrap and is
+			// deliberately not set here.
 			"vars": {
-				"MAIL_FROM_ADDRESS": "noreply@mail.example.com"
+				"MAIL_FROM_ADDRESS": "noreply@send.imsanti.dev"
 			},
 			"triggers": {
 				"crons": ["0 * * * *"]
@@ -125,6 +176,10 @@
 					{
 						"binding": "EMAIL_EVENTS_QUEUE",
 						"queue": "inbox-mcp-email-events-dev"
+					},
+					{
+						"binding": "NOTIFY_QUEUE",
+						"queue": "inbox-mcp-notify-dev"
 					}
 				],
 				"consumers": [
@@ -141,6 +196,38 @@
 						"max_batch_size": 10,
 						"max_batch_timeout": 2,
 						"max_retries": 3
+					},
+					{
+						"queue": "inbox-mcp-notify-dev",
+						"dead_letter_queue": "inbox-mcp-notify-dlq-dev",
+						// Mirrors prod: small batches because Telegram is ~1 msg/s per
+						// chat, a 1s timeout because a batched-up notification is a late
+						// one, and more retries than ingest because 429s and outages pass
+						// while a dropped push never comes back.
+						"max_batch_size": 5,
+						"max_batch_timeout": 1,
+						"max_retries": 5
+					},
+					// Terminal tombstone consumers, as in prod: a dead message gets a
+					// durable, named row in ops_events rather than expiring unseen.
+					// No dead_letter_queue on purpose — the line ends here.
+					{
+						"queue": "inbox-mcp-inbound-dlq-dev",
+						"max_batch_size": 10,
+						"max_batch_timeout": 5,
+						"max_retries": 5
+					},
+					{
+						"queue": "inbox-mcp-email-events-dlq-dev",
+						"max_batch_size": 10,
+						"max_batch_timeout": 5,
+						"max_retries": 5
+					},
+					{
+						"queue": "inbox-mcp-notify-dlq-dev",
+						"max_batch_size": 10,
+						"max_batch_timeout": 5,
+						"max_retries": 5
 					}
 				]
 			},

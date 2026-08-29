@@ -253,14 +253,40 @@ export default {
 		const { handleEmail } = await import("./cloudflare/email-handler");
 		return handleEmail(message, env, ctx);
 	},
+	// Explicit allowlist, no fallthrough. Every queue this Worker consumes —
+	// DLQs included — must name its consumer here; an unlisted queue throws
+	// instead of being handed to the inbound consumer, which would parse
+	// lifecycle events, notifications or dead letters as if they were mail. A
+	// deploy that adds a queue without a branch has to fail loudly.
 	async queue(batch: MessageBatch<InboundEmailQueueMessage>, env: Env, ctx: ExecutionContext) {
-		const queueName = batch.queue;
-		if (queueName === "inbox-mcp-email-events" || queueName === "inbox-mcp-email-events-dev") {
-			const { handleEmailEventsQueue } = await import("./cloudflare/email-events-consumer");
-			return handleEmailEventsQueue(batch as MessageBatch<unknown>, env, ctx);
+		switch (batch.queue) {
+			case "inbox-mcp-inbound":
+			case "inbox-mcp-inbound-dev": {
+				const { handleInboundQueue } = await import("./cloudflare/queue-consumer");
+				return handleInboundQueue(batch, env, ctx);
+			}
+			case "inbox-mcp-email-events":
+			case "inbox-mcp-email-events-dev": {
+				const { handleEmailEventsQueue } = await import("./cloudflare/email-events-consumer");
+				return handleEmailEventsQueue(batch as MessageBatch<unknown>, env, ctx);
+			}
+			case "inbox-mcp-notify":
+			case "inbox-mcp-notify-dev": {
+				const { handleNotifyQueue } = await import("./cloudflare/notify-consumer");
+				return handleNotifyQueue(batch as MessageBatch<unknown>, env, ctx);
+			}
+			case "inbox-mcp-inbound-dlq":
+			case "inbox-mcp-inbound-dlq-dev":
+			case "inbox-mcp-email-events-dlq":
+			case "inbox-mcp-email-events-dlq-dev":
+			case "inbox-mcp-notify-dlq":
+			case "inbox-mcp-notify-dlq-dev": {
+				const { handleDeadLetterQueue } = await import("./cloudflare/dlq-consumer");
+				return handleDeadLetterQueue(batch as MessageBatch<unknown>, env, ctx);
+			}
+			default:
+				throw new Error(`queue(): no consumer wired for queue "${batch.queue}"`);
 		}
-		const { handleInboundQueue } = await import("./cloudflare/queue-consumer");
-		return handleInboundQueue(batch, env, ctx);
 	},
 	async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext) {
 		const { handleScheduled } = await import("./cloudflare/scheduled");
