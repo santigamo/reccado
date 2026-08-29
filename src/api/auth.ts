@@ -1,3 +1,4 @@
+import { readOwnerRegistry } from "../db/owners";
 import {
 	fetchWithTimeout,
 	getAccessConfigStatus,
@@ -8,6 +9,21 @@ import {
 export type AuthContext = {
 	userId: string;
 	email: string;
+	/**
+	 * The owner emails in force for this request: the D1 registry unioned with the
+	 * ACCESS_ALLOWED_EMAILS bootstrap, resolved once here so the synchronous checks
+	 * downstream (assertMailboxAccess, requireMcpAuth) never need a database.
+	 *
+	 * Empty means nobody is declared owner, which denies. Absent means the context
+	 * was built by hand rather than by getAuthContext, and the decision falls back
+	 * to the bootstrap variable alone -- which also denies when it is unset.
+	 */
+	owners?: string[];
+	/**
+	 * True only for the localhost dev-bypass identity. getAuthContext refuses to
+	 * mint it for a non-local request, so it is not a claim a caller can make.
+	 */
+	local?: boolean;
 };
 
 export type AccessJwtPayload = {
@@ -147,7 +163,12 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 		if (!isLocalRequest(request)) {
 			return null;
 		}
-		return { userId: "dev-local", email: "dev@local" };
+		return {
+			userId: "dev-local",
+			email: "dev@local",
+			owners: await resolveOwnerEmails(env),
+			local: true,
+		};
 	}
 	if (!accessConfig.ok) {
 		throw new Error(accessConfig.reason ?? "Access validation is misconfigured");
@@ -161,7 +182,7 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 	try {
 		const payload = await verifyAccessJwt(token, env);
 		const email = payload.email ?? payload.sub ?? "unknown";
-		return { userId: payload.sub ?? email, email };
+		return { userId: payload.sub ?? email, email, owners: await resolveOwnerEmails(env) };
 	} catch (error) {
 		if (
 			isAbortTimeoutError(error) ||
@@ -179,6 +200,14 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 	}
 }
 
+/**
+ * The bootstrap variable, parsed. Null when unset.
+ *
+ * This is no longer the owner record -- owner_identities is (see db/owners.ts) --
+ * but it stays readable for the same reason a hotel keeps a master key: an
+ * operator whose database says nobody owns this deployment needs a way in that
+ * does not go through the database.
+ */
 export function parseAllowedEmails(env: Env): string[] | null {
 	const raw = env.ACCESS_ALLOWED_EMAILS;
 	if (!raw?.trim()) {
@@ -191,27 +220,57 @@ export function parseAllowedEmails(env: Env): string[] | null {
 	return emails.length > 0 ? emails : null;
 }
 
-let warnedOpenAccess = false;
+/** Registry plus bootstrap: one answer to "who owns this deployment", web-side. */
+export async function resolveOwnerEmails(env: Env): Promise<string[]> {
+	const registry = await readOwnerRegistry(env.INDEX_DB);
+	return [...new Set([...registry.emails, ...(parseAllowedEmails(env) ?? [])])];
+}
 
-function warnOpenAccessOnce(): void {
-	if (warnedOpenAccess) {
+let warnedNoOwner = false;
+
+function warnNoOwnerOnce(): void {
+	if (warnedNoOwner) {
 		return;
 	}
-	warnedOpenAccess = true;
+	warnedNoOwner = true;
 	console.warn(
-		"auth.open_access: ACCESS_ALLOWED_EMAILS is not set; every authenticated Access identity is treated as the single operator. Set ACCESS_ALLOWED_EMAILS to a comma-separated owner allowlist to restrict access.",
+		"auth.no_owner: no owner is registered for this deployment, so /api/* and /mcp deny every identity. Insert a row into owner_identities (see migrations/d1/0012_owner_registry.sql) or set the ACCESS_ALLOWED_EMAILS bootstrap.",
 	);
 }
 
-function isAllowedOwner(auth: AuthContext, env: Env): boolean {
-	const allowed = parseAllowedEmails(env);
-	if (!allowed) {
-		// Single-user private inbox v0: no allowlist configured, so any authenticated Access
-		// identity may access all mailboxes (open single-operator mode).
-		warnOpenAccessOnce();
-		return true;
+/**
+ * The allowlist governing this request.
+ *
+ * Falls back to the bootstrap variable only for an AuthContext nothing resolved
+ * owners for -- a hand-built one. Either way the empty case is an empty array,
+ * never "no opinion": there is no configuration of this system that means
+ * "everyone".
+ */
+function ownersFor(auth: AuthContext, env: Env): string[] {
+	return auth.owners ?? parseAllowedEmails(env) ?? [];
+}
+
+/**
+ * Is this identity an owner?
+ *
+ * The check is deliberately NOT redundant with the Cloudflare Access policy. The
+ * failure this defends against is the one the README documents: an Access app
+ * created for the wrong hostname, where Access does not deny -- it simply is not
+ * there. getAccessConfigStatus catches the half of that where the worker knows it
+ * is unprotected; this list is what still stands when the perimeter is missing
+ * and the worker cannot tell.
+ *
+ * With no owner at all it denies, with one exception: the localhost dev-bypass
+ * identity, which getAuthContext only mints for a local request, so it is the
+ * developer's own machine rather than an open door. Once any owner exists, even
+ * that identity has to be one.
+ */
+function isOwner(auth: AuthContext, env: Env): boolean {
+	const owners = ownersFor(auth, env);
+	if (owners.length === 0) {
+		return auth.local === true;
 	}
-	return allowed.includes(auth.email.trim().toLowerCase());
+	return owners.includes(auth.email.trim().toLowerCase());
 }
 
 export async function requireAuth(request: Request, env: Env): Promise<AuthContext> {
@@ -236,24 +295,33 @@ export async function requireAuth(request: Request, env: Env): Promise<AuthConte
 			headers: { "content-type": "application/json" },
 		});
 	}
-	const allowed = parseAllowedEmails(env);
-	if (allowed) {
-		if (!allowed.includes(auth.email.trim().toLowerCase())) {
-			throw new Response(JSON.stringify({ error: "forbidden" }), {
-				status: 403,
-				headers: { "content-type": "application/json" },
-			});
+	if (!isOwner(auth, env)) {
+		// 503 rather than 403 when nobody owns the deployment: the caller did nothing
+		// wrong, the install is unfinished, and saying "forbidden" would send an
+		// operator hunting for a policy that does not exist. The distinction is the
+		// same one /mcp has always drawn.
+		if (ownersFor(auth, env).length === 0) {
+			warnNoOwnerOnce();
+			throw new Response(
+				JSON.stringify({
+					error: "owner_not_configured",
+					reason: "No owner is registered for this deployment.",
+				}),
+				{ status: 503, headers: { "content-type": "application/json" } },
+			);
 		}
-	} else {
-		warnOpenAccessOnce();
+		throw new Response(JSON.stringify({ error: "forbidden" }), {
+			status: 403,
+			headers: { "content-type": "application/json" },
+		});
 	}
 	return auth;
 }
 
-// TODO: per-mailbox ACL — today every allowed owner can access every mailbox; there is no
-// per-mailbox ownership table yet, so this only enforces the global owner allowlist.
+// TODO: per-mailbox ACL — today every owner can access every mailbox; there is no
+// per-mailbox ownership table yet, so this only enforces the global owner registry.
 export function assertMailboxAccess(auth: AuthContext, _mailboxId: string, env: Env): void {
-	if (!isAllowedOwner(auth, env)) {
+	if (!isOwner(auth, env)) {
 		throw new Response(JSON.stringify({ error: "forbidden" }), {
 			status: 403,
 			headers: { "content-type": "application/json" },
@@ -262,33 +330,34 @@ export function assertMailboxAccess(auth: AuthContext, _mailboxId: string, env: 
 }
 
 /**
- * MCP-specific auth gate: fails closed if ACCESS_ALLOWED_EMAILS is unset or empty.
- * Unlike the UI (which allows open single-operator mode), the MCP endpoint refuses
- * to serve any tool call without an explicit allowlist. Returns true if the
- * authenticated identity is allowed to use MCP tools.
+ * MCP-specific gate: fails closed when no owner is registered and no bootstrap
+ * variable is set. Stricter than the UI in one respect on purpose -- the
+ * localhost dev-bypass identity gets no exemption here, because an MCP client is
+ * a program acting unattended and "it is only my laptop" is not a property of the
+ * request it makes.
  */
 export function isMcpAllowed(auth: AuthContext, env: Env): boolean {
-	const allowed = parseAllowedEmails(env);
-	if (!allowed) {
-		return false;
-	}
-	return allowed.includes(auth.email.trim().toLowerCase());
+	const owners = ownersFor(auth, env);
+	return owners.includes(auth.email.trim().toLowerCase());
 }
 
 /**
- * Returns 503 if ACCESS_ALLOWED_EMAILS is unset/empty (MCP misconfigured),
- * 403 if the authenticated identity is not in the allowlist,
+ * Returns 503 when this deployment has no owner (MCP unconfigured),
+ * 403 when the authenticated identity is not one,
  * or the AuthContext if allowed. Throws a Response for the Hono middleware to return.
  */
 export function requireMcpAuth(auth: AuthContext, env: Env): AuthContext {
-	const allowed = parseAllowedEmails(env);
-	if (!allowed) {
+	const owners = ownersFor(auth, env);
+	if (owners.length === 0) {
 		throw new Response(
-			JSON.stringify({ error: "mcp_not_configured", reason: "ACCESS_ALLOWED_EMAILS is not set" }),
+			JSON.stringify({
+				error: "mcp_not_configured",
+				reason: "No owner is registered for this deployment.",
+			}),
 			{ status: 503, headers: { "content-type": "application/json" } },
 		);
 	}
-	if (!allowed.includes(auth.email.trim().toLowerCase())) {
+	if (!owners.includes(auth.email.trim().toLowerCase())) {
 		throw new Response(JSON.stringify({ error: "forbidden" }), {
 			status: 403,
 			headers: { "content-type": "application/json" },
