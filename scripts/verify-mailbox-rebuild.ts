@@ -47,8 +47,7 @@
  *                       the deployment sits behind Access.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 type WranglerBlock = {
@@ -118,25 +117,25 @@ function sqlString(value: string): string {
 	return `'${value.replace(/'/g, "''")}'`;
 }
 
+// wrangler uploads a `--file` query to R2 before running it, and the JSON it
+// returns for an uploaded query carries a *summary* ("Total queries executed",
+// "Rows read", ...) in `results` instead of the rows themselves. Silently, with
+// success: true. So SELECTs go through `--command`, whose response really does
+// carry the rows. The queries here are small enough that the argv limit is not a
+// concern, and a query large enough to hit it would be the wrong shape for this
+// script anyway.
 function d1Query<T>(database: string, sql: string, extraArgs: string[] = []): T[] {
-	const dir = mkdtempSync(join(tmpdir(), "reccado-verify-sql-"));
-	const file = join(dir, "query.sql");
-	writeFileSync(file, sql, "utf8");
-	try {
-		const raw = execFileSync(
-			"pnpm",
-			["wrangler", "d1", "execute", database, "--remote", "--json", "--file", file, ...extraArgs],
-			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 },
-		);
-		const start = raw.indexOf("[");
-		if (start === -1) {
-			throw new Error(`unexpected wrangler d1 output:\n${raw}`);
-		}
-		const parsed = JSON.parse(raw.slice(start)) as Array<{ results?: T[] }>;
-		return parsed[0]?.results ?? [];
-	} finally {
-		rmSync(dir, { recursive: true, force: true });
+	const raw = execFileSync(
+		"pnpm",
+		["wrangler", "d1", "execute", database, "--remote", "--json", "--command", sql, ...extraArgs],
+		{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 },
+	);
+	const start = raw.indexOf("[");
+	if (start === -1) {
+		throw new Error(`unexpected wrangler d1 output:\n${raw}`);
 	}
+	const parsed = JSON.parse(raw.slice(start)) as Array<{ results?: T[] }>;
+	return parsed[0]?.results ?? [];
 }
 
 const args = parseArgs(process.argv.slice(2));

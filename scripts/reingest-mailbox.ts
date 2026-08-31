@@ -65,7 +65,7 @@
  * `wrangler whoami` that resolves one) — pushing to a queue has no wrangler command.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { InboundEmailQueueMessage } from "../src/cloudflare/types";
@@ -79,7 +79,7 @@ import { parseMimeBytes } from "../src/lib/mime";
 const MAX_QUEUE_BYTES = 128 * 1024;
 
 type WranglerBlock = {
-	r2_buckets?: Array<{ binding: string; bucket_name: string }>;
+	r2_buckets?: Array<{ binding: string; bucket_name: string; jurisdiction?: string }>;
 	queues?: { producers?: Array<{ binding: string; queue: string }> };
 	d1_databases?: Array<{ binding: string; database_name: string }>;
 };
@@ -174,30 +174,30 @@ function wrangler(args: string[]): string {
  * versions, so cut to the first `[` rather than parsing the whole stream — the
  * same shape doctor.ts relies on.
  */
+// wrangler uploads a `--file` query to R2 before running it, and the JSON it
+// returns for an uploaded query carries a *summary* ("Total queries executed",
+// "Rows read", ...) in `results` instead of the rows themselves. Silently, with
+// success: true. So SELECTs go through `--command`, whose response really does
+// carry the rows. The queries here are small enough that the argv limit is not a
+// concern, and a query large enough to hit it would be the wrong shape for this
+// script anyway.
 function d1Query<T>(database: string, sql: string, extraArgs: string[] = []): T[] {
-	const dir = mkdtempSync(join(tmpdir(), "reccado-reingest-sql-"));
-	const file = join(dir, "query.sql");
-	writeFileSync(file, sql, "utf8");
-	try {
-		const raw = wrangler([
-			"d1",
-			"execute",
-			database,
-			"--remote",
-			"--json",
-			"--file",
-			file,
-			...extraArgs,
-		]);
-		const start = raw.indexOf("[");
-		if (start === -1) {
-			throw new Error(`unexpected wrangler d1 output:\n${raw}`);
-		}
-		const parsed = JSON.parse(raw.slice(start)) as Array<{ results?: T[] }>;
-		return parsed[0]?.results ?? [];
-	} finally {
-		rmSync(dir, { recursive: true, force: true });
+	const raw = wrangler([
+		"d1",
+		"execute",
+		database,
+		"--remote",
+		"--json",
+		"--command",
+		sql,
+		...extraArgs,
+	]);
+	const start = raw.indexOf("[");
+	if (start === -1) {
+		throw new Error(`unexpected wrangler d1 output:\n${raw}`);
 	}
+	const parsed = JSON.parse(raw.slice(start)) as Array<{ results?: T[] }>;
+	return parsed[0]?.results ?? [];
 }
 
 function d1Exec(database: string, sql: string, extraArgs: string[] = []): void {
@@ -209,14 +209,32 @@ function d1Exec(database: string, sql: string, extraArgs: string[] = []): void {
  * failure is rethrown, because "R2 said no" and "your token expired" must not both
  * present as "this message is unrecoverable".
  */
-function fetchRawObject(bucket: string, key: string, dir: string): Uint8Array | null {
+function fetchRawObject(
+	bucket: string,
+	key: string,
+	dir: string,
+	jurisdiction: string | undefined,
+): Uint8Array | null {
 	const file = join(dir, "object.eml");
 	// Every download reuses this path, so clear it first: a wrangler run that exits
 	// zero without writing would otherwise hand back the *previous* message's bytes.
 	// The sha256 check downstream would catch it, but only as a mystery.
 	rmSync(file, { force: true });
 	try {
-		wrangler(["r2", "object", "get", `${bucket}/${key}`, "--remote", "--file", file]);
+		// A jurisdiction-restricted bucket is invisible without the flag: wrangler
+		// looks in the default jurisdiction, finds no such bucket, and reports every
+		// key as missing. That reads identically to "this mail is unrecoverable",
+		// which is the most dangerous wrong answer this script can give.
+		wrangler([
+			"r2",
+			"object",
+			"get",
+			`${bucket}/${key}`,
+			"--remote",
+			"--file",
+			file,
+			...(jurisdiction ? ["--jurisdiction", jurisdiction] : []),
+		]);
 	} catch (error) {
 		const output = [
 			error instanceof Error ? error.message : String(error),
@@ -316,7 +334,9 @@ if (!block) {
 }
 
 const targetDb = block.d1_databases?.find((db) => db.binding === "INDEX_DB")?.database_name;
-const bucket = block.r2_buckets?.find((r2) => r2.binding === "MAIL_OBJECTS")?.bucket_name;
+const bucketBinding = block.r2_buckets?.find((r2) => r2.binding === "MAIL_OBJECTS");
+const bucket = bucketBinding?.bucket_name;
+const bucketJurisdiction = bucketBinding?.jurisdiction;
 const queueName = block.queues?.producers?.find(
 	(producer) => producer.binding === "INBOUND_EMAIL_QUEUE",
 )?.queue;
@@ -338,7 +358,9 @@ console.log(`  Env:            ${envName}`);
 console.log(`  Mailbox:        ${mailboxId}`);
 console.log(`  Source D1:      ${sourceDb}${sourceDb === targetDb ? " (same as target)" : ""}`);
 console.log(`  Target D1:      ${targetDb}`);
-console.log(`  R2 bucket:      ${bucket}`);
+console.log(
+	`  R2 bucket:      ${bucket}${bucketJurisdiction ? ` (jurisdiction ${bucketJurisdiction})` : ""}`,
+);
 console.log(`  Inbound queue:  ${queueName}`);
 console.log(`  Mode:           ${apply ? "APPLY" : "DRY RUN (pass --apply to write)"}`);
 console.log();
@@ -384,7 +406,7 @@ try {
 	for (const row of indexRows) {
 		if (rebuildable.length >= limit) break;
 
-		const rawBytes = fetchRawObject(bucket, row.raw_r2_key, workDir);
+		const rawBytes = fetchRawObject(bucket, row.raw_r2_key, workDir, bucketJurisdiction);
 		if (!rawBytes) {
 			unrebuildable.push({ row, reason: `no object at R2 key ${row.raw_r2_key}` });
 			continue;
@@ -582,18 +604,50 @@ if (!apply) {
 	process.exit(0);
 }
 
-const apiToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
-if (!apiToken) {
-	fail(
-		"--apply needs CLOUDFLARE_API_TOKEN (Queues:Edit) — publishing to a queue has no wrangler command.",
-	);
+// Two ways to get a message onto the queue, because publishing has no wrangler
+// command. The REST API is the direct one but needs an API token with Queues:Edit,
+// which is a credential someone has to mint. `--push-url` is the alternative: a
+// Worker holding a producer binding to this queue, which needs nothing but the
+// wrangler session that deployed it. Both end at the same `send()`.
+const pushUrl = args["push-url"]?.trim();
+const pushToken = (args["push-token"] ?? process.env.RECCADO_PUSH_TOKEN)?.trim();
+let publish: (payload: unknown) => Promise<void>;
+
+if (pushUrl) {
+	console.log(`Pushing to queue ${queueName} via ${new URL(pushUrl).origin}.`);
+	publish = async (payload) => {
+		const response = await fetch(pushUrl, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				...(pushToken ? { authorization: `Bearer ${pushToken}` } : {}),
+			},
+			body: JSON.stringify(payload),
+		});
+		if (!response.ok) {
+			throw new Error(`push endpoint returned ${response.status}: ${await response.text()}`);
+		}
+	};
+} else {
+	const apiToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+	if (!apiToken) {
+		fail(
+			"--apply needs CLOUDFLARE_API_TOKEN (Queues:Edit), or --push-url pointing at a Worker with a producer binding for this queue.",
+		);
+	}
+	const accountId = resolveAccountId();
+	if (!accountId) {
+		fail("could not resolve an account id; set CLOUDFLARE_ACCOUNT_ID.");
+	}
+	const queueId = await resolveQueueId(apiToken, accountId, queueName);
+	console.log(`Pushing to queue ${queueName} (${queueId}) in account ${accountId}.`);
+	publish = async (payload) => {
+		await cfApi(apiToken, `/accounts/${accountId}/queues/${queueId}/messages`, {
+			method: "POST",
+			body: JSON.stringify({ body: payload, content_type: "json" }),
+		});
+	};
 }
-const accountId = resolveAccountId();
-if (!accountId) {
-	fail("could not resolve an account id; set CLOUDFLARE_ACCOUNT_ID.");
-}
-const queueId = await resolveQueueId(apiToken, accountId, queueName);
-console.log(`Pushing to queue ${queueName} (${queueId}) in account ${accountId}.`);
 console.log();
 
 const outcomes: Outcome[] = [];
@@ -615,10 +669,7 @@ for (const candidate of rebuildable) {
 	}
 
 	try {
-		await cfApi(apiToken, `/accounts/${accountId}/queues/${queueId}/messages`, {
-			method: "POST",
-			body: JSON.stringify({ body: payload, content_type: "json" }),
-		});
+		await publish(payload);
 	} catch (error) {
 		outcomes.push({
 			row,
