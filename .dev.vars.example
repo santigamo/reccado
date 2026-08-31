@@ -18,6 +18,13 @@
 # Unlocks the local /api/debug/phase0/* introspection endpoints the smoke scripts use.
 PHASE0_DEBUG_TOKEN=dev-phase0-debug-token
 
+# Which Cloudflare jurisdiction mailbox Durable Objects are pinned to. Deployed
+# environments declare "eu" in wrangler.jsonc; locally this must be "none",
+# because workerd does not implement jurisdictions and `jurisdiction()` throws.
+# Only "eu" and "none" are accepted — an unset value is a loud error rather than
+# a silent fall back to an unpinned Durable Object.
+MAILBOX_JURISDICTION=none
+
 # Cloudflare API token for admin provisioning workflows (leave empty for local dev).
 # Minimum intended scope: zone read, email routing write for test zones, and Access app/policy write only when configuring Access by API.
 CLOUDFLARE_API_TOKEN=

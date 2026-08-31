@@ -41,6 +41,7 @@ import {
 	readQuietHours,
 	writeQuietHours,
 } from "./noise";
+import { mailboxStub } from "../lib/mailbox-stub";
 
 /**
  * What the "/" menu offers.
@@ -148,7 +149,7 @@ async function searchAllMailboxes(env: Env, query: string): Promise<SearchResult
 	const rows: MailIndexRow[] = [];
 	let truncated = false;
 	for (const mailbox of mailboxes) {
-		const stub = env.MAILBOX_DO.getByName(mailbox.mailbox_id);
+		const stub = mailboxStub(env, mailbox.mailbox_id);
 		const url = new URL("https://mailbox-do/search");
 		url.searchParams.set("q", query);
 		url.searchParams.set("limit", String(SEARCH_CAP_PER_MAILBOX));
@@ -185,7 +186,7 @@ async function collectUnreadInbox(env: Env, limit: number): Promise<MailIndexRow
 	const mailboxes = await listMailboxes(env.INDEX_DB);
 	const rows: MailIndexRow[] = [];
 	for (const mailbox of mailboxes) {
-		const stub = env.MAILBOX_DO.getByName(mailbox.mailbox_id);
+		const stub = mailboxStub(env, mailbox.mailbox_id);
 		const response = await stub.fetch(`https://mailbox-do/threads?state=inbox&limit=${limit * 3}`);
 		if (!response.ok) continue;
 		const payload = (await response.json()) as { threads?: ThreadListRow[] };

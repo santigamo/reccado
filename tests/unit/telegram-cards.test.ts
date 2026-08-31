@@ -158,6 +158,7 @@ function buildEnv(bodyText: string | null): { env: Env; doCalls: DoCall[] } {
 			...testEnv,
 			TELEGRAM_BOT_TOKEN: "123:fake-token",
 			MAILBOX_DO: { getByName: () => stub },
+			MAILBOX_JURISDICTION: "none",
 		} as unknown as Env,
 		doCalls,
 	};

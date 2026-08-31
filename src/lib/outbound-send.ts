@@ -9,6 +9,7 @@ import {
 import { enqueueTelegramCardRefresh } from "../telegram/cards";
 import { AppError } from "./errors";
 import { outboundSendIdempotencyKey } from "./idempotency";
+import { mailboxStub } from "./mailbox-stub";
 
 /**
  * The one path that turns a confirmed draft into sent mail.
@@ -58,7 +59,7 @@ export async function confirmDraftSend(
 	if (!mailbox) {
 		throw new AppError("Mailbox not found", "mailbox_not_found", 404);
 	}
-	const stub = env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(env, mailboxId);
 
 	const idempotencyKey = outboundSendIdempotencyKey(draftId, attemptKey);
 	const existingSend = await getOutboundSendByIdempotency(env.INDEX_DB, idempotencyKey);

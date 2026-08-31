@@ -22,6 +22,7 @@ import {
 import type { TelegramEntity } from "./api";
 import { entitiesToHtml } from "./format";
 import { fetchMailboxMessage } from "./messages";
+import { mailboxStub } from "../lib/mailbox-stub";
 
 const nowIso = () => new Date().toISOString();
 
@@ -191,7 +192,7 @@ export async function applyDraftEdit(
 	row: TelegramDraftRow,
 	input: { text: string; entities: TelegramEntity[] | undefined },
 ): Promise<DraftEditOutcome> {
-	const stub = env.MAILBOX_DO.getByName(row.mailbox_id);
+	const stub = mailboxStub(env, row.mailbox_id);
 	const response = await stub.fetch(`https://mailbox-do/drafts/${row.draft_id}`);
 	if (!response.ok) {
 		return { status: "unknown_draft" };

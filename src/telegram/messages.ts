@@ -6,6 +6,8 @@
  * what "the DO said no" looks like instead of each inventing its own check.
  */
 
+import { mailboxStub } from "../lib/mailbox-stub";
+
 /** What the DO stores about one file that travelled with an email. */
 export type MailboxAttachment = {
 	id: string;
@@ -39,7 +41,7 @@ export async function fetchMailboxMessage(
 	mailboxId: string,
 	messageLocalId: string,
 ): Promise<MailboxMessage | null> {
-	const stub = env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(env, mailboxId);
 	const response = await stub.fetch(`https://mailbox-do/messages/${messageLocalId}`);
 	if (!response.ok) {
 		return null;
@@ -86,7 +88,7 @@ export async function applyMailboxMessageAction(
 	env: Env,
 	input: { mailboxId: string; messageLocalId: string; action: MailboxMessageAction },
 ): Promise<boolean> {
-	const stub = env.MAILBOX_DO.getByName(input.mailboxId);
+	const stub = mailboxStub(env, input.mailboxId);
 	const response = await stub.fetch(`https://mailbox-do/messages/${input.messageLocalId}/actions`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },

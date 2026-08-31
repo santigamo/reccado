@@ -1,5 +1,6 @@
 import { classifyEmailEvent, normalizeEmailSendingEvent, safeEventMetadata } from "./email-events";
 import { insertOpsEvent, upsertSuppressionProjection } from "../db/d1";
+import { mailboxStub } from "../lib/mailbox-stub";
 
 /**
  * Resolves the mailbox DO for a delivery event by looking up the transactional
@@ -79,7 +80,7 @@ export async function handleEmailEventsQueue(
 			}
 
 			// Forward to the mailbox DO for processing
-			const stub = env.MAILBOX_DO.getByName(resolved.mailboxId);
+			const stub = mailboxStub(env, resolved.mailboxId);
 			const response = await stub.fetch("https://mailbox-do/transactional/delivery-event", {
 				method: "POST",
 				headers: { "content-type": "application/json" },

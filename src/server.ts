@@ -1,6 +1,7 @@
 import { createApiApp } from "./api/hono";
 import type { InboundEmailQueueMessage } from "./cloudflare/types";
 import { deriveDevTestMailboxId } from "./db/seed-dev";
+import { mailboxStub } from "./lib/mailbox-stub";
 
 export { MailboxDurableObject } from "./do/mailbox-do";
 
@@ -42,7 +43,7 @@ api.get("/api/debug/phase0/mailboxes/:mailboxId/schema", async (c) => {
 		return c.notFound();
 	}
 	const mailboxId = c.req.param("mailboxId");
-	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch("https://mailbox-do/debug/schema");
 });
 
@@ -54,7 +55,7 @@ api.get("/api/debug/phase0/schema/:mailboxId", async (c) => {
 	if (c.req.query("dry") === "1") {
 		return c.json({ ok: true, route: "schema", mailboxId });
 	}
-	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch("https://mailbox-do/debug/schema");
 });
 
@@ -63,7 +64,7 @@ api.get("/api/debug/phase0/mailboxes/:mailboxId", async (c) => {
 		return c.notFound();
 	}
 	const mailboxId = c.req.param("mailboxId");
-	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch("https://mailbox-do/debug");
 });
 
@@ -101,7 +102,7 @@ api.get("/api/mailboxes/:mailboxId/ws", async (c) => {
 	const doUrl = new URL("https://mailbox-do/ws");
 	doUrl.searchParams.set("mailboxId", mailboxId);
 
-	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch(
 		new Request(doUrl.toString(), {
 			headers: c.req.raw.headers,
@@ -116,7 +117,7 @@ api.post("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
 	const auth = await requireAuth(c.req.raw, c.env);
 	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
 	const mailboxId = c.req.param("mailboxId");
-	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch("https://mailbox-do/transactional/templates", {
 		method: "POST",
 		body: JSON.stringify(await c.req.json()),
@@ -129,7 +130,7 @@ api.get("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
 	const auth = await requireAuth(c.req.raw, c.env);
 	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
 	const mailboxId = c.req.param("mailboxId");
-	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch("https://mailbox-do/transactional/templates");
 });
 
@@ -139,7 +140,7 @@ api.post("/api/mailboxes/:mailboxId/transactional/templates/:templateId/archive"
 	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
 	const mailboxId = c.req.param("mailboxId");
 	const templateId = c.req.param("templateId");
-	const stub = c.env.MAILBOX_DO.getByName(mailboxId);
+	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch(`https://mailbox-do/transactional/templates/${templateId}/archive`, {
 		method: "POST",
 	});
@@ -190,7 +191,7 @@ export default {
 			const mailboxId = transactionalMatch[1];
 			if (!mailboxId) return new Response("Bad request", { status: 400 });
 			const requestId = transactionalMatch[3];
-			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			const stub = mailboxStub(env, mailboxId);
 
 			if (request.method === "POST" && !requestId) {
 				// Body size limit (100KB), including requests without Content-Length.

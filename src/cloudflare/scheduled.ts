@@ -8,6 +8,7 @@ import {
 import { backupManifestR2Key } from "../lib/r2-keys";
 import { reconcileTelegramWebhook } from "../telegram/registration";
 import { sweepTelegramBridge } from "../telegram/sweep";
+import { mailboxStub } from "../lib/mailbox-stub";
 
 // Outbound sends stuck at status="sending" for longer than this are assumed to be
 // an interrupted saga (worker crash / DO call that never returned) rather than a
@@ -55,7 +56,7 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 
 	let reconciledTransactional = 0;
 	for (const mailbox of mailboxes) {
-		const stub = env.MAILBOX_DO.getByName(mailbox.mailbox_id);
+		const stub = mailboxStub(env, mailbox.mailbox_id);
 		const exportResponse = await stub.fetch("https://mailbox-do/export-index");
 		if (!exportResponse.ok) continue;
 		const exported = await exportResponse.text();

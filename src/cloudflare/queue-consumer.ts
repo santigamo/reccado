@@ -5,6 +5,7 @@ import type {
 	MailboxIngestResult,
 } from "./types";
 import { inboundEmailQueueMessageSchema } from "./types";
+import { mailboxStub } from "../lib/mailbox-stub";
 
 const MAX_RETRIES = 3;
 
@@ -38,7 +39,7 @@ export async function handleInboundQueue(
 				throw new Error(`raw MIME object missing: ${body.rawR2Key}`);
 			}
 
-			const stub = env.MAILBOX_DO.getByName(body.mailboxId);
+			const stub = mailboxStub(env, body.mailboxId);
 			const response = await stub.fetch("https://mailbox-do/ingest", {
 				method: "POST",
 				headers: { "content-type": "application/json" },

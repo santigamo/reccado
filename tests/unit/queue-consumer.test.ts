@@ -65,6 +65,7 @@ function buildEnv(opts: {
 		INDEX_DB: { prepare: opts.db.prepare },
 		MAIL_OBJECTS: { head: vi.fn().mockResolvedValue({ key: "raw-object-exists" }) },
 		MAILBOX_DO: { getByName: vi.fn(() => stub) },
+		MAILBOX_JURISDICTION: "none",
 		NOTIFY_QUEUE: { send: vi.fn(opts.notifySend ?? (async () => undefined)) },
 	} as unknown as Env;
 }

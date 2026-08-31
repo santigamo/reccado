@@ -55,6 +55,7 @@ import { entitiesToHtml, renderDraftPreview, telegramEscape } from "./format";
 import { fetchMailboxMessage } from "./messages";
 import { DIGEST_CALLBACK_VERB } from "./noise";
 import { claimTelegramPairing, type PairingOutcome, resolveTelegramOperators } from "./operators";
+import { mailboxStub } from "../lib/mailbox-stub";
 
 /** How long an inline Send button stays live. */
 const ACTION_TTL_MS = DRAFT_PREVIEW_TTL_MS;
@@ -472,7 +473,7 @@ async function handleMessage(
 		parent,
 	);
 
-	const stub = env.MAILBOX_DO.getByName(link.mailbox_id);
+	const stub = mailboxStub(env, link.mailbox_id);
 	const draftResponse = await stub.fetch("https://mailbox-do/drafts", {
 		method: "POST",
 		headers: { "content-type": "application/json" },
@@ -620,7 +621,7 @@ async function handleCallbackQuery(
 	const messageId = query.message?.message_id;
 
 	if (kind === "x") {
-		const stub = env.MAILBOX_DO.getByName(action.mailbox_id);
+		const stub = mailboxStub(env, action.mailbox_id);
 		await stub.fetch(`https://mailbox-do/drafts/${action.draft_id}/cancel`, { method: "POST" });
 		await deleteTelegramAction(env.INDEX_DB, token);
 		if (chatId && messageId) {

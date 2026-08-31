@@ -16,7 +16,12 @@
 	// Front public installs with a custom domain and Cloudflare Access.
 	"workers_dev": false,
 	"vars": {
-		"MAIL_FROM_ADDRESS": "noreply@mail.example.com"
+		"MAIL_FROM_ADDRESS": "noreply@mail.example.com",
+		// Mailbox Durable Objects are pinned to Cloudflare's EU jurisdiction.
+		// Declared rather than assumed because workerd does not implement
+		// jurisdictions, so `.dev.vars` overrides this to "none" locally and the
+		// guarantee only exists in a deployed Worker. See src/lib/mailbox-stub.ts.
+		"MAILBOX_JURISDICTION": "eu"
 	},
 	"triggers": {
 		"crons": ["0 * * * *"]
@@ -143,7 +148,8 @@
 			// TELEGRAM_ALLOWED_USER_IDS survives as an emergency bootstrap and is
 			// deliberately not set here.
 			"vars": {
-				"MAIL_FROM_ADDRESS": "noreply@send.imsanti.dev"
+				"MAIL_FROM_ADDRESS": "noreply@send.imsanti.dev",
+				"MAILBOX_JURISDICTION": "eu"
 			},
 			"triggers": {
 				"crons": ["0 * * * *"]
@@ -234,13 +240,17 @@
 			"d1_databases": [
 				{
 					"binding": "INDEX_DB",
-					"database_name": "inbox-mcp-index-dev",
+					// Created with `--jurisdiction eu`, which is a property of the
+					// database rather than of this binding, so there is nothing here to
+					// declare and nothing to keep in sync. It is named `-eu` precisely
+					// because that fact is otherwise invisible from the config.
+					"database_name": "inbox-mcp-index-dev-eu",
 					// Forkers: create your own dev D1 (`wrangler d1 create <name>
 					// --update-config --binding INDEX_DB --env dev`) and this id gets
 					// filled in for you. The all-zero UUID is a valid-format placeholder
 					// (kept parseable because local `vitest` uses `environment: "dev"`);
 					// remote dev deploys still need a real id.
-					"database_id": "ca3b5109-17bf-4a6e-9943-9892c4e04dbc",
+					"database_id": "ac9f17a6-3159-4fd5-8f81-cd839d6aa043",
 					"migrations_dir": "migrations/d1"
 				}
 			],

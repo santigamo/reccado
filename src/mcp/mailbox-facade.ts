@@ -1,6 +1,7 @@
 import type { AuthContext } from "../api/auth";
 import { getMailboxForOwner } from "../db/d1";
 import type { McpDraftResult, McpMessageDto, McpSearchResult, McpThread } from "./types";
+import { mailboxStub } from "../lib/mailbox-stub";
 
 const MCP_MAX_BODY_CHARS = 10_000;
 
@@ -75,7 +76,7 @@ export class McpMailboxFacade {
 		if (!mailbox) {
 			throw new Error("not_found");
 		}
-		return this.env.MAILBOX_DO.getByName(mailboxId);
+		return mailboxStub(this.env, mailboxId);
 	}
 
 	async listThreads(mailboxId: string, limit: number, state?: string): Promise<McpThread[]> {
