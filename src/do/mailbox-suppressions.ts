@@ -155,6 +155,32 @@ export function updateTransactionalRequestDeliveryStatus(
  * Handles a classified Email Sending event: suppresses if needed, records delivery event.
  * Returns the request_id if one was resolved, or null.
  */
+/**
+ * How long a provider-originated suppression lasts.
+ *
+ * A hard bounce and a complaint look alike in the event stream and are not alike
+ * at all. A hard bounce is a fact about a mailbox at a moment in time — the
+ * address did not exist, or the server refused it — and mailboxes get recreated,
+ * domains change hands, and typos get corrected. Ninety days is long enough that
+ * a genuinely dead address is not retried into a reputation problem, and short
+ * enough that an address which came back to life is reachable again without an
+ * operator noticing and intervening.
+ *
+ * A complaint is not a fact about a mailbox, it is a statement of intent by a
+ * person: they marked this mail as spam. Intent does not expire on a schedule, so
+ * a complaint suppression is permanent and only an explicit, owner-authorized
+ * removal lifts it.
+ */
+const HARD_BOUNCE_SUPPRESSION_DAYS = 90;
+
+export function suppressionExpiryFor(
+	reason: "hard_bounce" | "complaint" | "manual" | "provider_rejected",
+	now: Date = new Date(),
+): string | null {
+	if (reason !== "hard_bounce") return null;
+	return new Date(now.getTime() + HARD_BOUNCE_SUPPRESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+}
+
 export function handleDeliveryEvent(
 	sql: SqlStorage,
 	event: EmailSendingEvent,
@@ -173,7 +199,13 @@ export function handleDeliveryEvent(
 
 	// Suppress if hard bounce or complaint
 	if (classification.suppress && classification.suppressReason) {
-		addSuppression(sql, event.to, classification.suppressReason, event.event_id, null);
+		addSuppression(
+			sql,
+			event.to,
+			classification.suppressReason,
+			event.event_id,
+			suppressionExpiryFor(classification.suppressReason),
+		);
 	}
 
 	// Update transactional request delivery status if we have a request_id

@@ -13,6 +13,33 @@ Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox,
 transactional API (Phases 2–4 of the `docs/plans/transactional-api.md` plan) and the MCP
 read/search/draft endpoint.
 
+### Fixed
+
+- **A failed transactional send no longer answers `200`.** `permanent_failure` and `unknown` were
+  returned with HTTP 200 and the failure only in the JSON body, so the obvious integration — throw
+  on non-2xx — reported an undelivered message as sent. Nothing undelivered is 2xx any more:
+  `permanent_failure` → `502`, `unknown` → `504` (distinguishable without parsing the body, because
+  they call for different handling), `accepted` → `202`, and `quota_exceeded` → `429` rather than a
+  `403` that gave the caller no reason to retry. The mapping lives in one tested function,
+  `httpStatusForTransactionalResult`, instead of a conditional at the response site. **Breaking for
+  any existing client**, of which there are none — the transactional API has never been called in
+  production.
+
+- **Transactional variables are no longer retained after the send.** `variables_json` was written to
+  the mailbox Durable Object before the provider call and never removed, so every verification link,
+  password reset and invitation URL a caller passed accumulated indefinitely as live credentials.
+  Terminal states now null the column, as does the stale-request reconciler; `payload_hash` and
+  status remain, so idempotent replay and conflict detection are unaffected. D1 projections never
+  carried the values.
+
+- **Suppressions expire when the reason does.** `addSuppression` always wrote `expires_at` as
+  `null`, so the column existed and was honoured at read time but was never populated — a hard
+  bounce poisoned an address permanently, with an owner-gated removal as the only way back. Hard
+  bounces now expire after 90 days; complaints, manual and provider-rejected entries stay permanent.
+  The distinction is the point: a hard bounce is a fact about a mailbox at a moment in time and
+  mailboxes come back, while a complaint is a statement of intent by a person and intent does not
+  lapse on a schedule.
+
 ### Added
 
 - **Telegram: one forum topic per mailbox, not per email thread.** When the bound chat is a

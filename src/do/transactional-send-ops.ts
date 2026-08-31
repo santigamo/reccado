@@ -320,10 +320,20 @@ export async function handleTransactionalSend(
 		},
 	);
 
-	// 23. Update the request record post-send — store ONLY stable error category, not raw PII
+	// 23. Update the request record post-send — store ONLY stable error category, not raw PII.
+	//
+	// `variables_json` is dropped here, and this is the point of it. Transactional
+	// variables are how action-capable tokens travel: verification links, password
+	// resets, invitation URLs. Keeping them after the send turns this table into an
+	// accumulating pile of live credentials for every recipient the mailbox ever
+	// served. They are needed only between the pre-send insert and the terminal
+	// state — the message was already interpolated before the row was written, and
+	// idempotent replay compares `payload_hash`, never the variables themselves.
+	// The stale-request reconciler nulls them on the same principle for rows whose
+	// send never reported back.
 	const errorCategory = doSendResult.errorCategory ?? null;
 	ctx.sql.exec(
-		"UPDATE transactional_requests SET status = ?, provider_message_id = ?, error_code = ?, updated_at = ? WHERE request_id = ?",
+		"UPDATE transactional_requests SET status = ?, provider_message_id = ?, error_code = ?, variables_json = NULL, updated_at = ? WHERE request_id = ?",
 		doSendResult.status,
 		doSendResult.providerMessageId,
 		errorCategory,
@@ -807,7 +817,7 @@ export function reconcileStaleTransactionalRequests(
 
 	for (const req of staleRequests) {
 		sql.exec(
-			"UPDATE transactional_requests SET status = 'unknown', error_code = 'stale_reconciled', updated_at = ? WHERE request_id = ?",
+			"UPDATE transactional_requests SET status = 'unknown', error_code = 'stale_reconciled', variables_json = NULL, updated_at = ? WHERE request_id = ?",
 			new Date().toISOString(),
 			req.request_id,
 		);

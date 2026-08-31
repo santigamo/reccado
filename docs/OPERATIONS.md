@@ -97,6 +97,14 @@ consulted for authorization, quota, or idempotency.
 - Provider outcomes: `sent`, `permanent_failure` (definitely not delivered), `unknown`
   (ambiguous — never auto-retried), `accepted` (pending), `rejected`, `idempotency_conflict`,
   `duplicate`. Raw provider error messages are never stored.
+- HTTP status carries the outcome without the body: `200` (`sent`/`duplicate`), `202` (`accepted`),
+  `502` (`permanent_failure`), `504` (`unknown`), `409` (`idempotency_conflict`), and `401`/`400`/
+  `429`/`403` for rejections. Nothing undelivered answers 2xx — an integration that throws on
+  non-2xx is correct by default rather than by remembering an exception.
+- `variables_json` is nulled when a request reaches a terminal state (and by the stale reconciler
+  for requests that never reported back). Transactional variables carry action-capable tokens, so
+  the mailbox DO does not retain them past the send; `payload_hash` and status remain for
+  idempotency. D1 projections never received them in the first place.
 - D1 projections (`transactional_api_keys`, `transactional_request_log`) are rebuildable and
   redact the key hash, plaintext, request body, variables, payload hash, and idempotency key.
 - Cloudflare Email Sending lifecycle events are consumed through the
@@ -104,7 +112,13 @@ consulted for authorization, quota, or idempotency.
   suppressed recipients are rejected before quota reservation or provider dispatch. Soft
   bounces and deferred events update delivery state without suppressing. Cloudflare's own
   account suppression list remains upstream authoritative; the DO list is the local
-  application-enforcement mirror and is never automatically unsuppressed.
+  application-enforcement mirror.
+- Suppression lifetime follows the kind of thing the event was. A **hard bounce expires after 90
+  days**: it is a fact about a mailbox at a moment in time, and mailboxes get recreated, domains
+  change hands and typos get corrected, so a permanently poisoned address would be a silent denial
+  of service on a recipient who is reachable again. A **complaint never expires**: it is a
+  statement of intent by a person, and intent does not lapse on a timer — only an explicit,
+  owner-authorized removal lifts it. Manual and provider-rejected entries are likewise permanent.
 - Configure one Email Sending event subscription per sending domain in Cloudflare Dashboard:
   **Queues → `inbox-mcp-email-events` → Subscriptions → Subscribe to events → Email Sending**;
   select the sending domain and `message.delivered`, `message.deferred`, `message.bounced`,

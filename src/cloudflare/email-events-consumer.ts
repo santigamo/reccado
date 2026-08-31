@@ -125,6 +125,9 @@ export async function handleEmailEventsQueue(
 				const reason =
 					event.event_type === "cf.email.sending.message.complained" ? "complaint" : "hard_bounce";
 				const now = new Date().toISOString();
+				// Mirrors the DO's own policy so the projection does not read as permanent
+				// while the authoritative list expires it.
+				const { suppressionExpiryFor } = await import("../do/mailbox-suppressions");
 				await upsertSuppressionProjection(env.INDEX_DB, {
 					email: event.to,
 					mailbox_id: resolved.mailboxId,
@@ -132,7 +135,7 @@ export async function handleEmailEventsQueue(
 					source_event_id: event.event_id,
 					created_at: now,
 					updated_at: now,
-					expires_at: null,
+					expires_at: suppressionExpiryFor(reason),
 				});
 			}
 

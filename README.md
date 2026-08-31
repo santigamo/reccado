@@ -464,10 +464,19 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
 - Outcomes: `sent`, `permanent_failure`, `unknown` (ambiguous, never auto-retried — review
   manually), `accepted`, `rejected`, `duplicate`, `idempotency_conflict`. Provider error messages
   are never stored.
+- **Only a delivered message answers 2xx.** `sent`/`duplicate` → `200`, `accepted` → `202`;
+  `permanent_failure` → `502` and `unknown` → `504`, so a client that throws on non-2xx cannot
+  mistake an undelivered message for a sent one, and can tell a definite failure from an unresolved
+  one without parsing the body. Rejections are `401` (missing auth), `400` (missing
+  `Idempotency-Key`), `429` (quota) or `403`; an idempotency conflict is `409`.
+- **Template variables are dropped once a send reaches a terminal state.** They routinely carry
+  action-capable tokens (verification links, password resets, invitations); the request row keeps
+  its payload hash and status for idempotency, not the values.
 - **Test keys never send real mail** — the production send path rejects them until a simulated/test
   sink exists.
 - Cloudflare Email Sending events are consumed through a Queue; hard bounces and complaints
-  create mailbox-local suppressions that block future transactional sends. Configure the
+  create mailbox-local suppressions that block future transactional sends (hard bounces expire
+  after 90 days, complaints never — intent does not lapse on a timer). Configure the
   per-domain Email Sending event subscription in Cloudflare Dashboard; test keys still have no
   simulated delivery sink and are rejected for sending.
 - Stale transactional requests are reconciled hourly to `unknown` and never retried automatically.

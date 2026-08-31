@@ -6,6 +6,8 @@ import {
 	transactionalPayloadHash,
 	validateTemplateVariables,
 	extractTemplateVariables,
+	httpStatusForTransactionalResult,
+	transactionalResponseStatuses,
 } from "#/lib/transactional-send";
 
 describe("transactionalRequestSchema", () => {
@@ -357,5 +359,56 @@ describe("transactionalPayloadHash", () => {
 			variables: {},
 		});
 		expect(hash1).toBe(hash2);
+	});
+});
+
+describe("httpStatusForTransactionalResult", () => {
+	it("returns 2xx only when the message was accepted by the provider", () => {
+		expect(httpStatusForTransactionalResult({ status: "sent" })).toBe(200);
+		expect(httpStatusForTransactionalResult({ status: "duplicate" })).toBe(200);
+		expect(httpStatusForTransactionalResult({ status: "accepted" })).toBe(202);
+	});
+
+	// The regression this file exists for: these two used to return 200, so the
+	// obvious client (throw on non-2xx) reported an undelivered message as sent.
+	it("never returns 2xx for a failed or unresolved send", () => {
+		expect(httpStatusForTransactionalResult({ status: "permanent_failure" })).toBe(502);
+		expect(httpStatusForTransactionalResult({ status: "unknown" })).toBe(504);
+	});
+
+	it("distinguishes a definite failure from an unknown outcome by status alone", () => {
+		expect(httpStatusForTransactionalResult({ status: "permanent_failure" })).not.toBe(
+			httpStatusForTransactionalResult({ status: "unknown" }),
+		);
+	});
+
+	it("maps rejections to the reason the caller can act on", () => {
+		expect(
+			httpStatusForTransactionalResult({ status: "rejected", error: "missing_authorization" }),
+		).toBe(401);
+		expect(
+			httpStatusForTransactionalResult({ status: "rejected", error: "idempotency_key_required" }),
+		).toBe(400);
+		expect(httpStatusForTransactionalResult({ status: "rejected", error: "quota_exceeded" })).toBe(
+			429,
+		);
+		expect(
+			httpStatusForTransactionalResult({ status: "rejected", error: "insufficient_scope" }),
+		).toBe(403);
+		expect(httpStatusForTransactionalResult({ status: "rejected" })).toBe(403);
+	});
+
+	it("returns 409 for an idempotency conflict", () => {
+		expect(httpStatusForTransactionalResult({ status: "idempotency_conflict" })).toBe(409);
+	});
+
+	// Guards the switch: a new response status must be given a code deliberately
+	// rather than falling through to whatever the last branch happened to be.
+	it("assigns a status code to every declared response status", () => {
+		for (const status of transactionalResponseStatuses) {
+			const code = httpStatusForTransactionalResult({ status });
+			expect(typeof code).toBe("number");
+			expect(code).toBeGreaterThanOrEqual(200);
+		}
 	});
 });

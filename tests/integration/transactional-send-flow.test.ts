@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeAll } from "vitest";
 import { env as testEnv } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import type { TransactionalApiKeyRecord } from "#/lib/transactional-keys";
 import { upsertTransactionalRequestLog, listTransactionalRequestLogs } from "#/db/d1";
 import { splitSqlStatements } from "../helpers/migrations";
@@ -302,7 +303,9 @@ describe("Transactional send flow", () => {
 				template: "t",
 				to: "a@b.com",
 			});
-			expect(result.status).toBe(403);
+			// 429, not 403: a quota is a cue to back off and retry later, which is a
+			// different instruction to the caller than "this key may never do this".
+			expect(result.status).toBe(429);
 			expect(result.json.error).toBe("quota_exceeded");
 		});
 
@@ -619,6 +622,111 @@ describe("Transactional send flow", () => {
 				}),
 			});
 			expect(response.status).toBe(404);
+		});
+	});
+
+	describe("Variable retention", () => {
+		// Transactional variables carry action-capable tokens — verification links,
+		// password resets, invitation URLs. Keeping them after the send would make
+		// this table an accumulating store of live credentials, so a terminal state
+		// must drop them while leaving the idempotency record intact.
+		it("drops the variables once the send reaches a terminal state", async () => {
+			const mailboxId = "mbx_variable_retention";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["verify"],
+				scopes: ["transactional:send", "transactional:templates:use"],
+			});
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			const createResponse = await stub.fetch("https://mailbox-do/transactional/templates", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					id: "verify",
+					subject: "Verify your email",
+					body_text: "Verify here: {{url}}",
+				}),
+			});
+			expect(createResponse.status).toBe(201);
+
+			const secretUrl = "https://app.example.com/verify?token=super-secret-token-value";
+			const sent = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "retention-1", {
+				template: "verify",
+				to: "user@example.com",
+				variables: { url: secretUrl },
+			});
+			expect(sent.status).toBe(200);
+			expect(sent.json.status).toBe("sent");
+
+			const row = await runInDurableObject(stub, (_instance, state) => {
+				return state.storage.sql
+					.exec(
+						"SELECT variables_json, payload_hash, status FROM transactional_requests WHERE request_id = ?",
+						sent.json.requestId as string,
+					)
+					.toArray()[0] as
+					| { variables_json: string | null; payload_hash: string; status: string }
+					| undefined;
+			});
+
+			expect(row).toBeDefined();
+			expect(row?.status).toBe("sent");
+			// The idempotency record survives; only the token does not.
+			expect(row?.payload_hash).toBeTruthy();
+			expect(row?.variables_json).toBeNull();
+
+			const allRows = await runInDurableObject(stub, (_instance, state) => {
+				return state.storage.sql
+					.exec(
+						"SELECT COUNT(*) AS n FROM transactional_requests WHERE variables_json LIKE '%super-secret-token-value%'",
+					)
+					.toArray()[0] as { n: number };
+			});
+			expect(allRows.n).toBe(0);
+		});
+
+		it("replays an identical request after the variables are dropped", async () => {
+			const mailboxId = "mbx_variable_retention_replay";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["verify"],
+				scopes: ["transactional:send", "transactional:templates:use"],
+			});
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			await stub.fetch("https://mailbox-do/transactional/templates", {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ id: "verify", subject: "Verify", body_text: "Go: {{url}}" }),
+			});
+			const payload = {
+				template: "verify",
+				to: "user@example.com",
+				variables: { url: "https://app.example.com/verify?token=abc" },
+			};
+			const first = await sendTransactional(
+				mailboxId,
+				`Bearer ${plaintextKey}`,
+				"retention-replay-1",
+				payload,
+			);
+			expect(first.status).toBe(200);
+
+			// Idempotency compares payload_hash, not the stored variables, so a replay
+			// still resolves to the original result rather than sending twice.
+			const replay = await sendTransactional(
+				mailboxId,
+				`Bearer ${plaintextKey}`,
+				"retention-replay-1",
+				payload,
+			);
+			expect(replay.status).toBe(200);
+			expect(replay.json.requestId).toBe(first.json.requestId);
+
+			const conflict = await sendTransactional(
+				mailboxId,
+				`Bearer ${plaintextKey}`,
+				"retention-replay-1",
+				{ ...payload, to: "someone-else@example.com" },
+			);
+			expect(conflict.status).toBe(409);
 		});
 	});
 });

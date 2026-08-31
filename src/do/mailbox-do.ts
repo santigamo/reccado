@@ -12,6 +12,7 @@ import {
 	type SenderIdentity,
 } from "../lib/sender-identity";
 import { AmbiguousSendError } from "../lib/errors";
+import { httpStatusForTransactionalResult } from "../lib/transactional-send";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
 import {
 	createRealtimeBroadcaster,
@@ -1194,18 +1195,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				}
 			}
 
-			const status =
-				result.status === "rejected"
-					? result.error === "missing_authorization"
-						? 401
-						: result.error === "idempotency_key_required"
-							? 400
-							: 403
-					: result.status === "idempotency_conflict"
-						? 409
-						: 200;
-
-			return Response.json(result, { status });
+			return Response.json(result, { status: httpStatusForTransactionalResult(result) });
 		}
 
 		// --- Transactional reconcile-stale route (admin-only, never public API-key) ---

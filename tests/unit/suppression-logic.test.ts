@@ -6,6 +6,7 @@ import {
 	safeEventMetadata,
 	type EmailSendingEvent,
 } from "#/cloudflare/email-events";
+import { suppressionExpiryFor } from "#/do/mailbox-suppressions";
 
 // ---------------------------------------------------------------------------
 // DO route / suppression integration tests
@@ -243,5 +244,31 @@ describe("DO delivery event pipeline (normalize → classify → safe)", () => {
 		expect(meta).not.toHaveProperty("reason");
 		expect(meta).not.toHaveProperty("smtp_response");
 		expect(meta).not.toHaveProperty("subject");
+	});
+});
+
+describe("suppressionExpiryFor", () => {
+	const now = new Date("2026-01-15T10:00:00.000Z");
+
+	it("expires a hard bounce after 90 days", () => {
+		expect(suppressionExpiryFor("hard_bounce", now)).toBe("2026-04-15T10:00:00.000Z");
+	});
+
+	// A complaint is a statement of intent by a person, not a fact about a mailbox.
+	// Intent does not lapse on a timer, so only an explicit owner-authorized removal
+	// lifts it.
+	it("never expires a complaint", () => {
+		expect(suppressionExpiryFor("complaint", now)).toBeNull();
+	});
+
+	it("never expires a manual or provider-rejected suppression", () => {
+		expect(suppressionExpiryFor("manual", now)).toBeNull();
+		expect(suppressionExpiryFor("provider_rejected", now)).toBeNull();
+	});
+
+	it("returns an expiry in the future for a hard bounce", () => {
+		const expiry = suppressionExpiryFor("hard_bounce");
+		expect(expiry).not.toBeNull();
+		expect(new Date(expiry as string).getTime()).toBeGreaterThan(Date.now());
 	});
 });

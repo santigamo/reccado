@@ -41,6 +41,62 @@ export type TransactionalSendResult = {
 	error?: string;
 };
 
+/**
+ * The HTTP status a transactional result is returned with.
+ *
+ * The rule this encodes: **a caller that only checks `response.ok` must never
+ * conclude that a message was delivered when it was not.** The previous mapping
+ * returned 200 for `permanent_failure` and `unknown`, so the default integration
+ * anyone writes — throw on non-2xx — reported a hard provider failure as a
+ * success. A contract that requires every consumer to remember an exception is a
+ * contract that gets got wrong, so the exception is removed rather than
+ * documented.
+ *
+ * Only two outcomes are 2xx:
+ *  - `sent`/`duplicate` -> 200, the provider accepted it (a duplicate replays the
+ *    original result, which for a failed original is not a duplicate at all — see
+ *    the failure branch below).
+ *  - `accepted` -> 202, in flight and not yet resolved.
+ *
+ * The two failure outcomes are deliberately distinguishable without reading the
+ * body, because they call for different handling:
+ *  - `permanent_failure` -> 502. The provider definitively refused. Not delivered.
+ *  - `unknown` -> 504. The outcome is genuinely unknown and must never be
+ *    auto-retried with a *new* idempotency key. Retrying with the *same* key is
+ *    safe and replays this same result rather than sending again.
+ */
+export function httpStatusForTransactionalResult(result: {
+	status: TransactionalResponseStatus;
+	error?: string;
+}): number {
+	switch (result.status) {
+		case "sent":
+		case "duplicate":
+			return 200;
+		case "accepted":
+			return 202;
+		case "idempotency_conflict":
+			return 409;
+		case "permanent_failure":
+			return 502;
+		case "unknown":
+			return 504;
+		case "rejected":
+			switch (result.error) {
+				case "missing_authorization":
+					return 401;
+				case "idempotency_key_required":
+					return 400;
+				// Rate limits and quotas are the caller's cue to back off, which 403
+				// does not communicate and 429 does.
+				case "quota_exceeded":
+					return 429;
+				default:
+					return 403;
+			}
+	}
+}
+
 const VARIABLE_RE = /\{\{(\w+)\}\}/g;
 
 /**
