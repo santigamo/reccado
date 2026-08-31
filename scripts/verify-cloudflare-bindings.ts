@@ -99,10 +99,10 @@ const defaultConfigByEnv: Record<
 > = {
 	dev: {
 		worker: "reccado-dev",
-		r2: "inbox-mcp-raw-dev",
+		r2: "inbox-mcp-raw-dev-eu",
 		queue: "inbox-mcp-inbound-dev",
 		dlq: "inbox-mcp-inbound-dlq-dev",
-		d1: "inbox-mcp-index-dev",
+		d1: "inbox-mcp-index-dev-eu",
 		// Placeholder — pass your real dev D1 id via CF_VERIFY_D1_ID (or --d1-id).
 		d1Id: "00000000-0000-0000-0000-000000000000",
 		emailSendingDomain: "mail.example.com",
