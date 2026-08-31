@@ -146,10 +146,10 @@ actual repo state, fix this section rather than trusting it blindly.
 - Account: `<your-cloudflare-account-id>`.
 - Dev Worker: `reccado-dev`.
 - Dev URL: `https://reccado-dev.<your-subdomain>.workers.dev`.
-- R2 bucket: `inbox-mcp-raw-dev`.
+- R2 bucket: `inbox-mcp-raw-dev-eu` (created with `--jurisdiction eu`).
 - Queue: `inbox-mcp-inbound-dev`.
 - DLQ: `inbox-mcp-inbound-dlq-dev`.
-- D1 database: `inbox-mcp-index-dev`, id `<your-d1-database-id>`.
+- D1 database: `inbox-mcp-index-dev-eu` (created with `--jurisdiction eu`), id `<your-d1-database-id>`.
 - Email Routing rule: `test@example.com -> reccado-dev`.
 - Dev test mailbox: `test@example.com` resolves to the fixed dev-fixture id
   `DEV_TEST_MAILBOX_ID` (`src/db/seed-dev.ts`, seeded by `pnpm seed:dev-id`), so the dev server,

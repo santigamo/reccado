@@ -46,17 +46,45 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 | Binding | Type | Resource (maintainer dev example) | Purpose |
 | --- | --- | --- | --- |
 | `MAILBOX_DO` | Durable Object, class `MailboxDurableObject`, SQLite storage | n/a (per-mailbox instances) | Canonical mailbox state: messages, threads, FTS, drafts, outbox, idempotency, realtime sessions. |
-| `MAIL_OBJECTS` | R2 bucket | `inbox-mcp-raw-dev` | Raw inbound MIME, parsed HTML bodies, attachments, backup manifests. |
+| `MAIL_OBJECTS` | R2 bucket | `inbox-mcp-raw-dev-eu` (jurisdiction `eu`) | Raw inbound MIME, parsed HTML bodies, attachments, backup manifests. |
 | `INBOUND_EMAIL_QUEUE` | Queue producer + consumer | `inbox-mcp-inbound-dev` (DLQ: `inbox-mcp-inbound-dlq-dev`) | Metadata-only inbound transport; `max_batch_size: 5`, `max_batch_timeout: 2`, `max_retries: 3`. |
 | `EMAIL_EVENTS_QUEUE` | Queue producer + consumer | `inbox-mcp-email-events-dev` (DLQ: `inbox-mcp-email-events-dlq-dev`) | Cloudflare Email Sending lifecycle events (delivered/deferred/bounced/complained); `max_batch_size: 10`, `max_batch_timeout: 2`, `max_retries: 3`. |
 | `NOTIFY_QUEUE` | Queue producer + consumer | `inbox-mcp-notify-dev` (DLQ: `inbox-mcp-notify-dlq-dev`) | Telegram push cards, off the ingest ack path so a Telegram outage never blocks or retries ingest; `max_batch_size: 5`, `max_batch_timeout: 1`, `max_retries: 5`. |
-| `INDEX_DB` | D1 database | `inbox-mcp-index-dev` | Cross-mailbox/control-plane index (see data model below). |
+| `INDEX_DB` | D1 database | `inbox-mcp-index-dev-eu` (jurisdiction `eu`) | Cross-mailbox/control-plane index (see data model below). |
 | `EMAIL` | Email Sending (`send_email`) | n/a | Outbound `env.EMAIL.send()`, only after `confirm-send` (UI/Telegram/MCP) or a validated transactional API-key send. |
 | `triggers.crons` | Cron Trigger | `0 * * * *` (hourly, maintainer dev) | Backup sweep + stale `outbound_sends` and transactional-request reconciliation + expired Telegram action sweep + Telegram webhook reconciliation (re-registers the webhook when Telegram's registered URL has drifted from this deployment's origin). |
 
 Replace maintainer example names with your own. The verifier and migration commands are now
 parameterized; self-hosters should pass their resource names by env vars/CLI args rather than
 editing the repository.
+
+## Data residency
+
+Message content at rest is confined to the EU. Three stores hold it and all three are pinned:
+
+| Store | How it is pinned | Verifiable locally? |
+| --- | --- | --- |
+| Mailbox Durable Objects | `jurisdiction("eu")` on every resolution, via `mailboxStub()` | **No** |
+| `INDEX_DB` (D1) | Database created with `--jurisdiction eu`; fixed at creation | Yes (`wrangler d1 list` shows the jurisdiction) |
+| `MAIL_OBJECTS` (R2) | Bucket created with `--jurisdiction eu`; declared on the binding | Yes |
+
+Two things an operator should know rather than discover.
+
+**The Durable Object guarantee cannot be tested outside a deployed Worker.** `jurisdiction()` is not
+implemented in workerd, so it throws in `pnpm dev` and in `vitest`. That is why the jurisdiction is
+a declared variable rather than a constant: `MAILBOX_JURISDICTION` is `eu` in `wrangler.jsonc` for
+deployed environments and `none` in `.dev.vars` locally. Any other value, **including unset**,
+throws rather than falling back — a missing declaration is a loud failure on the first request
+instead of a quiet one that serves unpinned data indefinitely. `tests/unit/mailbox-stub.test.ts`
+asserts the committed config still declares `eu` for every deployable environment, because with
+this contract a dropped variable is a total outage.
+
+**Jurisdiction changes Durable Object id derivation.** Code that calls `MAILBOX_DO.getByName()`
+directly resolves to a *different, empty* Durable Object — it does not throw and it does not warn,
+it presents as a mailbox that lost its mail. Every resolution therefore goes through
+`mailboxStub()` in `src/lib/mailbox-stub.ts`, and the same test fails if a raw `getByName`, `get()`
+or `idFromName()` reappears anywhere under `src/`. If you are moving a mailbox between
+jurisdictions, note that the old Durable Object is not deleted, only unreferenced.
 
 ## Transactional API (current state)
 

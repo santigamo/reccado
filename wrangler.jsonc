@@ -42,7 +42,13 @@
 	"r2_buckets": [
 		{
 			"binding": "MAIL_OBJECTS",
-			"bucket_name": "inbox-mcp-raw"
+			"bucket_name": "inbox-mcp-raw",
+			// Raw MIME is the actual message content at rest — more so than D1,
+			// which only holds snippets — so the residency story is incomplete
+			// without it. A fork that does not want EU residency changes this and
+			// MAILBOX_JURISDICTION together; changing one alone leaves a half
+			// guarantee, which is worse than none because it reads as done.
+			"jurisdiction": "eu"
 		}
 	],
 	"queues": {
@@ -170,7 +176,8 @@
 			"r2_buckets": [
 				{
 					"binding": "MAIL_OBJECTS",
-					"bucket_name": "inbox-mcp-raw-dev"
+					"bucket_name": "inbox-mcp-raw-dev-eu",
+					"jurisdiction": "eu"
 				}
 			],
 			"queues": {
