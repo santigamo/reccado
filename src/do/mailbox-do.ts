@@ -26,7 +26,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 4;
+const MAILBOX_SCHEMA_VERSION = 5;
 
 // Minimal runtime validation for the /ingest payload. Defined locally (rather than
 // imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
@@ -861,6 +861,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 4) {
 			this.migrateDraftParentMessage();
 		}
+		// v5: add resolved_via to transactional_requests so a status reached by
+		// correlating a delivery event stays distinguishable from one the provider
+		// acknowledged directly. The supporting indexes are created by
+		// MAILBOX_SCHEMA_SQL's CREATE INDEX IF NOT EXISTS.
+		if (currentVersion < 5) {
+			this.migrateResolvedViaColumn();
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -897,6 +904,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		const columns = this.columnNames("outbound_drafts");
 		if (!columns.has("parent_message_id")) {
 			this.ctx.storage.sql.exec("ALTER TABLE outbound_drafts ADD COLUMN parent_message_id TEXT");
+		}
+	}
+
+	private migrateResolvedViaColumn(): void {
+		const columns = this.columnNames("transactional_requests");
+		if (!columns.has("resolved_via")) {
+			this.ctx.storage.sql.exec("ALTER TABLE transactional_requests ADD COLUMN resolved_via TEXT");
 		}
 	}
 
@@ -1180,10 +1194,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
 						error_code: string | null;
 						delivery_status: string | null;
 						delivery_event_at: string | null;
+						resolved_via: string | null;
 						created_at: string;
 						updated_at: string;
 					}>(
-						"SELECT request_id, key_id, status, to_addr, template_id, sender, provider_message_id, error_code, delivery_status, delivery_event_at, created_at, updated_at FROM transactional_requests WHERE request_id = ?",
+						// resolved_via is selected because this block also runs on an
+						// idempotent replay: a request already settled from a delivery event
+						// must not have that provenance erased by re-projecting the row.
+						"SELECT request_id, key_id, status, to_addr, template_id, sender, provider_message_id, error_code, delivery_status, delivery_event_at, resolved_via, created_at, updated_at FROM transactional_requests WHERE request_id = ?",
 						result.requestId,
 					)
 					.toArray()[0];
@@ -1820,8 +1838,15 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	 * 2. Checks eventId idempotency — if already recorded, returns 200 (already processed).
 	 * 3. Finds the canonical DO request by provider_message_id.
 	 * 4. Validates sender and recipient match exactly.
-	 * 5. If no match found via provider_message_id, falls back to requestId lookup.
+	 * 5. If no match found via provider_message_id, correlates on the envelope
+	 *    against this DO's own rows (see `correlateEventToUnknownRequest`).
 	 * 6. Unmatched events return 404 (triggers queue retry/DLQ).
+	 *
+	 * The queue consumer may pass a `requestId` it resolved from D1. That is a
+	 * routing hint and nothing more: for the envelope path the DO recomputes the
+	 * candidate from its own storage and refuses if the hint disagrees, because a
+	 * rebuildable projection must never be what decides which request an event
+	 * gets attributed to.
 	 */
 	private async handleDeliveryEvent(request: Request): Promise<Response> {
 		let json: unknown;
@@ -1837,20 +1862,32 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		const { classifyEmailEvent, emailSendingEventSchema } = await import(
 			"../cloudflare/email-events"
 		);
-		const { handleDeliveryEvent: processDeliveryEvent } = await import("./mailbox-suppressions");
+		const { handleDeliveryEvent: processDeliveryEvent, correlateEventToUnknownRequest } =
+			await import("./mailbox-suppressions");
 		const parsed = emailSendingEventSchema.safeParse(body.event);
 		if (!parsed.success) {
 			return Response.json({ error: "invalid_event_schema" }, { status: 400 });
 		}
 		const event = parsed.data;
 		const requestId = typeof body.requestId === "string" ? body.requestId : null;
-		const processEvent = (resolvedRequestId: string): Response => {
+		const processEvent = (resolvedRequestId: string, correlation: "provider_id" | "envelope") => {
 			const classification = classifyEmailEvent(event);
-			processDeliveryEvent(this.ctx.storage.sql, event, classification, resolvedRequestId);
+			const { resolvedStatus } = processDeliveryEvent(
+				this.ctx.storage.sql,
+				event,
+				classification,
+				resolvedRequestId,
+			);
 			return Response.json({
 				ok: true,
 				deliveryStatus: classification.deliveryStatus,
 				suppressed: classification.suppress,
+				requestId: resolvedRequestId,
+				correlation,
+				// Present only when this event settled a previously ambiguous send;
+				// the consumer mirrors it into the D1 projection.
+				resolvedStatus: resolvedStatus ?? undefined,
+				providerMessageId: event.provider_message_id,
 			});
 		};
 
@@ -1879,28 +1916,23 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			.toArray()[0];
 
 		if (!requestRow) {
-			// If we have a requestId from D1, try that too
-			if (requestId) {
-				const rowByRequestId = this.ctx.storage.sql
-					.exec<{
-						request_id: string;
-						to_addr: string;
-						sender: string;
-					}>(
-						"SELECT request_id, to_addr, sender FROM transactional_requests WHERE request_id = ?",
-						requestId,
-					)
-					.toArray()[0];
-				if (
-					rowByRequestId &&
-					rowByRequestId.sender.toLowerCase() === event.from.toLowerCase() &&
-					rowByRequestId.to_addr.toLowerCase() === event.to.toLowerCase()
-				) {
-					return processEvent(rowByRequestId.request_id);
-				}
+			// The provider id is unrecognised, which is the signature of an event for
+			// a send that threw before it could tell us its id. Fall back to the
+			// envelope, adjudicated here against this DO's own rows.
+			const correlation = correlateEventToUnknownRequest(this.ctx.storage.sql, event);
+			if (correlation.outcome === "ambiguous") {
+				return Response.json({ error: "correlation_ambiguous" }, { status: 409 });
 			}
-			// Unknown event — return 404 (triggers queue retry/DLQ)
-			return Response.json({ error: "request_not_found" }, { status: 404 });
+			if (correlation.outcome === "no_candidate") {
+				// Unknown event — return 404 (triggers queue retry/DLQ)
+				return Response.json({ error: "request_not_found" }, { status: 404 });
+			}
+			// A hint that names a different request than our own storage does means
+			// the projection is stale or wrong. Refuse instead of siding with it.
+			if (requestId && requestId !== correlation.requestId) {
+				return Response.json({ error: "correlation_hint_mismatch" }, { status: 409 });
+			}
+			return processEvent(correlation.requestId, "envelope");
 		}
 
 		// Validate sender and recipient match
@@ -1911,6 +1943,6 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			return Response.json({ error: "recipient_mismatch" }, { status: 404 });
 		}
 
-		return processEvent(requestRow.request_id);
+		return processEvent(requestRow.request_id, "provider_id");
 	}
 }

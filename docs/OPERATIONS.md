@@ -134,6 +134,30 @@ consulted for authorization, quota, or idempotency.
 - Provider outcomes: `sent`, `permanent_failure` (definitely not delivered), `unknown`
   (ambiguous — never auto-retried), `accepted` (pending), `rejected`, `idempotency_conflict`,
   `duplicate`. Raw provider error messages are never stored.
+- An `unknown` is no longer a dead end. Cloudflare mints the message id itself and rejects a
+  sender-supplied `Message-ID` header, so a send that throws never learns the id of a message
+  that may well have gone out, and its lifecycle events arrive unattributable. When an event's
+  `provider_message_id` matches nothing, the mailbox DO looks for the **one** request that is
+  `unknown`, has no provider id, matches the event's sender and recipient, and was created
+  within seven days before the event. Exactly one candidate resolves it; zero or more than one
+  refuses and the event rides its retries out to the DLQ for a human. The candidate set is small
+  by construction — every send that returned normally recorded its id and resolves on the primary
+  path — so this is narrower than it first sounds, but it is inference, not a provider
+  acknowledgement, and the row records which it was.
+- What a terminal event proves: `delivered`, `bounced` and `complained` all require that the
+  message was transmitted, so they settle an `unknown` to `sent` and let `delivery_status` carry
+  the bad news separately; `rejected` and `failed` mean the provider never handed it on, so they
+  settle it to `permanent_failure`. A `deferred` event settles nothing but does claim the
+  provider id, so the eventual terminal event needs no correlation at all. A resolved request
+  carries `resolvedVia: "envelope_correlation"` on its status response and in the D1 projection —
+  treat an inferred `sent` as weaker evidence than one the provider acknowledged at send time.
+- **Resolving is not retrying.** Nothing in this path sends anything; it reads an event
+  describing what already happened. The rule that an `unknown` is never automatically re-sent is
+  unchanged. A replay with the original `Idempotency-Key` now returns the resolved outcome
+  instead of the stored `unknown`, and still does not contact the provider.
+- D1 routes these events to a mailbox but never decides them: the DO repeats the candidate search
+  against its own rows and answers `409` if the projection named a different request or if it
+  sees a tie the projection did not.
 - HTTP status carries the outcome without the body: `200` (`sent`/`duplicate`), `202` (`accepted`),
   `502` (`permanent_failure`), `504` (`unknown`), `409` (`idempotency_conflict`), and `401`/`400`/
   `429`/`403` for rejections. Nothing undelivered answers 2xx — an integration that throws on
@@ -362,8 +386,10 @@ all related R2 prefixes.
 | Durable Object parse failure | MIME parser error on malformed/unusual message | Message row remains with `parse_status='failed'` and the raw R2 key preserved. Review the failure in `ops_events`. |
 | Outbound send failure | Provider rejection, size/recipient-limit violation, or crash mid-send | Inspect `outbound_sends.status`, `error_code`, and provider response context. Retry only after deciding whether the same idempotency key still represents the same logical send. |
 | `outbound_sends` row stuck at `status='sending'` | Crash/interruption mid-send | The hourly cron sweep marks stale sends `unknown` with `error_code='stale_sending_timeout_needs_review'` and an `outbound_send.stale_reconciled` ops event. Treat that as manual-review-required, not proof the message did or did not send. |
-| Transactional request stuck at `pending` | Crash mid-send in the transactional path | `reconcileStaleTransactionalRequests` exists in the DO (marks rows `unknown` / `stale_reconciled`) but is not yet wired to cron or an endpoint. Until then, resolve manually after reviewing `transactional_request_log` / DO state and the provider console. |
-| Transactional send returns `unknown` | Provider outcome is ambiguous (may have accepted before erroring) | Not auto-retried by design. Treat as manual-review-required; never re-send blindly with the same idempotency key. |
+| Transactional request stuck at `pending` | Crash mid-send in the transactional path | The hourly cron and the Access-protected `POST /api/mailboxes/:mailboxId/transactional/reconcile-stale` both run `reconcileStaleTransactionalRequests`, marking rows `unknown` / `stale_reconciled`. Those rows are then eligible for delivery-event correlation like any other `unknown`. |
+| Transactional send returns `unknown` | Provider outcome is ambiguous (may have accepted before erroring) | Never auto-retried. Wait before acting: if the message did leave, the delivery event resolves the row on its own and a replay with the original idempotency key returns the real outcome. Only rows that stay `unknown` — no event ever arrived, so most likely nothing was sent — need a human. |
+| `email_events.correlation_ambiguous` or `email_events.correlation_rejected` ops event | Two ambiguous sends to the same recipient from the same sender inside the same window, or a stale D1 projection disagreeing with the DO | Deliberate refusal to guess. The event goes to the DLQ; decide by hand which request it belonged to using the DO rows and the provider console. Both requests stay `unknown` until then. |
+| `transactional.unknown_resolved` ops event | An ambiguous send was settled from an observed delivery event | Informational. Check `resolvedVia` on the request: `envelope_correlation` means inferred, not provider-acknowledged. |
 | Access misconfiguration | Route exposed without proper Access enforcement | Treat as a security incident. Block public access first, then fix Access and re-verify with an unauthenticated request. |
 | Telegram bot token set but no cards ever arrive | The bridge is configured but not yet delivering: no chat adopted (nobody sent `/start` from an allowlisted account) and/or the worker has not observed its public origin yet, so the hourly `reconcileTelegramWebhook` skips registration | `GET /api/health` → `dependencies.telegram` reports `mode: "partial"` and `missing` names exactly which of the two it is waiting for. Load the authenticated UI once on the real hostname (the origin is only recorded from a request that cleared Access), send `/start` from an allowlisted account, then let the next hourly cron register the webhook. |
 | Telegram webhook receives nothing | Cloudflare Access is intercepting `/telegram/webhook` | Telegram cannot present an Access JWT, so updates are redirected to the login page. Add an Access **Bypass** policy for that path only. Confirm with `getWebhookInfo` — `last_error_message` shows what Telegram received. |

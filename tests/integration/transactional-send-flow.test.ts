@@ -20,7 +20,16 @@ async function applyD1Migrations(db: D1Database): Promise<void> {
 	const m6 = await import("../../migrations/d1/0006_transactional_api_keys.sql?raw");
 	const m7 = await import("../../migrations/d1/0007_transactional_requests.sql?raw");
 	const m8 = await import("../../migrations/d1/0008_email_events_suppressions.sql?raw");
-	for (const raw of [m1.default, m2.default, m3.default, m6.default, m7.default, m8.default]) {
+	const m15 = await import("../../migrations/d1/0015_transactional_resolved_via.sql?raw");
+	for (const raw of [
+		m1.default,
+		m2.default,
+		m3.default,
+		m6.default,
+		m7.default,
+		m8.default,
+		m15.default,
+	]) {
 		const statements = splitSqlStatements(raw as string);
 		for (const statement of statements) {
 			await db.prepare(statement).run();
@@ -96,6 +105,62 @@ async function sendTransactional(
 	});
 	const json = (await response.json()) as Record<string, unknown>;
 	return { status: response.status, json };
+}
+
+/**
+ * Drives a send whose provider call throws ambiguously — the only way to produce
+ * an `unknown`, and unreachable through the HTTP route because the real EMAIL
+ * binding will not fail on demand. Everything else (auth, quota, idempotency,
+ * the pre-send row, the at-most-once marker) is the production path.
+ */
+async function sendAmbiguous(
+	mailboxId: string,
+	plaintextKey: string,
+	idempotencyKey: string,
+	body: unknown,
+	options: { error?: Error } = {},
+): Promise<{ result: Record<string, unknown>; sendAttempts: number }> {
+	const stub = env.MAILBOX_DO.getByName(mailboxId);
+	return runInDurableObject(stub, async (_instance, state) => {
+		let sendAttempts = 0;
+		const { handleTransactionalSend } = await import("#/do/transactional-send-ops");
+		const result = await handleTransactionalSend(
+			{
+				sql: state.storage.sql,
+				transactionSync: (fn: () => void) => state.storage.transactionSync(fn),
+				email: {
+					send: async () => {
+						sendAttempts += 1;
+						// No non-delivery keyword, so isAmbiguousProviderError says "maybe".
+						throw options.error ?? new Error("connection reset by peer");
+					},
+				} as unknown as SendEmail,
+				fromAddress: "sender@test.com",
+			},
+			(env as unknown as { TRANSACTIONAL_API_KEY_PEPPER: string }).TRANSACTIONAL_API_KEY_PEPPER,
+			{
+				mailboxId,
+				authHeader: `Bearer ${plaintextKey}`,
+				idempotencyKeyHeader: idempotencyKey,
+				body,
+			},
+		);
+		return { result: result as unknown as Record<string, unknown>, sendAttempts };
+	});
+}
+
+async function postDeliveryEvent(
+	mailboxId: string,
+	event: Record<string, unknown>,
+	requestId?: string | null,
+): Promise<{ status: number; json: Record<string, unknown> }> {
+	const stub = env.MAILBOX_DO.getByName(mailboxId);
+	const response = await stub.fetch("https://mailbox-do/transactional/delivery-event", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ event, requestId: requestId ?? null }),
+	});
+	return { status: response.status, json: (await response.json()) as Record<string, unknown> };
 }
 
 async function getStatus(
@@ -373,6 +438,7 @@ describe("Transactional send flow", () => {
 				error_code: null,
 				delivery_status: null,
 				delivery_event_at: null,
+				resolved_via: null,
 				created_at: now,
 				updated_at: now,
 			});
@@ -622,6 +688,387 @@ describe("Transactional send flow", () => {
 				}),
 			});
 			expect(response.status).toBe(404);
+		});
+	});
+
+	describe("Resolving an ambiguous send from a delivery event", () => {
+		// Cloudflare mints the message id and refuses a sender-chosen Message-ID
+		// header, so an ambiguous send never learns the id of a message that may
+		// well have gone out. Correlating those events on the envelope is what makes
+		// an `unknown` answerable at all; see the block comment on
+		// correlateEventToUnknownRequest for why the narrow candidate set makes that
+		// sound rather than a guess.
+		const eventAt = () => new Date().toISOString();
+
+		it("resolves an unknown to sent when a delivered event correlates on the envelope", async () => {
+			const mailboxId = "mbx_unknown_resolve_sent";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const ambiguous = await sendAmbiguous(mailboxId, plaintextKey, "unknown-1", {
+				template: "t",
+				to: "ghost@example.com",
+			});
+			expect(ambiguous.result.status).toBe("unknown");
+			expect(ambiguous.result.providerMessageId).toBeNull();
+			const requestId = ambiguous.result.requestId as string;
+
+			const before = await getStatus(mailboxId, plaintextKey, requestId);
+			expect(before.json.status).toBe("unknown");
+			expect(before.json.resolvedVia).toBeNull();
+
+			// The provider id on this event was never seen by us — that is the whole
+			// point. Nothing is passed as a routing hint either.
+			const delivered = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-unknown-delivered-1",
+				event_type: "cf.email.sending.message.delivered",
+				provider_message_id: "cf-id-never-returned-to-us",
+				to: "ghost@example.com",
+				from: "sender@test.com",
+				timestamp: eventAt(),
+			});
+			expect(delivered.status).toBe(200);
+			expect(delivered.json.correlation).toBe("envelope");
+			expect(delivered.json.resolvedStatus).toBe("sent");
+			expect(delivered.json.requestId).toBe(requestId);
+
+			const after = await getStatus(mailboxId, plaintextKey, requestId);
+			expect(after.json.status).toBe("sent");
+			expect(after.json.deliveryStatus).toBe("delivered");
+			// An inferred `sent` must stay distinguishable from one the provider
+			// acknowledged at send time.
+			expect(after.json.resolvedVia).toBe("envelope_correlation");
+			// The id is adopted, so any later event for this message takes the
+			// primary path instead of coming back through correlation.
+			expect(after.json.providerMessageId).toBe("cf-id-never-returned-to-us");
+		});
+
+		it("replays a resolved request as sent without contacting the provider again", async () => {
+			const mailboxId = "mbx_unknown_resolve_replay";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+			const payload = { template: "t", to: "replay@example.com" };
+
+			const ambiguous = await sendAmbiguous(mailboxId, plaintextKey, "unknown-replay", payload);
+			expect(ambiguous.result.status).toBe("unknown");
+			expect(ambiguous.sendAttempts).toBe(1);
+
+			// Before resolution the replay still answers `unknown` — no send, no
+			// invented certainty.
+			const replayBefore = await sendAmbiguous(mailboxId, plaintextKey, "unknown-replay", payload);
+			expect(replayBefore.result.status).toBe("unknown");
+			expect(replayBefore.sendAttempts).toBe(0);
+
+			const delivered = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-unknown-replay-1",
+				event_type: "cf.email.sending.message.delivered",
+				provider_message_id: "cf-id-replay",
+				to: "replay@example.com",
+				from: "sender@test.com",
+				timestamp: eventAt(),
+			});
+			expect(delivered.status).toBe(200);
+
+			// This is the defect the whole change exists to fix: the replay used to
+			// return the stored `unknown` forever.
+			const replayAfter = await sendAmbiguous(mailboxId, plaintextKey, "unknown-replay", payload);
+			expect(replayAfter.result.status).toBe("sent");
+			expect(replayAfter.result.requestId).toBe(ambiguous.result.requestId);
+			expect(replayAfter.result.providerMessageId).toBe("cf-id-replay");
+			// Resolving an unknown is not a retry. Nothing was sent a second time.
+			expect(replayAfter.sendAttempts).toBe(0);
+
+			// A different payload under the same key is still a conflict.
+			const conflict = await sendAmbiguous(mailboxId, plaintextKey, "unknown-replay", {
+				template: "t",
+				to: "someone-else@example.com",
+			});
+			expect(conflict.result.status).toBe("idempotency_conflict");
+			expect(conflict.sendAttempts).toBe(0);
+		});
+
+		it("resolves an unknown to failed when the provider rejected the message", async () => {
+			const mailboxId = "mbx_unknown_resolve_failed";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const ambiguous = await sendAmbiguous(mailboxId, plaintextKey, "unknown-rejected", {
+				template: "t",
+				to: "refused@example.com",
+			});
+			expect(ambiguous.result.status).toBe("unknown");
+
+			const rejected = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-unknown-rejected-1",
+				event_type: "cf.email.sending.message.rejected",
+				provider_message_id: "cf-id-rejected",
+				to: "refused@example.com",
+				from: "sender@test.com",
+				timestamp: eventAt(),
+			});
+			expect(rejected.status).toBe(200);
+			expect(rejected.json.resolvedStatus).toBe("failed");
+
+			const after = await getStatus(mailboxId, plaintextKey, ambiguous.result.requestId as string);
+			expect(after.json.status).toBe("failed");
+			expect(after.json.errorCode).toBe("permanent_failure");
+			expect(after.json.resolvedVia).toBe("envelope_correlation");
+		});
+
+		it("treats a hard bounce as proof the message left, and still suppresses", async () => {
+			const mailboxId = "mbx_unknown_resolve_bounced";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const ambiguous = await sendAmbiguous(mailboxId, plaintextKey, "unknown-bounced", {
+				template: "t",
+				to: "gone@example.com",
+			});
+			expect(ambiguous.result.status).toBe("unknown");
+
+			const bounced = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-unknown-bounced-1",
+				event_type: "cf.email.sending.message.bounced",
+				provider_message_id: "cf-id-bounced",
+				to: "gone@example.com",
+				from: "sender@test.com",
+				timestamp: eventAt(),
+				bounce_type: "hard",
+			});
+			expect(bounced.status).toBe(200);
+			// A bounce means the message was transmitted and the far end refused it.
+			// That settles "did it leave" as yes; delivery_status carries the bad news.
+			expect(bounced.json.resolvedStatus).toBe("sent");
+
+			const after = await getStatus(mailboxId, plaintextKey, ambiguous.result.requestId as string);
+			expect(after.json.status).toBe("sent");
+			expect(after.json.deliveryStatus).toBe("bounced");
+
+			const blocked = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "post-bounce", {
+				template: "t",
+				to: "gone@example.com",
+			});
+			expect(blocked.status).toBe(403);
+			expect(blocked.json.error).toBe("recipient_suppressed");
+		});
+
+		it("adopts the provider id from a non-terminal event without settling the status", async () => {
+			const mailboxId = "mbx_unknown_deferred";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const ambiguous = await sendAmbiguous(mailboxId, plaintextKey, "unknown-deferred", {
+				template: "t",
+				to: "slow@example.com",
+			});
+			const requestId = ambiguous.result.requestId as string;
+
+			const deferred = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-unknown-deferred-1",
+				event_type: "cf.email.sending.message.deferred",
+				provider_message_id: "cf-id-deferred",
+				to: "slow@example.com",
+				from: "sender@test.com",
+				timestamp: eventAt(),
+			});
+			expect(deferred.status).toBe(200);
+			expect(deferred.json.resolvedStatus).toBeUndefined();
+
+			const mid = await getStatus(mailboxId, plaintextKey, requestId);
+			// Still ambiguous — a deferral is not an outcome.
+			expect(mid.json.status).toBe("unknown");
+			// But the id is ours now, so the eventual terminal event needs no
+			// correlation at all.
+			expect(mid.json.providerMessageId).toBe("cf-id-deferred");
+
+			const delivered = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-unknown-deferred-2",
+				event_type: "cf.email.sending.message.delivered",
+				provider_message_id: "cf-id-deferred",
+				to: "slow@example.com",
+				from: "sender@test.com",
+				timestamp: eventAt(),
+			});
+			expect(delivered.status).toBe(200);
+			expect(delivered.json.correlation).toBe("provider_id");
+			expect(delivered.json.resolvedStatus).toBe("sent");
+		});
+
+		it("refuses to guess when two ambiguous sends to the same recipient could match", async () => {
+			const mailboxId = "mbx_unknown_ambiguous_tie";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const first = await sendAmbiguous(mailboxId, plaintextKey, "tie-1", {
+				template: "t",
+				to: "twin@example.com",
+			});
+			const second = await sendAmbiguous(mailboxId, plaintextKey, "tie-2", {
+				template: "t",
+				to: "twin@example.com",
+			});
+			expect(first.result.status).toBe("unknown");
+			expect(second.result.status).toBe("unknown");
+
+			const event = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-tie-1",
+				event_type: "cf.email.sending.message.delivered",
+				provider_message_id: "cf-id-tie",
+				to: "twin@example.com",
+				from: "sender@test.com",
+				timestamp: eventAt(),
+			});
+			expect(event.status).toBe(409);
+			expect(event.json.error).toBe("correlation_ambiguous");
+
+			// Both stay honest rather than one of them being credited at random.
+			for (const requestId of [first.result.requestId, second.result.requestId]) {
+				const status = await getStatus(mailboxId, plaintextKey, requestId as string);
+				expect(status.json.status).toBe("unknown");
+				expect(status.json.resolvedVia).toBeNull();
+			}
+		});
+
+		it("does not let an unmatched event touch a request that already succeeded", async () => {
+			const mailboxId = "mbx_unknown_no_candidate";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const sent = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "healthy-1", {
+				template: "t",
+				to: "healthy@example.com",
+			});
+			expect(sent.status).toBe(200);
+
+			// A row that already has a provider id is never up for adoption, so this
+			// event finds no candidate at all.
+			const stray = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-stray-1",
+				event_type: "cf.email.sending.message.bounced",
+				provider_message_id: "cf-id-belongs-to-nobody",
+				to: "healthy@example.com",
+				from: "sender@test.com",
+				timestamp: eventAt(),
+				bounce_type: "hard",
+			});
+			expect(stray.status).toBe(404);
+
+			const after = await getStatus(mailboxId, plaintextKey, sent.json.requestId as string);
+			expect(after.json.status).toBe("sent");
+			expect(after.json.deliveryStatus).toBeNull();
+		});
+
+		it("will not claim a request older than the correlation window", async () => {
+			const mailboxId = "mbx_unknown_stale_window";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const ambiguous = await sendAmbiguous(mailboxId, plaintextKey, "stale-window-1", {
+				template: "t",
+				to: "ancient@example.com",
+			});
+			expect(ambiguous.result.status).toBe("unknown");
+
+			const event = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-stale-window-1",
+				event_type: "cf.email.sending.message.delivered",
+				provider_message_id: "cf-id-stale",
+				to: "ancient@example.com",
+				from: "sender@test.com",
+				// Thirty days on from the send: far past any plausible bounce delay.
+				timestamp: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+			});
+			expect(event.status).toBe(404);
+
+			const after = await getStatus(mailboxId, plaintextKey, ambiguous.result.requestId as string);
+			expect(after.json.status).toBe("unknown");
+		});
+
+		it("refuses a routing hint that disagrees with the DO's own candidate", async () => {
+			const mailboxId = "mbx_unknown_hint_mismatch";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const ambiguous = await sendAmbiguous(mailboxId, plaintextKey, "hint-mismatch-1", {
+				template: "t",
+				to: "hinted@example.com",
+			});
+			const requestId = ambiguous.result.requestId as string;
+
+			// D1 is a rebuildable projection; a stale one must not be able to
+			// attribute an event to a request the DO does not agree on.
+			const event = await postDeliveryEvent(
+				mailboxId,
+				{
+					event_id: "cf-hint-mismatch-1",
+					event_type: "cf.email.sending.message.delivered",
+					provider_message_id: "cf-id-hinted",
+					to: "hinted@example.com",
+					from: "sender@test.com",
+					timestamp: eventAt(),
+				},
+				"some-other-request-id",
+			);
+			expect(event.status).toBe(409);
+			expect(event.json.error).toBe("correlation_hint_mismatch");
+
+			const after = await getStatus(mailboxId, plaintextKey, requestId);
+			expect(after.json.status).toBe("unknown");
+		});
+
+		it("does not correlate across senders", async () => {
+			const mailboxId = "mbx_unknown_sender_scope";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const ambiguous = await sendAmbiguous(mailboxId, plaintextKey, "sender-scope-1", {
+				template: "t",
+				to: "scoped@example.com",
+			});
+			expect(ambiguous.result.status).toBe("unknown");
+
+			const event = await postDeliveryEvent(mailboxId, {
+				event_id: "cf-sender-scope-1",
+				event_type: "cf.email.sending.message.delivered",
+				provider_message_id: "cf-id-other-sender",
+				to: "scoped@example.com",
+				from: "someone-else@test.com",
+				timestamp: eventAt(),
+			});
+			expect(event.status).toBe(404);
+
+			const after = await getStatus(mailboxId, plaintextKey, ambiguous.result.requestId as string);
+			expect(after.json.status).toBe("unknown");
 		});
 	});
 

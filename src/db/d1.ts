@@ -952,6 +952,7 @@ export type TransactionalRequestLogRow = {
 	error_code: string | null;
 	delivery_status: string | null;
 	delivery_event_at: string | null;
+	resolved_via: string | null;
 	created_at: string;
 	updated_at: string;
 };
@@ -964,8 +965,9 @@ export async function upsertTransactionalRequestLog(
 		.prepare(
 			`INSERT OR REPLACE INTO transactional_request_log
        (request_id, key_id, mailbox_id, status, to_addr, template_id,
-        sender, provider_message_id, error_code, delivery_status, delivery_event_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sender, provider_message_id, error_code, delivery_status, delivery_event_at,
+        resolved_via, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
 		.bind(
 			row.request_id,
@@ -979,6 +981,7 @@ export async function upsertTransactionalRequestLog(
 			row.error_code,
 			row.delivery_status ?? null,
 			row.delivery_event_at ?? null,
+			row.resolved_via ?? null,
 			row.created_at,
 			row.updated_at,
 		)
@@ -1000,6 +1003,60 @@ export async function lookupTransactionalRequestByProviderMessageId(
 		)
 		.bind(providerMessageId)
 		.first<{ request_id: string; mailbox_id: string; to_addr: string; sender: string }>();
+}
+
+/**
+ * Narrows the candidates a delivery event with an unrecognised provider id could
+ * belong to, so the consumer knows which mailbox DO to hand it to.
+ *
+ * This routes; it does not decide. The DO re-runs the same narrowing against its
+ * own authoritative rows and refuses if it disagrees — D1 is a rebuildable
+ * projection and must never be what attributes an event to a request.
+ * `LIMIT 2` is deliberate: the caller only needs to know "exactly one" from
+ * "more than one".
+ */
+export async function lookupUnresolvedTransactionalRequestsByEnvelope(
+	db: D1Database,
+	filter: { sender: string; to: string; notBefore: string; notAfter: string },
+): Promise<Array<{ request_id: string; mailbox_id: string }>> {
+	const result = await db
+		.prepare(
+			`SELECT request_id, mailbox_id
+       FROM transactional_request_log
+       WHERE status = 'unknown'
+         AND provider_message_id IS NULL
+         AND created_at >= ?
+         AND created_at <= ?
+         AND lower(sender) = ?
+         AND lower(to_addr) = ?
+       LIMIT 2`,
+		)
+		.bind(filter.notBefore, filter.notAfter, filter.sender, filter.to)
+		.all<{ request_id: string; mailbox_id: string }>();
+	return result.results ?? [];
+}
+
+/**
+ * Mirrors a status the DO settled from an observed delivery event. Only the DO
+ * decides this; the projection follows.
+ */
+export async function updateTransactionalRequestResolutionProjection(
+	db: D1Database,
+	requestId: string,
+	status: string,
+	providerMessageId: string | null,
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE transactional_request_log
+       SET status = ?,
+           provider_message_id = COALESCE(provider_message_id, ?),
+           resolved_via = 'envelope_correlation',
+           updated_at = ?
+       WHERE request_id = ?`,
+		)
+		.bind(status, providerMessageId, new Date().toISOString(), requestId)
+		.run();
 }
 
 export async function updateTransactionalRequestDeliveryProjection(

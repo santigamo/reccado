@@ -1,3 +1,4 @@
+import type { TransactionalRequestLogRow } from "../db/d1";
 import type { TransactionalApiKeyRecord } from "../lib/transactional-keys";
 import { verifyApiKey, parseApiKey } from "../lib/transactional-keys";
 import {
@@ -17,9 +18,8 @@ import {
 	readSendMarker,
 	sentMarkerValue,
 	rowToApiKeyRecord,
+	transactionalSendMarkerKey,
 } from "./mailbox-send-utils";
-
-const IDEMPOTENCY_KEY_PREFIX = "txn:v1:";
 
 /**
  * Gets an API key record from DO sqlite by keyId.
@@ -373,7 +373,7 @@ async function doTransactionalSend(
 	providerMessageId: string | null;
 	errorCategory?: string;
 }> {
-	const idempotencyKey = `${IDEMPOTENCY_KEY_PREFIX}${requestId}`;
+	const idempotencyKey = transactionalSendMarkerKey(requestId);
 
 	// Check for existing sent marker (idempotency across DO retries)
 	const sentMarker = ctx.sql
@@ -764,24 +764,11 @@ export function makeTransactionalRequestLogRow(
 		error_code: string | null;
 		delivery_status: string | null;
 		delivery_event_at: string | null;
+		resolved_via?: string | null;
 		created_at: string;
 		updated_at: string;
 	},
-): {
-	request_id: string;
-	key_id: string;
-	mailbox_id: string;
-	status: string;
-	to_addr: string;
-	template_id: string | null;
-	sender: string;
-	provider_message_id: string | null;
-	error_code: string | null;
-	delivery_status: string | null;
-	delivery_event_at: string | null;
-	created_at: string;
-	updated_at: string;
-} {
+): TransactionalRequestLogRow {
 	return {
 		request_id: row.request_id,
 		key_id: row.key_id,
@@ -794,6 +781,7 @@ export function makeTransactionalRequestLogRow(
 		error_code: row.error_code,
 		delivery_status: row.delivery_status ?? null,
 		delivery_event_at: row.delivery_event_at ?? null,
+		resolved_via: row.resolved_via ?? null,
 		created_at: row.created_at,
 		updated_at: row.updated_at,
 	};
@@ -839,6 +827,7 @@ export function getTransactionalRequestStatus(
 	errorCode: string | null;
 	deliveryStatus: string | null;
 	deliveryEventAt: string | null;
+	resolvedVia: string | null;
 } | null {
 	const row =
 		sql
@@ -849,8 +838,9 @@ export function getTransactionalRequestStatus(
 				error_code: string | null;
 				delivery_status: string | null;
 				delivery_event_at: string | null;
+				resolved_via: string | null;
 			}>(
-				"SELECT status, provider_message_id, created_at, error_code, delivery_status, delivery_event_at FROM transactional_requests WHERE request_id = ? AND key_id = ?",
+				"SELECT status, provider_message_id, created_at, error_code, delivery_status, delivery_event_at, resolved_via FROM transactional_requests WHERE request_id = ? AND key_id = ?",
 				requestId,
 				keyId,
 			)
@@ -863,5 +853,8 @@ export function getTransactionalRequestStatus(
 		errorCode: row.error_code,
 		deliveryStatus: row.delivery_status,
 		deliveryEventAt: row.delivery_event_at,
+		// Non-null means this status was inferred from an observed delivery event
+		// rather than acknowledged by the provider at send time.
+		resolvedVia: row.resolved_via,
 	};
 }

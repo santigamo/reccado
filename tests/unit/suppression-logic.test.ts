@@ -6,7 +6,7 @@ import {
 	safeEventMetadata,
 	type EmailSendingEvent,
 } from "#/cloudflare/email-events";
-import { suppressionExpiryFor } from "#/do/mailbox-suppressions";
+import { envelopeCorrelationWindow, suppressionExpiryFor } from "#/do/mailbox-suppressions";
 
 // ---------------------------------------------------------------------------
 // DO route / suppression integration tests
@@ -270,5 +270,38 @@ describe("suppressionExpiryFor", () => {
 		const expiry = suppressionExpiryFor("hard_bounce");
 		expect(expiry).not.toBeNull();
 		expect(new Date(expiry as string).getTime()).toBeGreaterThan(Date.now());
+	});
+});
+
+describe("envelopeCorrelationWindow", () => {
+	// The queue consumer narrows candidates in D1 and the DO re-narrows in its own
+	// storage. They share this function precisely so the consumer can never offer
+	// the DO a candidate the DO would reject on bounds alone.
+	const at = "2026-06-01T12:00:00.000Z";
+
+	it("looks back far enough to cover a provider's exhausted retry schedule", () => {
+		const window = envelopeCorrelationWindow(at);
+		expect(window).not.toBeNull();
+		const lookback = Date.parse(at) - Date.parse(window!.notBefore);
+		// A bounce only arrives after the receiving side gives up, which runs to
+		// about three days at the large providers.
+		expect(lookback).toBeGreaterThanOrEqual(3 * 24 * 60 * 60 * 1000);
+		expect(lookback).toBe(7 * 24 * 60 * 60 * 1000);
+	});
+
+	it("allows a little forward skew but not an open-ended future", () => {
+		const window = envelopeCorrelationWindow(at);
+		const skew = Date.parse(window!.notAfter) - Date.parse(at);
+		// created_at is our clock and eventTimestamp is Cloudflare's, so a send can
+		// look marginally newer than the event reporting on it.
+		expect(skew).toBeGreaterThan(0);
+		expect(skew).toBeLessThanOrEqual(5 * 60 * 1000);
+	});
+
+	it("refuses an unparseable timestamp rather than defaulting to now", () => {
+		// Defaulting would silently widen the window around the wrong instant, which
+		// is how a correlation stops being a correlation.
+		expect(envelopeCorrelationWindow("not-a-date")).toBeNull();
+		expect(envelopeCorrelationWindow("")).toBeNull();
 	});
 });

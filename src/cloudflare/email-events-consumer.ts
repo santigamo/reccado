@@ -2,35 +2,85 @@ import { classifyEmailEvent, normalizeEmailSendingEvent, safeEventMetadata } fro
 import { insertOpsEvent, upsertSuppressionProjection } from "../db/d1";
 import { mailboxStub } from "../lib/mailbox-stub";
 
+type ResolvedEventTarget = {
+	mailboxId: string;
+	requestId: string | null;
+	correlation: "provider_id" | "envelope";
+};
+
 /**
  * Resolves the mailbox DO for a delivery event by looking up the transactional
  * request via D1 using provider_message_id. If the D1 projection is absent,
  * we retry — the event may have raced the projection write.
+ *
+ * A provider id we have never seen is not necessarily a stranger: an ambiguous
+ * send never learns the id of a message that may well have gone out, so its
+ * events arrive unattributable by design. Cloudflare mints the id itself and
+ * refuses a sender-chosen `Message-ID`, so there is nothing we could have
+ * stamped on the message to recognise it by. The envelope fallback narrows to
+ * the requests whose outcome we admit we do not know, and only to route: the DO
+ * repeats the narrowing against its own rows and has the final say.
  */
 async function resolveMailboxIdFromEvent(
 	env: Env,
-	event: { provider_message_id: string; to: string; from: string },
-): Promise<{ mailboxId: string; requestId: string | null } | null> {
+	event: { provider_message_id: string; to: string; from: string; timestamp: string },
+): Promise<ResolvedEventTarget | { ambiguous: true } | null> {
 	try {
-		const { lookupTransactionalRequestByProviderMessageId } = await import("../db/d1");
+		const {
+			lookupTransactionalRequestByProviderMessageId,
+			lookupUnresolvedTransactionalRequestsByEnvelope,
+		} = await import("../db/d1");
 		const row = await lookupTransactionalRequestByProviderMessageId(
 			env.INDEX_DB,
 			event.provider_message_id,
 		);
-		if (!row) {
-			return null;
+		if (row) {
+			// Validate sender and recipient match the event
+			if (row.sender.toLowerCase() !== event.from.toLowerCase()) {
+				return null;
+			}
+			if (row.to_addr.toLowerCase() !== event.to.toLowerCase()) {
+				return null;
+			}
+			return {
+				mailboxId: row.mailbox_id,
+				requestId: row.request_id,
+				correlation: "provider_id",
+			};
 		}
-		// Validate sender and recipient match the event
-		if (row.sender.toLowerCase() !== event.from.toLowerCase()) {
-			return null;
-		}
-		if (row.to_addr.toLowerCase() !== event.to.toLowerCase()) {
-			return null;
-		}
-		return { mailboxId: row.mailbox_id, requestId: row.request_id };
+
+		const { envelopeCorrelationWindow } = await import("../do/mailbox-suppressions");
+		const window = envelopeCorrelationWindow(event.timestamp);
+		if (!window) return null;
+		const candidates = await lookupUnresolvedTransactionalRequestsByEnvelope(env.INDEX_DB, {
+			sender: event.from.trim().toLowerCase(),
+			to: event.to.trim().toLowerCase(),
+			notBefore: window.notBefore,
+			notAfter: window.notAfter,
+		});
+		if (candidates.length === 0) return null;
+		// Two ambiguous sends to the same recipient in the same window: nothing
+		// distinguishes them, and retrying will not change that. Say so rather than
+		// attributing the event to a coin flip.
+		if (candidates.length > 1) return { ambiguous: true };
+		return {
+			mailboxId: candidates[0]!.mailbox_id,
+			requestId: candidates[0]!.request_id,
+			correlation: "envelope",
+		};
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Ops events describe events, not recipients. The domain is what an operator
+ * needs to see a pattern ("everything to this provider is bouncing"); the local
+ * part is the personal data and never belongs in a log row.
+ */
+function recipientDomain(address: string): string {
+	const at = address.lastIndexOf("@");
+	return at === -1 ? "unknown" : address.slice(at + 1).toLowerCase();
 }
 
 export async function handleEmailEventsQueue(
@@ -60,7 +110,28 @@ export async function handleEmailEventsQueue(
 			const classification = classifyEmailEvent(event);
 
 			// Resolve mailbox via D1 projection
-			const resolved = await resolveMailboxIdFromEvent(env, event);
+			const target = await resolveMailboxIdFromEvent(env, event);
+			if (target && "ambiguous" in target) {
+				// Unresolvable rather than not-yet-resolvable: retrying cannot break the
+				// tie, so this rides its retries out to the DLQ, where an operator can
+				// see it. Guessing which ambiguous send it belongs to would be worse
+				// than leaving both unresolved.
+				await insertOpsEvent(env.INDEX_DB, {
+					id: crypto.randomUUID(),
+					event_type: "email_events.correlation_ambiguous",
+					severity: "warning",
+					subject: event.provider_message_id,
+					payload_json: JSON.stringify({
+						event_id: event.event_id,
+						event_type: event.event_type,
+						to_domain: recipientDomain(event.to),
+						attempts: message.attempts,
+					}),
+				});
+				message.retry({ delaySeconds: 30 });
+				continue;
+			}
+			const resolved = target;
 			if (!resolved) {
 				// D1 projection absent — event may have raced the write. Retry.
 				await insertOpsEvent(env.INDEX_DB, {
@@ -71,7 +142,7 @@ export async function handleEmailEventsQueue(
 					payload_json: JSON.stringify({
 						event_id: event.event_id,
 						event_type: event.event_type,
-						to: event.to,
+						to_domain: recipientDomain(event.to),
 						attempts: message.attempts,
 					}),
 				});
@@ -87,6 +158,8 @@ export async function handleEmailEventsQueue(
 				body: JSON.stringify({
 					event: safeEventMetadata(event),
 					eventType: event.event_type,
+					// A routing hint only — the DO re-derives the attribution itself and
+					// refuses this id if its own storage names a different request.
 					requestId: resolved.requestId,
 				}),
 			});
@@ -103,7 +176,26 @@ export async function handleEmailEventsQueue(
 						payload_json: JSON.stringify({
 							event_id: event.event_id,
 							event_type: event.event_type,
-							to: event.to,
+							to_domain: recipientDomain(event.to),
+							attempts: message.attempts,
+						}),
+					});
+					message.retry({ delaySeconds: 30 });
+					continue;
+				}
+				// 409 is the DO rejecting the correlation the projection proposed —
+				// either the tie it sees is ambiguous or D1 named a different request.
+				// The DO is authoritative; do not argue with it.
+				if (response.status === 409) {
+					await insertOpsEvent(env.INDEX_DB, {
+						id: crypto.randomUUID(),
+						event_type: "email_events.correlation_rejected",
+						severity: "warning",
+						subject: event.provider_message_id,
+						payload_json: JSON.stringify({
+							event_id: event.event_id,
+							event_type: event.event_type,
+							to_domain: recipientDomain(event.to),
 							attempts: message.attempts,
 						}),
 					});
@@ -112,17 +204,51 @@ export async function handleEmailEventsQueue(
 				}
 				throw new Error(`DO delivery-event failed: ${response.status} ${body}`);
 			}
-			await response.arrayBuffer();
-			if (resolved.requestId) {
-				const { updateTransactionalRequestDeliveryProjection } = await import("../db/d1");
+			const doResult = (await response.json()) as {
+				requestId?: string;
+				resolvedStatus?: "sent" | "failed";
+			};
+			// The DO chose the request; trust its answer over the routing hint.
+			const settledRequestId = doResult.requestId ?? resolved.requestId;
+			if (settledRequestId) {
+				const {
+					updateTransactionalRequestDeliveryProjection,
+					updateTransactionalRequestResolutionProjection,
+				} = await import("../db/d1");
+				if (doResult.resolvedStatus) {
+					// An ambiguous send just became answerable. Project the settled status
+					// before the delivery status so the row is never briefly self-contradictory.
+					await updateTransactionalRequestResolutionProjection(
+						env.INDEX_DB,
+						settledRequestId,
+						doResult.resolvedStatus,
+						event.provider_message_id,
+					);
+					// Worth an ops event on its own: a request the API previously had to
+					// answer "unknown" for now has an answer, and an operator watching a
+					// backlog of ambiguous sends wants to see it drain.
+					await insertOpsEvent(env.INDEX_DB, {
+						id: crypto.randomUUID(),
+						event_type: "transactional.unknown_resolved",
+						severity: "info",
+						subject: resolved.mailboxId,
+						payload_json: JSON.stringify({
+							requestId: settledRequestId,
+							resolvedStatus: doResult.resolvedStatus,
+							deliveryStatus: classification.deliveryStatus,
+							correlation: resolved.correlation,
+							to_domain: recipientDomain(event.to),
+						}),
+					}).catch(() => {});
+				}
 				await updateTransactionalRequestDeliveryProjection(
 					env.INDEX_DB,
-					resolved.requestId,
+					settledRequestId,
 					classification.deliveryStatus,
 					event.timestamp,
 				);
 			}
-			if (resolved.requestId && classification.suppress) {
+			if (settledRequestId && classification.suppress) {
 				const reason =
 					event.event_type === "cf.email.sending.message.complained" ? "complaint" : "hard_bounce";
 				const now = new Date().toISOString();

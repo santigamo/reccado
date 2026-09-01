@@ -243,6 +243,11 @@ CREATE TABLE IF NOT EXISTS transactional_requests (
   error_code TEXT,
   delivery_status TEXT,
   delivery_event_at TEXT,
+  -- How this row reached its current status. NULL means the provider call itself
+  -- said so. 'envelope_correlation' means an ambiguous send was later resolved
+  -- from an observed delivery event, which is weaker evidence and must stay
+  -- distinguishable from a provider acknowledgement forever after.
+  resolved_via TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -250,6 +255,8 @@ CREATE TABLE IF NOT EXISTS transactional_requests (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_txn_idempotency ON transactional_requests(key_id, client_idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_txn_status ON transactional_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_txn_key_lookup ON transactional_requests(key_id, created_at);
+-- Delivery events arrive keyed on the provider id; that lookup had no index.
+CREATE INDEX IF NOT EXISTS idx_txn_provider_message ON transactional_requests(provider_message_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
   message_id UNINDEXED,

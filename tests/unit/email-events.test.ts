@@ -3,6 +3,7 @@ import {
 	classifyEmailEvent,
 	emailSendingEventSchema,
 	normalizeEmailSendingEvent,
+	safeEventMetadata,
 	type EmailSendingEvent,
 } from "#/cloudflare/email-events";
 
@@ -176,6 +177,101 @@ describe("normalizeEmailSendingEvent", () => {
 		const result = normalizeEmailSendingEvent(nested);
 		expect(result).not.toBeNull();
 		expect(result!.event_type).toBe("cf.email.sending.message.deferred");
+	});
+});
+
+describe("what a Cloudflare event can and cannot be correlated on", () => {
+	// A verbatim payload from Cloudflare's own docs
+	// (developers.cloudflare.com/email-service/platform/event-subscriptions), kept
+	// literal because the whole correlation design rests on what is in it.
+	const officialDelivered = {
+		type: "cf.email.sending.message.delivered",
+		source: {
+			type: "email.sending",
+			zoneId: "023e105f4ecef8ad9ca31a8372d0c353",
+			domain: "example.com",
+		},
+		payload: {
+			eventId: "0190d0c4-7e9a-7b3c-9f12-1a2b3c4d5e6f",
+			messageId: "0101018f7d0c4d9a-msg-deadbeef",
+			sender: "noreply@example.com",
+			recipient: "user@example.net",
+			subject: "Welcome",
+			terminal: true,
+			delivery: {
+				status: "delivered",
+				provider: "gmail",
+				deliveryTimeMs: 1234,
+				smtpStatusCode: "250",
+				smtpEnhancedStatusCode: "2.0.0",
+				smtpResponse: "250 2.0.0 OK 1714820445 a1b2c3 - gsmtp",
+			},
+		},
+		metadata: {
+			accountId: "f9f79265f388666de8122cfb508d7776",
+			eventSubscriptionId: "1830c4bb612e43c3af7f4cada31fbf3f",
+			eventSchemaVersion: 1,
+			eventTimestamp: "2026-06-01T02:48:57.132Z",
+		},
+	};
+
+	it("carries a Cloudflare-internal message id, not an RFC5322 Message-ID", () => {
+		const result = normalizeEmailSendingEvent(officialDelivered);
+		expect(result).not.toBeNull();
+		expect(result!.provider_message_id).toBe("0101018f7d0c4d9a-msg-deadbeef");
+		// The distinction is load-bearing: Cloudflare reserves the Message-ID header
+		// and rejects a sender-supplied one, so we cannot mint an id of our own and
+		// recognise it here. Any angle-bracketed addr-spec would mean that changed.
+		expect(result!.provider_message_id).not.toMatch(/^<.*@.*>$/);
+	});
+
+	it("exposes only sender, recipient and timestamp as correlatable fields", () => {
+		const result = normalizeEmailSendingEvent(officialDelivered);
+		expect(result!.from).toBe("noreply@example.com");
+		expect(result!.to).toBe("user@example.net");
+		expect(result!.timestamp).toBe("2026-06-01T02:48:57.132Z");
+		// There is no header passthrough and no sender-chosen correlation id in the
+		// payload, so a stamped X- header would be invisible to us. Envelope
+		// correlation exists because this list is all there is.
+		expect(Object.keys(result!).sort()).toEqual(
+			[
+				"bounce_type",
+				"error_category",
+				"event_id",
+				"event_type",
+				"from",
+				"provider_message_id",
+				"rejection_reason",
+				"timestamp",
+				"to",
+			].sort(),
+		);
+	});
+
+	it("drops the subject rather than carrying it into anything persisted", () => {
+		const result = normalizeEmailSendingEvent(officialDelivered);
+		expect(result).not.toBeNull();
+		// The interpolated subject routinely contains the template variables — "Your
+		// code is 123456" — so it is neither normalized nor logged, and it is not
+		// used as a correlation key for the same reason.
+		expect(JSON.stringify(result)).not.toContain("Welcome");
+		expect(JSON.stringify(safeEventMetadata(result!))).not.toContain("Welcome");
+	});
+
+	it("never carries the provider's own error prose", () => {
+		const bounced = normalizeEmailSendingEvent({
+			...officialDelivered,
+			type: "cf.email.sending.message.bounced",
+			payload: {
+				...officialDelivered.payload,
+				delivery: { status: "bounced", smtpResponse: "550 5.1.1 User unknown" },
+				bounce: { type: "hard", category: "permanent_failure", reason: "550 5.1.1 User unknown" },
+			},
+		});
+		expect(bounced).not.toBeNull();
+		expect(bounced!.bounce_type).toBe("hard");
+		expect(bounced!.error_category).toBe("permanent_failure");
+		expect(JSON.stringify(bounced)).not.toContain("User unknown");
 	});
 });
 
