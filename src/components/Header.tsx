@@ -19,6 +19,13 @@ export default function Header() {
 					<Link to="/" className="nav-link" activeProps={{ className: "nav-link is-active" }}>
 						Home
 					</Link>
+					<Link
+						to="/domains"
+						className="nav-link"
+						activeProps={{ className: "nav-link is-active" }}
+					>
+						Domains
+					</Link>
 					<Link to="/about" className="nav-link" activeProps={{ className: "nav-link is-active" }}>
 						About
 					</Link>

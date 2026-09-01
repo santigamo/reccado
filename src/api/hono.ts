@@ -26,6 +26,7 @@ import {
 	updateRoutingRule,
 } from "../db/d1";
 import { AppError } from "../lib/errors";
+import { provisionSendingDomain } from "../lib/provision";
 import { mailboxIdFromPrimaryAddress } from "../lib/mailbox-id";
 import {
 	fetchWithTimeout,
@@ -44,6 +45,7 @@ import {
 	createDomainSchema,
 	createMailboxSchema,
 	createRoutingRuleSchema,
+	provisionDomainSchema,
 	updateAliasSchema,
 	updateDomainSchema,
 	updateMailboxSchema,
@@ -595,6 +597,48 @@ export function createApiApp(): Hono<ApiBindings> {
 				name: payload.result?.name ?? null,
 			},
 		});
+	});
+
+	/**
+	 * Provision a sending domain end to end.
+	 *
+	 * Answers 200 with the per-step outcomes even when steps did not succeed, and
+	 * that is deliberate: the request itself was handled, and the interesting
+	 * information is WHICH step is blocked and what the remedy is. Collapsing that
+	 * into a 5xx would throw away the four steps that did work and leave the
+	 * caller re-running the whole thing blind. A non-2xx is reserved for a request
+	 * that could not be attempted at all.
+	 *
+	 * Idempotent by construction — every step asks what is already true — so the
+	 * normal way to finish a partially provisioned domain is to send this again.
+	 */
+	api.post("/api/domains/:domain/provision", async (c) => {
+		const body = provisionDomainSchema.parse(await c.req.json());
+		const zone = c.req.param("domain").trim().toLowerCase();
+		const sendingDomain = `${body.subdomain.toLowerCase()}.${zone}`;
+
+		if (body.mailbox && !body.mailbox.address.toLowerCase().endsWith(`@${zone}`)) {
+			// A mailbox on another domain would be created but unreachable: inbound
+			// routing is enabled on THIS zone, so nothing would ever deliver to it.
+			throw new AppError(
+				`Mailbox ${body.mailbox.address} is not on ${zone}.`,
+				"mailbox_outside_zone",
+				400,
+			);
+		}
+
+		const result = await provisionSendingDomain(c.env, c.env.INDEX_DB, {
+			zone,
+			sendingDomain,
+			dmarc: body.dmarc,
+			inbound: body.inbound,
+			// Account-scoped, so it needs its own configuration rather than riding on
+			// the zone token. Unset simply omits the step instead of failing the run.
+			feedbackQueueId: c.env.FEEDBACK_QUEUE_ID?.trim() || undefined,
+			mailbox: body.mailbox,
+		});
+
+		return c.json(result);
 	});
 
 	api.get("/api/aliases", async (c) => {

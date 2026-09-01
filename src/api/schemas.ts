@@ -22,6 +22,36 @@ export const createDomainSchema = z.object({
 	zoneId: z.string().min(1),
 });
 
+/**
+ * One provisioning request. The zone comes from the URL, and the sending domain
+ * is composed from `subdomain` rather than accepted whole: a caller who could
+ * name the sending domain freely could aim records at a zone other than the one
+ * in the path.
+ *
+ * `dmarc.policy` has no default on purpose. Choosing between monitoring and
+ * enforcement is the one judgement in this flow that has consequences for mail
+ * that is already flowing, so it is stated every time rather than inherited.
+ */
+export const provisionDomainSchema = z.object({
+	subdomain: z
+		.string()
+		.regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i, "subdomain must be a single DNS label")
+		.default("send"),
+	dmarc: z.object({
+		policy: z.enum(["none", "quarantine", "reject"]),
+		alignment: z.enum(["relaxed", "strict"]).optional(),
+		rua: z.string().email().optional(),
+	}),
+	inbound: z.boolean().default(false),
+	mailbox: z
+		.object({
+			address: z.string().email(),
+			displayName: z.string().optional(),
+			ownerEmail: z.string().email().optional(),
+		})
+		.optional(),
+});
+
 export const createRoutingRuleSchema = z.object({
 	domainId: z.string().min(1),
 	pattern: z.string().min(1),

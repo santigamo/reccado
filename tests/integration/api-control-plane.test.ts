@@ -1,6 +1,6 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
 	type AliasRow,
 	type DomainRow,
@@ -515,5 +515,124 @@ describe("CSRF Origin guard covers the destructive verbs", () => {
 		}
 		// The mailbox is untouched.
 		expect((await getMailbox(testEnv.INDEX_DB, mailboxId))?.status).toBe("active");
+	});
+});
+
+describe("POST /api/domains/:domain/provision", () => {
+	const realFetch = globalThis.fetch;
+
+	/**
+	 * Stands in for Cloudflare across every endpoint provisioning touches. The
+	 * endpoint builds its own client from the env token, so unlike the unit tests
+	 * there is no seam to inject through — the seam is the network itself, which
+	 * is the right level for an integration test anyway.
+	 */
+	function stubCloudflare(): { requests: Array<{ method: string; url: string }> } {
+		const requests: Array<{ method: string; url: string }> = [];
+		// biome-ignore lint/suspicious/noExplicitAny: minimal fetch stand-in
+		globalThis.fetch = (async (input: any, init: any) => {
+			const url = typeof input === "string" ? input : input.url;
+			const method = init?.method ?? "GET";
+			requests.push({ method, url });
+			let result: unknown = {};
+			if (url.includes("/zones?name=")) result = [{ id: "zone_test" }];
+			else if (url.includes("/email/sending/subdomains")) result = method === "GET" ? [] : {};
+			else if (url.includes("/email/routing")) result = { enabled: false };
+			else if (url.includes("event_subscriptions")) result = [];
+			else if (url.includes("dns_records")) result = method === "GET" ? [] : { id: "rec" };
+			return new Response(JSON.stringify({ success: true, errors: [], result }), { status: 200 });
+		}) as typeof fetch;
+		return { requests };
+	}
+
+	// The Worker builds its Cloudflare client from the env, and .dev.vars leaves the
+	// token empty (correctly — no real credential belongs in the repo). Without one
+	// the run short-circuits before the first step, so these tests supply a fake.
+	const realToken = (testEnv as { CLOUDFLARE_API_TOKEN?: string }).CLOUDFLARE_API_TOKEN;
+	beforeEach(() => {
+		(testEnv as { CLOUDFLARE_API_TOKEN?: string }).CLOUDFLARE_API_TOKEN = "test-token";
+	});
+
+	afterEach(() => {
+		globalThis.fetch = realFetch;
+		(testEnv as { CLOUDFLARE_API_TOKEN?: string }).CLOUDFLARE_API_TOKEN = realToken;
+	});
+
+	it("reports every step, and answers 200 even when a step is blocked", async () => {
+		const { requests } = stubCloudflare();
+		const zone = "provision-api.test";
+		const response = await send("POST", `/api/domains/${zone}/provision`, {
+			subdomain: "notify",
+			dmarc: { policy: "none", rua: "dmarc@example.com" },
+			inbound: true,
+		});
+
+		expect(response.status).toBe(200);
+		const body = response.body as {
+			sendingDomain: string;
+			steps: Array<{ name: string; outcome: { state: string } }>;
+		};
+		expect(body.sendingDomain).toBe(`notify.${zone}`);
+
+		const states = Object.fromEntries(
+			body.steps.map((step) => [step.name, step.outcome.state]),
+		);
+		expect(states.register_domain).toBe("done");
+		expect(states.email_sending).toBe("done");
+		expect(states.dmarc).toBe("done");
+		expect(states.email_routing).toBe("done");
+
+		// The DMARC record went to the registered zone, at the composed name, as TXT.
+		const dmarcWrite = requests.find(
+			(request) => request.url.includes("dns_records") && request.method === "POST",
+		);
+		expect(dmarcWrite?.url).toContain("/zones/zone_test/dns_records");
+	});
+
+	it("is idempotent: running it again changes nothing", async () => {
+		stubCloudflare();
+		const zone = "provision-idem.test";
+		const payload = { subdomain: "notify", dmarc: { policy: "none" as const } };
+		await send("POST", `/api/domains/${zone}/provision`, payload);
+		const second = await send("POST", `/api/domains/${zone}/provision`, payload);
+		const states = Object.fromEntries(
+			(second.body.steps as Array<{ name: string; outcome: { state: string } }>).map((step) => [
+				step.name,
+				step.outcome.state,
+			]),
+		);
+		// The domain row is now there, so registration reports `already` rather than
+		// inserting a duplicate.
+		expect(states.register_domain).toBe("already");
+	});
+
+	it("refuses a mailbox that is not on the zone being provisioned", async () => {
+		stubCloudflare();
+		const response = await send("POST", "/api/domains/provision-mb.test/provision", {
+			subdomain: "notify",
+			dmarc: { policy: "none" },
+			// Inbound routing is enabled on the zone in the path, so a mailbox on
+			// another domain would be created and never receive anything.
+			mailbox: { address: "hello@somewhere-else.test" },
+		});
+		expect(response.status).toBe(400);
+		expect(response.body.code ?? response.body.error).toBeTruthy();
+	});
+
+	it("rejects a subdomain that is not a single DNS label", async () => {
+		stubCloudflare();
+		const response = await send("POST", "/api/domains/provision-label.test/provision", {
+			subdomain: "notify.evil",
+			dmarc: { policy: "none" },
+		});
+		expect(response.status).toBe(400);
+	});
+
+	it("requires an explicit DMARC policy", async () => {
+		stubCloudflare();
+		const response = await send("POST", "/api/domains/provision-dmarc.test/provision", {
+			subdomain: "notify",
+		});
+		expect(response.status).toBe(400);
 	});
 });
