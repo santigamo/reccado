@@ -162,7 +162,8 @@ export async function handleTransactionalSend(
 		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "template_not_allowed" };
 	}
 
-	// 15. Check template exists
+	// 15. Check template exists. `getTemplate` already refuses a non-active row, so
+	// an archived template reads as absent here rather than as a separate case.
 	const template = getTemplate(ctx.sql, request.mailboxId, templateId);
 	if (!template) {
 		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "template_not_found" };
@@ -547,6 +548,37 @@ export function createTemplate(
 	);
 }
 
+/**
+ * Revise a template in place, keeping its id.
+ *
+ * Templates were write-once: `createTemplate` inserts against a primary key and
+ * archiving only flips a status flag, so there was no way to correct a typo, add
+ * an HTML part, or change wording without minting a new id -- and the id is the
+ * contract the caller hard-codes. "Register a new version" was not something this
+ * system could do.
+ *
+ * The id and status are deliberately not updatable here: renaming is a caller
+ * break, and retiring a template already has its own route.
+ */
+export function updateTemplate(
+	sql: DurableObjectState["storage"]["sql"],
+	mailboxId: string,
+	templateId: string,
+	input: { subject: string; body_text?: string | null; body_html?: string | null },
+): boolean {
+	const result = sql.exec(
+		`UPDATE templates SET subject = ?, body_text = ?, body_html = ?, updated_at = ?
+       WHERE id = ? AND mailbox_id = ?`,
+		input.subject,
+		input.body_text ?? null,
+		input.body_html ?? null,
+		new Date().toISOString(),
+		templateId,
+		mailboxId,
+	);
+	return result.rowsWritten > 0;
+}
+
 export function listTemplates(sql: DurableObjectState["storage"]["sql"], mailboxId: string) {
 	return sql
 		.exec(
@@ -560,7 +592,12 @@ export function getTemplate(
 	sql: DurableObjectState["storage"]["sql"],
 	mailboxId: string,
 	templateId: string,
-): { id: string; subject: string; body_text: string | null; body_html: string | null } | null {
+): {
+	id: string;
+	subject: string;
+	body_text: string | null;
+	body_html: string | null;
+} | null {
 	const row = sql
 		.exec<{
 			id: string;

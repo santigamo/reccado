@@ -1072,6 +1072,60 @@ describe("Transactional send flow", () => {
 		});
 	});
 
+	describe("Template revision", () => {
+		// Templates used to be write-once: the only writes were an insert against a
+		// primary key and an archive flag, so a wording fix or a new HTML part meant
+		// a new id -- which is the string the caller hard-codes.
+		it("revises a template in place, keeping its id and its declared variables", async () => {
+			const mailboxId = "mbx_tpl_revise";
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			await createTemplate(mailboxId, "welcome", "Old subject");
+
+			const updated = await stub.fetch("https://mailbox-do/transactional/templates/welcome", {
+				method: "PUT",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					subject: "Welcome, {{name}}",
+					body_text: "Hello {{name}}, visit {{url}}",
+					body_html: '<p>Hello {{name}}, visit <a href="{{url}}">here</a></p>',
+				}),
+			});
+			expect(updated.status).toBe(200);
+
+			const list = (await (
+				await stub.fetch("https://mailbox-do/transactional/templates")
+			).json()) as { templates: Array<{ id: string; subject: string; body_html: string | null }> };
+			const welcome = list.templates.find((t) => t.id === "welcome");
+			expect(welcome?.subject).toBe("Welcome, {{name}}");
+			// The HTML part is stored alongside the text one rather than replacing it,
+			// which is what makes a multipart/alternative send possible.
+			expect(welcome?.body_html).toContain("{{url}}");
+		});
+
+		it("refuses a revision that would inject a header into the subject", async () => {
+			const mailboxId = "mbx_tpl_revise_crlf";
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			await createTemplate(mailboxId, "welcome", "Old subject");
+			const response = await stub.fetch("https://mailbox-do/transactional/templates/welcome", {
+				method: "PUT",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ subject: "Hi\r\nBcc: victim@example.com" }),
+			});
+			expect(response.status).toBe(400);
+			expect(((await response.json()) as { error: string }).error).toBe("subject_contains_newline");
+		});
+
+		it("404s a revision of a template that does not exist", async () => {
+			const stub = env.MAILBOX_DO.getByName("mbx_tpl_revise_missing");
+			const response = await stub.fetch("https://mailbox-do/transactional/templates/nope", {
+				method: "PUT",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ subject: "Anything" }),
+			});
+			expect(response.status).toBe(404);
+		});
+	});
+
 	describe("Cross-mailbox key isolation", () => {
 		// The path names a mailbox and the key is bound to one, so the two can
 		// disagree. What happens then is a security boundary, and it had no test.

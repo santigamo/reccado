@@ -134,6 +134,20 @@ api.get("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
 	return stub.fetch("https://mailbox-do/transactional/templates");
 });
 
+api.put("/api/mailboxes/:mailboxId/transactional/templates/:templateId", async (c) => {
+	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
+	const auth = await requireAuth(c.req.raw, c.env);
+	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
+	const mailboxId = c.req.param("mailboxId");
+	const templateId = c.req.param("templateId");
+	const stub = mailboxStub(c.env, mailboxId);
+	return stub.fetch(`https://mailbox-do/transactional/templates/${templateId}`, {
+		method: "PUT",
+		body: JSON.stringify(await c.req.json()),
+		headers: { "content-type": "application/json" },
+	});
+});
+
 api.post("/api/mailboxes/:mailboxId/transactional/templates/:templateId/archive", async (c) => {
 	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
 	const auth = await requireAuth(c.req.raw, c.env);

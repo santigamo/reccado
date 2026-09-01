@@ -1314,6 +1314,35 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				return Response.json({ error: msg }, { status: 500 });
 			}
 		}
+		// Revise a template without changing its id. Templates were write-once, so
+		// correcting a typo or adding an HTML part meant minting a new id -- and the
+		// id is what the caller hard-codes, so a revision was a coordinated deploy
+		// across two codebases for a wording change.
+		if (url.pathname.match(/^\/transactional\/templates\/[^/]+$/) && request.method === "PUT") {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const templateId = url.pathname.split("/")[3];
+			if (!templateId) return Response.json({ error: "template_id_required" }, { status: 400 });
+			try {
+				const body = (await request.json()) as {
+					subject: string;
+					body_text?: string | null;
+					body_html?: string | null;
+				};
+				if (!body.subject) {
+					return Response.json({ error: "subject_required" }, { status: 400 });
+				}
+				if (body.subject.includes("\r") || body.subject.includes("\n")) {
+					return Response.json({ error: "subject_contains_newline" }, { status: 400 });
+				}
+				const { updateTemplate } = await import("./transactional-send-ops");
+				const updated = updateTemplate(this.ctx.storage.sql, mailboxId, templateId, body);
+				if (!updated) return Response.json({ error: "template_not_found" }, { status: 404 });
+				return Response.json({ ok: true, id: templateId });
+			} catch (error) {
+				const msg = error instanceof Error ? error.message : String(error);
+				return Response.json({ error: msg }, { status: 400 });
+			}
+		}
 		if (url.pathname === "/transactional/templates" && request.method === "GET") {
 			const mailboxId = this.ctx.id.name ?? "unknown";
 			const { listTemplates } = await import("./transactional-send-ops");
