@@ -119,7 +119,14 @@ type Unrebuildable = {
 
 type Outcome = {
 	row: MessageIndexRow;
-	status: "inserted" | "duplicate" | "conflict" | "timeout" | "push_failed" | "skipped";
+	status:
+		| "inserted"
+		| "duplicate"
+		| "conflict"
+		| "timeout"
+		| "push_failed"
+		| "skipped"
+		| "unverified";
 	detail: string;
 	newLocalId: string | null;
 };
@@ -683,6 +690,13 @@ for (const candidate of rebuildable) {
 
 	// Wait for this message to land before pushing the next one; see the ordering
 	// note at the top of this file.
+	// A row carrying this idempotency key may already exist before we push -- the
+	// projection is rebuildable and can be restored from a backup that predates the
+	// Durable Object it describes, which is exactly the state a jurisdiction move
+	// leaves behind. Waiting for "a row exists" would then be satisfied instantly by
+	// that stale row and report work that never happened, reusing the old message id.
+	// So completion means the id *changed*, not that a row is present.
+	const priorLocalId = alreadyProcessed.get(payload.idempotencyKey)?.message_local_id ?? null;
 	const deadline = Date.now() + timeoutMs;
 	let settled: IngestEventRow | undefined;
 	while (Date.now() < deadline) {
@@ -694,10 +708,26 @@ for (const candidate of rebuildable) {
 			envArgs,
 		);
 		const row0 = rows[0];
-		if (row0 && (row0.status === "processed" || row0.status === "failed")) {
-			settled = row0;
-			break;
-		}
+		if (!row0 || (row0.status !== "processed" && row0.status !== "failed")) continue;
+		if (priorLocalId !== null && row0.message_local_id === priorLocalId) continue;
+		settled = row0;
+		break;
+	}
+
+	// Timing out against an unchanged pre-existing row is genuinely ambiguous: the
+	// Durable Object either deduplicated this message or never processed it, and a
+	// stale projection row cannot tell those apart. Say so instead of picking one.
+	if (!settled && priorLocalId !== null) {
+		outcomes.push({
+			row,
+			status: "unverified",
+			detail: `a pre-existing ${targetDb} row for this key was unchanged after ${timeoutMs}ms — the DO either deduplicated it or never processed it, and this row predates the run`,
+			newLocalId: priorLocalId,
+		});
+		console.log(
+			`  UNVERIFIED ${label} — pre-existing row unchanged; cannot distinguish dedupe from no-op`,
+		);
+		continue;
 	}
 
 	if (!settled) {
@@ -721,7 +751,9 @@ for (const candidate of rebuildable) {
 		continue;
 	}
 
-	const reused = alreadyProcessed.get(payload.idempotencyKey);
+	// `duplicate` is only claimed when the Durable Object itself reported one, never
+	// inferred from a projection row we did not watch appear.
+	const reused = settled.message_local_id === priorLocalId;
 	outcomes.push({
 		row,
 		status: reused ? "duplicate" : "inserted",
@@ -773,6 +805,7 @@ console.log("-------");
 for (const status of [
 	"inserted",
 	"duplicate",
+	"unverified",
 	"skipped",
 	"conflict",
 	"timeout",

@@ -100,6 +100,11 @@ const apply = args.apply === "true";
 const local = args.local === "true";
 const targetEnv = args.env;
 const catchAll = args["catch-all"] === "true";
+// Inbound is provisioned by default, and this flag is how you say you meant it.
+// Seeding only the D1 rows produces a mailbox the portal lists and mail cannot
+// reach: "exists" and "can receive" were separate facts, and nothing surfaced the
+// gap -- the address simply bounced at the MX, which is the wrong place to learn.
+const skipInbound = args["no-inbound"] === "true";
 const envLabel = targetEnv ?? "production";
 
 const domain = args.domain?.trim().toLowerCase();
@@ -109,6 +114,10 @@ if (!domain || !rawAddress) {
 	console.error("Example: pnpm setup:mailbox --domain example.com --address inbox@example.com");
 	process.exit(1);
 }
+
+// `domain` is narrowed to a string by the guard above, but that narrowing does not
+// reach into functions declared later, which use the declared type.
+const resolvedDomain: string = domain;
 
 let address: string;
 try {
@@ -269,8 +278,51 @@ if (!apply) {
 		"Note: a dry run does not read D1, so it prints a fresh candidate id. If this address is\n" +
 			"already seeded, --apply keeps the stored mailbox_id and changes nothing.\n",
 	);
-	console.log("Dry run only. Re-run with --apply to execute.\n");
+	provisionInbound(false);
+	console.log("\nDry run only. Re-run with --apply to execute.\n");
 	process.exit(0);
+}
+
+function inboundArgs(withApply: boolean): string[] {
+	const out = ["setup:routing", "--domain", resolvedDomain, "--address", address];
+	if (catchAll) out.push("--catch-all");
+	if (targetEnv) out.push("--env", targetEnv);
+	if (withApply) out.push("--apply");
+	return out;
+}
+
+/**
+ * The other half of "a mailbox exists": Cloudflare Email Routing enabled on the
+ * zone and a rule delivering this address to the Worker. `setup:routing` owns
+ * that, including the catch-all shape Wrangler rejects client-side, so this
+ * delegates rather than reimplementing it.
+ *
+ * Local runs skip it: there is no zone behind a local D1.
+ */
+function provisionInbound(withApply: boolean): void {
+	if (local) return;
+	if (skipInbound) {
+		console.log("\n▸ Inbound: SKIPPED (--no-inbound)");
+		console.log(`  ${address} will be listed as a mailbox and will not receive mail.`);
+		console.log("  Replies to anything it sends bounce at the MX. Deliberate for a");
+		console.log("  send-only sender; a mistake anywhere else.");
+		return;
+	}
+	console.log("\n▸ Inbound (Email Routing → Worker)");
+	console.log(`  $ pnpm ${inboundArgs(withApply).join(" ")}`);
+	if (!withApply) return;
+	try {
+		execFileSync("pnpm", inboundArgs(true), { stdio: "inherit" });
+	} catch {
+		// The mailbox rows are already committed, so failing here must not read as
+		// "nothing happened". Name what exists and what does not.
+		console.error(
+			`\nsetup:mailbox: the D1 rows for ${address} are seeded, but inbound provisioning failed.`,
+		);
+		console.error(`  The mailbox is listed and cannot receive until you re-run:`);
+		console.error(`    $ pnpm ${inboundArgs(true).join(" ")}`);
+		process.exitCode = 1;
+	}
 }
 
 const dir = mkdtempSync(join(tmpdir(), "reccado-setup-mailbox-"));
@@ -288,3 +340,4 @@ const seededMailboxId =
 		? (seeded.results[0].mailbox_id as string)
 		: candidateMailboxId;
 console.log(`\nSeeded ${address} → ${seededMailboxId} into ${targetLabel}.`);
+provisionInbound(true);
