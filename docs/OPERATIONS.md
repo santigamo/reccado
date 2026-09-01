@@ -33,7 +33,9 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 | `ACCESS_JWT_AUDIENCE` | secret | Cloudflare Access application `aud` tag; validates the `CF-Access-JWT-Assertion` header on every request. Auth fails closed outside `localhost` if unset. | **Required** (non-local) |
 | `ACCESS_TEAM_DOMAIN` | secret | Zero Trust team domain (`https://<team>.cloudflareaccess.com`) used to fetch the Access JWKS. | **Required** (non-local) |
 | `ACCESS_ALLOWED_EMAILS` | secret | Bootstrap for the D1 owner registry (`owner_identities`); the two are unioned. Both empty = auth fails closed (`503`), never open. | Optional once an owner is registered |
-| `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, Email Routing write, Access app/policy write). | Optional |
+| `CLOUDFLARE_API_TOKEN` | secret | Token for admin provisioning workflows. See **Provisioning a sending domain** below for the exact permissions and what each one buys. | Optional |
+| `CLOUDFLARE_ACCOUNT_ID` | secret | Account id. Event subscriptions are account-scoped, so provisioning needs it to create a feedback subscription. | Optional |
+| `FEEDBACK_QUEUE_ID` | var | Queue **id** (not name) that Email Sending feedback events are delivered to. Configured explicitly rather than looked up, so the provisioning token never needs to read the account's queues. Unset = provisioning skips the subscription step and reports it. | Optional |
 | `TRANSACTIONAL_API_KEY_PEPPER` | secret | HMAC-SHA256 pepper for transactional API key hashing. Without it, transactional key operations and the `/v1/.../transactional/...` send/status endpoints fail closed (`503`). Rotation invalidates every existing transactional key. | **Required** to enable the transactional API |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates `/api/debug/phase0/*` introspection endpoints. Unset = endpoints unreachable. | Optional |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender; must be verified on a domain onboarded to Email Sending. | **Required** |
@@ -57,6 +59,58 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 Replace maintainer example names with your own. The verifier and migration commands are now
 parameterized; self-hosters should pass their resource names by env vars/CLI args rather than
 editing the repository.
+
+## Provisioning a sending domain
+
+`POST /api/domains/:domain/provision` (and the **Domains** page over it) runs the whole
+sequence: register the zone, enable Email Sending, publish the DMARC policy, enable
+inbound routing, subscribe to delivery feedback, create the mailbox.
+
+**Every step is idempotent.** Re-running is the normal way to finish a domain that
+stopped part way, not a recovery procedure. A blocked step never aborts the steps that
+do not depend on it, and the response lists a per-step outcome — `already`, `done`,
+`skipped`, `blocked`, `failed` — rather than a boolean. It answers `200` even when steps
+are blocked: the request was handled, and which step is stuck is the useful part.
+
+Two orderings are load-bearing:
+
+- **Registration first.** The DNS gate resolves the zone from the `domains` table and
+  refuses a domain nobody registered. Registration is the act that grants Reccado
+  authority over a zone.
+- **DMARC after Email Sending.** Enabling sending is what makes Cloudflare provision
+  DKIM, SPF, MX *and its own `p=reject` DMARC record*. The ramp replaces that record, so
+  running it first would have the provider overwrite it moments later.
+
+### Token permissions
+
+| Permission | Scope | What it buys | Without it |
+| --- | --- | --- | --- |
+| Zone · Zone · Read | the zones you serve | Resolving a zone id by name | `register_domain` blocked |
+| Zone · Email Sending · Edit | the zones you serve | Enabling the sending subdomain | `email_sending` blocked, `dmarc` and feedback skipped |
+| Zone · DNS · Edit | the zones you serve | Publishing the DMARC ramp record | `dmarc` blocked |
+| Zone · Email Routing · Edit | the zones you serve | Inbound routing | `email_routing` blocked |
+| Account · Event Subscriptions | account | The feedback subscription | `feedback_subscription` blocked |
+
+**Scope the token to the zones Reccado serves, not to all zones.** Only the last row is
+account-scoped; it is the one permission that cannot be bounded by zone. If you would
+rather not grant it, leave it off — that step reports `blocked` with its remedy and the
+rest of the run still completes. Do **not** substitute Queues · Edit: it can delete the
+inbound mail queue, and provisioning never needs it.
+
+### Why DNS write is safe enough to grant
+
+Cloudflare has no record-level token scope, so a token that can publish a DMARC record
+can also rewrite the apex, the MX records, and any TXT record a third party uses for
+account recovery on the same zone. The attenuation is therefore in code, in
+`src/lib/dns-gate.ts`: it is the only place in `src/` that may write DNS, it takes an
+intent rather than a record, it composes the record name itself, and it resolves the
+zone from the registry instead of accepting one from its caller. A source-level guard
+fails the build if anything else addresses the DNS API.
+
+That bounds what Reccado's own code can do — a new endpoint, a bug, a hurried refactor.
+It does **not** bound an attacker who has read the Worker's environment; they hold the
+token and the gate is irrelevant to them. Scoping the token to your zones is the control
+for that, and it is a separate one.
 
 ## Data residency
 

@@ -86,6 +86,15 @@ CREATE TABLE domain_sending (
 );
 ```
 
+> **Gap, noted 2026-09-01:** this table records whether a (domain × stream) can send,
+> but nothing about whether its *feedback channel* comes back. Those are different
+> planes and they fail independently: Email Sending event subscriptions are per sending
+> domain, so a domain can be verified, aligned and sending happily while its bounces and
+> complaints are published to nobody — the state that looks healthiest and is worst,
+> because the suppression list silently stops growing. `src/lib/feedback-liveness.ts`
+> already classifies this at runtime; the durable half belongs here, alongside
+> `last_send_ok_at`, as an observed fact rather than a declared one.
+
 Roles are fixed by convention, overridable by flag, never asked:
 `mail.<domain>` is conversational, `send.<domain>` is transactional. This diverges
 from the table currently in `docs/EMAIL-DELIVERABILITY.md`, which should be updated:
@@ -268,6 +277,34 @@ Decompose the ramp into three roles:
   the evidence and the exact command. If the operator ever declares a DNS token as a
   worker secret — itself a legitimate declaration of trust — the ramp runs autonomously
   on its own subdomains.
+
+  > **Amended 2026-09-01 — that branch has been taken.** The operator's requirement was
+  > no consent-and-paste step anywhere, which forces the DNS write into the Worker; the
+  > paragraph above already named this as the legitimate alternative rather than a
+  > departure from the plan, so this is the plan's own second branch and not a
+  > deviation from it.
+  >
+  > What changed in the reasoning: the original default leaned partly on the Worker
+  > being a bad place for a credential *because it parses untrusted MIME*. That argument
+  > is weaker than it reads. A Worker is a V8 isolate, and input-driven RCE is the
+  > threat that model is strongest against; the realistic compromise vectors are a
+  > dependency or a logic bug that exposes the environment, and a separate provisioning
+  > Worker built from this same repo, with the same dependencies and the same deploy
+  > pipeline, would share both. The isolation it appeared to buy was mostly against the
+  > vector that barely exists.
+  >
+  > So the attenuation went into code instead, in `src/lib/dns-gate.ts`: one function
+  > that takes an intent rather than a record, composes the name itself, resolves the
+  > zone from the `domains` registry rather than from its caller, and has no parameter
+  > through which a name, type or content can be supplied. A source-level guard fails
+  > the build if any other file in `src/` addresses the DNS API. **The hard rule below —
+  > the apex is never acted on — is now enforced structurally rather than by
+  > convention**, which is the property that made this trade acceptable.
+  >
+  > What this does NOT do, recorded so it is not mistaken for more: if the Worker's
+  > environment leaks, the attacker holds the token and the gate is irrelevant to them.
+  > The gate bounds what our own code can do. The token being scoped to Reccado's zones
+  > is the separate, and smaller, control on that.
 
 Three hard rules: **the apex is never acted on**, only read and reported, because there
 the system genuinely cannot enumerate legitimate senders. **The ramp's state is the DNS
