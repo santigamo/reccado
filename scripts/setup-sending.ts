@@ -307,6 +307,30 @@ async function listTxtRecords(
 	);
 }
 
+/**
+ * TXT content as the record actually means it, not as the API happens to spell it.
+ *
+ * Cloudflare returns provider-provisioned TXT records with their surrounding
+ * double quotes inside `content` ("v=spf1 ...") while records created through the
+ * API come back bare (v=spf1 ...). Comparing the raw strings therefore fails to
+ * recognise an existing record as the same one, and the consequence is not a
+ * cosmetic duplicate: `ownsRecord` filters the provider's record out, the upsert
+ * concludes nothing exists, and it adds a second record alongside it. For DMARC
+ * that is actively broken — two DMARC records at one name mean RFC 7489 treats
+ * the policy as absent, so a domain that looks configured is unprotected, and the
+ * dedupe below never fires because it only ever sees records it recognises.
+ *
+ * Observed on notify.eccos.chat: enabling Email Sending auto-provisioned quoted
+ * SPF, DKIM and DMARC records, and this script then created unquoted twins of all
+ * three, leaving Cloudflare's own `p=reject` DMARC in place next to the ramp's
+ * `p=none`.
+ */
+function normalizeTxtContent(content: string): string {
+	// A multi-string TXT ("part one" "part two") concatenates on the wire, so the
+	// quotes come out and the parts join.
+	return content.trim().replace(/"\s*"/g, "").replace(/^"/, "").replace(/"$/, "").trim();
+}
+
 async function upsertTxtStyleRecord(opts: {
 	apply: boolean;
 	token?: string;
@@ -352,7 +376,7 @@ async function upsertTxtStyleRecord(opts: {
 				`setup:sending: expected exactly one existing ${styleLabel} record at ${name}.`,
 			);
 		}
-		if (current.content === desiredContent) {
+		if (normalizeTxtContent(current.content) === normalizeTxtContent(desiredContent)) {
 			console.log("  (already matches — leaving it untouched)");
 			return;
 		}
@@ -673,7 +697,7 @@ if (apply && token && zoneId) {
 		styleLabel: "SPF",
 		desiredContent: spfValue,
 		comment: "Reccado setup:sending managed SPF for Cloudflare Email Sending bounce subdomain",
-		ownsRecord: (record) => record.content.trim().toLowerCase().startsWith("v=spf1"),
+		ownsRecord: (record) => normalizeTxtContent(record.content).toLowerCase().startsWith("v=spf1"),
 	});
 	await upsertTxtStyleRecord({
 		apply,
@@ -683,7 +707,8 @@ if (apply && token && zoneId) {
 		styleLabel: "DMARC",
 		desiredContent: dmarcValue,
 		comment: "Reccado setup:sending managed DMARC for dedicated sending subdomain",
-		ownsRecord: (record) => record.content.trim().toLowerCase().startsWith("v=dmarc1"),
+		ownsRecord: (record) =>
+			normalizeTxtContent(record.content).toLowerCase().startsWith("v=dmarc1"),
 		// Cloudflare Email Sending provisions its own DMARC; collapse to a single record.
 		dedupe: true,
 	});
@@ -740,7 +765,8 @@ if (!skipProviderRecords) {
 				desiredContent: dkim.content,
 				comment:
 					"Reccado setup:sending managed DKIM (provider-generated) for dedicated sending subdomain",
-				ownsRecord: (record) => record.content.trim().toLowerCase().startsWith("v=dkim1"),
+				ownsRecord: (record) =>
+					normalizeTxtContent(record.content).toLowerCase().startsWith("v=dkim1"),
 			});
 		} else {
 			console.log(
