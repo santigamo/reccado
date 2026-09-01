@@ -63,6 +63,12 @@
  *     CLOUDFLARE_API_TOKEN in the environment with zone DNS edit access
  */
 import { execFileSync } from "node:child_process";
+import {
+	buildDmarcValue,
+	type DmarcAlignment,
+	type DmarcPolicy,
+	normalizeTxtContent,
+} from "#/lib/dns-gate";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import {
 	describeFeedbackVerdict,
@@ -81,7 +87,7 @@ type SendEmailBinding = {
 
 type WranglerBlock = {
 	name?: string;
-	vars?: { MAIL_FROM_ADDRESS?: string };
+	vars?: { MAIL_FROM_ADDRESS?: string; MAIL_SENDING_DOMAINS?: string };
 	send_email?: SendEmailBinding[];
 	queues?: { producers?: Array<{ binding: string; queue: string }> };
 };
@@ -202,7 +208,7 @@ function normalizeLocalPart(raw: string | undefined): string {
 	return value;
 }
 
-function buildDmarcValue(policy: string, alignment: string, rua?: string): string {
+function buildDmarcValueFromArgs(policy: string, alignment: string, rua?: string): string {
 	const normalizedPolicy = policy.toLowerCase();
 	if (!["none", "quarantine", "reject"].includes(normalizedPolicy)) {
 		console.error(
@@ -215,23 +221,15 @@ function buildDmarcValue(policy: string, alignment: string, rua?: string): strin
 		console.error(`setup:sending: invalid --dmarc-alignment "${alignment}" (use relaxed|strict).`);
 		process.exit(1);
 	}
-	// Relaxed (`r`) is the safe default for a subdomain that hasn't confirmed DKIM/SPF alignment
-	// yet; strict (`s`) requires an exact domain match and should only be opted into once ramped.
-	const alignmentMode = normalizedAlignment === "strict" ? "s" : "r";
-	const tags = [
-		"v=DMARC1",
-		`p=${normalizedPolicy}`,
-		`adkim=${alignmentMode}`,
-		`aspf=${alignmentMode}`,
-	];
-	// `pct` is meaningless in monitor mode (`p=none` never applies any policy action), so omit it.
-	if (normalizedPolicy !== "none") {
-		tags.push("pct=100");
-	}
-	if (rua) {
-		tags.push(`rua=mailto:${rua}`);
-	}
-	return tags.join("; ");
+	// The string itself is built by the gate, not here. If the CLI and the Worker
+	// spelled the same policy differently by so much as a space, each would see the
+	// other's record as foreign and rewrite it, and the domain would flap between
+	// two policies on every run.
+	return buildDmarcValue(
+		normalizedPolicy as DmarcPolicy,
+		normalizedAlignment as DmarcAlignment,
+		rua,
+	);
 }
 
 function wrangler(argv: string[], opts: { capture?: boolean } = {}): string {
@@ -342,30 +340,6 @@ async function listTxtRecords(
 		"GET",
 		`/zones/${zoneId}/dns_records?type=TXT&name=${encodeURIComponent(name)}&per_page=100`,
 	);
-}
-
-/**
- * TXT content as the record actually means it, not as the API happens to spell it.
- *
- * Cloudflare returns provider-provisioned TXT records with their surrounding
- * double quotes inside `content` ("v=spf1 ...") while records created through the
- * API come back bare (v=spf1 ...). Comparing the raw strings therefore fails to
- * recognise an existing record as the same one, and the consequence is not a
- * cosmetic duplicate: `ownsRecord` filters the provider's record out, the upsert
- * concludes nothing exists, and it adds a second record alongside it. For DMARC
- * that is actively broken — two DMARC records at one name mean RFC 7489 treats
- * the policy as absent, so a domain that looks configured is unprotected, and the
- * dedupe below never fires because it only ever sees records it recognises.
- *
- * Observed on notify.eccos.chat: enabling Email Sending auto-provisioned quoted
- * SPF, DKIM and DMARC records, and this script then created unquoted twins of all
- * three, leaving Cloudflare's own `p=reject` DMARC in place next to the ramp's
- * `p=none`.
- */
-function normalizeTxtContent(content: string): string {
-	// A multi-string TXT ("part one" "part two") concatenates on the wire, so the
-	// quotes come out and the parts join.
-	return content.trim().replace(/"\s*"/g, "").replace(/^"/, "").replace(/"$/, "").trim();
 }
 
 async function upsertTxtStyleRecord(opts: {
@@ -615,7 +589,7 @@ const fromLocalPart = normalizeLocalPart(args["from-local-part"]);
 const rua = args["dmarc-rua"]?.trim();
 const dmarcPolicy = (args["dmarc-policy"] ?? "none").trim().toLowerCase();
 const dmarcAlignment = (args["dmarc-alignment"] ?? "relaxed").trim().toLowerCase();
-const dmarcValue = buildDmarcValue(dmarcPolicy, dmarcAlignment, rua);
+const dmarcValue = buildDmarcValueFromArgs(dmarcPolicy, dmarcAlignment, rua);
 if (dmarcPolicy === "none" && !rua) {
 	console.warn(
 		'\nWARNING: --dmarc-policy is "none" (monitor mode) and no --dmarc-rua was provided, so ' +
@@ -660,11 +634,58 @@ if (!mutableBlock) {
 	process.exit(1);
 }
 
-mutableBlock.vars = { ...(mutableBlock.vars ?? {}), MAIL_FROM_ADDRESS: fromAddress };
+/**
+ * Adding a sending domain must not reconfigure the ones already there.
+ *
+ * This script used to be run once, by hand, on the first domain. It is now the
+ * engine behind a provisioning flow that runs on the second, third and fourth —
+ * and two of its writes were only ever safe on the first run:
+ *
+ *   MAIL_FROM_ADDRESS is a single value: the fallback identity for every mailbox
+ *   whose own domain is not verified. Overwriting it while provisioning a new
+ *   customer domain silently moves everyone else's outbound mail to that
+ *   customer's domain.
+ *
+ *   allowed_sender_addresses is ABSENT by default, and absent means "any sender".
+ *   Adding one address does not widen an existing list, it replaces an unbounded
+ *   permission with a list of exactly one — so the first provisioning run would
+ *   cut off sending from every address already in use.
+ *
+ * Both are still reachable, but only when asked for by name.
+ */
+const setDefaultFrom = Boolean(args["set-default-from"]);
+const restrictSenders = Boolean(args["restrict-senders"]);
+
+const previousFrom = mutableBlock.vars?.MAIL_FROM_ADDRESS;
+const nextFrom = previousFrom && !setDefaultFrom ? previousFrom : fromAddress;
+const fromAddressPreserved = nextFrom !== fromAddress;
+
+// The list of domains verified for outbound. A mailbox on a listed domain sends
+// as itself; anything else falls back to MAIL_FROM_ADDRESS with a Reply-To. This
+// is a union and never a replacement — it is the one var here that is genuinely
+// additive, and forgetting to extend it is why a freshly provisioned domain would
+// otherwise be verified at Cloudflare but still send under someone else's name.
+const sendingDomains = new Set(
+	(mutableBlock.vars?.MAIL_SENDING_DOMAINS ?? "")
+		.split(",")
+		.map((entry) => entry.trim().toLowerCase())
+		.filter(Boolean),
+);
+sendingDomains.add(sendingDomain.toLowerCase());
+
+mutableBlock.vars = {
+	...(mutableBlock.vars ?? {}),
+	MAIL_FROM_ADDRESS: nextFrom,
+	MAIL_SENDING_DOMAINS: [...sendingDomains].sort().join(","),
+};
+
 const emailBinding =
 	mutableBlock.send_email?.find((binding) => binding.name === "EMAIL") ??
 	mutableBlock.send_email?.[0];
-if (emailBinding) {
+const senderAllowListWasUnbounded = emailBinding
+	? emailBinding.allowed_sender_addresses === undefined
+	: false;
+if (emailBinding && (!senderAllowListWasUnbounded || restrictSenders)) {
 	const nextAllowed = new Set(emailBinding.allowed_sender_addresses ?? []);
 	nextAllowed.add(fromAddress);
 	emailBinding.allowed_sender_addresses = [...nextAllowed].sort();
@@ -703,13 +724,25 @@ console.log(
 );
 console.log(`  source: ${sourceConfigPath}`);
 console.log(`  target: ${generatedConfigPath}`);
-console.log(`  MAIL_FROM_ADDRESS=${fromAddress}`);
-if (emailBinding) {
+console.log(`  MAIL_FROM_ADDRESS=${nextFrom}`);
+if (fromAddressPreserved) {
+	console.log(
+		`  (kept the existing default sender; this domain's ${fromAddress} was NOT made the\n` +
+			"   global fallback. Pass --set-default-from if that is what you want.)",
+	);
+}
+console.log(`  MAIL_SENDING_DOMAINS=${[...sendingDomains].sort().join(",")}`);
+if (!emailBinding) {
+	console.log("  EMAIL.allowed_sender_addresses not updated (no send_email binding found).");
+} else if (senderAllowListWasUnbounded && !restrictSenders) {
+	console.log(
+		"  EMAIL.allowed_sender_addresses left unrestricted (any sender). Narrowing it here would\n" +
+			"   cut off every address already sending. Pass --restrict-senders to opt in.",
+	);
+} else {
 	console.log(
 		`  EMAIL.allowed_sender_addresses=${emailBinding.allowed_sender_addresses?.join(", ")}`,
 	);
-} else {
-	console.log("  EMAIL.allowed_sender_addresses not updated (no send_email binding found).");
 }
 if (apply) {
 	writeFileSync(generatedConfigPath, `${JSON.stringify(mutableConfig, null, 2)}\n`);
