@@ -11,6 +11,8 @@ import {
 	explainKeyError,
 	formatKeyDate,
 	maskedKey,
+	sendScopeHasTemplateAllowlist,
+	sendScopeHasTemplateUse,
 	type TransactionalApiKey,
 } from "./api-keys";
 
@@ -90,6 +92,12 @@ export function ApiKeyCard({
 	}
 
 	const explanation = error ? explainKeyError(error) : null;
+	// Two ways an active key is refused by the send path no matter what it is asked to
+	// send. Creation now rejects both, but keys minted before it did are still out there.
+	const missingTemplateUse = status === "active" && !sendScopeHasTemplateUse(apiKey.scopes);
+	const missingAllowlist =
+		status === "active" &&
+		!sendScopeHasTemplateAllowlist(apiKey.scopes, apiKey.templateAllowlist ?? []);
 
 	return (
 		<article
@@ -153,6 +161,11 @@ export function ApiKeyCard({
 							))}
 						</span>
 					)}
+					{missingTemplateUse ? (
+						<span className="mt-1 block text-[12px] text-[var(--app-danger)]">
+							Missing transactional:templates:use, so every send is refused.
+						</span>
+					) : null}
 				</Meta>
 				<Meta label="Quota">
 					{apiKey.quotaMax === null ? "Unlimited" : `${apiKey.quotaUsed} / ${apiKey.quotaMax}`}
@@ -161,6 +174,15 @@ export function ApiKeyCard({
 				<Meta label="Created">{formatKeyDate(apiKey.createdAt)}</Meta>
 				{apiKey.templateAllowlist && apiKey.templateAllowlist.length > 0 ? (
 					<Meta label="Templates">{apiKey.templateAllowlist.join(", ")}</Meta>
+				) : missingAllowlist ? (
+					// Hiding the row when the allowlist is empty reads as "no restriction",
+					// which is the opposite of what the send path does with it.
+					<Meta label="Templates">
+						<span className="text-[var(--app-danger)]">
+							None allowlisted, so every send is refused. Replace this key with one that names its
+							templates.
+						</span>
+					</Meta>
 				) : null}
 				{apiKey.recipientPolicy ? (
 					<Meta label="Recipient policy">{apiKey.recipientPolicy}</Meta>

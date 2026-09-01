@@ -180,7 +180,46 @@ export const DEFAULT_SCOPES: KeyScope[] = [
 
 /**
  * Validates that the given scopes array contains only known scope values.
+ * Says nothing about whether the combination is *usable* — see the two
+ * predicates below for that.
  */
 export function validateScopes(scopes: string[]): scopes is KeyScope[] {
 	return scopes.length > 0 && scopes.every((s) => (KEY_SCOPES as readonly string[]).includes(s));
+}
+
+/**
+ * Names for the two ways a key can be minted already incapable of sending. Both
+ * layers that can refuse a key — the creation request schema and the DO's key
+ * ops — report these exact strings, so the operator reads the same words
+ * whichever one turned them down.
+ */
+export const SEND_SCOPE_REQUIRES_TEMPLATES_USE = "send_scope_requires_templates_use";
+export const SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST = "send_scope_requires_template_allowlist";
+
+export const KEY_SHAPE_MESSAGES = {
+	[SEND_SCOPE_REQUIRES_TEMPLATES_USE]:
+		"A key with transactional:send also needs transactional:templates:use, because every send renders a template.",
+	[SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST]:
+		"A key with transactional:send needs at least one allowlisted template id. An empty allowlist permits nothing, not everything.",
+} as const;
+
+/**
+ * Rendering a template is the only send path, so `transactional:send` on its own
+ * mints a credential that is refused with `insufficient_scope` at the first real
+ * send — long after whoever asked for it has stopped watching.
+ */
+export function sendScopeHasTemplateUse(scopes: readonly string[]): boolean {
+	return !scopes.includes("transactional:send") || scopes.includes("transactional:templates:use");
+}
+
+/**
+ * The send path reads a null or empty allowlist as "no template may be sent",
+ * not as "any template may be sent". A sending key therefore has to name the
+ * templates it is for, or it can never send anything.
+ */
+export function sendScopeHasTemplateAllowlist(
+	scopes: readonly string[],
+	templateAllowlist: readonly string[] | null | undefined,
+): boolean {
+	return !scopes.includes("transactional:send") || (templateAllowlist?.length ?? 0) > 0;
 }

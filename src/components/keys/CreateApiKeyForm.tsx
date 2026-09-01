@@ -13,6 +13,8 @@ import {
 	type KeyScope,
 	type MintedApiKey,
 	SCOPE_LABELS,
+	sendScopeHasTemplateAllowlist,
+	sendScopeHasTemplateUse,
 } from "./api-keys";
 
 const INPUT_CLASS =
@@ -21,9 +23,19 @@ const INPUT_CLASS =
 /** Mirrors `z.string().email()` loosely; the server schema stays the authority. */
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-const DEFAULT_SCOPES: KeyScope[] = ["transactional:send", "transactional:status"];
+/**
+ * `transactional:templates:use` is in here because rendering a template is the only
+ * send path: a key offered "send" without it is refused at every send.
+ */
+const DEFAULT_SCOPES: KeyScope[] = [
+	"transactional:send",
+	"transactional:status",
+	"transactional:templates:use",
+];
 
-type FieldErrors = Partial<Record<"sender" | "scopes" | "quotaMax" | "expiresAt", string>>;
+type FieldErrors = Partial<
+	Record<"sender" | "scopes" | "templateAllowlist" | "quotaMax" | "expiresAt", string>
+>;
 
 function Field({
 	label,
@@ -99,6 +111,21 @@ export function CreateApiKeyForm({
 		else if (!EMAIL_RE.test(trimmedSender)) errors.sender = "Enter a valid email address.";
 		if (scopes.length === 0) errors.scopes = "Pick at least one scope.";
 
+		const templates = templateAllowlist
+			.split(/[\n,]/)
+			.map((t) => t.trim())
+			.filter((t) => t.length > 0);
+
+		// The server refuses both of these outright, so catch them here rather than
+		// spending a round trip to be told the same thing.
+		if (!sendScopeHasTemplateUse(scopes)) {
+			errors.scopes =
+				"A key that sends also needs transactional:templates:use — every send renders a template.";
+		}
+		if (!sendScopeHasTemplateAllowlist(scopes, templates)) {
+			errors.templateAllowlist = "List at least one template id this key is allowed to send.";
+		}
+
 		let quota: number | undefined;
 		const trimmedQuota = quotaMax.trim();
 		if (trimmedQuota) {
@@ -121,10 +148,6 @@ export function CreateApiKeyForm({
 		setFieldErrors(errors);
 		if (Object.keys(errors).length > 0) return null;
 
-		const templates = templateAllowlist
-			.split(/[\n,]/)
-			.map((t) => t.trim())
-			.filter((t) => t.length > 0);
 		const policy = recipientPolicy.trim();
 
 		return {
@@ -155,7 +178,12 @@ export function CreateApiKeyForm({
 			const mapped: FieldErrors = {};
 			for (const [field, messages] of Object.entries(apiError.fieldErrors)) {
 				if (!Array.isArray(messages) || messages.length === 0) continue;
-				if (field === "sender" || field === "scopes" || field === "quotaMax") {
+				if (
+					field === "sender" ||
+					field === "scopes" ||
+					field === "templateAllowlist" ||
+					field === "quotaMax"
+				) {
 					mapped[field] = messages.join(" ");
 				} else if (field === "expiresAt") {
 					mapped.expiresAt = messages.join(" ");
@@ -168,6 +196,7 @@ export function CreateApiKeyForm({
 	}
 
 	const explanation = serverError ? explainKeyError(serverError) : null;
+	const canSend = scopes.includes("transactional:send");
 
 	return (
 		<form
@@ -270,6 +299,30 @@ export function CreateApiKeyForm({
 				) : null}
 			</fieldset>
 
+			{/* Not filed under "Restrictions (optional)": for a sending key this is the
+			    difference between a working credential and one that 403s on every send. */}
+			<div className="mt-4">
+				<Field
+					label={canSend ? "Template allowlist (required)" : "Template allowlist"}
+					htmlFor={`${formId}-templates`}
+					hint={
+						canSend
+							? "One template id per line. A sending key may only send the templates listed here, so an empty list can send nothing."
+							: "One template id per line. Only a key with transactional:send needs one."
+					}
+					error={fieldErrors.templateAllowlist}
+				>
+					<textarea
+						id={`${formId}-templates`}
+						value={templateAllowlist}
+						onChange={(event) => setTemplateAllowlist(event.target.value)}
+						rows={3}
+						placeholder={"welcome-email\npassword-reset"}
+						className={cn(INPUT_CLASS, "h-auto resize-y py-2 font-mono text-[13px]")}
+					/>
+				</Field>
+			</div>
+
 			<button
 				type="button"
 				onClick={() => setAdvancedOpen((open) => !open)}
@@ -282,21 +335,6 @@ export function CreateApiKeyForm({
 
 			{advancedOpen ? (
 				<div className="mt-3 grid gap-4 sm:grid-cols-2">
-					<Field
-						label="Template allowlist"
-						htmlFor={`${formId}-templates`}
-						hint="One template id per line. Empty means every template is allowed."
-					>
-						<textarea
-							id={`${formId}-templates`}
-							value={templateAllowlist}
-							onChange={(event) => setTemplateAllowlist(event.target.value)}
-							rows={3}
-							placeholder={"welcome-email\npassword-reset"}
-							className={cn(INPUT_CLASS, "h-auto resize-y py-2 font-mono text-[13px]")}
-						/>
-					</Field>
-
 					<Field
 						label="Recipient policy"
 						htmlFor={`${formId}-policy`}

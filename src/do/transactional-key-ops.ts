@@ -1,17 +1,20 @@
 type SqlStorage = DurableObjectState["storage"]["sql"];
+
 import {
+	displaySuffix,
+	formatApiKey,
+	generateKeyId,
+	generateSecret,
+	hashApiKey,
 	type KeyEnvironment,
 	type KeyScope,
 	type KeyStatus,
+	nowISO,
+	SEND_SCOPE_REQUIRES_TEMPLATES_USE,
+	sendScopeHasTemplateUse,
 	type TransactionalApiKeyProjection,
 	type TransactionalApiKeyRecord,
-	generateKeyId,
-	generateSecret,
-	formatApiKey,
-	hashApiKey,
 	validateScopes,
-	displaySuffix,
-	nowISO,
 } from "../lib/transactional-keys";
 
 export type RevokeApiKeyResult = {
@@ -89,6 +92,18 @@ export async function createApiKey(
 ): Promise<CreateApiKeyResult> {
 	if (!validateScopes(input.scopes)) {
 		throw new Error("invalid_scopes");
+	}
+	// Every send renders a template, so `transactional:send` without
+	// `transactional:templates:use` stores a key that is refused at every send. This
+	// is the one function every creation passes through, so the scope set is settled
+	// here rather than trusted from the caller.
+	//
+	// Its sibling rule — a sending key must name at least one template — is enforced
+	// one layer up in `createTransactionalApiKeySchema` instead: this primitive has to
+	// stay able to reproduce rows that predate the rule, which `rotateApiKey` does by
+	// copying an existing key's allowlist verbatim.
+	if (!sendScopeHasTemplateUse(input.scopes)) {
+		throw new Error(SEND_SCOPE_REQUIRES_TEMPLATES_USE);
 	}
 
 	const keyId = generateKeyId();

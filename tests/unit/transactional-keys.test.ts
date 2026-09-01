@@ -1,16 +1,21 @@
 import { describe, expect, it } from "vitest";
+import { createTransactionalApiKeySchema } from "#/api/schemas";
 import {
+	displaySuffix,
 	formatApiKey,
-	parseApiKey,
 	generateKeyId,
 	generateSecret,
-	displaySuffix,
 	hashApiKey,
-	verifyApiKey,
-	KEY_SCOPES,
 	KEY_ENVIRONMENTS,
-	validateScopes,
+	KEY_SCOPES,
+	parseApiKey,
+	SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST,
+	SEND_SCOPE_REQUIRES_TEMPLATES_USE,
+	sendScopeHasTemplateAllowlist,
+	sendScopeHasTemplateUse,
 	type TransactionalApiKeyRecord,
+	validateScopes,
+	verifyApiKey,
 } from "#/lib/transactional-keys";
 
 const TEST_PEPPER = "test-pepper-for-testing-only-32bytes!!";
@@ -287,6 +292,120 @@ describe("validateScopes", () => {
 		expect(validateScopes([])).toBe(false);
 		expect(validateScopes(["transactional:send", "invalid"])).toBe(false);
 		expect(validateScopes(["transactional:destroy"])).toBe(false);
+	});
+
+	it("says nothing about whether the combination can actually send", () => {
+		// `transactional:send` alone is a set of known scopes and still an unusable key;
+		// the sendability rules below are what separate the two questions.
+		expect(validateScopes(["transactional:send"])).toBe(true);
+		expect(sendScopeHasTemplateUse(["transactional:send"])).toBe(false);
+	});
+});
+
+describe("sendScopeHasTemplateUse", () => {
+	it("requires transactional:templates:use alongside transactional:send", () => {
+		expect(sendScopeHasTemplateUse(["transactional:send"])).toBe(false);
+		expect(sendScopeHasTemplateUse(["transactional:send", "transactional:status"])).toBe(false);
+		expect(sendScopeHasTemplateUse(["transactional:send", "transactional:templates:use"])).toBe(
+			true,
+		);
+	});
+
+	it("ignores keys that cannot send at all", () => {
+		expect(sendScopeHasTemplateUse([])).toBe(true);
+		expect(sendScopeHasTemplateUse(["transactional:status"])).toBe(true);
+	});
+});
+
+describe("sendScopeHasTemplateAllowlist", () => {
+	const sender = ["transactional:send", "transactional:templates:use"];
+
+	it("requires at least one template id for a sending key", () => {
+		expect(sendScopeHasTemplateAllowlist(sender, null)).toBe(false);
+		expect(sendScopeHasTemplateAllowlist(sender, undefined)).toBe(false);
+		expect(sendScopeHasTemplateAllowlist(sender, [])).toBe(false);
+		expect(sendScopeHasTemplateAllowlist(sender, ["welcome"])).toBe(true);
+	});
+
+	it("ignores keys that cannot send at all", () => {
+		expect(sendScopeHasTemplateAllowlist(["transactional:status"], null)).toBe(true);
+	});
+});
+
+/**
+ * The bug this guards: `CreateApiKeyForm` used to default to send + status with no
+ * template allowlist, so pressing "Create key" and changing nothing minted a
+ * credential that `transactional-send-ops` refuses at step 8 (`insufficient_scope`)
+ * and again at step 14 (`template_not_allowed`). Nothing said so until the first
+ * real send returned a bare 403.
+ */
+describe("createTransactionalApiKeySchema — keys that could never send", () => {
+	const OLD_FORM_DEFAULTS = {
+		environment: "test" as const,
+		sender: "notifications@example.com",
+		scopes: ["transactional:send", "transactional:status"],
+	};
+
+	function fieldErrorsFor(body: unknown): Record<string, string[] | undefined> {
+		const result = createTransactionalApiKeySchema.safeParse(body);
+		expect(result.success).toBe(false);
+		if (result.success) throw new Error("unreachable");
+		return result.error.flatten().fieldErrors;
+	}
+
+	it("refuses the exact body the creation form used to default to", () => {
+		const fieldErrors = fieldErrorsFor(OLD_FORM_DEFAULTS);
+		expect(fieldErrors.scopes?.join(" ")).toContain(SEND_SCOPE_REQUIRES_TEMPLATES_USE);
+		expect(fieldErrors.templateAllowlist?.join(" ")).toContain(
+			SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST,
+		);
+	});
+
+	it("names the missing scope on the scopes field", () => {
+		const fieldErrors = fieldErrorsFor({
+			...OLD_FORM_DEFAULTS,
+			templateAllowlist: ["welcome"],
+		});
+		expect(fieldErrors.scopes?.join(" ")).toContain(SEND_SCOPE_REQUIRES_TEMPLATES_USE);
+		expect(fieldErrors.templateAllowlist).toBeUndefined();
+	});
+
+	it("names the empty allowlist on the templateAllowlist field", () => {
+		const fieldErrors = fieldErrorsFor({
+			...OLD_FORM_DEFAULTS,
+			scopes: [...KEY_SCOPES],
+			templateAllowlist: [],
+		});
+		expect(fieldErrors.templateAllowlist?.join(" ")).toContain(
+			SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST,
+		);
+		expect(fieldErrors.scopes).toBeUndefined();
+	});
+
+	it("does not let a blank line pass as an allowlist entry", () => {
+		const fieldErrors = fieldErrorsFor({
+			...OLD_FORM_DEFAULTS,
+			scopes: [...KEY_SCOPES],
+			templateAllowlist: [""],
+		});
+		expect(fieldErrors.templateAllowlist).toBeDefined();
+	});
+
+	it("accepts a key that can actually send", () => {
+		const result = createTransactionalApiKeySchema.safeParse({
+			...OLD_FORM_DEFAULTS,
+			scopes: [...KEY_SCOPES],
+			templateAllowlist: ["welcome"],
+		});
+		expect(result.success).toBe(true);
+	});
+
+	it("leaves non-sending keys alone", () => {
+		const result = createTransactionalApiKeySchema.safeParse({
+			...OLD_FORM_DEFAULTS,
+			scopes: ["transactional:status"],
+		});
+		expect(result.success).toBe(true);
 	});
 });
 

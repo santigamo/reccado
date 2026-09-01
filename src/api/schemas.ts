@@ -1,4 +1,11 @@
 import { z } from "zod";
+import {
+	KEY_SHAPE_MESSAGES,
+	SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST,
+	SEND_SCOPE_REQUIRES_TEMPLATES_USE,
+	sendScopeHasTemplateAllowlist,
+	sendScopeHasTemplateUse,
+} from "../lib/transactional-keys";
 
 export const createMailboxSchema = z.object({
 	primaryAddress: z.string().email(),
@@ -111,12 +118,39 @@ export const transactionalApiKeyScopeSchema = z.enum([
 	"transactional:templates:use",
 ]);
 
-export const createTransactionalApiKeySchema = z.object({
-	environment: z.enum(["test", "live"]),
-	sender: z.string().email(),
-	scopes: z.array(transactionalApiKeyScopeSchema).min(1),
-	templateAllowlist: z.array(z.string()).optional(),
-	recipientPolicy: z.string().optional(),
-	quotaMax: z.number().int().positive().optional(),
-	expiresAt: z.string().datetime().optional(),
-});
+// A key that can send is usable only if it can also render templates and names at
+// least one. The send path enforces both, but only at the first real send — which
+// is hours or days after the secret was handed out, and answers a bare 403. Refuse
+// the combination at creation instead, while the operator is still looking at the
+// form that produced it.
+//
+// Refuse rather than quietly complete: adding `transactional:templates:use` on the
+// caller's behalf would leave the stored scope list describing something nobody
+// asked for, and scopes on a credential are the record auditors read.
+export const createTransactionalApiKeySchema = z
+	.object({
+		environment: z.enum(["test", "live"]),
+		sender: z.string().email(),
+		scopes: z.array(transactionalApiKeyScopeSchema).min(1),
+		// `.min(1)` per entry so a blank line cannot pad the allowlist into looking non-empty.
+		templateAllowlist: z.array(z.string().min(1)).optional(),
+		recipientPolicy: z.string().optional(),
+		quotaMax: z.number().int().positive().optional(),
+		expiresAt: z.string().datetime().optional(),
+	})
+	.superRefine((body, ctx) => {
+		if (!sendScopeHasTemplateUse(body.scopes)) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["scopes"],
+				message: `${SEND_SCOPE_REQUIRES_TEMPLATES_USE}: ${KEY_SHAPE_MESSAGES[SEND_SCOPE_REQUIRES_TEMPLATES_USE]}`,
+			});
+		}
+		if (!sendScopeHasTemplateAllowlist(body.scopes, body.templateAllowlist)) {
+			ctx.addIssue({
+				code: "custom",
+				path: ["templateAllowlist"],
+				message: `${SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST}: ${KEY_SHAPE_MESSAGES[SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST]}`,
+			});
+		}
+	});

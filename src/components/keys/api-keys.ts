@@ -30,6 +30,29 @@ export const KEY_SCOPES = [
 ] as const;
 export type KeyScope = (typeof KEY_SCOPES)[number];
 
+/**
+ * The two shapes of key the server refuses to mint, mirrored here so the form can
+ * say so before spending a round trip. `createTransactionalApiKeySchema` stays the
+ * authority; these names match the codes it reports back.
+ *
+ * Both exist because a key that can send is only usable if it can also render a
+ * template and names at least one: the send path treats a missing
+ * `transactional:templates:use` and an empty allowlist alike as "send nothing".
+ */
+export const SEND_SCOPE_REQUIRES_TEMPLATES_USE = "send_scope_requires_templates_use";
+export const SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST = "send_scope_requires_template_allowlist";
+
+export function sendScopeHasTemplateUse(scopes: readonly KeyScope[]): boolean {
+	return !scopes.includes("transactional:send") || scopes.includes("transactional:templates:use");
+}
+
+export function sendScopeHasTemplateAllowlist(
+	scopes: readonly KeyScope[],
+	templateAllowlist: readonly string[],
+): boolean {
+	return !scopes.includes("transactional:send") || templateAllowlist.length > 0;
+}
+
 /** Persisted status. `expired` is derived at read time, never stored. */
 export type KeyStatus = "active" | "revoked";
 export type DisplayStatus = "active" | "revoked" | "expired";
@@ -122,6 +145,10 @@ export function explainKeyError(error: ApiKeyError): string | null {
 			return "Only an active key can be rotated. This one is already revoked.";
 		case "invalid_scopes":
 			return "At least one scope is required, and every scope must be a known value.";
+		case SEND_SCOPE_REQUIRES_TEMPLATES_USE:
+			return "A sending key must also carry transactional:templates:use — every send renders a template.";
+		case SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST:
+			return "A sending key must list at least one allowlisted template id.";
 		case "validation_error":
 			return "The server rejected the form values.";
 		case "origin_mismatch":

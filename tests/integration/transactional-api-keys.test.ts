@@ -1,12 +1,12 @@
-import { describe, expect, it, beforeAll } from "vitest";
 import { env as testEnv } from "cloudflare:workers";
-import type { TransactionalApiKeyRecord } from "#/lib/transactional-keys";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
-	upsertApiKeyProjection,
+	getApiKeyProjection,
 	getMailboxForOwner,
 	insertMailbox,
-	getApiKeyProjection,
+	upsertApiKeyProjection,
 } from "#/db/d1";
+import type { TransactionalApiKeyRecord } from "#/lib/transactional-keys";
 import { splitSqlStatements } from "../helpers/migrations";
 
 type TestEnv = Env & {
@@ -53,7 +53,8 @@ describe("Transactional API key integration tests", () => {
 			body: JSON.stringify({
 				environment: "test",
 				sender: "sender@example.com",
-				scopes: ["transactional:send", "transactional:status"],
+				scopes: ["transactional:send", "transactional:status", "transactional:templates:use"],
+				templateAllowlist: ["welcome"],
 			}),
 		});
 		const createBody = (await createResponse.json()) as {
@@ -66,7 +67,11 @@ describe("Transactional API key integration tests", () => {
 		expect(createBody.plaintextKey).toMatch(/^rck_test_[0-9a-f]{32}_/);
 		expect(createBody.key.status).toBe("active");
 		expect(createBody.key.sender).toBe("sender@example.com");
-		expect(createBody.key.scopes).toEqual(["transactional:send", "transactional:status"]);
+		expect(createBody.key.scopes).toEqual([
+			"transactional:send",
+			"transactional:status",
+			"transactional:templates:use",
+		]);
 		expect(createBody.key.environment).toBe("test");
 
 		const keyId = createBody.key.keyId;
@@ -156,6 +161,37 @@ describe("Transactional API key integration tests", () => {
 		expect(rotateRevokedResponse.status).toBe(400);
 	});
 
+	/**
+	 * The creation form used to default to send + status with no template allowlist,
+	 * which mints a key `transactional-send-ops` refuses on every send. The DO refuses
+	 * to store the scope half of that shape at all, so the dead key never reaches an
+	 * operator's clipboard — not even from a caller that skips the request schema.
+	 */
+	it("refuses to mint a send key that cannot use templates", async () => {
+		const mailboxId = "mbx_keys_inert_scopes";
+		const stub = env.MAILBOX_DO.getByName(mailboxId);
+
+		const response = await stub.fetch("https://mailbox-do/transactional/api-keys", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				environment: "live",
+				sender: "sender@example.com",
+				scopes: ["transactional:send", "transactional:status"],
+				templateAllowlist: ["welcome"],
+			}),
+		});
+
+		expect(response.ok).toBe(false);
+		const body = (await response.json()) as { error?: string };
+		expect(body.error).toBe("send_scope_requires_templates_use");
+
+		// And nothing was stored: a refusal that still writes a row is not a refusal.
+		const list = await stub.fetch("https://mailbox-do/transactional/api-keys", { method: "GET" });
+		const listBody = (await list.json()) as { keys: Array<unknown> };
+		expect(listBody.keys.length).toBe(0);
+	});
+
 	it("prevents key from crossing mailboxes", async () => {
 		const mailboxA = "mbx_cross_a";
 		const mailboxB = "mbx_cross_b";
@@ -169,7 +205,8 @@ describe("Transactional API key integration tests", () => {
 			body: JSON.stringify({
 				environment: "test",
 				sender: "a@example.com",
-				scopes: ["transactional:send"],
+				scopes: ["transactional:send", "transactional:templates:use"],
+				templateAllowlist: ["welcome"],
 			}),
 		});
 		const createBody = (await createResponse.json()) as {
@@ -273,7 +310,8 @@ describe("Transactional API key integration tests", () => {
 			body: JSON.stringify({
 				environment: "test",
 				sender: "sender@test.com",
-				scopes: ["transactional:send"],
+				scopes: ["transactional:send", "transactional:templates:use"],
+				templateAllowlist: ["welcome"],
 			}),
 		});
 		const createResult = (await createResponse.json()) as {
@@ -341,7 +379,8 @@ describe("Transactional API key integration tests", () => {
 				body: JSON.stringify({
 					environment: "test",
 					sender: "revoke-proj@test.com",
-					scopes: ["transactional:send"],
+					scopes: ["transactional:send", "transactional:templates:use"],
+					templateAllowlist: ["welcome"],
 				}),
 			})
 			.then((r) => r.json())) as {
