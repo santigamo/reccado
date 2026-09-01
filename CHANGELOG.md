@@ -15,6 +15,28 @@ read/search/draft endpoint.
 
 ### Fixed
 
+- **Reccado no longer reads "no delivery event" as evidence about a message.** Delivery outcomes
+  arrive through Cloudflare Email Sending event subscriptions, and a sending domain without one
+  produces no events for anything — so `delivery_status` stays null forever, an `unknown` never
+  resolves, and no bounce or complaint reaches the suppression mirror. Three features consumed that
+  silence as evidence, including a runbook row that inferred "no event ever arrived, so most likely
+  nothing was sent"; on a domain whose feedback channel was never live, that inference inverts.
+  The live account had four enabled sending domains and one subscription. The system now has a
+  concept of **feedback liveness per sending domain**: `pnpm setup:sending` creates-or-verifies the
+  subscription and exits non-zero rather than reporting success on a domain incapable of its
+  documented feature set; `pnpm doctor --cloud` crosses two live provider lists (enabled sending
+  domains × subscriptions on the events queue) and checks all three of existence, full event-type
+  coverage and destination queue, because existence alone is a false pass; `/api/health` →
+  `dependencies.sendingFeedback` and each transactional status response's new `deliveryFeedback`
+  field answer the question no config check can — whether events actually arrive — from our own
+  send log, with no Cloudflare credential. `unobserved` stays healthy on purpose: too early to tell
+  is an absence of evidence, and calling it a fault would repeat the original error backwards.
+
+- **`pnpm doctor --cloud` ran no cloud checks at all.** It crashed on a TDZ `ReferenceError`
+  before the first one, so every `--cloud` invocation died with a stack trace instead of a report —
+  including the checks that would have passed. The opt-in block now runs below the declarations it
+  reads.
+
 - **A failed transactional send no longer answers `200`.** `permanent_failure` and `unknown` were
   returned with HTTP 200 and the failure only in the JSON body, so the obvious integration — throw
   on non-2xx — reported an undelivered message as sent. Nothing undelivered is 2xx any more:
@@ -235,6 +257,12 @@ trust is not derivable, and whoever can drive the bot can send mail as the opera
 
 ### Tooling & docs
 
+- Pinned wrangler moved 4.106.0 → 4.127.1, which is the version that first exposes
+  `--source email.sending` on `queues subscription create` (plus `--zone-id`/`--domain`) and a
+  `--json` mode on `queues subscription list`. That turns the per-domain Email Sending event
+  subscription from a dashboard-only step into something the setup scripts can create and verify.
+  `pnpm setup:sending` still probes the CLI's own `--help` before shelling out, so an older
+  wrangler yields "unresolved, here is the exact command" rather than an opaque failure.
 - Added `PRODUCTION-READINESS.md` to declare the current production claim honestly and record the
   remaining gaps that still keep Reccado at `READY-WITH-CAVEATS` rather than an unqualified
   production-ready status.

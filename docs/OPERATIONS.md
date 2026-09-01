@@ -180,14 +180,39 @@ consulted for authorization, quota, or idempotency.
   of service on a recipient who is reachable again. A **complaint never expires**: it is a
   statement of intent by a person, and intent does not lapse on a timer — only an explicit,
   owner-authorized removal lifts it. Manual and provider-rejected entries are likewise permanent.
-- Configure one Email Sending event subscription per sending domain in Cloudflare Dashboard:
-  **Queues → `inbox-mcp-email-events` → Subscriptions → Subscribe to events → Email Sending**;
-  select the sending domain and `message.delivered`, `message.deferred`, `message.bounced`,
-  `message.rejected`, `message.complained`, and `message.failed`. Repeat for the dev queue and
-  dev sending domain. The currently installed Wrangler CLI does not yet expose
-  `email.sending` in `queues subscription create`, so do not use its generic command with an
-  unsupported source. The event queue has a configured DLQ; unresolved or invalid events are
-  retried rather than silently acknowledged.
+- **Every sending domain needs its own Email Sending event subscription.** Enabling Email Sending
+  gives a domain the ability to send; only a subscription gives it the ability to *report*. A
+  domain without one emits no events for anything, so every send from it stays
+  `delivery_status: null`, no `unknown` ever resolves, and no bounce or complaint ever reaches the
+  suppression mirror — silently, and identically to a healthy domain whose events have not arrived
+  yet. `pnpm setup:sending` creates-or-verifies it and refuses to exit 0 without one
+  (`--skip-event-subscription` opts out explicitly).
+- To create one by hand — wrangler ≥ 4.127.1 exposes `email.sending` as a source (earlier versions
+  did not, which is why this step used to be dashboard-only):
+
+  ```sh
+  pnpm wrangler queues subscription create inbox-mcp-email-events \
+    --source email.sending --zone-id <zone-id> --domain <sending-domain> \
+    --events message.delivered,message.deferred,message.bounced,message.rejected,message.complained,message.failed
+  ```
+
+  Repeat per sending domain, and for the dev queue with the dev sending domain. The equivalent
+  dashboard path is **Queues → `inbox-mcp-email-events` → Subscriptions → Subscribe to events →
+  Email Sending**. `pnpm wrangler queues subscription list <queue> --json` shows what exists.
+  **All six event types matter**: a subscription with only `message.delivered` selected passes a
+  glance while suppression stays dark. The event queue has a configured DLQ; unresolved or invalid
+  events are retried rather than silently acknowledged.
+- Two independent checks watch this, on purpose. `pnpm doctor --env <env> --cloud` crosses two
+  *live* provider lists — enabled sending domains × subscriptions on the events queue — and fails
+  on a missing subscription, a missing event type, or a destination that is not this
+  environment's queue. `GET /api/health` → `dependencies.sendingFeedback` answers the different
+  question of whether events actually *arrive*, from our own send log and with no Cloudflare
+  credential: it names any domain that has dispatched mail older than 24h and never been answered
+  (`never_observed`), or that stopped being answered (`went_dark`). Only the second catches a
+  subscription pointed at the other environment's queue, a broken consumer, or a provider fault.
+  `unobserved` means not enough evidence yet, and is deliberately not a fault. The read is bounded
+  to the last 30 days of provider-acknowledged sends, so a domain nobody has used in a month
+  simply drops out rather than staying red on stale evidence.
 - Owner-gated suppression administration is available at
   `/api/mailboxes/:mailboxId/suppressions` and
   `/api/mailboxes/:mailboxId/suppressions/remove`. Provider-originated
@@ -387,7 +412,8 @@ all related R2 prefixes.
 | Outbound send failure | Provider rejection, size/recipient-limit violation, or crash mid-send | Inspect `outbound_sends.status`, `error_code`, and provider response context. Retry only after deciding whether the same idempotency key still represents the same logical send. |
 | `outbound_sends` row stuck at `status='sending'` | Crash/interruption mid-send | The hourly cron sweep marks stale sends `unknown` with `error_code='stale_sending_timeout_needs_review'` and an `outbound_send.stale_reconciled` ops event. Treat that as manual-review-required, not proof the message did or did not send. |
 | Transactional request stuck at `pending` | Crash mid-send in the transactional path | The hourly cron and the Access-protected `POST /api/mailboxes/:mailboxId/transactional/reconcile-stale` both run `reconcileStaleTransactionalRequests`, marking rows `unknown` / `stale_reconciled`. Those rows are then eligible for delivery-event correlation like any other `unknown`. |
-| Transactional send returns `unknown` | Provider outcome is ambiguous (may have accepted before erroring) | Never auto-retried. Wait before acting: if the message did leave, the delivery event resolves the row on its own and a replay with the original idempotency key returns the real outcome. Only rows that stay `unknown` — no event ever arrived, so most likely nothing was sent — need a human. |
+| Transactional send returns `unknown` | Provider outcome is ambiguous (may have accepted before erroring) | Never auto-retried. Wait before acting: if the message did leave, the delivery event resolves the row on its own and a replay with the original idempotency key returns the real outcome. A row that stays `unknown` means "most likely nothing was sent" **only if that sender domain's feedback channel is live** — on a domain with no event subscription no event ever arrives for anything, so the silence says nothing at all. Check `deliveryFeedback` on the status response (or `dependencies.sendingFeedback` in `/api/health`) first: `live` means the silence is evidence, `never_observed`/`went_dark` means it is not and the row needs the provider console, not an inference. |
+| A send returns `sent` but `delivery_status` stays null forever | Either the event has not arrived yet, or the sender's domain has no Email Sending event subscription and never will produce one | These are indistinguishable from the status row alone, which is why the response carries `deliveryFeedback`. `unobserved` = wait. `never_observed` = the channel, not the message: create the subscription (`pnpm setup:sending … --apply`, or the `queues subscription create` command above) and note that events are not backfilled — sends made while the domain was dark stay null forever. `went_dark` = it used to work; check the subscription's destination queue, that the events consumer is deployed, and the DLQ. |
 | `email_events.correlation_ambiguous` or `email_events.correlation_rejected` ops event | Two ambiguous sends to the same recipient from the same sender inside the same window, or a stale D1 projection disagreeing with the DO | Deliberate refusal to guess. The event goes to the DLQ; decide by hand which request it belonged to using the DO rows and the provider console. Both requests stay `unknown` until then. |
 | `transactional.unknown_resolved` ops event | An ambiguous send was settled from an observed delivery event | Informational. Check `resolvedVia` on the request: `envelope_correlation` means inferred, not provider-acknowledged. |
 | Access misconfiguration | Route exposed without proper Access enforcement | Treat as a security incident. Block public access first, then fix Access and re-verify with an unauthenticated request. |

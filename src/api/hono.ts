@@ -330,6 +330,14 @@ export function createApiApp(): Hono<ApiBindings> {
 		// A bridge that is on but not delivering has to be visible somewhere a human
 		// or a script actually looks; that it never was is why it stayed broken.
 		const telegram = indexDbHealth.ok ? await getTelegramStatus(c.env).catch(() => null) : null;
+		const { getSendingFeedbackStatus } = await import("../lib/feedback-liveness");
+		// Same failure shape as the bridge, one layer out: sending works, the
+		// channel that reports on it does not, and nothing said so. This is the
+		// only check that survives having no Cloudflare token — it reads what our
+		// own sends already recorded.
+		const sendingFeedback = indexDbHealth.ok
+			? await getSendingFeedbackStatus(c.env.INDEX_DB).catch(() => null)
+			: null;
 		const dependencyStates = {
 			auth: {
 				ok: authOk,
@@ -359,6 +367,20 @@ export function createApiApp(): Hono<ApiBindings> {
 				// The other side of a failing webhook: a count that climbs while the
 				// error message stays generic. Null until the cron has looked once.
 				pendingUpdateCount: telegram?.pendingUpdateCount ?? null,
+			},
+			sendingFeedback: {
+				// A domain nobody has sent from yet is healthy; one that sends and is
+				// never answered is not. `unobserved` stays healthy on purpose — it is
+				// an absence of evidence, and treating it as a fault would repeat the
+				// error this block exists to correct, pointed the other way.
+				ok: sendingFeedback?.ok ?? true,
+				configured: (sendingFeedback?.domains.length ?? 0) > 0,
+				mode: sendingFeedback?.mode ?? "unknown",
+				reason: sendingFeedback?.reason ?? null,
+				// Named, because "something is dark" without which domain sends the
+				// operator back to the dashboard to find out.
+				darkDomains: sendingFeedback?.dark ?? [],
+				maturityHours: sendingFeedback?.maturityHours ?? null,
 			},
 		};
 		const readinessOk = authOk && indexDbHealth.ok;

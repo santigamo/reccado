@@ -25,6 +25,13 @@
  *     `--apply` is passed, upserts them too, unless `--skip-provider-records` is given
  *   - writes MAIL_FROM_ADDRESS (default `hello@send.<domain>`) into a generated config
  *   - narrows the `EMAIL` binding to the chosen sender via `allowed_sender_addresses`
+ *   - creates-or-verifies the Email Sending **event subscription** binding the sending domain to
+ *     the EMAIL_EVENTS_QUEUE, which is what makes delivered/deferred/bounced/rejected/complained/
+ *     failed events exist for it at all. This phase reports `verified` or `unresolved` and exits
+ *     non-zero on an unresolved --apply run: a domain that can send but produces no feedback is a
+ *     half-built domain, and reporting success on it is what let three features read "no event"
+ *     as evidence of nothing sent. Opt out with `--skip-event-subscription` (an explicit
+ *     declaration, not silence).
  *
  * DMARC ramp (recommended for a brand-new sending subdomain):
  *   1. Default is `p=none` (monitor mode) with relaxed alignment (`adkim=r; aspf=r`). Pass
@@ -57,6 +64,15 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	describeFeedbackVerdict,
+	EMAIL_SENDING_EVENT_TYPES,
+	evaluateFeedbackSubscription,
+	helpAdvertisesEmailSendingSource,
+	MIN_WRANGLER_FOR_EMAIL_SENDING,
+	parseQueueListTable,
+	parseSubscriptionListJson,
+} from "./lib/event-subscriptions";
 
 type SendEmailBinding = {
 	name?: string;
@@ -67,6 +83,7 @@ type WranglerBlock = {
 	name?: string;
 	vars?: { MAIL_FROM_ADDRESS?: string };
 	send_email?: SendEmailBinding[];
+	queues?: { producers?: Array<{ binding: string; queue: string }> };
 };
 
 type WranglerConfig = WranglerBlock & {
@@ -257,6 +274,26 @@ function runIdempotent(title: string, argv: string[], apply: boolean): void {
 		}
 		if (stderr) console.error(stderr);
 		throw error;
+	}
+}
+
+/**
+ * Runs wrangler for its output and reports failure as a value. `runIdempotent`
+ * throws, which is right for a mutation the operator asked for; the subscription
+ * phase instead has to distinguish "not there yet" from "this CLI cannot do it",
+ * and both of those are answers, not crashes.
+ */
+function wranglerCapture(argv: string[]): { ok: boolean; out: string; err: string } {
+	try {
+		return { ok: true, out: wrangler(argv, { capture: true }), err: "" };
+	} catch (error) {
+		const stderr = (error as { stderr?: unknown })?.stderr;
+		const stdout = (error as { stdout?: unknown })?.stdout;
+		return {
+			ok: false,
+			out: typeof stdout === "string" ? stdout : "",
+			err: typeof stderr === "string" ? stderr : String(error),
+		};
 	}
 }
 
@@ -569,6 +606,7 @@ function selectProviderRecords(
 const args = parseArgs(process.argv.slice(2));
 const apply = args.apply === "true";
 const skipProviderRecords = args["skip-provider-records"] === "true";
+const skipEventSubscription = args["skip-event-subscription"] === "true";
 const targetEnv = args.env;
 const envLabel = targetEnv ?? "production";
 const zoneDomain = assertDomain(requireArg(args.domain, "--domain"), "--domain");
@@ -806,6 +844,218 @@ if (!skipProviderRecords) {
 	}
 }
 
+// --- Email Sending event subscription ----------------------------------------
+//
+// Enabling Email Sending on a domain does not give it a feedback channel.
+// Lifecycle events (delivered/deferred/bounced/rejected/complained/failed) only
+// exist for a domain an event subscription binds to a queue, and until now that
+// step lived exclusively in `docs/OPERATIONS.md`. So this script could exit 0
+// having provisioned a sending domain structurally incapable of the delivery
+// tracking and suppression mirror the rest of Reccado documents — not a missing
+// warning, a claim of completion that was false. Three features read the absence
+// of events as evidence, and absence is only evidence where presence was
+// possible; this phase is what makes presence possible.
+//
+// Terminal state is therefore verified or unresolved, never silent green, on the
+// same contract as `pnpm doctor`: a fix line exact enough to paste.
+type SubscriptionOutcome = {
+	state: "verified" | "unresolved" | "skipped";
+	detail: string;
+	fix?: string;
+};
+
+const eventsQueue = configBlock.queues?.producers?.find(
+	(producer) => producer.binding === "EMAIL_EVENTS_QUEUE",
+)?.queue;
+
+const subscriptionOutcome = await ensureEventSubscription();
+
+async function ensureEventSubscription(): Promise<SubscriptionOutcome> {
+	console.log(`\n▸ Email Sending event subscription for ${sendingDomain}`);
+	if (skipEventSubscription) {
+		return {
+			state: "skipped",
+			detail: "--skip-event-subscription was passed; this run made no claim about feedback.",
+		};
+	}
+	if (!eventsQueue) {
+		return {
+			state: "unresolved",
+			detail: `no EMAIL_EVENTS_QUEUE producer is declared for env "${envLabel}", so there is no queue to subscribe to.`,
+			fix: "Add the EMAIL_EVENTS_QUEUE producer to wrangler.jsonc, then re-run.",
+		};
+	}
+	console.log(`  queue: ${eventsQueue}`);
+	console.log(`  events: ${EMAIL_SENDING_EVENT_TYPES.join(", ")}`);
+
+	const listed = wranglerCapture(["queues", "subscription", "list", eventsQueue, "--json"]);
+	const subscriptions = listed.ok ? parseSubscriptionListJson(listed.out) : null;
+	if (!subscriptions) {
+		return {
+			state: "unresolved",
+			detail: `could not read the subscriptions on ${eventsQueue}${listed.err.trim() ? ` (${listed.err.trim().split("\n")[0]})` : ""}.`,
+			fix: `pnpm wrangler queues subscription list ${eventsQueue} --json — check you are logged in (pnpm wrangler login) and on wrangler >= ${MIN_WRANGLER_FOR_EMAIL_SENDING}.`,
+		};
+	}
+
+	// The subscription's destination is a queue *id*; only `queues list` maps ids
+	// to names, and without that mapping "it exists" cannot be told from "it
+	// exists and points somewhere else".
+	const queueList = wranglerCapture(["queues", "list"]);
+	const queueId = queueList.ok
+		? parseQueueListTable(queueList.out).find((queue) => queue.name === eventsQueue)?.id
+		: undefined;
+	if (!queueId) {
+		return {
+			state: "unresolved",
+			detail: `queue ${eventsQueue} was not found in this account, so its subscriptions cannot be verified.`,
+			fix: `pnpm setup:cloud${targetEnv ? ` --env ${targetEnv}` : ""} --domain ${zoneDomain} --address inbox@${zoneDomain} --apply (or pnpm wrangler queues create ${eventsQueue})`,
+		};
+	}
+
+	const verdict = evaluateFeedbackSubscription({
+		sendingDomain,
+		expectedQueueId: queueId,
+		subscriptions,
+	});
+	if (verdict.state === "live") {
+		return {
+			state: "verified",
+			detail: describeFeedbackVerdict(sendingDomain, eventsQueue, verdict),
+		};
+	}
+	console.log(`  ${describeFeedbackVerdict(sendingDomain, eventsQueue, verdict)}`);
+
+	// A zone id is the one input neither wrangler nor the sending-domain list will
+	// hand over. An existing subscription in the same zone already carries it, so
+	// the second sending domain of a zone needs no token at all; the first one
+	// falls back to the same REST lookup the DNS upserts already use.
+	const zoneIdForSubscription =
+		zoneId ??
+		subscriptions.find(
+			(sub) =>
+				sub.source.type === "email.sending" &&
+				sub.source.zone_id &&
+				(sub.source.domain?.toLowerCase() === zoneDomain ||
+					sub.source.domain?.toLowerCase().endsWith(`.${zoneDomain}`)),
+		)?.source.zone_id;
+
+	const createCommand = `pnpm wrangler queues subscription create ${eventsQueue} --source email.sending --zone-id ${zoneIdForSubscription ?? "<zone-id>"} --domain ${sendingDomain} --events ${EMAIL_SENDING_EVENT_TYPES.join(",")}`;
+
+	if (!apply) {
+		console.log(`  Would run:\n    $ ${createCommand}`);
+		return {
+			state: "unresolved",
+			detail: "dry run — no subscription was created or verified.",
+			fix: `Re-run with --apply, or run: ${createCommand}`,
+		};
+	}
+
+	// An `update` cannot move a subscription between queues, and one pointed at
+	// another queue is not ours to repoint — creating a second alongside it would
+	// leave two owners for one fact.
+	if (verdict.state === "wrong_queue") {
+		return {
+			state: "unresolved",
+			detail: describeFeedbackVerdict(sendingDomain, eventsQueue, verdict),
+			fix: `Delete it (pnpm wrangler queues subscription delete <its-queue> --id ${verdict.subscriptionIds[0]}), then: ${createCommand}`,
+		};
+	}
+
+	const help = wranglerCapture(["queues", "subscription", "create", "--help"]);
+	if (!helpAdvertisesEmailSendingSource(`${help.out}${help.err}`)) {
+		return {
+			state: "unresolved",
+			detail: "this wrangler's `queues subscription create` does not offer --source email.sending.",
+			fix: `Upgrade to wrangler >= ${MIN_WRANGLER_FOR_EMAIL_SENDING} (pnpm add -D wrangler@${MIN_WRANGLER_FOR_EMAIL_SENDING}) and re-run, or create it in the dashboard: Queues -> ${eventsQueue} -> Subscriptions -> Subscribe to events -> Email Sending -> ${sendingDomain}, selecting all ${EMAIL_SENDING_EVENT_TYPES.length} message.* events.`,
+		};
+	}
+
+	// Converge rather than duplicate: a subscription that exists but is switched
+	// off or missing event types is fixed in place, because a second subscription
+	// for the same domain would make "which one is authoritative" a question
+	// nobody wants to answer at 3am.
+	if (verdict.state === "disabled" || verdict.state === "partial_events") {
+		const id = verdict.subscriptionIds[0] ?? "";
+		const updated = wranglerCapture([
+			"queues",
+			"subscription",
+			"update",
+			eventsQueue,
+			"--id",
+			id,
+			"--events",
+			EMAIL_SENDING_EVENT_TYPES.join(","),
+			"--enabled",
+			"true",
+		]);
+		if (!updated.ok) {
+			return {
+				state: "unresolved",
+				detail: `updating subscription ${id} failed${updated.err.trim() ? ` (${updated.err.trim().split("\n")[0]})` : ""}.`,
+				fix: `pnpm wrangler queues subscription update ${eventsQueue} --id ${id} --events ${EMAIL_SENDING_EVENT_TYPES.join(",")} --enabled true`,
+			};
+		}
+	} else {
+		if (!zoneIdForSubscription) {
+			return {
+				state: "unresolved",
+				detail: `no subscription exists and the zone id for ${zoneDomain} could not be resolved.`,
+				fix: `Set CLOUDFLARE_API_TOKEN and re-run with --apply, or read the zone id from the Cloudflare dashboard (zone overview, right-hand column) and run: ${createCommand}`,
+			};
+		}
+		const created = wranglerCapture([
+			"queues",
+			"subscription",
+			"create",
+			eventsQueue,
+			"--source",
+			"email.sending",
+			"--zone-id",
+			zoneIdForSubscription,
+			"--domain",
+			sendingDomain,
+			"--events",
+			EMAIL_SENDING_EVENT_TYPES.join(","),
+		]);
+		if (!created.ok) {
+			return {
+				state: "unresolved",
+				detail: `creating the subscription failed${created.err.trim() ? ` (${created.err.trim().split("\n")[0]})` : ""}.`,
+				fix: createCommand,
+			};
+		}
+	}
+
+	// Re-read rather than trust the mutation's exit code: "verified" has to mean
+	// the provider agrees, not that a command returned 0.
+	const recheck = wranglerCapture(["queues", "subscription", "list", eventsQueue, "--json"]);
+	const after = recheck.ok ? parseSubscriptionListJson(recheck.out) : null;
+	const afterVerdict = after
+		? evaluateFeedbackSubscription({
+				sendingDomain,
+				expectedQueueId: queueId,
+				subscriptions: after,
+			})
+		: null;
+	if (afterVerdict?.state === "live") {
+		return {
+			state: "verified",
+			detail: describeFeedbackVerdict(sendingDomain, eventsQueue, afterVerdict),
+		};
+	}
+	return {
+		state: "unresolved",
+		detail: afterVerdict
+			? describeFeedbackVerdict(sendingDomain, eventsQueue, afterVerdict)
+			: `the subscription list on ${eventsQueue} could not be re-read to confirm the change.`,
+		fix: `pnpm wrangler queues subscription list ${eventsQueue} --json`,
+	};
+}
+
+console.log(`  ${subscriptionOutcome.state.toUpperCase()}: ${subscriptionOutcome.detail}`);
+if (subscriptionOutcome.fix) console.log(`  → ${subscriptionOutcome.fix}`);
+
 console.log(`\n${"─".repeat(72)}`);
 console.log("Still required / intentionally manual:\n");
 if (skipProviderRecords) {
@@ -825,6 +1075,13 @@ if (skipProviderRecords) {
 			"records printed above (or pass --skip-provider-records to manage them by hand instead).",
 	);
 }
+if (skipEventSubscription) {
+	console.log(
+		`- Event subscription: skipped (--skip-event-subscription). Until ${sendingDomain} is bound to ` +
+			"the events queue, every send from it stays delivery_status=null and no bounce or complaint " +
+			"ever reaches the suppression mirror.",
+	);
+}
 console.log(
 	`- Re-deploy through the setup scripts when you want the Worker to use ${fromAddress}; they build the TanStack app and patch dist/server/wrangler.json from ${generatedConfigPath}.`,
 );
@@ -840,4 +1097,17 @@ console.log(
 
 if (!apply) {
 	console.log("\nDry run only. Re-run with --apply to execute against Cloudflare.\n");
+}
+
+// A dry run never claimed to have finished, so its unresolved subscription is
+// just the plan. An --apply run did claim it, and exiting 0 on a sending domain
+// with no feedback channel is the exact lie this phase was added to stop.
+if (apply && subscriptionOutcome.state === "unresolved") {
+	console.error(
+		`\nsetup:sending: UNRESOLVED — ${sendingDomain} can send, but its delivery/bounce/complaint events do not reach Reccado.` +
+			`\n  ${subscriptionOutcome.detail}` +
+			(subscriptionOutcome.fix ? `\n  → ${subscriptionOutcome.fix}` : "") +
+			"\n  Sending still works; delivery tracking and the suppression mirror do not.\n",
+	);
+	process.exit(1);
 }

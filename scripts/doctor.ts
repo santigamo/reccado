@@ -5,8 +5,9 @@
  *
  * Default run is offline and deterministic (toolchain + local dev + config placeholders).
  * Pass `--cloud` to add remote checks (auth, D1 exists + id match, every declared Queue exists and
- * its DLQs are consumed, required secrets, and — with `--url` — that Cloudflare Access is protecting
- * the route). Exhaustive R2/queue/Email-Routing *binding* wiring lives in `pnpm verify:cf`.
+ * its DLQs are consumed, every sending domain publishes its lifecycle events to the events queue,
+ * required secrets, and — with `--url` — that Cloudflare Access is protecting the route).
+ * Exhaustive R2/queue/Email-Routing *binding* wiring lives in `pnpm verify:cf`.
  *
  * Usage:
  *   pnpm doctor                       # local + config checks for the default (production) config
@@ -16,6 +17,16 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
+import {
+	type AccountQueue,
+	describeFeedbackVerdict,
+	EMAIL_SENDING_EVENT_TYPES,
+	evaluateFeedbackSubscription,
+	MIN_WRANGLER_FOR_EMAIL_SENDING,
+	parseQueueListTable,
+	parseSendingDomainsTable,
+	parseSubscriptionListJson,
+} from "./lib/event-subscriptions";
 
 type Status = "pass" | "warn" | "fail" | "info";
 type Check = { id: string; status: Status; message: string; fix?: string };
@@ -320,45 +331,6 @@ if (!block) {
 	}
 }
 
-// --- Cloud (opt-in) ----------------------------------------------------------
-
-if (args.cloud === "true") {
-	try {
-		const who = execFileSync("pnpm", ["wrangler", "whoami"], { encoding: "utf8" });
-		const email = who.match(/[\w.+-]+@[\w.-]+/)?.[0];
-		add({
-			id: "cloud.auth",
-			status: "pass",
-			message: `Authenticated with Cloudflare${email ? ` as ${email}` : ""}.`,
-		});
-	} catch {
-		add({
-			id: "cloud.auth",
-			status: "warn",
-			message: "Not authenticated with Cloudflare (cloud checks skipped).",
-			fix: "Run `pnpm wrangler login`, then re-run with --cloud.",
-		});
-	}
-	addAll(checkD1Remote());
-	addAll(checkQueuesRemote());
-	addAll(checkSecretsRemote());
-	if (args.url) {
-		add(await checkAccessRedirect(args.url));
-	} else {
-		add({
-			id: "cloud.access",
-			status: "info",
-			message: "Pass --url <deployed-url> to check that Cloudflare Access is protecting /api/*.",
-		});
-	}
-	add({
-		id: "cloud.bindings",
-		status: "info",
-		message:
-			"Exhaustive binding verification (R2/queues/Email Routing wiring) lives in `pnpm verify:cf`.",
-	});
-}
-
 function addAll(items: Check[]): void {
 	for (const c of items) add(c);
 }
@@ -410,10 +382,9 @@ function checkD1Remote(): Check[] {
 	}
 }
 
-type AccountQueue = { name: string; consumers: number };
-
-// `queues list` grew a --json flag after the wrangler this repo pins, so the first
-// page decides which surface to read and the rest follow it: no repeated failures.
+// `queues list` may or may not accept --json depending on the wrangler in play, so
+// the first page decides which surface to read and the rest follow it: no repeated
+// failures.
 let queueListJson = true;
 
 function runQueueList(page: number): string | null {
@@ -442,6 +413,7 @@ function parseQueueListJson(raw: string): AccountQueue[] | null {
 		const parsed = JSON.parse(raw.slice(start)) as unknown;
 		if (!Array.isArray(parsed)) return null;
 		return parsed.map((entry: Record<string, unknown>) => ({
+			id: String(entry.queue_id ?? entry.id ?? ""),
 			name: String(entry.queue_name ?? entry.name ?? ""),
 			consumers: Array.isArray(entry.consumers)
 				? entry.consumers.length
@@ -452,25 +424,14 @@ function parseQueueListJson(raw: string): AccountQueue[] | null {
 	}
 }
 
-/** Wrangler's box-drawn table: │ id │ name │ created_on │ modified_on │ producers │ consumers │. */
-function parseQueueListTable(raw: string): AccountQueue[] {
-	const rows: AccountQueue[] = [];
-	for (const line of raw.split("\n")) {
-		if (!line.startsWith("│")) continue;
-		const cells = line
-			.split("│")
-			.slice(1, -1)
-			.map((cell) => cell.trim());
-		const name = cells[1];
-		if (cells.length < 6 || !name || name === "name") continue;
-		rows.push({ name, consumers: Number.parseInt(cells[5] ?? "", 10) || 0 });
-	}
-	return rows;
-}
-
-/** Queue name → consumer count for the whole account, or null if it can't be read. */
-function listAccountQueues(): Map<string, number> | null {
-	const byName = new Map<string, number>();
+/**
+ * Queue name → the account's row for it, or null if it can't be read. The id
+ * matters as much as the consumer count: an event subscription's destination is
+ * a queue id, so nothing can tell "subscribed to us" from "subscribed to the
+ * other environment" without this mapping.
+ */
+function listAccountQueues(): Map<string, AccountQueue> | null {
+	const byName = new Map<string, AccountQueue>();
 	// Paginated: a queue that merely sits on page 2 would otherwise be reported as
 	// a missing one, which is a deploy-breaking verdict.
 	for (let page = 1; page <= 10; page += 1) {
@@ -479,7 +440,7 @@ function listAccountQueues(): Map<string, number> | null {
 		const rows = parseQueueListJson(raw) ?? parseQueueListTable(raw);
 		if (rows.length === 0) break;
 		for (const row of rows) {
-			if (row.name) byName.set(row.name, row.consumers);
+			if (row.name) byName.set(row.name, row);
 		}
 	}
 	return byName;
@@ -542,7 +503,7 @@ function checkQueuesRemote(): Check[] {
 	// already a fail above, and saying "all DLQs have a consumer" about queues that
 	// are not there would be the false reassurance this check exists to remove.
 	const existingDlqs = dlqs.filter((name) => account.has(name));
-	const orphanDlqs = existingDlqs.filter((name) => account.get(name) === 0);
+	const orphanDlqs = existingDlqs.filter((name) => account.get(name)?.consumers === 0);
 	if (orphanDlqs.length > 0) {
 		out.push({
 			id: "cloud.queues.dlq",
@@ -558,6 +519,178 @@ function checkQueuesRemote(): Check[] {
 		});
 	}
 	return out;
+}
+
+/**
+ * Whether every sending domain Reccado owns can actually report what happened to
+ * the mail it sends.
+ *
+ * Enabling Email Sending on a domain gives it the ability to send; only an event
+ * subscription gives it the ability to *answer*. Nothing joined those two facts,
+ * so the account ran for weeks with four enabled sending domains and one
+ * subscription, and three features went on reading "no delivery event" as
+ * evidence about the message rather than about the channel.
+ *
+ * Two live provider lists are crossed here, never a flag written at setup time:
+ * a flag records what someone intended once, and the failure being caught is
+ * precisely reality drifting from that intention.
+ *
+ * Existence alone is a false pass, so three things are checked: the subscription
+ * exists, its event-type set covers all six, and its destination is this
+ * environment's queue. A subscription with only `message.delivered` selected
+ * satisfies a naive check while suppression stays dark.
+ *
+ * Scope is the sending domains sitting under a zone Reccado has registered in
+ * D1. An account may host sending domains for other projects entirely, and
+ * failing a Reccado diagnostic over someone else's subdomain would be noise that
+ * teaches the operator to skip the whole check.
+ */
+function checkSendingFeedbackRemote(): Check[] {
+	const queueName = block?.queues?.producers?.find(
+		(producer) => producer.binding === "EMAIL_EVENTS_QUEUE",
+	)?.queue;
+	if (!queueName) return [];
+
+	const account = listAccountQueues();
+	const queueId = account?.get(queueName)?.id;
+	if (!queueId) {
+		// checkQueuesRemote already reports a missing or unreadable queue; repeating
+		// it as a second failure would double-count one fault.
+		return [
+			{
+				id: "cloud.sending-feedback",
+				status: "warn",
+				message: `Could not resolve the id of queue ${queueName}, so its event subscriptions cannot be checked.`,
+				fix: "Run `pnpm wrangler login`, then re-run with --cloud.",
+			},
+		];
+	}
+
+	const ours = listRegisteredDomains();
+	if (ours === null) {
+		return [
+			{
+				id: "cloud.sending-feedback",
+				status: "warn",
+				message: "Could not read the registered domains from D1, so sending feedback is unchecked.",
+				fix: `pnpm d1:migrate:${targetEnv ?? "prod"}, or check Cloudflare auth.`,
+			},
+		];
+	}
+
+	let sendingDomains: Array<{ zone: string; name: string; enabled: boolean }>;
+	try {
+		sendingDomains = parseSendingDomainsTable(
+			execFileSync("pnpm", ["wrangler", "email", "sending", "list"], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			}),
+		);
+	} catch {
+		return [
+			{
+				id: "cloud.sending-feedback",
+				status: "warn",
+				message: "Could not list Email Sending domains (auth? open-beta command changed?).",
+				fix: "pnpm wrangler email sending list",
+			},
+		];
+	}
+
+	const mine = sendingDomains.filter(
+		(domain) => domain.enabled && ours.has(domain.zone.trim().toLowerCase()),
+	);
+	if (mine.length === 0) {
+		return [
+			{
+				id: "cloud.sending-feedback",
+				status: "info",
+				message:
+					ours.size === 0
+						? "No domains are registered yet, so there is no sending feedback to check."
+						: "No enabled Email Sending domain belongs to a registered domain yet.",
+				fix: `pnpm setup:sending${targetEnv ? ` --env ${targetEnv}` : ""} --domain <your-domain> --apply`,
+			},
+		];
+	}
+
+	let subscriptions: ReturnType<typeof parseSubscriptionListJson>;
+	try {
+		subscriptions = parseSubscriptionListJson(
+			execFileSync("pnpm", ["wrangler", "queues", "subscription", "list", queueName, "--json"], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			}),
+		);
+	} catch {
+		subscriptions = null;
+	}
+	if (!subscriptions) {
+		return [
+			{
+				id: "cloud.sending-feedback",
+				status: "warn",
+				message: `Could not read the event subscriptions on ${queueName}.`,
+				fix: `pnpm wrangler queues subscription list ${queueName} --json — needs wrangler >= ${MIN_WRANGLER_FOR_EMAIL_SENDING}.`,
+			},
+		];
+	}
+
+	const broken: string[] = [];
+	for (const domain of mine) {
+		const verdict = evaluateFeedbackSubscription({
+			sendingDomain: domain.name,
+			expectedQueueId: queueId,
+			subscriptions,
+		});
+		if (verdict.state !== "live") {
+			broken.push(describeFeedbackVerdict(domain.name, queueName, verdict));
+		}
+	}
+	if (broken.length > 0) {
+		return [
+			{
+				id: "cloud.sending-feedback",
+				status: "fail",
+				message: broken.join(" "),
+				fix: `pnpm setup:sending${targetEnv ? ` --env ${targetEnv}` : ""} --domain <zone> --subdomain <label> --apply (or: pnpm wrangler queues subscription create ${queueName} --source email.sending --zone-id <zone-id> --domain <sending-domain> --events ${EMAIL_SENDING_EVENT_TYPES.join(",")})`,
+			},
+		];
+	}
+	return [
+		{
+			id: "cloud.sending-feedback",
+			status: "pass",
+			message: `All ${mine.length} sending domain(s) publish all ${EMAIL_SENDING_EVENT_TYPES.length} lifecycle events to ${queueName}.`,
+		},
+	];
+}
+
+/** The zones Reccado has registered, lowercased. Null when D1 can't be read. */
+function listRegisteredDomains(): Set<string> | null {
+	try {
+		const raw = execFileSync(
+			"pnpm",
+			[
+				"wrangler",
+				"d1",
+				"execute",
+				"INDEX_DB",
+				"--remote",
+				"--json",
+				"--command",
+				"SELECT domain FROM domains WHERE status = 'active'",
+				...(targetEnv ? ["--env", targetEnv] : []),
+			],
+			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+		);
+		const parsed = JSON.parse(raw.slice(raw.indexOf("["))) as Array<{
+			results: Array<{ domain: string }>;
+		}>;
+		return new Set((parsed[0]?.results ?? []).map((row) => row.domain.trim().toLowerCase()));
+	} catch {
+		return null;
+	}
 }
 
 /** Mirrors src/telegram/registration.ts: two minutes of clock-skew tolerance. */
@@ -806,6 +939,52 @@ async function checkAccessRedirect(rawUrl: string): Promise<Check> {
 	} finally {
 		clearTimeout(timeout);
 	}
+}
+
+// --- Cloud (opt-in) ----------------------------------------------------------
+//
+// Runs here, below every declaration it touches, and not up with the local checks
+// where it used to sit: `runQueueList` reads a module-level `let`, and calling it
+// from above that declaration threw a TDZ ReferenceError that killed the entire
+// process — so `--cloud` diagnosed nothing at all, including the checks that were
+// passing before it. A diagnostic that crashes is worse than one that fails.
+
+if (args.cloud === "true") {
+	try {
+		const who = execFileSync("pnpm", ["wrangler", "whoami"], { encoding: "utf8" });
+		const email = who.match(/[\w.+-]+@[\w.-]+/)?.[0];
+		add({
+			id: "cloud.auth",
+			status: "pass",
+			message: `Authenticated with Cloudflare${email ? ` as ${email}` : ""}.`,
+		});
+	} catch {
+		add({
+			id: "cloud.auth",
+			status: "warn",
+			message: "Not authenticated with Cloudflare (cloud checks skipped).",
+			fix: "Run `pnpm wrangler login`, then re-run with --cloud.",
+		});
+	}
+	addAll(checkD1Remote());
+	addAll(checkQueuesRemote());
+	addAll(checkSendingFeedbackRemote());
+	addAll(checkSecretsRemote());
+	if (args.url) {
+		add(await checkAccessRedirect(args.url));
+	} else {
+		add({
+			id: "cloud.access",
+			status: "info",
+			message: "Pass --url <deployed-url> to check that Cloudflare Access is protecting /api/*.",
+		});
+	}
+	add({
+		id: "cloud.bindings",
+		status: "info",
+		message:
+			"Exhaustive binding verification (R2/queues/Email Routing wiring) lives in `pnpm verify:cf`.",
+	});
 }
 
 // --- Report ------------------------------------------------------------------

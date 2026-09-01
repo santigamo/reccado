@@ -1264,4 +1264,58 @@ describe("Transactional send flow", () => {
 			expect(conflict.status).toBe(409);
 		});
 	});
+	// A send from a domain whose feedback channel never worked returns `sent` with
+	// `delivery_status: null` -- byte-identical to a send whose event has simply
+	// not arrived yet. One of those means "wait", the other means "stop waiting".
+	// Nothing in the response distinguished them, so the status API was silently
+	// telling two different stories in one shape.
+	describe("Feedback liveness on the status response", () => {
+		it("marks a fresh send unobserved and the same domain never_observed once its sends mature", async () => {
+			const mailboxId = "mbx_feedback_liveness";
+			const { plaintextKey } = await createKey(mailboxId, {
+				sender: "bot@notify.example.com",
+				templateAllowlist: ["t"],
+				quotaMax: 10,
+				scopes: ["transactional:send", "transactional:status", "transactional:templates:use"],
+			});
+			await createTemplate(mailboxId, "t", "Test");
+
+			const sendRes = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "ik-fb-1", {
+				template: "t",
+				to: "a@b.com",
+			});
+			expect(sendRes.status).toBe(200);
+			const requestId = sendRes.json.requestId as string;
+
+			const fresh = await getStatus(mailboxId, plaintextKey, requestId);
+			expect(fresh.status).toBe(200);
+			expect(fresh.json.deliveryStatus).toBeNull();
+			// Too early to judge the channel: an absence of evidence, said as one.
+			const freshFeedback = fresh.json.deliveryFeedback as { state: string; reason: string };
+			expect(freshFeedback.state).toBe("unobserved");
+			expect(freshFeedback.reason).toContain("too early to tell");
+
+			// Age the dispatch past the maturity window. Nothing else changes -- same
+			// row, same null delivery_status, same 200.
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+			await runInDurableObject(stub, async (_instance, state) => {
+				state.storage.sql.exec(
+					"UPDATE transactional_requests SET created_at = ? WHERE request_id = ?",
+					old,
+					requestId,
+				);
+			});
+
+			const matured = await getStatus(mailboxId, plaintextKey, requestId);
+			expect(matured.json.deliveryStatus).toBeNull();
+			const feedback = matured.json.deliveryFeedback as { state: string; reason: string };
+			expect(feedback.state).toBe("never_observed");
+			expect(feedback.reason).toContain("notify.example.com");
+			expect(feedback.reason).toContain("describes the channel, not the message");
+			// Additive only: everything a live consumer already reads is untouched.
+			expect(matured.json.status).toBe("sent");
+			expect(matured.json).toHaveProperty("resolvedVia");
+		});
+	});
 });

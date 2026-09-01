@@ -1106,6 +1106,65 @@ export async function upsertSuppressionProjection(
 		.run();
 }
 
+/**
+ * Per sending domain, the four numbers that decide whether its feedback channel
+ * is answering. See `src/lib/feedback-liveness.ts` for what they mean and why
+ * only provider-acknowledged dispatches count.
+ *
+ * This is a projection reading a projection, which is fine and deliberate: the
+ * question is about a *provider channel*, not about any single request's
+ * outcome, so no authority is being borrowed from the DO. The DO answers the
+ * same question from its own rows when a caller asks about one request.
+ *
+ * `status = 'sent' AND created_at >= ?2` is the leading edge of `idx_trl_status`,
+ * so this stays a bounded range scan however large the log grows — which matters
+ * because `/api/health` is polled.
+ */
+export async function readSenderFeedbackObservations(
+	db: D1Database,
+	maturityCutoff: string,
+	lookbackFloor: string,
+): Promise<
+	Array<{
+		domain: string;
+		dispatched: number;
+		observed: number;
+		last_event_at: string | null;
+		last_dispatch_at: string | null;
+		silent_mature: number;
+		last_silent_mature_at: string | null;
+	}>
+> {
+	const result = await db
+		.prepare(
+			`SELECT lower(substr(sender, instr(sender, '@') + 1)) AS domain,
+              COUNT(*) AS dispatched,
+              SUM(CASE WHEN delivery_event_at IS NOT NULL THEN 1 ELSE 0 END) AS observed,
+              MAX(delivery_event_at) AS last_event_at,
+              MAX(created_at) AS last_dispatch_at,
+              SUM(CASE WHEN delivery_event_at IS NULL AND created_at < ?1 THEN 1 ELSE 0 END) AS silent_mature,
+              MAX(CASE WHEN delivery_event_at IS NULL AND created_at < ?1 THEN created_at END) AS last_silent_mature_at
+       FROM transactional_request_log
+       WHERE status = 'sent'
+         AND created_at >= ?2
+         AND provider_message_id IS NOT NULL
+         AND instr(sender, '@') > 0
+       GROUP BY 1
+       ORDER BY 1`,
+		)
+		.bind(maturityCutoff, lookbackFloor)
+		.all<{
+			domain: string;
+			dispatched: number;
+			observed: number;
+			last_event_at: string | null;
+			last_dispatch_at: string | null;
+			silent_mature: number;
+			last_silent_mature_at: string | null;
+		}>();
+	return result.results ?? [];
+}
+
 export async function listTransactionalRequestLogs(
 	db: D1Database,
 	keyId: string,

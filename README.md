@@ -476,9 +476,12 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
   sink exists.
 - Cloudflare Email Sending events are consumed through a Queue; hard bounces and complaints
   create mailbox-local suppressions that block future transactional sends (hard bounces expire
-  after 90 days, complaints never — intent does not lapse on a timer). Configure the
-  per-domain Email Sending event subscription in Cloudflare Dashboard; test keys still have no
-  simulated delivery sink and are rejected for sending.
+  after 90 days, complaints never — intent does not lapse on a timer). Those events only exist for
+  a sending domain an event subscription binds to the queue: `pnpm setup:sending` creates and
+  verifies it, `pnpm doctor --cloud` cross-checks the live provider lists, and
+  `/api/health` → `dependencies.sendingFeedback` reports, per sending domain, whether events are
+  actually arriving — so a null `delivery_status` can be told apart from a dead feedback channel.
+  Test keys still have no simulated delivery sink and are rejected for sending.
 - Stale transactional requests are reconciled hourly to `unknown` and never retried automatically.
 - Hardening: JSON-only, 100 KB body cap, `Cache-Control: no-store`, no CORS, no cookies, no
   query-param credentials.

@@ -14,6 +14,14 @@ import {
 import { isAmbiguousProviderError } from "../lib/outbound-classification";
 import { AmbiguousSendError } from "../lib/errors";
 import {
+	classifyFeedbackLiveness,
+	describeFeedbackLiveness,
+	type FeedbackLivenessState,
+	feedbackLookbackFloor,
+	feedbackMaturityCutoff,
+	type SenderFeedbackObservation,
+} from "../lib/feedback-liveness";
+import {
 	extractProviderMessageId,
 	readSendMarker,
 	sentMarkerValue,
@@ -853,10 +861,66 @@ export function reconcileStaleTransactionalRequests(
 
 // --- Status lookup ---
 
+/**
+ * What this mailbox's own rows say about the feedback channel of one sending
+ * domain. The mailbox DO is authoritative for its requests and never reads D1,
+ * so this deliberately samples less than `/api/health` does — one mailbox's
+ * sends rather than every mailbox's. That is the correct trade here: a narrower
+ * sample can only make the verdict more cautious, and borrowing D1's wider view
+ * would put a rebuildable projection inside an authoritative answer.
+ */
+export function observeSenderFeedback(
+	sql: DurableObjectState["storage"]["sql"],
+	sender: string,
+	now: Date | number = Date.now(),
+): SenderFeedbackObservation | null {
+	const at = sender.lastIndexOf("@");
+	if (at === -1) return null;
+	const domain = sender.slice(at + 1).toLowerCase();
+	const cutoff = feedbackMaturityCutoff(now);
+	const floor = feedbackLookbackFloor(now);
+	const row = sql
+		.exec<{
+			dispatched: number;
+			observed: number;
+			last_event_at: string | null;
+			last_dispatch_at: string | null;
+			silent_mature: number;
+			last_silent_mature_at: string | null;
+		}>(
+			`SELECT COUNT(*) AS dispatched,
+              SUM(CASE WHEN delivery_event_at IS NOT NULL THEN 1 ELSE 0 END) AS observed,
+              MAX(delivery_event_at) AS last_event_at,
+              MAX(created_at) AS last_dispatch_at,
+              SUM(CASE WHEN delivery_event_at IS NULL AND created_at < ? THEN 1 ELSE 0 END) AS silent_mature,
+              MAX(CASE WHEN delivery_event_at IS NULL AND created_at < ? THEN created_at END) AS last_silent_mature_at
+       FROM transactional_requests
+       WHERE status = 'sent'
+         AND created_at >= ?
+         AND provider_message_id IS NOT NULL
+         AND lower(substr(sender, instr(sender, '@') + 1)) = ?`,
+			cutoff,
+			cutoff,
+			floor,
+			domain,
+		)
+		.toArray()[0];
+	return {
+		domain,
+		dispatched: Number(row?.dispatched ?? 0),
+		observed: Number(row?.observed ?? 0),
+		lastEventAt: row?.last_event_at ?? null,
+		lastDispatchAt: row?.last_dispatch_at ?? null,
+		silentMatureDispatches: Number(row?.silent_mature ?? 0),
+		lastSilentMatureAt: row?.last_silent_mature_at ?? null,
+	};
+}
+
 export function getTransactionalRequestStatus(
 	sql: DurableObjectState["storage"]["sql"],
 	requestId: string,
 	keyId: string,
+	now: Date | number = Date.now(),
 ): {
 	status: string;
 	providerMessageId: string | null;
@@ -865,11 +929,13 @@ export function getTransactionalRequestStatus(
 	deliveryStatus: string | null;
 	deliveryEventAt: string | null;
 	resolvedVia: string | null;
+	deliveryFeedback: { state: FeedbackLivenessState; reason: string | null };
 } | null {
 	const row =
 		sql
 			.exec<{
 				status: string;
+				sender: string;
 				provider_message_id: string | null;
 				created_at: string;
 				error_code: string | null;
@@ -877,12 +943,13 @@ export function getTransactionalRequestStatus(
 				delivery_event_at: string | null;
 				resolved_via: string | null;
 			}>(
-				"SELECT status, provider_message_id, created_at, error_code, delivery_status, delivery_event_at, resolved_via FROM transactional_requests WHERE request_id = ? AND key_id = ?",
+				"SELECT status, sender, provider_message_id, created_at, error_code, delivery_status, delivery_event_at, resolved_via FROM transactional_requests WHERE request_id = ? AND key_id = ?",
 				requestId,
 				keyId,
 			)
 			.toArray()[0] ?? null;
 	if (!row) return null;
+	const observation = observeSenderFeedback(sql, row.sender, now);
 	return {
 		status: row.status,
 		providerMessageId: row.provider_message_id,
@@ -893,5 +960,17 @@ export function getTransactionalRequestStatus(
 		// Non-null means this status was inferred from an observed delivery event
 		// rather than acknowledged by the provider at send time.
 		resolvedVia: row.resolved_via,
+		// Additive, and the reason it exists: `deliveryStatus: null` on a domain
+		// whose feedback channel never worked is indistinguishable from the same
+		// null on a message whose event has simply not arrived yet. One means
+		// "wait"; the other means "stop waiting, nothing is coming". Same spirit
+		// as `resolvedVia` — mark inferred evidence as inferred instead of letting
+		// the caller assume it is a measurement.
+		deliveryFeedback: observation
+			? {
+					state: classifyFeedbackLiveness(observation),
+					reason: describeFeedbackLiveness(observation),
+				}
+			: { state: "unobserved", reason: null },
 	};
 }

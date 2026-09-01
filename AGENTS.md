@@ -121,8 +121,13 @@ actual repo state, fix this section rather than trusting it blindly.
   `src/mcp/*` (no send tool). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
   Gateway) has not started — do not claim it. Cloudflare Email Sending lifecycle events are
   consumed by the `inbox-mcp-email-events` Queue and hard-bounce/complaint suppressions are
-  enforced in the mailbox DO; the per-domain Email Sending event subscription still requires
-  Cloudflare Dashboard configuration.
+  enforced in the mailbox DO. The per-domain Email Sending event subscription is now created and
+  verified by `pnpm setup:sending` (wrangler ≥ 4.127.1 exposes `--source email.sending`), checked
+  against the live provider lists by `pnpm doctor --cloud`, and its actual liveness is reported
+  per sending domain in `/api/health` → `dependencies.sendingFeedback` and on each transactional
+  status response as `deliveryFeedback`. A domain with no subscription produces no events at all,
+  so **never read the absence of a delivery event as evidence about a message without checking
+  that domain's feedback liveness first** — see `src/lib/feedback-liveness.ts`.
 - Transactional API current gap: no simulated delivery sink for test keys; test keys are rejected
   by the production send path. `reconcileStaleTransactionalRequests` is wired into the hourly
   cron and an Access-protected operator endpoint, and unknown outcomes remain manual-review-only.
