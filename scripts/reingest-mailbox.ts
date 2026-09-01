@@ -57,8 +57,8 @@
  * preview is the plan. `--apply` is the only thing that writes.
  *
  * Usage:
- *   pnpm reingest:mailbox --env dev --mailbox mbx_... --source-d1 inbox-mcp-index-dev
- *   pnpm reingest:mailbox --env dev --mailbox mbx_... --source-d1 inbox-mcp-index-dev --apply
+ *   pnpm reingest:mailbox --env dev --mailbox mbx_... --source-d1 <pre-migration-index>
+ *   pnpm reingest:mailbox --env dev --mailbox mbx_... --source-d1 <pre-migration-index> --apply
  *
  * Requires: `wrangler` auth (remote D1 + R2 reads) and, for `--apply`, a
  * CLOUDFLARE_API_TOKEN with Queues:Edit plus CLOUDFLARE_ACCOUNT_ID (or a

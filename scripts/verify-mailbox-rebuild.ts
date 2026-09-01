@@ -33,7 +33,7 @@
  *
  * Usage:
  *   pnpm verify:mailbox-rebuild --env dev --mailbox mbx_... \
- *     --source-d1 inbox-mcp-index-dev --base-url https://reccado-dev.<sub>.workers.dev
+ *     --source-d1 <pre-migration-index> --base-url https://reccado-dev.<sub>.workers.dev
  *
  * Credentials:
  *   PHASE0_DEBUG_TOKEN  the deployed Worker's debug token — reads the DO's own
