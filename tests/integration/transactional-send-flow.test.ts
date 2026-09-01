@@ -625,6 +625,40 @@ describe("Transactional send flow", () => {
 		});
 	});
 
+	describe("Cross-mailbox key isolation", () => {
+		// The path names a mailbox and the key is bound to one, so the two can
+		// disagree. What happens then is a security boundary, and it had no test.
+		it("refuses a key from one mailbox used against another mailbox's path", async () => {
+			const owning = "mbx_xmb_owner";
+			const other = "mbx_xmb_other";
+			const { plaintextKey } = await createKey(owning, {
+				templateAllowlist: ["t"],
+				scopes: ["transactional:send", "transactional:templates:use"],
+			});
+			await createTemplate(owning, "t", "Test");
+			// The other mailbox has the same template, so a failure here is about the
+			// key's binding and nothing else.
+			await createTemplate(other, "t", "Test");
+
+			const ownPath = await sendTransactional(owning, `Bearer ${plaintextKey}`, "ik-xmb-1", {
+				template: "t",
+				to: "a@b.com",
+			});
+			expect(ownPath.status).toBe(200);
+
+			const wrongPath = await sendTransactional(other, `Bearer ${plaintextKey}`, "ik-xmb-2", {
+				template: "t",
+				to: "a@b.com",
+			});
+			expect(wrongPath.status).toBe(403);
+			// It fails as an unknown key rather than as a mismatched one: keys live in
+			// the owning mailbox's own Durable Object storage, so from the other
+			// mailbox's DO this key simply does not exist. The explicit
+			// `key_does_not_belong_to_mailbox` check is defence in depth behind that.
+			expect(wrongPath.json.error).toBe("invalid_api_key");
+		});
+	});
+
 	describe("Variable retention", () => {
 		// Transactional variables carry action-capable tokens — verification links,
 		// password resets, invitation URLs. Keeping them after the send would make

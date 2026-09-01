@@ -108,6 +108,15 @@ the UI, Telegram, and MCP surfaces still require `request-send` → `confirm-sen
 
 ### Key format and auth
 
+**A key belongs to exactly one mailbox, so the `:mailboxId` in the path is derivable rather than a
+selector.** It is kept because the route names the resource it acts on, not because a key can
+address more than one mailbox. When path and key disagree the request fails closed with `403
+invalid_api_key` — not `key_does_not_belong_to_mailbox`, which is the obvious answer and the wrong
+one: keys live in the owning mailbox's own Durable Object storage, so from another mailbox's DO the
+key simply does not exist. The explicit binding check is defence in depth behind that and is
+unreachable in normal operation. A caller may fold the mailbox id into its configured endpoint URL
+rather than carrying it as a separate setting.
+
 Keys are `rck_<env>_<key-id>_<secret>` (`env` ∈ `test|live`); the plaintext secret (256-bit) is
 shown once at creation. Only the keyed hash
 `HMAC-SHA256(TRANSACTIONAL_API_KEY_PEPPER, keyId + ":" + secret)` is stored in the mailbox DO;
