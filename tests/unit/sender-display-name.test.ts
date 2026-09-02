@@ -57,9 +57,23 @@ describe("sender name validation", () => {
 		expect(isValidSenderName("a".repeat(MAX_SENDER_NAME_LENGTH))).toBe(true);
 	});
 
-	it("accepts non-ASCII, because brand names have accents", () => {
-		expect(isValidSenderName("Café Ñandú")).toBe(true);
-		expect(normalizeSenderName("  Café Ñandú  ")).toBe("Café Ñandú");
+	// Provisional, and the comment on isValidSenderName explains why. RFC 5322 does
+	// not allow raw UTF-8 in a header — a non-ASCII name needs RFC 2047 encoded-word
+	// encoding — and neither Cloudflare's docs nor its local implementation say
+	// whether the send binding does that. Accepting it would fail SILENTLY: correct
+	// in whichever client you tested, mojibake in others, on mail already sent.
+	// This test is here to be DELETED once a real delivered message proves the wire
+	// format, not to enshrine the restriction.
+	it("refuses non-ASCII until the wire encoding is verified", () => {
+		expect(isValidSenderName("Café Ñandú")).toBe(false);
+		expect(() => normalizeSenderName("Café")).toThrow();
+	});
+
+	it("accepts the printable ASCII a brand name actually needs", () => {
+		for (const name of ["Eccos", "Acme Inc.", "Foo & Bar", "Support (EU)", "A-B_C 123"]) {
+			expect(isValidSenderName(name)).toBe(true);
+		}
+		expect(normalizeSenderName("  Acme Inc.  ")).toBe("Acme Inc.");
 	});
 
 	it("treats empty and whitespace-only as absent rather than as a name", () => {
@@ -218,5 +232,8 @@ describe("conversational sender identity", () => {
 				.fromName,
 		).toBeNull();
 		expect(resolveSenderIdentity(baseEnv, "hello@imsanti.dev", "   ").fromName).toBeNull();
+		// Including a name that is merely un-encodable rather than dangerous: the
+		// reply still goes out, just without the name.
+		expect(resolveSenderIdentity(baseEnv, "hello@imsanti.dev", "Café").fromName).toBeNull();
 	});
 });

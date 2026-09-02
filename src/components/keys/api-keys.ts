@@ -144,7 +144,7 @@ export function explainKeyError(error: ApiKeyError): string | null {
 		case "key_not_found":
 			return "That key no longer exists. Refresh the list.";
 		case "invalid_sender_name":
-			return "A sender name cannot contain line breaks, angle brackets or double quotes — it goes straight into the From header.";
+			return "A sender name must be printable ASCII without angle brackets or double quotes — it goes straight into the From header.";
 		case "key_not_active":
 			return "Only an active key can be rotated. This one is already revoked.";
 		case "invalid_scopes":

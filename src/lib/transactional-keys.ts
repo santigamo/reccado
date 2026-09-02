@@ -92,14 +92,30 @@ export const SENDER_NAME_INVALID = "invalid_sender_name";
  * either be escaped into something the operator did not intend or, worse,
  * produce a header that parses as a different address entirely.
  *
- * Everything else is allowed, including non-ASCII — "Café" is a legitimate
- * brand name, and the mail library encodes it.
+ * ASCII-only, and that restriction is provisional rather than principled.
+ * RFC 5322 does not allow raw UTF-8 in a header: a non-ASCII display name has to
+ * be RFC 2047 encoded-word encoded (`=?UTF-8?B?...?=`). The send binding builds
+ * the MIME itself, so it may well do that for us — but Cloudflare's documentation
+ * says nothing about the `name` field's encoding, and miniflare's local
+ * implementation renders it as raw quoted UTF-8 with no encoding at all. Encoding
+ * it ourselves is no safer: if the binding also encodes, recipients see a literal
+ * `=?UTF-8?B?...?=` instead of the name.
+ *
+ * So both choices are guesses, and they fail differently. Accepting non-ASCII
+ * fails SILENTLY — it renders correctly in whichever client you happen to test
+ * and as mojibake in others, on mail that has already gone out. Refusing it fails
+ * LOUDLY, at the moment an operator types the name, and blocks nobody today.
+ *
+ * To lift this: send one message with an accented name to a real mailbox and read
+ * the RAW MIME (not a decoded view — a decoder makes a correctly-encoded header
+ * and a broken one look identical). If `From:` carries an encoded-word, widen the
+ * regex below to allow non-ASCII and delete this paragraph.
  */
 export function isValidSenderName(value: string): boolean {
 	if (value.length === 0 || value.length > MAX_SENDER_NAME_LENGTH) return false;
-	// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
-	if (/[\r\n\u0000-\u001f\u007f]/.test(value)) return false;
-	return !/[<>"]/.test(value);
+	// Printable ASCII only, minus the three delimiters. This excludes CR, LF and
+	// every other control character by construction rather than by a second test.
+	return /^[\x20-\x7e]+$/.test(value) && !/[<>"]/.test(value);
 }
 
 /**

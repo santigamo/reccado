@@ -1,4 +1,5 @@
 import { domainFromAddress } from "./email-headers";
+import { isValidSenderName } from "./transactional-keys";
 
 /**
  * Which address outbound mail actually goes out as.
@@ -112,17 +113,19 @@ export function resolveSenderIdentity(
 /**
  * A display name safe for a From header, or null.
  *
- * Same rule as the transactional path (`isValidSenderName`), applied here too
- * because `mailboxes.display_name` is free text an operator typed and this is
- * the last point before it reaches a mail header. CR/LF would let it inject
- * additional headers; angle brackets and quotes would break the address form.
+ * Same rule as the transactional path (`isValidSenderName`), including its
+ * provisional ASCII-only restriction — see that function for why non-ASCII is
+ * held back and what would lift it. Applied here too because
+ * `mailboxes.display_name` is free text an operator typed and this is the last
+ * point before it reaches a mail header.
+ *
+ * Unlike the transactional path this DROPS an unusable name instead of throwing.
+ * That path is a configuration action with an operator watching a form; this one
+ * runs on the send path, where refusing to deliver a reply because a mailbox has
+ * an accent in its name would be a far worse failure than sending it bare.
  */
 function normalizeDisplayName(value: string | null | undefined): string | null {
 	if (value == null) return null;
 	const trimmed = value.trim();
-	if (trimmed.length === 0 || trimmed.length > 64) return null;
-	// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
-	if (/[\r\n\u0000-\u001f\u007f]/.test(trimmed)) return null;
-	if (/[<>"]/.test(trimmed)) return null;
-	return trimmed;
+	return isValidSenderName(trimmed) ? trimmed : null;
 }

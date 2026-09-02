@@ -172,7 +172,8 @@ const senderNameField = z
 	.trim()
 	.max(MAX_SENDER_NAME_LENGTH)
 	.refine(isValidSenderName, {
-		message: "Sender name cannot contain line breaks, angle brackets or double quotes",
+		message:
+			"Sender name must be printable ASCII without angle brackets or double quotes",
 	});
 
 export const updateTransactionalApiKeySchema = z.object({

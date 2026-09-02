@@ -116,9 +116,12 @@ export function CreateApiKeyForm({
 		// The name goes straight into a mail header, so the same characters the
 		// server refuses are refused here — while the operator is still on the form.
 		const trimmedName = senderName.trim();
-		if (trimmedName && !/^[^<>"\r\n]{1,64}$/.test(trimmedName)) {
+		// Mirrors isValidSenderName on the server: printable ASCII minus the three
+		// address-form delimiters. Non-ASCII is held back until the From header's
+		// wire encoding is verified — see that function for the full reasoning.
+		if (trimmedName && !(/^[\x20-\x7e]{1,64}$/.test(trimmedName) && !/[<>"]/.test(trimmedName))) {
 			errors.senderName =
-				"A sender name cannot contain line breaks, angle brackets or double quotes.";
+				"Use printable ASCII only, without angle brackets or double quotes — this goes straight into the From header.";
 		}
 		if (scopes.length === 0) errors.scopes = "Pick at least one scope.";
 
