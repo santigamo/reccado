@@ -94,12 +94,26 @@ export const SENDER_NAME_INVALID = "invalid_sender_name";
  *
  * ASCII-only, and that restriction is provisional rather than principled.
  * RFC 5322 does not allow raw UTF-8 in a header: a non-ASCII display name has to
- * be RFC 2047 encoded-word encoded (`=?UTF-8?B?...?=`). The send binding builds
- * the MIME itself, so it may well do that for us — but Cloudflare's documentation
- * says nothing about the `name` field's encoding, and miniflare's local
- * implementation renders it as raw quoted UTF-8 with no encoding at all. Encoding
- * it ourselves is no safer: if the binding also encodes, recipients see a literal
- * `=?UTF-8?B?...?=` instead of the name.
+ * be RFC 2047 encoded-word encoded (`=?UTF-8?B?...?=`). Whether the send binding
+ * does that for us is, as of 2026-09-02, NOT KNOWABLE without sending a message.
+ * Three places were checked, so nobody has to check them again:
+ *
+ *   - Cloudflare's docs specify `interface EmailAddress { name, email }` and say
+ *     nothing about character sets, encoding, or MIME construction.
+ *   - workerd's source does not build the MIME. `EmailMessageBuilder` and
+ *     `EmailReplyMessageBuilder` appear ONLY in types/defines/email.d.ts, with no
+ *     implementation anywhere, and the repository contains no `MIME-Version` at
+ *     all (`Content-Transfer-Encoding` appears once, in an HTTP comment in
+ *     form-data.c++). The builder is therefore resolved server-side by the Email
+ *     Sending service, which is closed source. Reading the source cannot settle
+ *     this — do not spend the afternoon trying.
+ *   - miniflare's local implementation is its own stub
+ *     (workers/email/send_email.worker.js) and renders the name as raw quoted
+ *     UTF-8. It says nothing about production.
+ *
+ * Encoding it ourselves is not the safe fallback it looks like: if the service
+ * also encodes, recipients see a literal `=?UTF-8?B?...?=` where the name should
+ * be. Same uncertainty, more visible damage.
  *
  * So both choices are guesses, and they fail differently. Accepting non-ASCII
  * fails SILENTLY — it renders correctly in whichever client you happen to test
