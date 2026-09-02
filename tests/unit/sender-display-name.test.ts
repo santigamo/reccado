@@ -59,11 +59,15 @@ describe("sender name validation", () => {
 
 	// Provisional, and the comment on isValidSenderName explains why. RFC 5322 does
 	// not allow raw UTF-8 in a header — a non-ASCII name needs RFC 2047 encoded-word
-	// encoding — and neither Cloudflare's docs nor its local implementation say
-	// whether the send binding does that. Accepting it would fail SILENTLY: correct
-	// in whichever client you tested, mojibake in others, on mail already sent.
-	// This test is here to be DELETED once a real delivered message proves the wire
-	// format, not to enshrine the restriction.
+	// encoding — and the builder is resolved inside a closed service, so neither the
+	// docs nor workerd's source says whether it does that. Accepting it would fail
+	// SILENTLY: correct in whichever client you tested, mojibake in others, on mail
+	// already sent.
+	//
+	// Do not delete this on the strength of one green wire check. A pass is a
+	// snapshot of current service behaviour, not a contract, so lifting the
+	// restriction means accepting a silent regression whenever that behaviour
+	// changes. The durable fix is the raw-MIME overload, costed in that comment.
 	it("refuses non-ASCII until the wire encoding is verified", () => {
 		expect(isValidSenderName("Café Ñandú")).toBe(false);
 		expect(() => normalizeSenderName("Café")).toThrow();

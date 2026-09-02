@@ -120,10 +120,30 @@ export const SENDER_NAME_INVALID = "invalid_sender_name";
  * and as mojibake in others, on mail that has already gone out. Refusing it fails
  * LOUDLY, at the moment an operator types the name, and blocks nobody today.
  *
- * To lift this: send one message with an accented name to a real mailbox and read
- * the RAW MIME (not a decoded view — a decoder makes a correctly-encoded header
- * and a broken one look identical). If `From:` carries an encoded-word, widen the
- * regex below to allow non-ASCII and delete this paragraph.
+ * The test for whether lifting it is safe: send one message with an accented name
+ * to a real mailbox and read the RAW MIME — not a decoded view, since a decoder
+ * makes a correctly-encoded header and a broken one look identical.
+ *
+ * Note carefully what a pass would and would not license. Because the builder is
+ * resolved inside a closed service, a green result is a SNAPSHOT of Cloudflare's
+ * current behaviour, not a contract. They can start or stop emitting
+ * encoded-words without a changelog that reaches us, and the breakage would be
+ * silent and retroactive in exactly the way the original problem was. So this is
+ * a re-runnable check, not a one-time licence to delete the restriction — treat
+ * a pass as "safe to lift for now", and expect to re-run it.
+ *
+ * If a customer ever genuinely needs a non-ASCII sender name, the durable answer
+ * is not to trust the snapshot but to stop asking the service: `SendEmail.send`
+ * has a first overload, `send(message: EmailMessage)`, taking raw MIME we build
+ * ourselves. Then the encoding is ours, it is on the wire because we put it
+ * there, and it cannot change underneath us. The cost is owning MIME
+ * construction, which is a bad trade for a display name today but a smaller one
+ * than it looks: `mimetext` is already a dependency (agents pulls it in
+ * transitively, so it is in the bundle either way) and its `dumpMailboxSingle`
+ * already emits `=?utf-8?B?<base64>?= <addr>` for exactly this. One caveat if
+ * that day comes — mimetext encodes the display name unconditionally, so ASCII
+ * names would move from `Eccos <a@b>` to an encoded-word on the wire too. Same
+ * rendering in every client, different bytes.
  */
 export function isValidSenderName(value: string): boolean {
 	if (value.length === 0 || value.length > MAX_SENDER_NAME_LENGTH) return false;
