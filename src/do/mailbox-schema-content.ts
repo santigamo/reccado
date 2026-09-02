@@ -184,6 +184,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
   environment TEXT NOT NULL CHECK (environment IN ('test', 'live')),
   mailbox_id TEXT NOT NULL,
   sender TEXT NOT NULL,
+  -- Display phrase for the From header. Nullable: absent means send the bare
+  -- address, the behaviour of every key that predates this column.
+  sender_name TEXT,
   scopes_json TEXT NOT NULL DEFAULT '[]',
   template_allowlist_json TEXT,
   recipient_policy TEXT,
@@ -201,7 +204,8 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
 CREATE TABLE IF NOT EXISTS api_key_events (
   id TEXT PRIMARY KEY,
   key_id TEXT NOT NULL,
-  event_type TEXT NOT NULL CHECK (event_type IN ('created', 'revoked', 'rotated')),
+  event_type TEXT NOT NULL
+    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated')),
   metadata_json TEXT,
   created_at TEXT NOT NULL
 );

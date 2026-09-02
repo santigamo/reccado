@@ -26,7 +26,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 5;
+const MAILBOX_SCHEMA_VERSION = 6;
 
 // Minimal runtime validation for the /ingest payload. Defined locally (rather than
 // imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
@@ -397,6 +397,8 @@ type ConfirmSendDraftContext = {
 	sql: SqlStorage;
 	transactionSync: (fn: () => void) => void;
 	email: Env["EMAIL"];
+	/** Display phrase for the From header, or null to send the bare address. */
+	fromName?: string | null;
 	fromAddress: string;
 	replyToAddress: string | null;
 };
@@ -478,9 +480,10 @@ export function resolveReplyIdentity(
 	sql: SqlStorage,
 	draftId: string | undefined,
 	primaryAddress: string | null,
+	displayName?: string | null,
 ): SenderIdentity {
 	const alias = draftId ? resolveDraftAlias(env, sql, draftId, primaryAddress) : null;
-	return resolveSenderIdentity(env, alias ?? primaryAddress);
+	return resolveSenderIdentity(env, alias ?? primaryAddress, displayName);
 }
 
 function resolveDraftAlias(
@@ -650,7 +653,10 @@ export async function confirmSendDraft(
 		}
 
 		const providerResult = await ctx.email.send({
-			from: fromAddress,
+			// Bare address when the mailbox has no display name — identical to the
+			// behaviour before names existed, so no mailbox changes how it renders
+			// unless someone gave it a name.
+			from: ctx.fromName ? { name: ctx.fromName, email: fromAddress } : fromAddress,
 			to,
 			cc: cc.length ? cc : undefined,
 			bcc: bcc.length ? bcc : undefined,
@@ -868,6 +874,16 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 5) {
 			this.migrateResolvedViaColumn();
 		}
+		// v6: From display names. `api_keys.sender_name` holds the phrase, and
+		// `api_key_events` needs its CHECK widened to admit the audit row that
+		// records a change to it — a constraint SQLite cannot ALTER, hence a
+		// rebuild. Both are new gates rather than additions to an older one:
+		// every mailbox in production is already past v5, so a migration hidden
+		// behind an earlier version would never run for the mailboxes that need it.
+		if (currentVersion < 6) {
+			this.migrateApiKeySenderName();
+			this.migrateApiKeyEventTypes();
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -905,6 +921,56 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (!columns.has("parent_message_id")) {
 			this.ctx.storage.sql.exec("ALTER TABLE outbound_drafts ADD COLUMN parent_message_id TEXT");
 		}
+	}
+
+	/**
+	 * Adds `api_keys.sender_name` to mailboxes provisioned before display names
+	 * existed. Nullable with no backfill, deliberately: null means "send the bare
+	 * address", which is exactly what those keys did yesterday, so the migration
+	 * cannot change the From header of a key already in use.
+	 */
+	private migrateApiKeySenderName(): void {
+		const columns = this.columnNames("api_keys");
+		if (!columns.has("sender_name")) {
+			this.ctx.storage.sql.exec("ALTER TABLE api_keys ADD COLUMN sender_name TEXT");
+		}
+	}
+
+	/**
+	 * Widens `api_key_events.event_type` to admit 'sender_name_updated'.
+	 *
+	 * A CHECK constraint cannot be altered in SQLite, so a mailbox provisioned
+	 * before this event type existed would reject the audit row — and because the
+	 * insert happens in the same call as the update, the whole rename would fail
+	 * with a constraint error rather than silently skipping the audit. Hence a
+	 * table rebuild rather than an ALTER.
+	 *
+	 * Detection reads the stored DDL rather than tracking a version number: the
+	 * constraint text is the fact we care about, so asking the table directly
+	 * cannot drift from reality the way a counter can.
+	 */
+	private migrateApiKeyEventTypes(): void {
+		const ddl = this.ctx.storage.sql
+			.exec("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_key_events'")
+			.toArray()[0] as { sql?: string } | undefined;
+		if (!ddl?.sql || ddl.sql.includes("sender_name_updated")) return;
+
+		this.ctx.storage.sql.exec("ALTER TABLE api_key_events RENAME TO api_key_events_old");
+		this.ctx.storage.sql.exec(`CREATE TABLE api_key_events (
+  id TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL,
+  event_type TEXT NOT NULL
+    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated')),
+  metadata_json TEXT,
+  created_at TEXT NOT NULL
+)`);
+		this.ctx.storage.sql.exec(
+			"INSERT INTO api_key_events SELECT id, key_id, event_type, metadata_json, created_at FROM api_key_events_old",
+		);
+		this.ctx.storage.sql.exec("DROP TABLE api_key_events_old");
+		this.ctx.storage.sql.exec(
+			"CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id)",
+		);
 	}
 
 	private migrateResolvedViaColumn(): void {
@@ -1024,8 +1090,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const body = (await request.json()) as {
 				idempotencyKey: string;
 				mailboxAddress?: string | null;
+				displayName?: string | null;
 			};
-			const result = await this.confirmSendDraft(draftId, body.idempotencyKey, body.mailboxAddress);
+			const result = await this.confirmSendDraft(
+				draftId,
+				body.idempotencyKey,
+				body.mailboxAddress,
+				body.displayName,
+			);
 			// Ambiguous provider outcomes are business-level, not transport-level errors.
 			// Return 200 so the caller's confirmDraftSend reaches the "ambiguous" branch
 			// and records D1 status as "unknown" (not "failed"). Any other "error" property
@@ -1063,6 +1135,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				const result = await createApiKey(this.ctx.storage.sql, pepper, mailboxId, {
 					environment: body.environment as "test" | "live",
 					sender: body.sender as string,
+					senderName: body.senderName as string | null | undefined,
 					scopes: body.scopes as import("../lib/transactional-keys").KeyScope[],
 					templateAllowlist: body.templateAllowlist as string[] | null | undefined,
 					recipientPolicy: body.recipientPolicy as string | null | undefined,
@@ -1074,6 +1147,35 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				const msg = error instanceof Error ? error.message : String(error);
 				const status = msg === "invalid_scopes" ? 400 : 500;
 				return Response.json({ error: msg }, { status });
+			}
+		}
+		if (
+			url.pathname.match(/^\/transactional\/api-keys\/[^/]+$/) &&
+			request.method === "PATCH"
+		) {
+			const keyId = url.pathname.split("/")[3];
+			if (!keyId) {
+				return Response.json({ error: "key_not_found" }, { status: 404 });
+			}
+			const body = (await request.json()) as { senderName?: unknown };
+			const { updateApiKeySenderName } = await import("./transactional-key-ops");
+			try {
+				const result = updateApiKeySenderName(
+					this.ctx.storage.sql,
+					keyId,
+					(body.senderName ?? null) as string | null,
+				);
+				if (!result) {
+					return Response.json({ error: "key_not_found" }, { status: 404 });
+				}
+				return Response.json({ key: result });
+			} catch (error) {
+				const code = error instanceof Error ? error.message : "update_failed";
+				// key_not_active is the caller pointing at a revoked key; the sender-name
+				// codes are a value that cannot go in a header. Both are the caller's
+				// mistake, neither is a server fault.
+				const status = code === "key_not_active" || code === "invalid_sender_name" ? 400 : 500;
+				return Response.json({ error: code }, { status });
 			}
 		}
 		if (url.pathname === "/transactional/api-keys" && request.method === "GET") {
@@ -1772,6 +1874,31 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	 * in mailbox_meta — later sends (a Telegram confirm, a retry) then work even when
 	 * the caller didn't pass it.
 	 */
+	/**
+	 * The mailbox's display name, cached in mailbox_meta.
+	 *
+	 * Same shape as resolveMailboxAddress: the DO has no D1 access, so the value
+	 * travels in on requests that know it and is remembered for the ones that do
+	 * not. A caller that omits it gets the last one seen rather than nothing,
+	 * which keeps Telegram- and MCP-initiated sends named like UI-initiated ones.
+	 */
+	private resolveMailboxDisplayName(provided: string | null | undefined): string | null {
+		const candidate = provided?.trim();
+		if (candidate) {
+			this.ctx.storage.sql.exec(
+				`INSERT INTO mailbox_meta (key, value, updated_at) VALUES ('display_name', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+				candidate,
+				new Date().toISOString(),
+			);
+			return candidate;
+		}
+		const cached = this.ctx.storage.sql
+			.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = 'display_name'")
+			.toArray()[0];
+		return cached?.value ?? null;
+	}
+
 	private resolveMailboxAddress(provided: string | null | undefined): string | null {
 		const candidate = provided?.trim().toLowerCase();
 		if (candidate?.includes("@")) {
@@ -1793,12 +1920,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		draftId: string | undefined,
 		idempotencyKey: string,
 		mailboxAddress?: string | null,
+		displayName?: string | null,
 	): Promise<Record<string, unknown>> {
 		const identity = resolveReplyIdentity(
 			this.env,
 			this.ctx.storage.sql,
 			draftId,
 			this.resolveMailboxAddress(mailboxAddress),
+			this.resolveMailboxDisplayName(displayName),
 		);
 		return confirmSendDraft(
 			{
@@ -1806,6 +1935,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				transactionSync: (fn) => this.ctx.storage.transactionSync(fn),
 				email: this.env.EMAIL,
 				fromAddress: identity.from,
+				fromName: identity.fromName,
 				replyToAddress: identity.replyTo,
 			},
 			draftId,

@@ -1,6 +1,8 @@
 import { z } from "zod";
 import {
+	isValidSenderName,
 	KEY_SHAPE_MESSAGES,
+	MAX_SENDER_NAME_LENGTH,
 	SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST,
 	SEND_SCOPE_REQUIRES_TEMPLATES_USE,
 	sendScopeHasTemplateAllowlist,
@@ -157,6 +159,28 @@ export const transactionalApiKeyScopeSchema = z.enum([
 // Refuse rather than quietly complete: adding `transactional:templates:use` on the
 // caller's behalf would leave the stored scope list describing something nobody
 // asked for, and scopes on a credential are the record auditors read.
+/**
+ * The From display phrase, e.g. "Eccos" in `Eccos <hello@notify.eccos.chat>`.
+ *
+ * Validated here as well as in the storage layer because this value ends up in a
+ * mail header: CR/LF would let it inject additional headers, and angle brackets
+ * or quotes would break the address form. Rejecting it at the edge means the
+ * operator sees the problem on the form they typed it into.
+ */
+const senderNameField = z
+	.string()
+	.trim()
+	.max(MAX_SENDER_NAME_LENGTH)
+	.refine(isValidSenderName, {
+		message: "Sender name cannot contain line breaks, angle brackets or double quotes",
+	});
+
+export const updateTransactionalApiKeySchema = z.object({
+	// Explicitly nullable: null clears the name back to sending the bare address,
+	// which an operator must be able to do without reissuing the key.
+	senderName: senderNameField.nullable(),
+});
+
 export const createTransactionalApiKeySchema = z
 	.object({
 		environment: z.enum(["test", "live"]),

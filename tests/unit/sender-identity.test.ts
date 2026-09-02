@@ -27,13 +27,14 @@ describe("resolveSenderIdentity", () => {
 			{ ...baseEnv, MAIL_SENDING_DOMAINS: "imsanti.dev" },
 			"hello@imsanti.dev",
 		);
-		expect(identity).toEqual({ from: "hello@imsanti.dev", replyTo: null });
+		expect(identity).toEqual({ from: "hello@imsanti.dev", fromName: null, replyTo: null });
 	});
 
 	it("falls back to the global sender with Reply-To when the domain is unverified", () => {
 		const identity = resolveSenderIdentity(baseEnv, "hello@imsanti.dev");
 		expect(identity).toEqual({
 			from: "noreply@mail.imsanti.dev",
+			fromName: null,
 			replyTo: "hello@imsanti.dev",
 		});
 	});
@@ -46,6 +47,7 @@ describe("resolveSenderIdentity", () => {
 	it("handles an unknown mailbox address", () => {
 		expect(resolveSenderIdentity(baseEnv, null)).toEqual({
 			from: "noreply@mail.imsanti.dev",
+			fromName: null,
 			replyTo: null,
 		});
 	});

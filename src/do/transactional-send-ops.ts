@@ -323,6 +323,7 @@ export async function handleTransactionalSend(
 		{
 			to,
 			from: fromAddress,
+			fromName: record.senderName,
 			subject: interpolated.subject,
 			bodyText: interpolated.body_text,
 			bodyHtml: interpolated.body_html,
@@ -362,6 +363,15 @@ export async function handleTransactionalSend(
 type DoSendParams = {
 	to: string;
 	from: string;
+	/**
+	 * Display phrase for the From header, or null to send the bare address.
+	 *
+	 * Kept separate from `from` rather than pre-formatted into `"Name <addr>"`:
+	 * the binding takes a structured `{ name, email }` and does its own encoding,
+	 * so formatting it here would mean quoting and RFC 2047 encoding by hand — and
+	 * the address is also used unformatted elsewhere in this function.
+	 */
+	fromName: string | null;
 	subject: string;
 	bodyText: string | null;
 	bodyHtml: string | null;
@@ -421,7 +431,10 @@ async function doTransactionalSend(
 	let providerMessageId: string | null = null;
 	try {
 		const providerResult = await ctx.email.send({
-			from: params.from,
+			// A key with no display name sends exactly what it sent before this
+			// existed: the bare address. That equivalence is what makes the column
+			// safe to add without touching keys already in production.
+			from: params.fromName ? { name: params.fromName, email: params.from } : params.from,
 			to: [params.to],
 			subject: params.subject,
 			text: params.bodyText ?? undefined,

@@ -62,6 +62,8 @@ export type TransactionalApiKey = {
 	keyId: string;
 	mailboxId: string;
 	sender: string;
+	/** Display phrase for the From header, e.g. "Eccos". Null = bare address. */
+	senderName: string | null;
 	/** Last 6 characters of the secret, safe to display. */
 	displaySuffix: string;
 	environment: KeyEnvironment;
@@ -141,6 +143,8 @@ export function explainKeyError(error: ApiKeyError): string | null {
 			return "The worker is missing the TRANSACTIONAL_API_KEY_PEPPER secret, so keys cannot be minted or rotated.";
 		case "key_not_found":
 			return "That key no longer exists. Refresh the list.";
+		case "invalid_sender_name":
+			return "A sender name cannot contain line breaks, angle brackets or double quotes — it goes straight into the From header.";
 		case "key_not_active":
 			return "Only an active key can be rotated. This one is already revoked.";
 		case "invalid_scopes":
@@ -225,6 +229,7 @@ export function normalizeApiKey(raw: RawApiKey): TransactionalApiKey {
 		keyId: asString(raw.keyId),
 		mailboxId: asString(raw.mailboxId),
 		sender: asString(raw.sender),
+		senderName: asStringOrNull(raw.senderName),
 		displaySuffix: asString(raw.displaySuffix),
 		environment: raw.environment === "live" ? "live" : "test",
 		scopes: Array.isArray(raw.scopes) ? raw.scopes.filter(isKeyScope) : [],
@@ -275,6 +280,28 @@ export async function createApiKey(
 		key: normalizeApiKey(data.projection ?? data.key ?? {}),
 		plaintextKey: asString(data.plaintextKey),
 	};
+}
+
+/**
+ * Change (or clear) a key's From display name.
+ *
+ * A PATCH, not a reissue: the secret, its hash and the sender address are
+ * untouched, so nobody has to redeploy a credential to fix how their mail reads.
+ */
+export async function updateApiKeySenderName(
+	mailboxId: string,
+	keyId: string,
+	senderName: string | null,
+): Promise<TransactionalApiKey | null> {
+	const data = await json<{ key?: { projection?: RawApiKey; key?: RawApiKey } }>(
+		await fetch(`${base(mailboxId)}/${encodeURIComponent(keyId)}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ senderName }),
+		}),
+	);
+	const projection = data.key?.projection ?? data.key?.key;
+	return projection ? normalizeApiKey(projection) : null;
 }
 
 export async function revokeApiKey(

@@ -20,6 +20,7 @@ import {
 	confirmSendSchema,
 	createDraftSchema,
 	createTransactionalApiKeySchema,
+	updateTransactionalApiKeySchema,
 	messageActionSchema,
 	searchQuerySchema,
 	threadListQuerySchema,
@@ -464,6 +465,41 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 				key?: { key?: Record<string, unknown>; projection?: unknown };
 			};
 			if (data.key?.projection) {
+				await projectApiKey(c.env, data.key.projection as Parameters<typeof projectApiKey>[1]);
+			}
+		}
+		return doResponse;
+	});
+
+	/**
+	 * Change (or clear) a key's From display name.
+	 *
+	 * A PATCH rather than a reissue, deliberately: renaming a brand should not
+	 * force every integrator into a coordinated secret swap, and a secret rotated
+	 * for cosmetic reasons is a secret people learn to rotate carelessly. The
+	 * secret, its hash and the sender address are untouched.
+	 */
+	api.patch("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
+		if (ownershipError) return ownershipError;
+		const body = updateTransactionalApiKeySchema.parse(await c.req.json());
+		const keyId = c.req.param("keyId");
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		const doResponse = await stub.fetch(
+			`https://mailbox-do/transactional/api-keys/${encodeURIComponent(keyId)}`,
+			{
+				method: "PATCH",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ senderName: body.senderName }),
+			},
+		);
+		if (doResponse.ok) {
+			const data = (await doResponse.json()) as { key?: { projection?: unknown } };
+			if (data.key?.projection) {
+				// Keep the D1 projection in step; the list view reads from there.
 				await projectApiKey(c.env, data.key.projection as Parameters<typeof projectApiKey>[1]);
 			}
 		}

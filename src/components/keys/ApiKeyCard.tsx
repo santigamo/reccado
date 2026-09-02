@@ -52,15 +52,36 @@ export function ApiKeyCard({
 	apiKey,
 	onRevoke,
 	onRotate,
+	onRenameSender,
 }: {
 	apiKey: TransactionalApiKey;
 	onRevoke: () => Promise<void>;
 	onRotate: () => Promise<void>;
+	/** Sets or clears the From display name. A PATCH — the secret is untouched. */
+	onRenameSender: (senderName: string | null) => Promise<void>;
 }): ReactElement {
 	const [pending, setPending] = useState<"revoke" | "rotate" | null>(null);
 	const [busy, setBusy] = useState<"revoke" | "rotate" | null>(null);
 	const [error, setError] = useState<ApiKeyError | null>(null);
 	const [copied, setCopied] = useState(false);
+	const [editingName, setEditingName] = useState(false);
+	const [nameDraft, setNameDraft] = useState(apiKey.senderName ?? "");
+	const [savingName, setSavingName] = useState(false);
+
+	async function saveSenderName(): Promise<void> {
+		setError(null);
+		setSavingName(true);
+		try {
+			// Empty means "no name", not an empty name — the two must not be
+			// different states or the address renders with a stray leading space.
+			await onRenameSender(nameDraft.trim() || null);
+			setEditingName(false);
+		} catch (caught) {
+			setError(asApiKeyError(caught));
+		} finally {
+			setSavingName(false);
+		}
+	}
 
 	const status = displayStatus(apiKey);
 	const statusStyle = STATUS_STYLES[status];
@@ -131,7 +152,54 @@ export function ApiKeyCard({
 			</div>
 
 			<dl className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-				<Meta label="Sender">{apiKey.sender || "—"}</Meta>
+				<Meta label="Sender">
+					{/* What a recipient's client actually shows, rather than the two
+					    fields separately — the rendering is the thing being edited. */}
+					{apiKey.senderName ? (
+						<span>
+							{apiKey.senderName}{" "}
+							<span className="text-[var(--app-text-soft)]">&lt;{apiKey.sender}&gt;</span>
+						</span>
+					) : (
+						apiKey.sender || "—"
+					)}
+					{editingName ? (
+						<span className="mt-1.5 flex items-center gap-1.5">
+							<input
+								value={nameDraft}
+								onChange={(event) => setNameDraft(event.target.value)}
+								placeholder="Display name"
+								maxLength={64}
+								autoComplete="off"
+								className="w-full rounded-md border border-[var(--app-border-strong)] bg-[var(--app-surface)] px-2 py-1 text-[13px] text-[var(--app-text)] outline-none focus:border-[var(--app-accent)]"
+							/>
+							<Button size="sm" variant="primary" disabled={savingName} onClick={() => void saveSenderName()}>
+								{savingName ? "Saving…" : "Save"}
+							</Button>
+							<Button
+								size="sm"
+								variant="ghost"
+								disabled={savingName}
+								onClick={() => {
+									setNameDraft(apiKey.senderName ?? "");
+									setEditingName(false);
+								}}
+							>
+								Cancel
+							</Button>
+						</span>
+					) : (
+						actionable && (
+							<button
+								type="button"
+								onClick={() => setEditingName(true)}
+								className="mt-1 block text-[12px] text-[var(--app-text-soft)] underline underline-offset-2 hover:text-[var(--app-text)]"
+							>
+								{apiKey.senderName ? "Change display name" : "Add a display name"}
+							</button>
+						)
+					)}
+				</Meta>
 				<Meta label="Key ID">
 					<span className="inline-flex items-center gap-1">
 						<code className="select-all font-mono text-[12px] text-[var(--app-text-soft)]">

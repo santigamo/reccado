@@ -34,7 +34,10 @@ const DEFAULT_SCOPES: KeyScope[] = [
 ];
 
 type FieldErrors = Partial<
-	Record<"sender" | "scopes" | "templateAllowlist" | "quotaMax" | "expiresAt", string>
+	Record<
+		"sender" | "senderName" | "scopes" | "templateAllowlist" | "quotaMax" | "expiresAt",
+		string
+	>
 >;
 
 function Field({
@@ -87,6 +90,7 @@ export function CreateApiKeyForm({
 	const formId = useId();
 	const [environment, setEnvironment] = useState<KeyEnvironment>("test");
 	const [sender, setSender] = useState(defaultSender ?? "");
+	const [senderName, setSenderName] = useState("");
 	const [scopes, setScopes] = useState<KeyScope[]>(DEFAULT_SCOPES);
 	const [advancedOpen, setAdvancedOpen] = useState(false);
 	const [templateAllowlist, setTemplateAllowlist] = useState("");
@@ -109,6 +113,13 @@ export function CreateApiKeyForm({
 		const trimmedSender = sender.trim();
 		if (!trimmedSender) errors.sender = "A sender address is required.";
 		else if (!EMAIL_RE.test(trimmedSender)) errors.sender = "Enter a valid email address.";
+		// The name goes straight into a mail header, so the same characters the
+		// server refuses are refused here — while the operator is still on the form.
+		const trimmedName = senderName.trim();
+		if (trimmedName && !/^[^<>"\r\n]{1,64}$/.test(trimmedName)) {
+			errors.senderName =
+				"A sender name cannot contain line breaks, angle brackets or double quotes.";
+		}
 		if (scopes.length === 0) errors.scopes = "Pick at least one scope.";
 
 		const templates = templateAllowlist
@@ -153,6 +164,7 @@ export function CreateApiKeyForm({
 		return {
 			environment,
 			sender: trimmedSender,
+			...(senderName.trim() ? { senderName: senderName.trim() } : {}),
 			// Keep the canonical scope order regardless of click order.
 			scopes: KEY_SCOPES.filter((s) => scopes.includes(s)),
 			...(templates.length > 0 ? { templateAllowlist: templates } : {}),
@@ -180,6 +192,7 @@ export function CreateApiKeyForm({
 				if (!Array.isArray(messages) || messages.length === 0) continue;
 				if (
 					field === "sender" ||
+					field === "senderName" ||
 					field === "scopes" ||
 					field === "templateAllowlist" ||
 					field === "quotaMax"
@@ -254,7 +267,33 @@ export function CreateApiKeyForm({
 						className={INPUT_CLASS}
 					/>
 				</Field>
+
+				<Field
+					label="Sender name"
+					htmlFor={`${formId}-sender-name`}
+					hint="What recipients see instead of the bare address. Leave empty to send the address alone."
+					error={fieldErrors.senderName}
+				>
+					<input
+						id={`${formId}-sender-name`}
+						value={senderName}
+						onChange={(event) => setSenderName(event.target.value)}
+						placeholder="Acme"
+						autoComplete="off"
+						maxLength={64}
+						className={INPUT_CLASS}
+					/>
+				</Field>
 			</div>
+
+			{senderName.trim() && sender.trim() && (
+				<p className="mt-3 text-[13px] text-[var(--app-text-soft)]">
+					Recipients will see{" "}
+					<code className="rounded bg-[var(--app-surface)] px-1.5 py-0.5 text-[var(--app-text)]">
+						{senderName.trim()} &lt;{sender.trim()}&gt;
+					</code>
+				</p>
+			)}
 
 			{environment === "live" ? (
 				<p className="mt-3 flex items-start gap-2 rounded-lg border border-[var(--app-danger)] bg-[color-mix(in_oklab,var(--app-danger)_8%,transparent)] px-3 py-2 text-sm text-[var(--app-text)]">

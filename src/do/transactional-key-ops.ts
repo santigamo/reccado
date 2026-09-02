@@ -9,6 +9,7 @@ import {
 	type KeyEnvironment,
 	type KeyScope,
 	type KeyStatus,
+	normalizeSenderName,
 	nowISO,
 	SEND_SCOPE_REQUIRES_TEMPLATES_USE,
 	sendScopeHasTemplateUse,
@@ -27,6 +28,7 @@ export type RevokeApiKeyResult = {
 export type CreateApiKeyInput = {
 	environment: KeyEnvironment;
 	sender: string;
+	senderName?: string | null;
 	scopes: KeyScope[];
 	templateAllowlist?: string[] | null;
 	recipientPolicy?: string | null;
@@ -66,6 +68,7 @@ function rowToRecord(row: Record<string, unknown>): TransactionalApiKeyRecord {
 		environment: String(row.environment) as KeyEnvironment,
 		mailboxId: String(row.mailbox_id),
 		sender: String(row.sender),
+		senderName: row.sender_name ? String(row.sender_name) : null,
 		scopes: JSON.parse(String(row.scopes_json)) as KeyScope[],
 		templateAllowlist: row.template_allowlist_json
 			? (JSON.parse(String(row.template_allowlist_json)) as string[])
@@ -116,15 +119,16 @@ export async function createApiKey(
 	sql.exec(
 		`INSERT INTO api_keys
      (key_id, hash_version, key_hash, display_suffix, environment, mailbox_id, sender,
-      scopes_json, template_allowlist_json, recipient_policy, quota_max, expires_at,
-      status, created_at, updated_at, revoked_at)
-     VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL)`,
+      sender_name, scopes_json, template_allowlist_json, recipient_policy, quota_max,
+      expires_at, status, created_at, updated_at, revoked_at)
+     VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL)`,
 		keyId,
 		keyHash,
 		suffix,
 		input.environment,
 		mailboxId,
 		input.sender,
+		normalizeSenderName(input.senderName),
 		JSON.stringify(input.scopes),
 		input.templateAllowlist ? JSON.stringify(input.templateAllowlist) : null,
 		input.recipientPolicy ?? null,
@@ -153,6 +157,7 @@ export async function createApiKey(
 		keyId: record.keyId,
 		mailboxId: record.mailboxId,
 		sender: record.sender,
+		senderName: record.senderName,
 		displaySuffix: record.displaySuffix,
 		environment: record.environment,
 		scopes: record.scopes,
@@ -187,6 +192,7 @@ export function listApiKeys(sql: SqlStorage, mailboxId: string): ListApiKeysEntr
 		keyId: String(row.key_id),
 		mailboxId: String(row.mailbox_id),
 		sender: String(row.sender),
+		senderName: row.sender_name ? String(row.sender_name) : null,
 		displaySuffix: String(row.display_suffix),
 		environment: String(row.environment) as KeyEnvironment,
 		scopes: JSON.parse(String(row.scopes_json)) as KeyScope[],
@@ -234,6 +240,7 @@ export function revokeApiKey(
 				keyId: existing.keyId,
 				mailboxId: existing.mailboxId,
 				sender: existing.sender,
+				senderName: existing.senderName,
 				displaySuffix: existing.displaySuffix,
 				environment: existing.environment,
 				scopes: existing.scopes,
@@ -276,6 +283,7 @@ export function revokeApiKey(
 		keyId: updated.keyId,
 		mailboxId: updated.mailboxId,
 		sender: updated.sender,
+		senderName: updated.senderName,
 		displaySuffix: updated.displaySuffix,
 		environment: updated.environment,
 		scopes: updated.scopes,
@@ -381,6 +389,7 @@ export async function rotateApiKey(
 		keyId: oldKeyId,
 		mailboxId,
 		sender: existing.sender,
+		senderName: existing.senderName,
 		displaySuffix: existing.displaySuffix,
 		environment: existing.environment,
 		scopes: existing.scopes,
@@ -431,4 +440,85 @@ export function exportApiKeyProjections(
 	mailboxId: string,
 ): TransactionalApiKeyProjection[] {
 	return listApiKeys(sql, mailboxId);
+}
+
+export type UpdateApiKeySenderNameResult = {
+	key: TransactionalApiKeyRecord;
+	auditEvent: { id: string };
+	projection: TransactionalApiKeyProjection;
+};
+
+/**
+ * Sets or clears a key's From display name.
+ *
+ * Exists so changing a brand name is not a key rotation. The alternative — reissue
+ * the key to change its name — would force every integrator to coordinate a secret
+ * swap for a cosmetic change, and a secret rotated for no security reason is a
+ * secret people learn to rotate carelessly.
+ *
+ * The secret, hash and sender ADDRESS are untouched: this only ever writes the
+ * display phrase. A revoked key is refused, since editing how a dead credential
+ * would render is meaningless and usually means the caller has the wrong key id.
+ */
+export function updateApiKeySenderName(
+	sql: SqlStorage,
+	keyId: string,
+	senderName: string | null,
+): UpdateApiKeySenderNameResult | null {
+	const existing = getApiKey(sql, keyId);
+	if (!existing) return null;
+	if (existing.status === "revoked") {
+		throw new Error("key_not_active");
+	}
+
+	// Throws on a name that cannot go in a header; the caller maps it to a 400.
+	const normalized = normalizeSenderName(senderName);
+	const now = nowISO();
+	const eventId = crypto.randomUUID();
+
+	sql.exec(
+		"UPDATE api_keys SET sender_name = ?, updated_at = ? WHERE key_id = ?",
+		normalized,
+		now,
+		keyId,
+	);
+
+	sql.exec(
+		`INSERT INTO api_key_events (id, key_id, event_type, metadata_json, created_at)
+     VALUES (?, ?, 'sender_name_updated', ?, ?)`,
+		eventId,
+		keyId,
+		// Both sides recorded: "who changed the sender name and to what" is the
+		// question an audit log gets asked, and the previous value is half the answer.
+		JSON.stringify({ from: existing.senderName, to: normalized }),
+		now,
+	);
+
+	const updated = getApiKey(sql, keyId);
+	if (!updated) {
+		throw new Error("key_not_found");
+	}
+
+	return {
+		key: updated,
+		auditEvent: { id: eventId },
+		projection: {
+			keyId: updated.keyId,
+			mailboxId: updated.mailboxId,
+			sender: updated.sender,
+			senderName: updated.senderName,
+			displaySuffix: updated.displaySuffix,
+			environment: updated.environment,
+			scopes: updated.scopes,
+			templateAllowlist: updated.templateAllowlist,
+			recipientPolicy: updated.recipientPolicy,
+			status: updated.status,
+			quotaMax: updated.quotaMax,
+			quotaUsed: 0,
+			expiresAt: updated.expiresAt,
+			createdAt: updated.createdAt,
+			updatedAt: updated.updatedAt,
+			revokedAt: updated.revokedAt,
+		},
+	};
 }

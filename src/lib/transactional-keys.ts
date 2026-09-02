@@ -33,6 +33,15 @@ export type TransactionalApiKeyRecord = {
 	environment: KeyEnvironment;
 	mailboxId: string;
 	sender: string;
+	/**
+	 * Display phrase for the From header, e.g. "Eccos" in `Eccos <hello@…>`.
+	 *
+	 * Per key rather than per mailbox on purpose: one mailbox can serve two
+	 * products over the same reply-capable address, and each wants its own name.
+	 * Null means send the bare address, which is what every key created before
+	 * this column existed does — so nothing changes for them.
+	 */
+	senderName: string | null;
 	scopes: KeyScope[];
 	templateAllowlist: string[] | null;
 	recipientPolicy: string | null;
@@ -48,6 +57,7 @@ export type TransactionalApiKeyProjection = {
 	keyId: string;
 	mailboxId: string;
 	sender: string;
+	senderName: string | null;
 	displaySuffix: string;
 	environment: KeyEnvironment;
 	scopes: KeyScope[];
@@ -66,6 +76,50 @@ export type TransactionalApiKeyProjection = {
  * Generates a 32-byte random secret and returns it as a base32url string.
  * Roughly 52 characters, 256 bits of entropy.
  */
+/** Longest display phrase accepted. Well under any practical header limit. */
+export const MAX_SENDER_NAME_LENGTH = 64;
+
+export const SENDER_NAME_INVALID = "invalid_sender_name";
+
+/**
+ * Whether a string is safe to place in a From header as a display phrase.
+ *
+ * This value is operator-supplied and lands in a mail header, so the check is a
+ * security boundary, not tidiness. CR and LF are the header-injection vector —
+ * a name containing a newline could append arbitrary headers (a second Bcc, a
+ * different Reply-To) to every message the key sends. Angle brackets and double
+ * quotes are refused because they are the address-form delimiters: they would
+ * either be escaped into something the operator did not intend or, worse,
+ * produce a header that parses as a different address entirely.
+ *
+ * Everything else is allowed, including non-ASCII — "Café" is a legitimate
+ * brand name, and the mail library encodes it.
+ */
+export function isValidSenderName(value: string): boolean {
+	if (value.length === 0 || value.length > MAX_SENDER_NAME_LENGTH) return false;
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
+	if (/[\r\n\u0000-\u001f\u007f]/.test(value)) return false;
+	return !/[<>"]/.test(value);
+}
+
+/**
+ * Storage form of a display name: trimmed, with empty treated as absent.
+ *
+ * Null and "" must not be two different states — a key with an empty-string name
+ * would render as `<hello@…>` with a stray space rather than a bare address.
+ * Throws rather than silently stripping: a name the operator typed and cannot
+ * have should be refused where they can see it, not quietly altered.
+ */
+export function normalizeSenderName(value: string | null | undefined): string | null {
+	if (value == null) return null;
+	const trimmed = value.trim();
+	if (trimmed.length === 0) return null;
+	if (!isValidSenderName(trimmed)) {
+		throw new Error(SENDER_NAME_INVALID);
+	}
+	return trimmed;
+}
+
 export function generateSecret(): string {
 	const bytes = crypto.getRandomValues(new Uint8Array(32));
 	return base32urlEncode(bytes);

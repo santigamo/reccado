@@ -18,6 +18,17 @@ import { domainFromAddress } from "./email-headers";
  */
 export type SenderIdentity = {
 	from: string;
+	/**
+	 * Display phrase for the From header, or null for a bare address.
+	 *
+	 * Carried on the identity rather than derived at the send site because the
+	 * name belongs to the MAILBOX, not to whichever address the fallback logic
+	 * below happens to pick. When a mailbox on an unverified domain relays through
+	 * MAIL_FROM_ADDRESS, "Foo Support <noreply@relay>" with Reply-To back to the
+	 * mailbox is still the honest rendering: the human it names is the one who
+	 * will read the reply.
+	 */
+	fromName: string | null;
 	replyTo: string | null;
 };
 
@@ -76,19 +87,42 @@ export function resolveDeliveredAlias(
 export function resolveSenderIdentity(
 	env: SenderEnv,
 	mailboxAddress: string | null | undefined,
+	displayName?: string | null,
 ): SenderIdentity {
 	const fallback = env.MAIL_FROM_ADDRESS?.trim() || DEFAULT_FROM_ADDRESS;
 	const mailbox = mailboxAddress?.trim().toLowerCase() || null;
+	// A name that cannot go in a header is dropped rather than thrown on: this
+	// runs on the send path, and refusing to deliver mail because a mailbox has an
+	// odd display name would be a far worse failure than sending it bare.
+	const name = normalizeDisplayName(displayName);
 	if (!mailbox) {
-		return { from: fallback, replyTo: null };
+		return { from: fallback, fromName: name, replyTo: null };
 	}
 	if (mailbox === fallback.toLowerCase()) {
-		return { from: fallback, replyTo: null };
+		return { from: fallback, fromName: name, replyTo: null };
 	}
 	const domain = domainFromAddress(mailbox);
 	const verified = parseSendingDomains(env.MAIL_SENDING_DOMAINS);
 	if (domain && verified.includes(domain)) {
-		return { from: mailbox, replyTo: null };
+		return { from: mailbox, fromName: name, replyTo: null };
 	}
-	return { from: fallback, replyTo: mailbox };
+	return { from: fallback, fromName: name, replyTo: mailbox };
+}
+
+/**
+ * A display name safe for a From header, or null.
+ *
+ * Same rule as the transactional path (`isValidSenderName`), applied here too
+ * because `mailboxes.display_name` is free text an operator typed and this is
+ * the last point before it reaches a mail header. CR/LF would let it inject
+ * additional headers; angle brackets and quotes would break the address form.
+ */
+function normalizeDisplayName(value: string | null | undefined): string | null {
+	if (value == null) return null;
+	const trimmed = value.trim();
+	if (trimmed.length === 0 || trimmed.length > 64) return null;
+	// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
+	if (/[\r\n\u0000-\u001f\u007f]/.test(trimmed)) return null;
+	if (/[<>"]/.test(trimmed)) return null;
+	return trimmed;
 }

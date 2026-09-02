@@ -11,6 +11,7 @@ import {
 	type MintedApiKey,
 	revokeApiKey,
 	rotateApiKey,
+	updateApiKeySenderName,
 	type TransactionalApiKey,
 } from "#/components/keys/api-keys";
 import { CreateApiKeyForm } from "#/components/keys/CreateApiKeyForm";
@@ -176,6 +177,10 @@ function ApiKeysPage(): ReactElement {
 									key={key.keyId}
 									apiKey={key}
 									onRevoke={() => handleRevoke(key.keyId)}
+									onRenameSender={async (senderName) => {
+										await updateApiKeySenderName(mailboxId, key.keyId, senderName);
+										keys.refetch();
+									}}
 									onRotate={() => handleRotate(key.keyId)}
 								/>
 							))}

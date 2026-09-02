@@ -140,11 +140,13 @@ export async function confirmDraftSend(
 		response = await stub.fetch(`https://mailbox-do/drafts/${draftId}/confirm-send`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			// The mailbox's own address travels with the request: the DO has no D1
-			// access, and it decides From/Reply-To from this value.
+			// The mailbox's own address and display name travel with the request: the
+			// DO has no D1 access, and it decides the whole From/Reply-To rendering
+			// from these two values.
 			body: JSON.stringify({
 				idempotencyKey,
 				mailboxAddress: mailbox.primary_address,
+				displayName: mailbox.display_name,
 			}),
 		});
 	} catch (error) {

@@ -523,7 +523,7 @@ describe("reply sender identity", () => {
 			return resolved;
 		});
 
-		expect(identity).toEqual({ from: "shop@imsanti.dev", replyTo: null });
+		expect(identity).toEqual({ from: "shop@imsanti.dev", fromName: null, replyTo: null });
 		expect(sent[0]?.from).toBe("shop@imsanti.dev");
 	});
 
@@ -545,6 +545,7 @@ describe("reply sender identity", () => {
 		// Never the canonical address: the person wrote to shop@, the reply comes back there.
 		expect(identity).toEqual({
 			from: "noreply@send.example.com",
+			fromName: null,
 			replyTo: "shop@imsanti.dev",
 		});
 	});
@@ -564,7 +565,7 @@ describe("reply sender identity", () => {
 			);
 		});
 
-		expect(identity).toEqual({ from: "hello@imsanti.dev", replyTo: null });
+		expect(identity).toEqual({ from: "hello@imsanti.dev", fromName: null, replyTo: null });
 	});
 
 	it("reads the alias off the message being answered, not the newest in the thread", async () => {
