@@ -7,19 +7,34 @@ in one Cloudflare account; there is no multi-tenant SaaS deployment of this code
 security model reflects that scope — it is not yet hardened for "many untrusted users sharing one
 deployment."
 
-### Auth perimeter: Cloudflare Access
+### Auth perimeter: Better Auth in the worker
 
-Reccado has no built-in login system. **Cloudflare Access is the auth perimeter** for the UI and
-every `/api/*` route. The Worker validates the `CF-Access-JWT-Assertion` header against your
-Access application's audience (`ACCESS_JWT_AUDIENCE`) and your Zero Trust team's JWKS
-(`ACCESS_TEAM_DOMAIN`). If those two values are not configured, the Worker **fails closed**:
-requests from any hostname other than `localhost`/`127.0.0.1`/`::1` are rejected outright rather
-than falling back to an open or trust-the-client mode. Local dev (`localhost`) intentionally
-bypasses Access so you can develop without a Cloudflare account.
+**The issuer is Better Auth running inside the Worker.** `/login` opens a web session via e-mail
+OTP, `/api/auth/*` serves the auth endpoints, and `/mcp` accepts OAuth tokens (with `jwt()` signing
+keys and a JWKS endpoint). Unlike the previous edge-perimeter model, every trust decision here is
+**observable in the worker's own code and logs** — there is no unverifiable edge component whose
+configuration the app has to take on faith.
 
-On top of Access, Reccado keeps its own owner registry in D1 (`owner_identities`) naming exactly
-who is authorized — email identities for the web and MCP perimeters, Telegram identities for the
-bot. `ACCESS_ALLOWED_EMAILS` still works as a bootstrap for the email side, and the two are unioned.
+- **Registration is closed at the issuer.** An OTP is only ever sent to an address the owner
+  registry vouches for: `owner_identities` in D1 unioned with the `OWNER_BOOTSTRAP_EMAILS` secret,
+  which remains the master key into the registry. With an empty registry and no bootstrap, `/api/*`
+  and `/mcp` fail closed (`503`).
+- **Session cookie cache** — session verification uses Better Auth's short-lived signed cookie
+  cache (5 minutes) so a request does not cost a D1 read. The **confirm-send path deliberately
+  bypasses the cache** and verifies the session against D1, so a revoked session takes effect
+  the moment a send is about to happen.
+- **Rate limiting** — Better Auth's built-in rate limiter is enabled with database-backed storage
+  on the auth endpoints. As an outer layer, a Cloudflare WAF rate-limiting rule on `/api/auth/*`
+  (created or printed by `pnpm setup:auth`) drops brute-force traffic before it reaches the
+  worker; the perimeter works without it.
+- **Pairing-code rescue** — the same single-use, expiring pairing codes the Telegram bridge uses
+  can open a web session at `/login` when the code is minted via `wrangler d1 execute`. This is the
+  only safety net: it lets the first owner log in before mail sending is configured, and it works
+  even when the registry says nobody owns the deployment yet.
+- **Fails closed** — without `BETTER_AUTH_SECRET` (or with one shorter than 32 characters), the
+  issuer refuses to start and requests from any hostname other than `localhost`/`127.0.0.1`/`::1`
+  are rejected outright rather than falling back to an open or trust-the-client mode. Local dev
+  (`localhost`) intentionally falls back to a dev bypass so you can develop without secrets.
 
 **This fails closed.** With no owner registered and no bootstrap variable, `/api/*` answers `503
 owner_not_configured` and `/mcp` answers `503 mcp_not_configured` — an install that is half
@@ -27,9 +42,9 @@ configured authorizes nobody. The single exception is a loopback request during 
 and it stops applying the moment a real owner exists. `/mcp` has no such exception at all, because
 an MCP client acts without a human watching.
 
-This check is defence in depth, not redundancy with Access. The failure it is there for is an
-Access application created for the wrong hostname, where Access does not deny — it simply is not
-there, and the worker's own list is the only thing left standing.
+This check is defence in depth, not redundancy with the login flow. The failure it is there for is
+a deployment whose perimeter was left half-configured — where nothing denies, nothing vouches, and
+the worker's own list is the only thing left standing.
 
 ### Debug endpoints fail closed
 
@@ -51,7 +66,7 @@ sandboxed.
 ### CSRF / mutating requests
 
 Mutating `/api/*` routes (anything that isn't a plain `GET`) check the request `Origin` against
-the deployed Worker's own origin before processing, as a CSRF defense layered on top of Access.
+the deployed Worker's own origin before processing, as a CSRF defense layered on top of the session perimeter.
 Baseline response headers (`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
 `Referrer-Policy`) are set on API responses.
 
@@ -75,7 +90,7 @@ mailbox state). There is no separate, application-level encryption layer on top 
 an explicit trade-off, not an oversight. It means:
 
 - Anyone with sufficient access to your Cloudflare account (account owner, or a token with broad
-  R2/D1/Durable Objects scopes) can read mailbox contents directly, bypassing the app's Access
+  R2/D1/Durable Objects scopes) can read mailbox contents directly, bypassing the app's auth
   layer entirely. Scope Cloudflare API tokens narrowly and treat account-level access as
   equivalent to mailbox access.
 - There is currently no per-mailbox or per-message application-level encryption, no
@@ -111,7 +126,7 @@ transactional key operations and the send/status endpoints fail closed (`503`).
   allowlist (null/empty = no template may be sent), a recipient policy (glob patterns,
   `!`-prefix deny rules take precedence), an optional per-key daily quota, and expiration.
 - Key management (create, list, revoke, rotate) lives under `/api/mailboxes/:mailboxId/transactional/*`
-  behind Cloudflare Access **and** an explicit mailbox-ownership check (`owner_email` on the D1
+  behind the Better Auth session perimeter **and** an explicit mailbox-ownership check (`owner_email` on the D1
   mailbox row).
 - All authorization, quota, and idempotency decisions are made in the mailbox Durable Object. D1
   (`transactional_api_keys`, `transactional_request_log`) is only a rebuildable, non-authoritative
@@ -120,7 +135,7 @@ transactional key operations and the send/status endpoints fail closed (`503`).
 ### Transactional endpoint hardening
 
 The external endpoint (`POST`/`GET /v1/mailboxes/:mailboxId/transactional/...`) is the only path
-outside the `/api/*` Access perimeter and authenticates via the API key `Bearer` header:
+outside the `/api/*` session perimeter and authenticates via the API key `Bearer` header:
 
 - JSON-only content type on POST, body size limited to 100 KB (by `content-length`), responses carry
   `Cache-Control: no-store`.
@@ -150,11 +165,12 @@ authoritative, and provider-originated local suppressions require an explicit ov
 Event logs omit subjects, bodies, SMTP responses, provider reasons, variables, and credentials.
 
 Transactional send outcomes marked `unknown` remain manual-review-required. The stale-request
-reconciliation helper is wired to the hourly cron and an Access-protected operator endpoint.
+reconciliation helper is wired to the hourly cron and an auth-protected operator endpoint.
 
 ### Secrets
 
-`ACCESS_JWT_AUDIENCE`, `ACCESS_TEAM_DOMAIN`, `ACCESS_ALLOWED_EMAILS`, `CLOUDFLARE_API_TOKEN`,
+`BETTER_AUTH_SECRET` (the issuer's signing key; rotating it signs out every session),
+`OWNER_BOOTSTRAP_EMAILS` (the master key into the owner registry), `CLOUDFLARE_API_TOKEN`,
 `PHASE0_DEBUG_TOKEN`, `TRANSACTIONAL_API_KEY_PEPPER`, and `TELEGRAM_BOT_TOKEN` are Cloudflare
 Worker secrets (`wrangler secret put`), never committed to the repository. `.dev.vars*` is
 gitignored except `.dev.vars.example`, which documents names and placeholder values only.
@@ -249,7 +265,7 @@ Please report security issues privately rather than opening a public GitHub issu
   from commit history) and avoid including exploit details in a public channel until a fix is
   available.
 
-Please include: the affected component (e.g. "Access JWT validation", "attachment serving",
+Please include: the affected component (e.g. "session verification", "attachment serving",
 "inbound size handling"), reproduction steps or a proof of concept, and the impact you believe it
 has. Given this is a single-maintainer self-hosted project, response times are best-effort, not
 SLA-backed — but security reports get priority over feature work.

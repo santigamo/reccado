@@ -9,6 +9,34 @@ package.
 
 ## [Unreleased]
 
+### Changed
+
+- **The auth perimeter moved from Cloudflare Access into the worker.** The issuer is now
+  **Better Auth 1.7.2** running inside the Worker — observable in the worker's own code and logs,
+  with no unverifiable edge perimeter to take on faith. `/login` opens a web session via e-mail
+  OTP with **registration closed at the issuer**: an OTP is only ever sent to an address the owner
+  registry (`owner_identities`) vouches for, bootstrapped by the renamed secret
+  `OWNER_BOOTSTRAP_EMAILS` (formerly `ACCESS_ALLOWED_EMAILS`). The Access validator,
+  `getAccessConfigStatus`, `ACCESS_JWT_AUDIENCE` and `ACCESS_TEAM_DOMAIN` are gone. The Telegram
+  bridge keeps its derived-secret perimeter, so the two perimeters still fail independently.
+- **The pairing-code rescue now covers the web.** The same single-use, expiring
+  `owner_pairing_codes` ladder Telegram uses can open a session at `/login` when the code is
+  minted through `wrangler d1 execute` — the only safety net for a first login before mail sending
+  is configured or when the registry is empty.
+- **`/mcp` authenticates with OAuth** through `@better-auth/mcp` (plus `jwt()` for stable signing
+  keys and `/jwks`); the owner gate still applies after the token. MCP clients need to reconnect.
+- **Session cookie cache enabled** (5-minute signed cookie, one fewer D1 read per request). The
+  confirm-send path deliberately bypasses the cache so a revoked session takes effect the moment a
+  send is about to happen. Better Auth's database-backed rate limiter covers `/api/auth/*`, with an
+  optional outer WAF rate-limiting rule.
+- D1 migrations `0016`–`0018` carry the Better Auth schema (auth core, MCP plugin, FK fix).
+- `pnpm setup:access` and its smoke script are deleted; **`pnpm setup:auth`** replaces them:
+  machine-generated `BETTER_AUTH_SECRET` uploaded as a Worker secret (dry-run by default,
+  `--apply` to upload), base-URL and first-login/rescue guidance, and the WAF rate-limit rule for
+  `/api/auth/*` created via the zone rulesets API when a zone-scoped `CLOUDFLARE_API_TOKEN` is
+  present — or the exact dashboard steps and curl shape printed when it is not. The script never
+  fails on a missing token.
+
 Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox, plus the
 transactional API (Phases 2–4 of the `docs/plans/transactional-api.md` plan) and the MCP
 read/search/draft endpoint.

@@ -60,7 +60,7 @@ Cloudflare primitives in the base architecture:
 - D1 for cross-mailbox and control-plane indexes.
 - Email Routing for inbound mail.
 - Email Service / `send_email` binding for outbound mail.
-- Cloudflare Access for private UI auth.
+- Better Auth (in-worker issuer) for private UI auth.
 - Hibernatable WebSockets for cheap realtime connections.
 - Workflows for long, recoverable sagas once those sagas exist.
 - Tier B: Agents SDK, `McpAgent`, OAuth Provider, Workers AI, Vectorize, and AI Gateway.
@@ -171,7 +171,10 @@ provider returned.
 
 ## Authentication and Security Model
 
-- Cloudflare Access is sufficient for a private single-user or trusted-user UI.
+- Better Auth inside the worker is the auth perimeter for a private single-operator UI: `/login`
+  e-mail OTP with registration closed to the owner registry, MCP over OAuth, and the same
+  pairing-code rescue Telegram uses. The issuer is observable in the worker's own code and logs —
+  there is no unverifiable edge perimeter to trust.
 - API routes map authenticated identities to allowed mailboxes and domains.
 - Clients never choose Durable Object names directly without server-side authorization.
 - Cross-mailbox D1 queries are filtered by caller permissions.

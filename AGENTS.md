@@ -49,9 +49,9 @@ informed decision from the user/supervisor.
   behavior/pattern understanding and attribution notes — reimplement from first principles.
 - If evaluating an external reference implementation (clone it to verify behavior, deploy it to
   compare), clone only to a disposable path (e.g. `/tmp`), never import its code, deploy only
-  under a disposable Worker name, and treat real Cloudflare Access edge enforcement (an
-  unauthenticated request must `302` to your team's `cloudflareaccess.com` login) as the only
-  acceptable evidence that auth actually works — an app-level "Access not configured" message is
+  under a disposable Worker name, and treat real edge-auth enforcement (an
+  unauthenticated request must `302` to the provider's login page) as the only
+  acceptable evidence that auth actually works — an app-level "not configured" message is
   not sufficient.
 
 ### Cloudflare resource safety
@@ -112,12 +112,12 @@ actual repo state, fix this section rather than trusting it blindly.
 
 - Phase 1 (Tier A inbox) is senior-validated; see `docs/validation/PHASE1_VALIDATION.md` for the historical
   record. The transactional API (Phases 2–4 of `docs/plans/transactional-api.md` — HMAC/pepper API
-  keys, Access + owner-gated key/template admin, `POST/GET /v1/.../transactional/...` with Bearer
+  keys, auth + owner-gated key/template admin, `POST/GET /v1/.../transactional/...` with Bearer
   auth, mandatory `Idempotency-Key`, scopes, quotas, limits, test-key rejection for sending,
   `unknown` → no auto-retry, redacted logs, non-authoritative D1 projections) is implemented in
   `src/lib/transactional-*`, `src/do/transactional-*`, D1 migrations `0006`/`0007`, and covered by
   `tests/unit/transactional-*.test.ts` + `tests/integration/transactional-*.test.ts`. The
-  MCP endpoint (`/mcp`, Access + `ACCESS_ALLOWED_EMAILS`, read/search/draft only) is implemented in
+  MCP endpoint (`/mcp`, Better Auth OAuth + owner registry, read/search/draft only) is implemented in
   `src/mcp/*` (no send tool). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
   Gateway) has not started — do not claim it. Cloudflare Email Sending lifecycle events are
   consumed by the `inbox-mcp-email-events` Queue and hard-bounce/complaint suppressions are
@@ -130,14 +130,19 @@ actual repo state, fix this section rather than trusting it blindly.
   that domain's feedback liveness first** — see `src/lib/feedback-liveness.ts`.
 - Transactional API current gap: no simulated delivery sink for test keys; test keys are rejected
   by the production send path. `reconcileStaleTransactionalRequests` is wired into the hourly
-  cron and an Access-protected operator endpoint, and unknown outcomes remain manual-review-only.
+  cron and an auth-protected operator endpoint, and unknown outcomes remain manual-review-only.
 - A security-hardening pass on top of Phase 1 is current/recent work: debug endpoints fail closed
   by default, attachment/raw downloads get hardened response headers, dev-data seeding requires
-  explicit opt-in, an optional `ACCESS_ALLOWED_EMAILS` owner allowlist exists, inbound size is
+  explicit opt-in, an optional `OWNER_BOOTSTRAP_EMAILS` owner bootstrap exists, inbound size is
   capped, and mutating `/api/*` routes get an Origin-check CSRF defense. See `SECURITY.md` for the
   current posture and `CHANGELOG.md` for what's landed.
-- Cloudflare Access **is** configured for the maintainer's dev environment (`ACCESS_JWT_AUDIENCE`
-  / `ACCESS_TEAM_DOMAIN` secrets set); auth fails closed outside `localhost` when those are unset.
+- The web perimeter is **Better Auth inside the worker** (Better Auth 1.7.2): `/login` with e-mail
+  OTP (registration closed to the owner registry ∪ `OWNER_BOOTSTRAP_EMAILS`), pairing-code rescue
+  via `wrangler d1 execute`, `/mcp` over OAuth + `jwt()`, session cookie cache (5 min) with a
+  confirm-send bypass, and migrations `0016`–`0018`. `BETTER_AUTH_SECRET` is set for the
+  maintainer's dev environment; auth fails closed outside `localhost` when it is unset.
+  `pnpm setup:auth` machine-generates and uploads the secret and offers the WAF rate-limit rule
+  for `/api/auth/*`; `scripts/setup-access.ts` and `scripts/smoke-access.ts` are deleted.
 - D1 **is** in the inbound/outbound hot path as the cross-mailbox index (`message_index`,
   `ingest_events`, `outbound_sends`, `ops_events` are written on every ingest/send; transactional
   key/request projections are written on admin ops and send outcomes) — it is not authoritative
@@ -188,7 +193,7 @@ pnpm wrangler d1 list
 ```
 
 Do not list every Cloudflare service on every task. Do not browse Cloudflare docs unless the
-assigned gate explicitly requires verifying a current limit, API shape, or Access behavior.
+assigned gate explicitly requires verifying a current limit or API shape.
 
 ### Current verified commands
 

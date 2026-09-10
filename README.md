@@ -62,7 +62,7 @@ human-confirmed), and a scoped transactional REST API for programmatic outbound 
 - **Telegram bridge (optional)** — new mail arrives as a card in Telegram; replying there builds a
   properly threaded email (`Re:`, `In-Reply-To`/`References`, quoted original) that still goes
   through the same confirm-send button. See [Telegram bridge](#telegram-bridge-optional).
-- **Agent-ready** — an MCP endpoint (`/mcp`, Access + `ACCESS_ALLOWED_EMAILS` allowlist) exposes
+- **Agent-ready** — an MCP endpoint (`/mcp`, Better Auth OAuth + owner allowlist) exposes
   read/search/draft tools for agents; there is deliberately **no send tool** (drafts still go
   through the human confirm gate). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - **Transactional API (scoped, pre-authorized)** — external apps can send transactional mail
@@ -126,8 +126,8 @@ generation with `RECCADO_SKIP_DEV_VARS=1`). Vite defaults to port `3000`; if tha
 the port it actually bound to — use that one in the commands below.
 
 That generated `.dev.vars` also unlocks the `/api/debug/phase0/*` introspection endpoints the smoke
-script below uses, and intentionally leaves Cloudflare Access unset so local `/api/*` falls back to
-the dev bypass. See [`.dev.vars.example`](.dev.vars.example) for every supported variable.
+script below uses, and intentionally leaves `BETTER_AUTH_SECRET` unset so local `/api/*` falls back
+to the dev bypass. See [`.dev.vars.example`](.dev.vars.example) for every supported variable.
 
 In a second terminal, check the health endpoint and simulate an inbound email:
 
@@ -214,7 +214,7 @@ pnpm wrangler queues create <your-inbound-queue>
 pnpm wrangler queues create <your-inbound-dlq>
 pnpm wrangler d1 create <your-index-db-name> --location=weur   # or maintain your own deploy config
 pnpm d1:migrate:dev                                            # D1_DB_NAME_DEV=<db> to override the name
-pnpm wrangler secret put ACCESS_JWT_AUDIENCE --env dev         # + ACCESS_TEAM_DOMAIN (step 2)
+pnpm setup:auth --env dev --url https://inbox-dev.<you.com>    # generates + uploads BETTER_AUTH_SECRET (step 2)
 pnpm run deploy:dev                                           # build + wrangler deploy --env dev --name reccado-dev
 ```
 
@@ -229,8 +229,8 @@ documented in [`.dev.vars.example`](.dev.vars.example) and
 DNS and identity live outside the Worker, so no button or script fully does them for you.
 
 **Custom domain** — make the UI/API reachable on a hostname you control before treating it as an
-inbox. `workers.dev` is useful for smoke tests, but the supported protected path is custom domain +
-Cloudflare Access.
+inbox. `workers.dev` is useful for smoke tests, but the supported protected path is a custom domain
+with Better Auth sessions and the WAF rate-limit rule on `/api/auth/*`.
 
 ```bash
 pnpm setup:domain --env dev --hostname inbox.<you.com>        # dry run
@@ -288,16 +288,29 @@ Tighten alignment with `--dmarc-alignment strict` once you're confident (default
 > keep inbound and outbound separated, isolate reputation per stream subdomain, and never run bulk
 > mail or experiments from your apex domain.
 
-**Cloudflare Access** — Reccado has no built-in login; **Access is the auth perimeter** for the UI
-and `/api/*`. `pnpm setup:access --hostname inbox.<you.com>` prints the dashboard steps to create a
-self-hosted Access application for the custom hostname, then sets `ACCESS_JWT_AUDIENCE` /
-`ACCESS_TEAM_DOMAIN` (+ optional `ACCESS_ALLOWED_EMAILS`) as secrets once you pass `--aud` /
-`--team-domain` (dry-run by default). See [`SECURITY.md`](SECURITY.md) for the model.
+**Better Auth (the web perimeter)** — the issuer lives in the worker: `/login` opens a session via
+e-mail OTP, and **registration is closed at the issuer** — an OTP is only ever sent to an address the
+owner registry (`owner_identities` in D1) vouches for, optionally bootstrapped with
+`OWNER_BOOTSTRAP_EMAILS`. `pnpm setup:auth --url https://inbox.<you.com>` machine-generates
+`BETTER_AUTH_SECRET` and uploads it (dry-run by default), prints the first-login/rescue steps, and
+offers to create a WAF rate-limiting rule for `/api/auth/*` when a zone-scoped
+`CLOUDFLARE_API_TOKEN` is present (otherwise it prints the dashboard steps — it never fails on a
+missing token).
+
+If you cannot sign in because mail sending is not configured yet (or the registry is empty), mint a
+pairing code and spend it at `/login` — the same emergency ladder the Telegram bridge uses:
+
+```bash
+wrangler d1 execute inbox-mcp-index-dev --remote --env dev --command \
+  "INSERT INTO owner_pairing_codes (code, created_at, expires_at, issued_by) VALUES ('<code>', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+2 hours'), 'manual')"
+```
+
+See [`SECURITY.md`](SECURITY.md) for the model.
 
 ### 3. Verify
 
 ```bash
-pnpm doctor --env dev --cloud --url https://inbox.<you.com>  # auth, D1, secrets, Access redirect
+pnpm doctor --env dev --cloud --url https://inbox.<you.com>  # auth, D1, secrets, live session issuer
 pnpm smoke:access https://inbox.<you.com>                    # fails if unauthenticated /api/* returns 200
 pnpm smoke:routing --domain <you.com> --env dev              # fails if no Email Routing rule targets the Worker
 ```
@@ -377,8 +390,9 @@ asks you to confirm once with a code.
 - **The webhook URL is reconciled hourly by the cron** (`reconcileTelegramWebhook`,
   `src/telegram/registration.ts`): it compares what Telegram believes against the truth and
   re-registers on drift. The worker learns its own public origin by observing a request that
-  already cleared Cloudflare Access — never an unauthenticated one, because the `Host` header is
-  forgeable and that value decides where Telegram delivers.
+  already cleared the web auth perimeter (an owner's Better Auth session) — never an
+  unauthenticated one, because the `Host` header is forgeable and that value decides where
+  Telegram delivers.
 - **The chat is adopted, not declared.** The first `/start` from an operator stores the chat in D1
   (`runtime_config`). First writer wins: a later `/start` from another chat does *not* move the
   binding, and the bot says so.
@@ -393,10 +407,9 @@ asks you to confirm once with a code.
 `GET /api/health` reports `dependencies.telegram` with `mode: off | partial | on` plus a `missing`
 list, so a bridge that is configured but not yet delivering says exactly what it is waiting for.
 
-**If the worker is behind Cloudflare Access, add a Bypass policy for `/telegram/webhook`.**
-Telegram cannot present an Access JWT, so every update would be redirected to the login page. The
-route authenticates itself instead: the `X-Telegram-Bot-Api-Secret-Token` header (compared in
-constant time) plus the operator allowlist. An unpaired bridge does answer the route — refusing to
+**`/telegram/webhook` sits deliberately outside the session perimeter.** Telegram cannot present a
+Better Auth session or OAuth token, so the route authenticates itself instead: the
+`X-Telegram-Bot-Api-Secret-Token` header (compared in constant time) plus the operator allowlist. An unpaired bridge does answer the route — refusing to
 would make pairing impossible, since `/start <code>` arrives through it — but the secret still
 gates every update, and the only command that does anything for a stranger is the one that spends
 a valid code.
@@ -429,7 +442,7 @@ pnpm d1:migrate:dev                      # applies 0006/0007 projections (transa
 ```
 
 Rotating the pepper invalidates every existing transactional key — re-issue keys after rotation.
-Template and key management stay behind Cloudflare Access (plus a `mailboxes.owner_email`
+Template and key management stay behind the Better Auth session perimeter (plus a `mailboxes.owner_email`
 ownership check):
 
 ```text
@@ -492,11 +505,10 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
 
 | Name | Kind | Purpose | Required? |
 | --- | --- | --- | --- |
-| `ACCESS_JWT_AUDIENCE` | secret | Cloudflare Access application audience (`aud`) tag, used to validate the `CF-Access-JWT-Assertion` header on every API request. | **Required** for any non-`localhost` deployment (auth fails closed without it) |
-| `ACCESS_TEAM_DOMAIN` | secret | Your Cloudflare Zero Trust team domain (`https://<your-team>.cloudflareaccess.com`), used to fetch the JWKS that validates the Access JWT. | **Required** for any non-`localhost` deployment |
-| `ACCESS_ALLOWED_EMAILS` | secret | Bootstrap for the owner registry (`owner_identities` in D1), unioned with it — not the record itself. Enforced in addition to Cloudflare Access, as an app-level check that still stands if the Access app was created for the wrong hostname. With an empty registry **and** this unset, `/api/*` and `/mcp` fail closed (`503`). | Optional once an owner is registered in D1 |
+| `BETTER_AUTH_SECRET` | secret | Signing key for the Better Auth issuer inside the worker (web sessions, `/api/auth/*`, `/mcp` OAuth tokens). Machine-generated and uploaded by `pnpm setup:auth --apply`. Auth fails closed outside `localhost` without it, or if it is shorter than 32 characters. Rotating it signs out every current session. | **Required** for any non-`localhost` deployment |
+| `OWNER_BOOTSTRAP_EMAILS` | secret | Bootstrap for the owner registry (`owner_identities` in D1), unioned with it — not the record itself. It is the **master key into the registry**: `/login` only emails an OTP to an address in this union, and `/mcp` OAuth only issues tokens to it. With an empty registry **and** this unset, `/api/*` and `/mcp` fail closed (`503`) — use the pairing-code rescue (see [Wire your domain](#2-wire-your-domain)) to open the first session. | Optional once an owner is registered in D1 |
 | `TRANSACTIONAL_API_KEY_PEPPER` | secret | HMAC-SHA256 pepper that hashes transactional API keys (`rck_*`). Key ops and the `/v1/.../transactional/*` send/status endpoints fail closed (`503`) without it. Rotating it invalidates all existing transactional keys. | Required to enable the transactional API |
-| `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, DNS edit for setup:sending's SPF/DMARC/DKIM/MX records, Email Routing write for catch-all API setup, Access app/policy write for future in-app provisioning). Also enables setup:domain's up-front custom-domain conflict check via the Workers Custom Domains API. | Optional |
+| `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, DNS edit for setup:sending's SPF/DMARC/DKIM/MX records, Email Routing write for catch-all API setup, WAF rate-limiting rule creation for `/api/auth/*` in setup:auth). Also enables setup:domain's up-front custom-domain conflict check via the Workers Custom Domains API. | Optional |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates the `/api/debug/phase0/*` introspection endpoints (R2 head, DO schema/state dumps, local email simulation in deployed environments). These endpoints are unreachable unless this token is set, and every request must present it. | Optional (leave unset to disable debug endpoints entirely) |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender address. Must be a verified sender on a domain onboarded to Cloudflare Email Sending. | **Required** |
 | `MAIL_SENDING_DOMAINS` | var | Comma-separated domains verified in Cloudflare Email Sending. A mailbox whose domain is listed replies as itself; anything else goes out as `MAIL_FROM_ADDRESS` with `Reply-To` set to the mailbox. | Optional (recommended once your domain is verified) |
@@ -526,12 +538,13 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (Risks) and
   [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) (Prerequisites).
 - **Cloudflare features** required on the account: Workers, Durable Objects, R2, Queues, D1, Email
-  Routing, Email Sending, Cron Triggers, and Access (Zero Trust).
+  Routing, Email Sending, Cron Triggers. A WAF rate-limiting rule on `/api/auth/*` is optional but
+  recommended (setup:auth creates or prints it).
 - **Public routing** — the default (production) environment ships with `workers_dev: false` in
   `wrangler.jsonc`: it is intentionally not reachable on the shared `*.workers.dev` subdomain.
   Front it with your own custom domain before deploying to production. The `dev` environment
-  (`reccado-dev`) keeps `workers_dev: true` for local-to-cloud smoke tests, but Access-protected UI
-  verification still needs a custom domain.
+  (`reccado-dev`) keeps `workers_dev: true` for local-to-cloud smoke tests, but real-session UI
+  verification and the WAF rule still want a custom domain.
 
 ## Troubleshooting
 
@@ -543,10 +556,10 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
 | Mailbox stops updating but inbound keeps arriving | D1 is unavailable | The Durable Object remains the source of truth and keeps ingesting; the D1 cross-mailbox index falls behind. Retry the index write through the Queue, then run `/api/admin/reindex` for the affected mailbox once D1 recovers. |
 | A message shows up with no parsed body/search hits | MIME parsing failed inside the Durable Object | Expected degraded behavior: the message row is kept with `parse_status='failed'` and the raw R2 key preserved (the email is never dropped); check `/api/admin/ops-events` for the parse-failure event. |
 | `confirm-send` returns an error and nothing sends | Outbound send failed at the provider, or recipient/size limits exceeded | Check `outbound_sends.status='failed'` and `error_code` for the draft; fix the underlying issue (recipient count, size, sender verification) and retry — `confirm-send` is idempotency-keyed, so retries with the same key never double-send. |
-| `curl /api/health` returns `200` directly instead of redirecting to Access login | Cloudflare Access is misconfigured or not enabled on that route | Treat this as a security incident: block public access to the API first (disable the route or tighten the Access policy), then fix and re-verify the Access app/policy before reopening it. |
+| An unauthenticated UI visit never lands on `/login`, or `/api/*` answers `503 auth_not_configured` | `BETTER_AUTH_SECRET` is unset (or shorter than 32 characters), so the issuer refuses to start | Upload it with `pnpm setup:auth --env <env> --url https://<host> --apply`, re-run `pnpm doctor --cloud --url https://<host>`, then reload the UI. |
 | `pnpm wrangler deploy --env dev` deploys the wrong Worker name | The Cloudflare Vite plugin can redirect Wrangler to its own generated config and drop the `--env` name override | Always deploy with both flags explicit: `pnpm wrangler deploy --env dev --name reccado-dev` (this is exactly what `pnpm run deploy:dev` does). |
 | `pnpm setup:cloud --apply` fails while building or patching `dist/server/wrangler.json` | The TanStack/Vite build failed, or the build output was not produced before Wrangler deploy | Fix the build error first (`pnpm run build` should pass), then rerun the same `setup:cloud` command. Do not hand-edit the tracked `wrangler.jsonc`; `setup:cloud` patches the built config from `wrangler.generated.<env>.json`. |
-| `pnpm setup:domain --apply` deploys but Access still does not redirect | The Access application was created for a different hostname, or you tested `*.workers.dev` instead of the custom domain | Run `pnpm setup:access --hostname <custom-host>` and verify with `pnpm doctor --cloud --url https://<custom-host>`. Treat `*.workers.dev` as smoke-only, not an Access proof. |
+| `pnpm setup:auth --apply` ran but `/login` still cannot sign anyone in | The owner registry is empty and `OWNER_BOOTSTRAP_EMAILS` is unset, so the issuer closes registration (`503 owner_not_configured`) | Register the owner in D1 or set `OWNER_BOOTSTRAP_EMAILS`, or spend a pairing code minted with `wrangler d1 execute` (see [Wire your domain](#2-wire-your-domain)). Verify with `pnpm doctor --cloud --url https://<custom-host>`. |
 | `pnpm setup:domain --apply` refuses to attach the hostname | The hostname is already a Workers Custom Domain on a **different** Worker (e.g. left over from a rename) | The script won't silently steal it. Detach it from the other Worker first (Cloudflare dashboard → Workers & Pages → Custom Domains, or redeploy that Worker without the route), or choose a different hostname. Re-running for the *same* Worker is idempotent and safe. |
 | `pnpm setup:routing --catch-all --apply` asks for `CLOUDFLARE_API_TOKEN` | Wrangler can enable routing and create explicit-address worker rules, but its catch-all command rejects `worker` client-side | Set a token with Zone Read + Email Routing Write for the zone and rerun. The script uses Cloudflare's REST `catch_all` endpoint, which supports `worker`. |
 | `pnpm setup:sending --apply` only prints DKIM/MX records instead of adding them | No `CLOUDFLARE_API_TOKEN` is set, or `--skip-provider-records` was passed | Set `CLOUDFLARE_API_TOKEN` (DNS edit) and re-run `--apply` to auto-add the provider-generated DKIM TXT + MX records parsed from `wrangler email sending dns get <sending-domain>`. Drop `--skip-provider-records` if you passed it and want the script to manage them after all. |
