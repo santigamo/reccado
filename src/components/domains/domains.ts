@@ -111,7 +111,7 @@ export function explainDomainError(error: DomainError): string | null {
 		case "domain_not_found":
 			return "That domain is not registered yet.";
 		case "unauthorized":
-			return "Your Cloudflare Access session expired. Reload the page to sign in again.";
+			return "Your session expired. Sign in again at /login.";
 		case "network_error":
 			return "The request never reached the worker. Check your connection and retry.";
 		default:

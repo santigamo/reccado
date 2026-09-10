@@ -9,9 +9,9 @@
  *  - POST .../transactional/api-keys/:id/rotate     -> { key, plaintextKey, previousKeyId,
  *                                                        previousKeyProjection }
  *
- * All requests are same-origin; the browser attaches the Cloudflare Access
- * session cookie and the Origin header (required by the API's CSRF guard)
- * automatically, exactly like the mail client in `#/lib/mail`.
+ * All requests are same-origin; the browser attaches the Better Auth session
+ * cookie and the Origin header (required by the API's CSRF guard) automatically,
+ * exactly like the mail client in `#/lib/mail`.
  *
  * SECURITY — `plaintextKey` is returned exactly once, by create and by rotate.
  * It is handed straight back to the caller and is never persisted, logged, or
@@ -158,7 +158,7 @@ export function explainKeyError(error: ApiKeyError): string | null {
 		case "origin_mismatch":
 			return "Request blocked by the CSRF origin guard.";
 		case "unauthorized":
-			return "Your Cloudflare Access session expired. Reload the page to sign in again.";
+			return "Your session expired. Sign in again at /login.";
 		case "network_error":
 			return "The request never reached the worker. Check your connection and retry.";
 		default:

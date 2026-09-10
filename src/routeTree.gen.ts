@@ -9,7 +9,9 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as LoginRouteImport } from './routes/login'
 import { Route as DomainsRouteImport } from './routes/domains'
+import { Route as ConsentRouteImport } from './routes/consent'
 import { Route as AboutRouteImport } from './routes/about'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as MailboxesIndexRouteImport } from './routes/mailboxes/index'
@@ -19,9 +21,19 @@ import { Route as MailboxesMailboxIdKeysRouteImport } from './routes/mailboxes/$
 import { Route as MailboxesMailboxIdComposeRouteImport } from './routes/mailboxes/$mailboxId/compose'
 import { Route as MailboxesMailboxIdThreadIdRouteImport } from './routes/mailboxes/$mailboxId/$threadId'
 
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const DomainsRoute = DomainsRouteImport.update({
   id: '/domains',
   path: '/domains',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ConsentRoute = ConsentRouteImport.update({
+  id: '/consent',
+  path: '/consent',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AboutRoute = AboutRouteImport.update({
@@ -70,7 +82,9 @@ const MailboxesMailboxIdThreadIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/consent': typeof ConsentRoute
   '/domains': typeof DomainsRoute
+  '/login': typeof LoginRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdRouteWithChildren
   '/mailboxes/': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
@@ -81,7 +95,9 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/consent': typeof ConsentRoute
   '/domains': typeof DomainsRoute
+  '/login': typeof LoginRoute
   '/mailboxes': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
@@ -92,7 +108,9 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
+  '/consent': typeof ConsentRoute
   '/domains': typeof DomainsRoute
+  '/login': typeof LoginRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdRouteWithChildren
   '/mailboxes/': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
@@ -105,7 +123,9 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/about'
+    | '/consent'
     | '/domains'
+    | '/login'
     | '/mailboxes/$mailboxId'
     | '/mailboxes/'
     | '/mailboxes/$mailboxId/$threadId'
@@ -116,7 +136,9 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/about'
+    | '/consent'
     | '/domains'
+    | '/login'
     | '/mailboxes'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
@@ -126,7 +148,9 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/about'
+    | '/consent'
     | '/domains'
+    | '/login'
     | '/mailboxes/$mailboxId'
     | '/mailboxes/'
     | '/mailboxes/$mailboxId/$threadId'
@@ -138,18 +162,34 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AboutRoute: typeof AboutRoute
+  ConsentRoute: typeof ConsentRoute
   DomainsRoute: typeof DomainsRoute
+  LoginRoute: typeof LoginRoute
   MailboxesMailboxIdRoute: typeof MailboxesMailboxIdRouteWithChildren
   MailboxesIndexRoute: typeof MailboxesIndexRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/domains': {
       id: '/domains'
       path: '/domains'
       fullPath: '/domains'
       preLoaderRoute: typeof DomainsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/consent': {
+      id: '/consent'
+      path: '/consent'
+      fullPath: '/consent'
+      preLoaderRoute: typeof ConsentRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/about': {
@@ -231,7 +271,9 @@ const MailboxesMailboxIdRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AboutRoute: AboutRoute,
+  ConsentRoute: ConsentRoute,
   DomainsRoute: DomainsRoute,
+  LoginRoute: LoginRoute,
   MailboxesMailboxIdRoute: MailboxesMailboxIdRouteWithChildren,
   MailboxesIndexRoute: MailboxesIndexRoute,
 }
