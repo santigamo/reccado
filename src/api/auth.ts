@@ -1,18 +1,20 @@
 import { readOwnerRegistry } from "../db/owners";
-import {
-	fetchWithTimeout,
-	getAccessConfigStatus,
-	isAbortTimeoutError,
-	isLocalRequest,
-} from "../lib/runtime-config";
+import { getAuthConfigStatus, isLocalRequest } from "../lib/runtime-config";
+
+// Imported dynamically (inside getAuthContext) rather than statically: this
+// module is imported by api/better-auth.ts (for resolveOwnerEmails, the owner
+// gate), and a static cycle between the two would run their module initialisers
+// in a fragile order.
+import type { AuthEnv } from "./better-auth";
+export type { AuthEnv };
 
 export type AuthContext = {
 	userId: string;
 	email: string;
 	/**
 	 * The owner emails in force for this request: the D1 registry unioned with the
-	 * ACCESS_ALLOWED_EMAILS bootstrap, resolved once here so the synchronous checks
-	 * downstream (assertMailboxAccess, requireMcpAuth) never need a database.
+	 * OWNER_BOOTSTRAP_EMAILS bootstrap, resolved once here so the synchronous checks
+	 * downstream (assertMailboxAccess, requireMcpOwner) never need a database.
 	 *
 	 * Empty means nobody is declared owner, which denies. Absent means the context
 	 * was built by hand rather than by getAuthContext, and the decision falls back
@@ -26,140 +28,26 @@ export type AuthContext = {
 	local?: boolean;
 };
 
-export type AccessJwtPayload = {
-	sub?: string;
-	email?: string;
-	aud?: string[];
-	exp?: number;
-	iss?: string;
+export type AuthVerificationOptions = {
+	/**
+	 * Skip better-auth's session cookie cache and verify against D1.
+	 *
+	 * The cookie cache trades freshness for a D1 read: a session revoked up to
+	 * `session.cookieCache.maxAge` (5 minutes) ago can still pass. Paths where a
+	 * revoked session must take effect IMMEDIATELY — confirm-send, where the
+	 * very next act is sending mail as the operator's mailboxes — verify against
+	 * the database instead. Used only there; the cache is safe everywhere else.
+	 */
+	disableCookieCache?: boolean;
 };
 
-type AccessCertResponse = {
-	keys: Array<{ kid: string; kty: string; n: string; e: string; alg: string }>;
-};
-
-let cachedCerts: AccessCertResponse | null = null;
-let cachedCertsAt = 0;
-
-function decodeBase64Url(input: string): Uint8Array {
-	const padded = input.replace(/-/g, "+").replace(/_/g, "/");
-	const pad = padded.length % 4 === 0 ? "" : "=".repeat(4 - (padded.length % 4));
-	const binary = atob(padded + pad);
-	return Uint8Array.from(binary, (c) => c.charCodeAt(0));
-}
-
-function parseJwt(token: string): {
-	header: Record<string, unknown>;
-	payload: AccessJwtPayload;
-	signature: Uint8Array;
-	signed: Uint8Array;
-} {
-	const parts = token.split(".");
-	if (parts.length !== 3) {
-		throw new Error("Invalid JWT");
-	}
-	const [headerPart, payloadPart, signaturePart] = parts as [string, string, string];
-	const header = JSON.parse(new TextDecoder().decode(decodeBase64Url(headerPart))) as Record<
-		string,
-		unknown
-	>;
-	const payload = JSON.parse(
-		new TextDecoder().decode(decodeBase64Url(payloadPart)),
-	) as AccessJwtPayload;
-	return {
-		header,
-		payload,
-		signature: decodeBase64Url(signaturePart),
-		signed: new TextEncoder().encode(`${headerPart}.${payloadPart}`),
-	};
-}
-
-async function getAccessCerts(teamDomain: string): Promise<AccessCertResponse> {
-	const now = Date.now();
-	if (cachedCerts && now - cachedCertsAt < 60_000) {
-		return cachedCerts;
-	}
-	const response = await fetchWithTimeout(`${teamDomain.replace(/\/$/, "")}/cdn-cgi/access/certs`, {
-		timeoutMs: 5_000,
-	});
-	if (!response.ok) {
-		throw new Error(`Failed to fetch Access certs: ${response.status}`);
-	}
-	cachedCerts = (await response.json()) as AccessCertResponse;
-	cachedCertsAt = now;
-	return cachedCerts;
-}
-
-export async function verifyAccessJwt(token: string, env: Env): Promise<AccessJwtPayload> {
-	const accessConfig = getAccessConfigStatus(env);
-	if (!accessConfig.configured || accessConfig.mode !== "access-jwt") {
-		throw new Error(accessConfig.reason ?? "Access validation is not configured");
-	}
-	const audience = env.ACCESS_JWT_AUDIENCE!;
-	const teamDomain = env.ACCESS_TEAM_DOMAIN!;
-
-	const { header, payload, signature, signed } = parseJwt(token);
-	const kid = header.kid;
-	if (typeof kid !== "string") {
-		throw new Error("JWT missing kid");
-	}
-
-	const certs = await getAccessCerts(teamDomain);
-	const jwk = certs.keys.find((key) => key.kid === kid);
-	if (!jwk) {
-		throw new Error("Unknown JWT kid");
-	}
-
-	const key = await crypto.subtle.importKey(
-		"jwk",
-		jwk,
-		{ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-		false,
-		["verify"],
-	);
-	const valid = await crypto.subtle.verify(
-		"RSASSA-PKCS1-v1_5",
-		key,
-		new Uint8Array(signature),
-		new Uint8Array(signed),
-	);
-	if (!valid) {
-		throw new Error("Invalid JWT signature");
-	}
-
-	// Issuer validation: must match the team domain's Access issuer URL.
-	const expectedIssuer = `${teamDomain.replace(/\/$/, "")}`;
-	if (!payload.iss) {
-		throw new Error("JWT missing iss");
-	}
-	if (payload.iss !== expectedIssuer && payload.iss !== `${expectedIssuer}/`) {
-		throw new Error("JWT issuer mismatch");
-	}
-
-	// Required exp: reject tokens without exp or with expired exp.
-	if (!payload.exp) {
-		throw new Error("JWT missing exp");
-	}
-	if (payload.exp * 1000 < Date.now()) {
-		throw new Error("JWT expired");
-	}
-
-	// Required email: reject tokens without a usable email claim.
-	if (!payload.email?.trim()) {
-		throw new Error("JWT missing email");
-	}
-
-	const aud = payload.aud ?? [];
-	if (!aud.includes(audience)) {
-		throw new Error("JWT audience mismatch");
-	}
-
-	return payload;
-}
-
-export async function getAuthContext(request: Request, env: Env): Promise<AuthContext | null> {
-	const accessConfig = getAccessConfigStatus(env);
-	if (accessConfig.mode === "local-dev-bypass") {
+export async function getAuthContext(
+	request: Request,
+	env: Env,
+	opts: AuthVerificationOptions = {},
+): Promise<AuthContext | null> {
+	const authConfig = getAuthConfigStatus(env);
+	if (authConfig.mode === "local-dev-bypass") {
 		if (!isLocalRequest(request)) {
 			return null;
 		}
@@ -170,34 +58,24 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
 			local: true,
 		};
 	}
-	if (!accessConfig.ok) {
-		throw new Error(accessConfig.reason ?? "Access validation is misconfigured");
+	if (!authConfig.ok) {
+		throw new Error(authConfig.reason ?? "Auth validation is misconfigured");
 	}
 
-	const token = request.headers.get("CF-Access-JWT-Assertion");
-	if (!token) {
+	const { createAuth } = await import("./better-auth");
+	const auth = await createAuth(env as unknown as AuthEnv, { request });
+	const session = await auth.api.getSession({
+		headers: request.headers,
+		query: opts.disableCookieCache ? { disableCookieCache: true } : undefined,
+	});
+	if (!session) {
 		return null;
 	}
-
-	try {
-		const payload = await verifyAccessJwt(token, env);
-		const email = payload.email ?? payload.sub ?? "unknown";
-		return { userId: payload.sub ?? email, email, owners: await resolveOwnerEmails(env) };
-	} catch (error) {
-		if (
-			isAbortTimeoutError(error) ||
-			(error instanceof Error && error.message.startsWith("Failed to fetch Access certs:"))
-		) {
-			throw error;
-		}
-		if (
-			error instanceof Error &&
-			(error.message.includes("misconfigured") || error.message.includes("not configured"))
-		) {
-			throw error;
-		}
-		return null;
-	}
+	return {
+		userId: session.user.id,
+		email: session.user.email,
+		owners: await resolveOwnerEmails(env),
+	};
 }
 
 /**
@@ -209,7 +87,7 @@ export async function getAuthContext(request: Request, env: Env): Promise<AuthCo
  * does not go through the database.
  */
 export function parseAllowedEmails(env: Env): string[] | null {
-	const raw = env.ACCESS_ALLOWED_EMAILS;
+	const raw = env.OWNER_BOOTSTRAP_EMAILS;
 	if (!raw?.trim()) {
 		return null;
 	}
@@ -234,7 +112,7 @@ function warnNoOwnerOnce(): void {
 	}
 	warnedNoOwner = true;
 	console.warn(
-		"auth.no_owner: no owner is registered for this deployment, so /api/* and /mcp deny every identity. Insert a row into owner_identities (see migrations/d1/0012_owner_registry.sql) or set the ACCESS_ALLOWED_EMAILS bootstrap.",
+		"auth.no_owner: no owner is registered for this deployment, so /api/* and /mcp deny every identity. Insert a row into owner_identities (see migrations/d1/0012_owner_registry.sql) or set the OWNER_BOOTSTRAP_EMAILS bootstrap.",
 	);
 }
 
@@ -253,11 +131,11 @@ function ownersFor(auth: AuthContext, env: Env): string[] {
 /**
  * Is this identity an owner?
  *
- * The check is deliberately NOT redundant with the Cloudflare Access policy. The
- * failure this defends against is the one the README documents: an Access app
- * created for the wrong hostname, where Access does not deny -- it simply is not
- * there. getAccessConfigStatus catches the half of that where the worker knows it
- * is unprotected; this list is what still stands when the perimeter is missing
+ * The check is deliberately NOT redundant with the login flow. The failure this
+ * defends against is the one the README documents: a perimeter configured for
+ * the wrong hostname, where the gate does not deny -- it simply is not there.
+ * getAuthConfigStatus catches the half of that where the worker knows it is
+ * unprotected; this list is what still stands when the perimeter is missing
  * and the worker cannot tell.
  *
  * With no owner at all it denies, with one exception: the localhost dev-bypass
@@ -273,17 +151,16 @@ function isOwner(auth: AuthContext, env: Env): boolean {
 	return owners.includes(auth.email.trim().toLowerCase());
 }
 
-export async function requireAuth(request: Request, env: Env): Promise<AuthContext> {
+export async function requireAuth(
+	request: Request,
+	env: Env,
+	opts: AuthVerificationOptions = {},
+): Promise<AuthContext> {
 	let auth: AuthContext | null;
 	try {
-		auth = await getAuthContext(request, env);
+		auth = await getAuthContext(request, env, opts);
 	} catch (error) {
-		const message =
-			error instanceof Error
-				? isAbortTimeoutError(error)
-					? "Cloudflare Access validation timed out."
-					: error.message
-				: "Cloudflare Access validation failed.";
+		const message = error instanceof Error ? error.message : "Session validation failed.";
 		throw new Response(JSON.stringify({ error: "auth_unavailable", reason: message }), {
 			status: 503,
 			headers: { "content-type": "application/json" },
@@ -344,9 +221,14 @@ export function isMcpAllowed(auth: AuthContext, env: Env): boolean {
 /**
  * Returns 503 when this deployment has no owner (MCP unconfigured),
  * 403 when the authenticated identity is not one,
- * or the AuthContext if allowed. Throws a Response for the Hono middleware to return.
+ * or the AuthContext if allowed. Throws a Response for the caller to return.
+ *
+ * Renamed from requireMcpAuth (docs/plans/sending-streams-and-auth.md Phase 2
+ * item 5): the name `requireMcpAuth` now belongs to @better-auth/mcp, which owns
+ * bearer-token verification. This is the owner gate that runs AFTER that
+ * verification, once the token's identity is established.
  */
-export function requireMcpAuth(auth: AuthContext, env: Env): AuthContext {
+export function requireMcpOwner(auth: AuthContext, env: Env): AuthContext {
 	const owners = ownersFor(auth, env);
 	if (owners.length === 0) {
 		throw new Response(

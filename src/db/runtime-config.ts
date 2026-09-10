@@ -204,12 +204,13 @@ export async function adoptRuntimeConfig(
  * Remembers the public origin this worker is served on, so the cron can keep the
  * Telegram webhook registered without anyone configuring a URL.
  *
- * Recorded ONLY from a request that already cleared Cloudflare Access on a public
- * https origin. `request.url` is built from the Host header, which any client can
- * forge -- and this value decides where Telegram is told to deliver updates, so an
- * unauthenticated request that could write here would be able to redirect the
- * operator's mail notifications to a host of its choosing. Gating on Access means
- * only the operator's own authenticated browser, on the real hostname, can set it.
+ * Recorded ONLY from a request that already cleared the auth perimeter (an
+ * authenticated owner) on a public https origin. `request.url` is built from the
+ * Host header, which any client can forge -- and this value decides where Telegram
+ * is told to deliver updates, so an unauthenticated request that could write here
+ * would be able to redirect the operator's mail notifications to a host of its
+ * choosing. Gating on requireAuth means only the operator's own browser, on the
+ * real hostname, can set it.
  */
 export async function recordDeploymentOrigin(db: D1Database, requestUrl: string): Promise<void> {
 	let url: URL;

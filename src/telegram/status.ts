@@ -8,7 +8,7 @@
  * console.error, which nobody reads, and nothing else in the system knew.
  *
  * So the state is reified here and surfaced in /api/health and `pnpm doctor`,
- * exactly as getAccessConfigStatus already does for Access. Degrading to a named
+ * exactly as getAuthConfigStatus already does for the auth perimeter. Degrading to a named
  * mode is the standard; degrading to a mute broken one is the bug.
  *
  * Everything here is read from D1. Deliberately: /api/health is what a monitor

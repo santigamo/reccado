@@ -82,9 +82,8 @@ describe("health route", () => {
 					ok: true,
 					configured: false,
 					mode: "local-dev-bypass",
-					reason:
-						"Cloudflare Access validation is disabled until ACCESS_JWT_AUDIENCE is configured.",
-					missing: ["ACCESS_JWT_AUDIENCE", "ACCESS_TEAM_DOMAIN"],
+					reason: "Better Auth is disabled until BETTER_AUTH_SECRET is configured.",
+					missing: ["BETTER_AUTH_SECRET"],
 				},
 				indexDb: {
 					ok: true,
@@ -131,7 +130,7 @@ describe("health route", () => {
 		expect(body.readiness).toEqual({ ok: false, status: "degraded" });
 		expect(body.dependencies.auth.ok).toBe(false);
 		expect(body.dependencies.auth.reason).toBe(
-			"Cloudflare Access validation is not configured for non-localhost requests.",
+			"Better Auth is not configured, so non-localhost requests cannot authenticate.",
 		);
 	});
 

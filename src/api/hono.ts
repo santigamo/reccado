@@ -30,10 +30,11 @@ import { provisionSendingDomain } from "../lib/provision";
 import { mailboxIdFromPrimaryAddress } from "../lib/mailbox-id";
 import {
 	fetchWithTimeout,
-	getAccessConfigStatus,
+	getAuthConfigStatus,
 	isAbortTimeoutError,
 	isLocalRequest,
 } from "../lib/runtime-config";
+import { handleAuthRequest } from "./better-auth";
 import { assertMailboxAccess, type getAuthContext, requireAuth } from "./auth";
 import {
 	registerAdminRoutes,
@@ -203,6 +204,11 @@ export function createApiApp(): Hono<ApiBindings> {
 	// Lightweight CSRF defense for state-changing requests: an Origin header that doesn't
 	// match this request's own host is rejected. Requests without an Origin header (curl,
 	// tests, server-to-server calls) are not affected.
+	//
+	// /api/auth/* is deliberately NOT exempt from this: the login and pairing endpoints
+	// are state-changing, unauthenticated, and exactly what an attacker with a planted
+	// cross-site form would target. better-auth adds its own trusted-origin check on
+	// top.
 	api.use("/api/*", async (c, next) => {
 		const method = c.req.method.toUpperCase();
 		const isStateChanging =
@@ -216,15 +222,35 @@ export function createApiApp(): Hono<ApiBindings> {
 		return next();
 	});
 
+	// --- Web auth issuer (Better Auth) ---------------------------------------------
+	//
+	// /api/auth/* must be registered BEFORE the requireAuth middleware below: a login
+	// request is by definition not yet authenticated, and the owner gate that closes
+	// registration lives inside handleAuthRequest. Deliberately still under the CSRF
+	// Origin middleware above, and deliberately NOT calling recordDeploymentOrigin:
+	// the origin is learned only from a request an owner authenticated, and nobody
+	// here is one yet.
+	api.all("/api/auth/*", (c) => handleAuthRequest(c.req.raw, c.env));
+
 	api.use("/api/*", async (c, next) => {
 		if (c.req.path === "/api/health" || c.req.path.startsWith("/api/debug/")) {
 			return next();
 		}
 		try {
-			const auth = await requireAuth(c.req.raw, c.env);
+			// The web confirm-send path verifies the session against D1 (cookie cache
+			// bypassed): it is the one path where a revoked session must take effect
+			// before the very next act, which is sending mail.
+			const bypassCookieCache = /^\/api\/mailboxes\/[^/]+\/drafts\/[^/]+\/confirm-send$/.test(
+				c.req.path,
+			);
+			const auth = await requireAuth(
+				c.req.raw,
+				c.env,
+				bypassCookieCache ? { disableCookieCache: true } : undefined,
+			);
 			c.set("auth", auth);
 			// Learn the hostname we are served on from a request that already cleared
-			// Access. It is the one input the cron needs to keep the Telegram webhook
+			// the auth perimeter. It is the one input the cron needs to keep the Telegram webhook
 			// registered, and gating it on authentication is what stops a forged Host
 			// header from redirecting the operator's notifications.
 			//
@@ -251,52 +277,12 @@ export function createApiApp(): Hono<ApiBindings> {
 
 	// MCP endpoint: dedicated middleware (does NOT inherit /api/* middleware).
 	// Security headers already applied via the global api.use("*") above.
-	// MCP auth: fail-closed if ACCESS_ALLOWED_EMAILS is unset (503),
-	// 403 if authenticated identity is not in the allowlist.
-	// OPTIONS (CORS preflight) bypasses auth — the MCP transport handles it.
-	api.use("/mcp", async (c, next) => {
-		if (c.req.method === "OPTIONS") {
-			return next();
-		}
-		try {
-			const auth = await requireAuth(c.req.raw, c.env);
-			c.set("auth", auth);
-			// Learn the hostname we are served on from a request that already cleared
-			// Access. It is the one input the cron needs to keep the Telegram webhook
-			// registered, and gating it on authentication is what stops a forged Host
-			// header from redirecting the operator's notifications.
-			//
-			// Isolated from the auth try/catch below on purpose: bookkeeping must never
-			// be able to turn an authenticated request into a 500, and c.executionCtx
-			// throws outright in contexts that have none.
-			try {
-				c.executionCtx.waitUntil(
-					import("../db/runtime-config").then(({ recordDeploymentOrigin }) =>
-						recordDeploymentOrigin(c.env.INDEX_DB, c.req.url).catch(() => undefined),
-					),
-				);
-			} catch {
-				// No execution context to defer onto; the next request will record it.
-			}
-		} catch (error) {
-			if (error instanceof Response) {
-				return error;
-			}
-			throw error;
-		}
-		// MCP fail-closed: require explicit allowlist.
-		const { requireMcpAuth } = await import("../mcp/auth-import");
-		try {
-			requireMcpAuth(c.get("auth")!, c.env);
-		} catch (error) {
-			if (error instanceof Response) {
-				return error;
-			}
-			throw error;
-		}
-		return next();
-	});
-
+	//
+	// Authentication moved into mcp/handler.ts (bearer-token verification via
+	// @better-auth/mcp + the requireMcpOwner owner gate); CORS preflights
+	// (OPTIONS) pass through to the MCP transport there, which answers them
+	// without a token — the same exemption the old session middleware granted.
+	//
 	// MCP CSRF: Origin check for state-changing POST requests.
 	// Non-browser MCP clients (Claude Desktop, MCP Inspector) omit Origin — allow those.
 	// Browser-origin POSTs with a mismatched Origin are rejected.
@@ -310,8 +296,19 @@ export function createApiApp(): Hono<ApiBindings> {
 		return next();
 	});
 
+	// --- OAuth discovery (RFC 8414 / RFC 9728) ---------------------------------------
+	//
+	// MCP clients start the OAuth flow from the WWW-Authenticate challenge /mcp
+	// answers 401 with, and fetch the well-known metadata at the ROOT of the
+	// origin. The mcp plugin serves those documents through the auth handler's
+	// plugin hooks, which match the raw request path BEFORE endpoint routing —
+	// so forwarding the request unmodified is enough: the hooks answer the
+	// protected-resource and authorization-server documents, and requests that
+	// match nothing 404 in the auth router.
+	api.all("/.well-known/*", (c) => handleAuthRequest(c.req.raw, c.env));
+
 	// Telegram webhook. Deliberately outside /api/* — see handleTelegramWebhook for
-	// why it cannot use Access or the Origin guard, and what authenticates it instead.
+	// why it cannot use the session perimeter or the Origin guard, and what authenticates it instead.
 	// Registered for every method (not just POST) so the handler itself decides —
 	// it answers 404 when the bridge is off, which must win over a router 405.
 	api.all("/telegram/webhook", async (c) => {
@@ -320,12 +317,13 @@ export function createApiApp(): Hono<ApiBindings> {
 	});
 
 	api.get("/api/health", async (c) => {
-		const access = getAccessConfigStatus(c.env);
-		const authOk = access.ok && (access.mode !== "local-dev-bypass" || isLocalRequest(c.req.raw));
+		const authConfig = getAuthConfigStatus(c.env);
+		const authOk =
+			authConfig.ok && (authConfig.mode !== "local-dev-bypass" || isLocalRequest(c.req.raw));
 		const authReason =
-			authOk || access.mode !== "local-dev-bypass"
-				? access.reason
-				: "Cloudflare Access validation is not configured for non-localhost requests.";
+			authOk || authConfig.mode !== "local-dev-bypass"
+				? authConfig.reason
+				: "Better Auth is not configured, so non-localhost requests cannot authenticate.";
 		const cloudflareApiConfigured = Boolean(c.env.CLOUDFLARE_API_TOKEN?.trim());
 		const indexDbHealth = await checkIndexDbHealth(c.env.INDEX_DB);
 		const { getTelegramStatus } = await import("../telegram/status");
@@ -343,10 +341,10 @@ export function createApiApp(): Hono<ApiBindings> {
 		const dependencyStates = {
 			auth: {
 				ok: authOk,
-				configured: access.configured,
-				mode: access.mode,
+				configured: authConfig.configured,
+				mode: authConfig.mode,
 				reason: authReason,
-				missing: access.missing,
+				missing: authConfig.missing,
 			},
 			indexDb: {
 				ok: indexDbHealth.ok,
@@ -401,7 +399,7 @@ export function createApiApp(): Hono<ApiBindings> {
 		return c.json({ userId: auth?.userId, email: auth?.email });
 	});
 
-	// Protected setup diagnostic (behind the Access perimeter, like the rest of /api/*): runtime
+	// Protected setup diagnostic (behind the auth perimeter, like the rest of /api/*): runtime
 	// facts the CLI `pnpm doctor` cannot infer — index health plus control-plane completeness.
 	api.get("/api/setup/status", async (c) => {
 		const indexDbHealth = await checkIndexDbHealth(c.env.INDEX_DB);

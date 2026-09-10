@@ -41,7 +41,9 @@ beforeAll(async () => {
 });
 
 describe("Transactional API key integration tests", () => {
-	it("creates, lists, revokes, rotates an API key via the DO", async () => {
+	// timeout: same reason as the ingest dedupe test — the better-auth issuer in the
+	// worker bundle narrows the timing margin under a full-suite run.
+	it("creates, lists, revokes, rotates an API key via the DO", { timeout: 20_000 }, async () => {
 		const mailboxId = "mbx_test_keys";
 
 		const stub = env.MAILBOX_DO.getByName(mailboxId);

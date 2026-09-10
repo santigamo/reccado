@@ -110,7 +110,7 @@ api.get("/api/mailboxes/:mailboxId/ws", async (c) => {
 	);
 });
 
-// --- Transactional API: template management (Access-protected, under /api/*) ---
+// --- Transactional API: template management (session-protected, under /api/*) ---
 
 api.post("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
 	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
@@ -177,6 +177,9 @@ export default {
 		if (
 			url.pathname.startsWith("/api/") ||
 			url.pathname === "/mcp" ||
+			// OAuth discovery documents (RFC 8414/9728) that MCP clients fetch at the
+			// root of the origin; see the /.well-known route in api/hono.ts.
+			url.pathname.startsWith("/.well-known/") ||
 			url.pathname === "/telegram/webhook"
 		) {
 			return api.fetch(request, env, ctx);

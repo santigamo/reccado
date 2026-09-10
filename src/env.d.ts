@@ -1,8 +1,12 @@
 /// <reference types="@cloudflare/workers-types" />
 
 declare interface Env {
-	ACCESS_JWT_AUDIENCE?: string;
-	ACCESS_TEAM_DOMAIN?: string;
+	/**
+	 * HMAC secret for the web auth issuer (Better Auth). Machine-generated,
+	 * uploaded with `wrangler secret put`; minimum 32 characters. Unset = the
+	 * local-dev bypass stays active and non-localhost requests get nothing.
+	 */
+	BETTER_AUTH_SECRET?: string;
 	PHASE0_DEBUG_TOKEN?: string;
 	CLOUDFLARE_API_TOKEN?: string;
 	/** Account id. Event subscriptions are account-scoped, so provisioning needs it. */
@@ -19,7 +23,7 @@ declare interface Env {
 	 * record itself. Comma-separated owner emails, unioned with whatever the
 	 * registry holds. Unset AND an empty registry = /api/* and /mcp deny.
 	 */
-	ACCESS_ALLOWED_EMAILS?: string;
+	OWNER_BOOTSTRAP_EMAILS?: string;
 	/**
 	 * Comma-separated domains verified for outbound sending in Cloudflare Email
 	 * Sending. A mailbox whose domain is listed sends as itself; anything else

@@ -120,7 +120,12 @@ function buildDeeplyNestedMimeBytes(depth: number, messageId: string): Uint8Arra
 }
 
 describe("mailbox DO ingest", () => {
-	it("dedups a redelivery of the same message-id and raw bytes as duplicate", async () => {
+	// timeout: the worker bundle now carries the better-auth issuer, which widens
+	// the per-test import/first-call margin just enough that this DO round-trip can
+	// brush the 5s default when the whole suite shares one workerd process.
+	it("dedups a redelivery of the same message-id and raw bytes as duplicate", {
+		timeout: 20_000,
+	}, async () => {
 		const mailboxId = "mbx_ingest_dedupe";
 
 		const first = await ingestFixture(
