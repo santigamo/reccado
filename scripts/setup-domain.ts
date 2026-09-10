@@ -161,7 +161,8 @@ if (!hostname) {
 if (hostname.endsWith(".workers.dev")) {
 	console.error(
 		"setup:domain: pass a custom hostname on a zone you control, not a *.workers.dev URL.\n" +
-			"Reccado's supported public path is custom domain + Cloudflare Access.",
+			"Reccado's supported public path is a custom domain: it is the canonical origin the\n" +
+			"auth issuer signs sessions for, and the zone the /api/auth/* rate-limit rule needs.",
 	);
 	process.exit(1);
 }
@@ -384,9 +385,11 @@ if (apply) {
 
 console.log(`\n${"─".repeat(72)}`);
 console.log("Next:");
-console.log(`1. Protect https://${hostname} with Cloudflare Access:`);
-console.log(`   pnpm setup:access${targetEnv ? ` --env ${targetEnv}` : ""} --hostname ${hostname}`);
-console.log(`2. Verify the route is protected and the Worker is reachable:`);
+console.log(`1. Set up the auth perimeter for https://${hostname}:`);
+console.log(
+	`   pnpm setup:auth${targetEnv ? ` --env ${targetEnv}` : ""} --url https://${hostname} [--apply]`,
+);
+console.log(`2. Verify the perimeter answers and the Worker is reachable:`);
 console.log(
 	`   pnpm doctor${targetEnv ? ` --env ${targetEnv}` : ""} --cloud --url https://${hostname}`,
 );

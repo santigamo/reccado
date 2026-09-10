@@ -6,7 +6,7 @@
  * MCP fails closed for NULL-owned mailboxes (returns not_found). This script
  * claims them for a specific owner email so MCP tools can access them.
  *
- * SAFETY: dry-run by default. Pass `--apply` to run. If ACCESS_ALLOWED_EMAILS
+ * SAFETY: dry-run by default. Pass `--apply` to run. If OWNER_BOOTSTRAP_EMAILS
  * has more than one entry, `--owner <email>` is required to prevent accidental
  * multi-user claims. The script canonicalizes the owner email (lowercase, trim).
  *
@@ -74,20 +74,20 @@ function resolveOwner(owner: string | null): string {
 	if (owner) return owner.trim().toLowerCase();
 
 	const devVars = readDevVars();
-	const allowList = devVars.ACCESS_ALLOWED_EMAILS ?? process.env.ACCESS_ALLOWED_EMAILS ?? "";
+	const allowList = devVars.OWNER_BOOTSTRAP_EMAILS ?? process.env.OWNER_BOOTSTRAP_EMAILS ?? "";
 	const emails = allowList
 		.split(",")
 		.map((e) => e.trim())
 		.filter((e) => e.length > 0);
 
 	if (emails.length === 0) {
-		console.error("ERROR: No --owner specified and ACCESS_ALLOWED_EMAILS is not set.");
-		console.error("Set ACCESS_ALLOWED_EMAILS in .dev.vars or pass --owner <email>.");
+		console.error("ERROR: No --owner specified and OWNER_BOOTSTRAP_EMAILS is not set.");
+		console.error("Set OWNER_BOOTSTRAP_EMAILS in .dev.vars or pass --owner <email>.");
 		process.exit(1);
 	}
 	if (emails.length > 1) {
 		console.error(
-			`ERROR: ACCESS_ALLOWED_EMAILS has ${emails.length} entries. --owner <email> is required to prevent accidental multi-user claims.`,
+			`ERROR: OWNER_BOOTSTRAP_EMAILS has ${emails.length} entries. --owner <email> is required to prevent accidental multi-user claims.`,
 		);
 		console.error(`Entries: ${emails.join(", ")}`);
 		process.exit(1);

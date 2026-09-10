@@ -40,11 +40,12 @@
  *                       message list and R2 heads through /api/debug/phase0/*,
  *                       which is the only route that reports what the Durable
  *                       Object actually holds. Required.
- *   RECCADO_ACCESS_JWT  a Cloudflare Access JWT for an owner identity (the
- *                       CF_Authorization cookie value, or
- *                       `cloudflared access token --app <url>`). Required for the
- *                       full-text search check, and for any request at all when
- *                       the deployment sits behind Access.
+ *   RECCADO_SESSION_COOKIE  a signed Better Auth session cookie pair from an
+ *                           authenticated browser session (devtools → Application
+ *                           → Cookies → copy the whole `better-auth.session_token=`
+ *                           pair, including any `__Secure-` prefix in the name).
+ *                           Required for the full-text search check, which reads
+ *                           session-protected /api routes.
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -143,7 +144,7 @@ const envName = args.env ?? "dev";
 const mailboxId = args.mailbox?.trim();
 const baseUrl = (args["base-url"] ?? process.env.RECCADO_BASE_URL)?.trim();
 const debugToken = (args["debug-token"] ?? process.env.PHASE0_DEBUG_TOKEN)?.trim();
-const accessJwt = (args["access-jwt"] ?? process.env.RECCADO_ACCESS_JWT)?.trim();
+const accessJwt = (args["session-cookie"] ?? process.env.RECCADO_SESSION_COOKIE)?.trim();
 const expectLost = (args["expect-lost"] ?? "")
 	.split(",")
 	.map((id) => id.trim())
@@ -180,14 +181,15 @@ const sourceDb = args["source-d1"]?.trim() || targetDb;
 const envArgs = envName === "production" ? [] : ["--env", envName];
 
 /**
- * Access sits in front of the Worker, so its JWT rides on every request when one is
- * supplied — as both the header the Worker verifies and the cookie the edge does.
+ * The session cookie rides on every request when one is supplied — it is what
+ * the worker's issuer (Better Auth) verifies on the /api/* routes the FTS probe
+ * reads. The variable name `accessJwt` is kept only to keep the diff small; it
+ * carries a cookie pair now, not a JWT.
  */
 function requestHeaders(extra?: Record<string, string>): Record<string, string> {
 	const headers: Record<string, string> = { ...extra };
 	if (accessJwt) {
-		headers["cf-access-jwt-assertion"] = accessJwt;
-		headers.cookie = `CF_Authorization=${accessJwt}`;
+		headers.cookie = accessJwt;
 	}
 	return headers;
 }
@@ -200,10 +202,10 @@ async function getJson<T>(path: string, extraHeaders?: Record<string, string>): 
 	});
 	if (response.status === 302 || response.status === 303) {
 		const location = response.headers.get("location") ?? "";
-		if (/cloudflareaccess\.com/i.test(location)) {
+		if (!accessJwt && /login/i.test(location)) {
 			incomplete(
-				`${url} is behind Cloudflare Access and no usable JWT was supplied. Pass --access-jwt ` +
-					"(the CF_Authorization cookie value, or `cloudflared access token --app <url>`).",
+				`${url} redirected to the login page and no session cookie was supplied. Pass ` +
+					"--session-cookie with the signed better-auth.session_token cookie pair from an authenticated browser.",
 			);
 		}
 		incomplete(`${url} redirected to ${location}`);
@@ -225,7 +227,7 @@ console.log(`  Env:        ${envName}`);
 console.log(`  Mailbox:    ${mailboxId}`);
 console.log(`  Source D1:  ${sourceDb} (what the mailbox held before the rebuild)`);
 console.log(`  Base URL:   ${baseUrl}`);
-console.log(`  Access JWT: ${accessJwt ? "supplied" : "absent — the FTS check cannot run"}`);
+console.log(`  Session:    ${accessJwt ? "supplied" : "absent — the FTS check cannot run"}`);
 console.log();
 
 const rawIndexRows = d1Query<MessageIndexRow>(
@@ -572,7 +574,7 @@ let ftsChecked = 0;
 let ftsSkipped = false;
 if (!accessJwt) {
 	ftsSkipped = true;
-	console.log("  SKIPPED — /api/mailboxes/:id/search is Access-protected; pass --access-jwt.");
+	console.log("  SKIPPED — /api/mailboxes/:id/search is session-protected; pass --session-cookie.");
 } else {
 	const probes = snapshot.messages
 		.map((message) => {

@@ -6,11 +6,11 @@
 # (`pnpm cf-typegen`) — so every key must stay present here even when its value is empty,
 # or the generated worker-configuration.d.ts would drop it.
 #
-# The Access / API-token values are intentionally LEFT EMPTY (not placeholder strings):
-# the local-dev bypass in src/lib/runtime-config.ts stays active only while BOTH Access
-# vars are empty/absent, so copying this file verbatim keeps local `/api/*` working.
-# Fill them in only when you deliberately test the real Access perimeter or admin
-# provisioning locally.
+# The auth / API-token values are intentionally LEFT EMPTY (not placeholder strings):
+# the local-dev bypass in src/lib/runtime-config.ts stays active only while
+# BETTER_AUTH_SECRET is empty/absent, so copying this file verbatim keeps local
+# `/api/*` working. Fill in BETTER_AUTH_SECRET (32+ chars, `openssl rand -base64 32`)
+# only when you deliberately exercise the real Better Auth login locally.
 
 # Key order below is significant: `wrangler types` emits keys in this order, so it must match
 # the committed worker-configuration.d.ts (the CI "generated artifacts" check diffs it).
@@ -29,9 +29,9 @@ MAILBOX_JURISDICTION=none
 # Minimum intended scope: zone read, email routing write for test zones, and Access app/policy write only when configuring Access by API.
 CLOUDFLARE_API_TOKEN=
 
-# Cloudflare Access validation settings (leave empty for local dev; see note above).
-ACCESS_JWT_AUDIENCE=
-ACCESS_TEAM_DOMAIN=
+# Web auth issuer secret (Better Auth; leave empty for local dev — see note above).
+# Deployed environments set it as a secret: openssl rand -base64 32 | pnpm wrangler secret put BETTER_AUTH_SECRET
+BETTER_AUTH_SECRET=
 
 # --- Telegram bridge (optional) --------------------------------------------
 # Deliberately NOT active keys in this file: they are deployed with
@@ -65,7 +65,7 @@ ACCESS_TEAM_DOMAIN=
 #           strftime('%Y-%m-%dT%H:%M:%fZ','now','+2 hours'), 'manual')
 #
 # The same table names the web side of the same owner: `owner_identities` rows of kind
-# 'email' are what ACCESS_ALLOWED_EMAILS used to be, and both are read together:
+# 'email' are what OWNER_BOOTSTRAP_EMAILS used to be, and both are read together:
 #
 #   INSERT INTO owner_identities (kind, identity, linked_at, linked_via)
 #   VALUES ('email', 'you@example.com', strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'manual')

@@ -134,11 +134,11 @@ if (!address.endsWith(`@${domain}`)) {
 const displayName = args["display-name"]?.trim() || address.split("@")[0] || "Inbox";
 const zoneId = args["zone-id"]?.trim() || "zone-placeholder";
 
-// Resolve owner email: explicit flag > ACCESS_ALLOWED_EMAILS (first entry if single).
+// Resolve owner email: explicit flag > OWNER_BOOTSTRAP_EMAILS (first entry if single).
 let ownerEmail = args.owner?.trim().toLowerCase() || undefined;
 if (!ownerEmail) {
 	const allowList =
-		readDotEnvValue(".dev.vars", "ACCESS_ALLOWED_EMAILS") || process.env.ACCESS_ALLOWED_EMAILS;
+		readDotEnvValue(".dev.vars", "OWNER_BOOTSTRAP_EMAILS") || process.env.OWNER_BOOTSTRAP_EMAILS;
 	if (allowList) {
 		const emails = allowList
 			.split(",")

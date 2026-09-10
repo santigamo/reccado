@@ -3,12 +3,13 @@
  * Generates a minimal, valid `.dev.vars` for local development if one is missing,
  * so `pnpm dev` works straight from a clone with no manual `cp` step.
  *
- * Why not just copy `.dev.vars.example`? The example documents the *remote* secrets
- * (Cloudflare Access `aud`/team domain, CF API token) with non-empty placeholder
- * values. `getAccessConfigStatus()` (src/lib/runtime-config.ts) only enables the
- * local-dev bypass when BOTH Access vars are empty/absent — so copying the example
- * verbatim would flip local `/api/*` out of bypass and into failed JWT validation.
- * This writes only the local-safe debug token and intentionally leaves Access unset.
+ * Why not just copy `.dev.vars.example`? The example documents the *remote*
+ * secrets (Better Auth secret, CF API token) with non-empty placeholder values.
+ * `getAuthConfigStatus()` (src/lib/runtime-config.ts) only enables the local-dev
+ * bypass when BETTER_AUTH_SECRET is empty/absent — so copying the example
+ * verbatim would flip local `/api/*` out of bypass and into real session
+ * validation. This writes only the local-safe debug token and intentionally
+ * leaves the auth secret unset.
  *
  * Idempotent and non-destructive: if `.dev.vars` already exists it is never touched.
  * Escape hatch: set RECCADO_SKIP_DEV_VARS=1 to skip generation entirely (e.g. CI).
@@ -26,12 +27,12 @@ const LOCAL_DEV_VARS = `# Auto-generated minimal local dev config (scripts/ensur
 # Unlocks the local /api/debug/phase0/* introspection endpoints the smoke scripts use.
 PHASE0_DEBUG_TOKEN=dev-phase0-debug-token
 
-# Access / API-token vars are present-but-EMPTY: this keeps the full key set (so a local
+# Auth / API-token vars are present-but-EMPTY: this keeps the full key set (so a local
 # \`pnpm cf-typegen\` matches the committed types) while leaving the local-dev bypass active
-# (it needs both Access vars empty/absent). Fill them in only to test real Access locally.
+# (it needs BETTER_AUTH_SECRET empty/absent). Fill in BETTER_AUTH_SECRET (32+ chars) only
+# to exercise the real Better Auth login locally.
 CLOUDFLARE_API_TOKEN=
-ACCESS_JWT_AUDIENCE=
-ACCESS_TEAM_DOMAIN=
+BETTER_AUTH_SECRET=
 `;
 
 if (process.env.RECCADO_SKIP_DEV_VARS === "1") {

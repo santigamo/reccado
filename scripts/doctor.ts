@@ -6,13 +6,13 @@
  * Default run is offline and deterministic (toolchain + local dev + config placeholders).
  * Pass `--cloud` to add remote checks (auth, D1 exists + id match, every declared Queue exists and
  * its DLQs are consumed, every sending domain publishes its lifecycle events to the events queue,
- * required secrets, and — with `--url` — that Cloudflare Access is protecting the route).
+ * required secrets, and — with `--url` — that the deployed login page and /api/health answer).
  * Exhaustive R2/queue/Email-Routing *binding* wiring lives in `pnpm verify:cf`.
  *
  * Usage:
  *   pnpm doctor                       # local + config checks for the default (production) config
  *   pnpm doctor --env dev             # inspect the env.dev block instead
- *   pnpm doctor --env dev --cloud --url https://…   # remote: D1, secrets, Access redirect
+ *   pnpm doctor --env dev --cloud --url https://…   # remote: D1, secrets, auth endpoints
  *   pnpm -s doctor:json               # machine-readable output (-s drops pnpm's banner; exit 1 on any fail)
  */
 import { execFileSync } from "node:child_process";
@@ -180,28 +180,26 @@ if (!existsSync(".dev.vars")) {
 	const devVars = parseDotEnv(readFileSync(".dev.vars", "utf8"));
 	add({ id: "devvars.present", status: "pass", message: ".dev.vars exists." });
 
-	const aud = devVars.get("ACCESS_JWT_AUDIENCE")?.trim();
-	const team = devVars.get("ACCESS_TEAM_DOMAIN")?.trim();
-	if (aud && team) {
+	const secret = devVars.get("BETTER_AUTH_SECRET")?.trim();
+	if (!secret) {
 		add({
-			id: "devvars.access-bypass",
+			id: "devvars.auth-bypass",
+			status: "pass",
+			message: "BETTER_AUTH_SECRET is unset locally — local-dev bypass is active.",
+		});
+	} else if (secret.length < 32) {
+		add({
+			id: "devvars.auth-bypass",
 			status: "fail",
 			message:
-				"Both Access vars are set in .dev.vars, so local /api/* leaves the local-dev bypass.",
-			fix: "Comment out ACCESS_JWT_AUDIENCE and ACCESS_TEAM_DOMAIN in .dev.vars for local dev.",
-		});
-	} else if (aud || team) {
-		add({
-			id: "devvars.access-bypass",
-			status: "warn",
-			message: "Exactly one Access var is set — the runtime treats this as misconfigured Access.",
-			fix: "Set both Access vars (real Access test) or neither (local bypass) in .dev.vars.",
+				"BETTER_AUTH_SECRET is set but shorter than 32 characters — the issuer refuses to start.",
+			fix: "Generate a real secret: openssl rand -base64 32",
 		});
 	} else {
 		add({
-			id: "devvars.access-bypass",
+			id: "devvars.auth-bypass",
 			status: "pass",
-			message: "Access is unset locally — local-dev bypass is active.",
+			message: "BETTER_AUTH_SECRET is set — real Better Auth sessions locally.",
 		});
 	}
 }
@@ -301,7 +299,7 @@ if (!block) {
 			id: "config.public-host",
 			status: "info",
 			message:
-				"dev keeps workers.dev available for remote smoke tests; use a custom domain for Access-protected UI/API checks.",
+				"dev keeps workers.dev available for remote smoke tests; use a custom domain for the authenticated UI/API.",
 			fix: `Attach a custom domain with pnpm setup:domain --env dev --hostname app.<your-domain>`,
 		});
 	} else {
@@ -809,7 +807,7 @@ function checkTelegramBridge(): Check {
 			id: "cloud.telegram",
 			status: "warn",
 			message: `Telegram is failing to deliver webhook updates since ${observation?.lastErrorAt}: ${observation?.lastErrorMessage ?? "no message reported"} (${observation?.pendingUpdateCount ?? 0} update(s) pending).`,
-			fix: "The hourly cron re-registers the webhook; if the error persists, check that Cloudflare Access has a Bypass policy for /telegram/webhook.",
+			fix: "The hourly cron re-registers the webhook; if the error persists, check the Telegram webhook URL and secret.",
 		};
 	}
 	return {
@@ -832,7 +830,7 @@ function parseJsonValue(raw: string | undefined): Record<string, unknown> | null
 	}
 }
 
-/** Confirms the Worker's remote Access secrets. */
+/** Confirms the Worker's remote auth secret. */
 function checkSecretsRemote(): Check[] {
 	let names: Set<string>;
 	try {
@@ -867,75 +865,86 @@ function checkSecretsRemote(): Check[] {
 	if (names.has("TELEGRAM_BOT_TOKEN")) {
 		out.push(checkTelegramBridge());
 	}
-	const missingAccess = ["ACCESS_JWT_AUDIENCE", "ACCESS_TEAM_DOMAIN"].filter((n) => !names.has(n));
+	const missingAuth = ["BETTER_AUTH_SECRET"].filter((n) => !names.has(n));
 	out.push(
-		missingAccess.length === 0
-			? { id: "cloud.secret.access", status: "pass", message: "Access secrets are set." }
+		missingAuth.length === 0
+			? { id: "cloud.secret.auth", status: "pass", message: "Better Auth secret is set." }
 			: {
-					id: "cloud.secret.access",
+					id: "cloud.secret.auth",
 					status: "warn",
-					message: `Access secret(s) missing: ${missingAccess.join(", ")} — /api/* is unprotected without them.`,
-					fix: "pnpm setup:access --hostname <app.your-domain> ... --apply",
+					message: `Auth secret(s) missing: ${missingAuth.join(", ")} — the web login cannot issue sessions without it.`,
+					fix: "openssl rand -base64 32 && pnpm wrangler secret put BETTER_AUTH_SECRET",
 				},
 	);
 	return out;
 }
 
 /**
- * An unauthenticated request to a Worker fronted by Cloudflare Access should be redirected to
- * the team's cloudflareaccess.com login. A 200 means Access is NOT protecting the route.
+ * The web perimeter is now in the worker, so "is the perimeter actually up" is
+ * two plain HTTP probes instead of an edge-redirect shape: the login page must
+ * be reachable, and /api/health — deliberately unauthenticated — must answer.
+ * A 404 on /login or a dead /api/health means the deploy or the route is wrong
+ * before any question of sessions even arises.
  */
-async function checkAccessRedirect(rawUrl: string): Promise<Check> {
-	const url = new URL("/api/health", rawUrl).toString();
-	if (url.includes(".workers.dev/")) {
-		return {
-			id: "cloud.access",
-			status: "warn",
-			message: `Access check skipped for ${url}: Reccado's supported public path is a custom domain, not workers.dev.`,
-			fix: `Attach a custom domain first with pnpm setup:domain${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain>`,
-		};
+async function checkAuthEndpoints(rawUrl: string): Promise<Check[]> {
+	const healthUrl = new URL("/api/health", rawUrl).toString();
+	const loginUrl = new URL("/login", rawUrl).toString();
+	if (healthUrl.includes(".workers.dev/")) {
+		return [
+			{
+				id: "cloud.auth",
+				status: "warn",
+				message: `Auth endpoint check skipped for ${healthUrl}: Reccado's supported public path is a custom domain, not workers.dev.`,
+				fix: `Attach a custom domain first with pnpm setup:domain${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain>`,
+			},
+		];
 	}
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 8000);
 	try {
-		const res = await fetch(url, { redirect: "manual", signal: controller.signal });
-		const location = res.headers.get("location") ?? "";
-		if ((res.status === 302 || res.status === 303) && /cloudflareaccess\.com/i.test(location)) {
-			return {
-				id: "cloud.access",
+		const [health, login] = await Promise.all([
+			fetch(healthUrl, { redirect: "manual", signal: controller.signal }),
+			fetch(loginUrl, { redirect: "follow", signal: controller.signal }),
+		]);
+		const out: Check[] = [];
+		if (health.status === 200) {
+			out.push({
+				id: "cloud.auth.health",
 				status: "pass",
-				message: `Access redirects unauthenticated ${url} to login.`,
-			};
-		}
-		if (res.status === 403 || res.status === 401) {
-			return {
-				id: "cloud.access",
-				status: "warn",
-				message: `Unauthenticated ${url} is blocked (${res.status}) but not confirmed as an Access login — a WAF/firewall/wrong route looks the same.`,
-				fix: "Confirm it's a 302 to cloudflareaccess.com for the exact route.",
-			};
-		}
-		if (res.status === 200) {
-			return {
-				id: "cloud.access",
+				message: `Unauthenticated ${healthUrl} answers (health is deliberately public).`,
+			});
+		} else {
+			out.push({
+				id: "cloud.auth.health",
 				status: "fail",
-				message: `Unauthenticated ${url} returned 200 — Cloudflare Access is NOT protecting it.`,
-				fix: "Create a self-hosted Access app for the route and an allow policy (see `pnpm setup:access`).",
-			};
+				message: `Unauthenticated ${healthUrl} returned ${health.status} (expected 200).`,
+				fix: "Check that the Worker is deployed and the /api/health route is reachable.",
+			});
 		}
-		return {
-			id: "cloud.access",
-			status: "warn",
-			message: `Unauthenticated ${url} returned ${res.status} (expected a 302 to cloudflareaccess.com).`,
-			fix: "Confirm the Access application covers this exact route.",
-		};
+		if (login.ok) {
+			out.push({
+				id: "cloud.auth.login",
+				status: "pass",
+				message: `The login page ${loginUrl} is reachable.`,
+			});
+		} else {
+			out.push({
+				id: "cloud.auth.login",
+				status: "fail",
+				message: `The login page ${loginUrl} returned ${login.status}.`,
+				fix: "Check that the deployed build includes the /login route (pnpm run build, then redeploy).",
+			});
+		}
+		return out;
 	} catch {
-		return {
-			id: "cloud.access",
-			status: "warn",
-			message: `Could not reach ${url} to check Access.`,
-			fix: "Check the URL and that the Worker is deployed.",
-		};
+		return [
+			{
+				id: "cloud.auth",
+				status: "warn",
+				message: `Could not reach ${healthUrl} or ${loginUrl} to check the auth endpoints.`,
+				fix: "Check the URL and that the Worker is deployed.",
+			},
+		];
 	} finally {
 		clearTimeout(timeout);
 	}
@@ -971,12 +980,13 @@ if (args.cloud === "true") {
 	addAll(checkSendingFeedbackRemote());
 	addAll(checkSecretsRemote());
 	if (args.url) {
-		add(await checkAccessRedirect(args.url));
+		addAll(await checkAuthEndpoints(args.url));
 	} else {
 		add({
-			id: "cloud.access",
+			id: "cloud.auth",
 			status: "info",
-			message: "Pass --url <deployed-url> to check that Cloudflare Access is protecting /api/*.",
+			message:
+				"Pass --url <deployed-url> to check that the login page and /api/health answer on the deployment.",
 		});
 	}
 	add({

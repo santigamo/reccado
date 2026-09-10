@@ -23,7 +23,7 @@
  *
  * What it deliberately does NOT do (domain / identity — see the printed "Still required"):
  *   - Custom domain attachment (use `pnpm setup:domain`)
- *   - Cloudflare Access app creation (use `pnpm setup:access` + `pnpm doctor --cloud --url`)
+ *   - BETTER_AUTH_SECRET creation (`openssl rand -base64 32 | pnpm wrangler secret put BETTER_AUTH_SECRET`)
  *   - Email Routing DNS/verification (use `pnpm setup:routing`; MX/SPF/DKIM live on your zone)
  *   - Outbound sender identity (use `pnpm setup:sending`)
  *
@@ -483,11 +483,12 @@ console.log("1. Attach a custom domain before using the UI/API as a real inbox:"
 console.log(
 	`     pnpm setup:domain${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain> --apply`,
 );
-console.log("\n2. Cloudflare Access must protect that custom domain.");
 console.log(
-	`   Then set ACCESS_JWT_AUDIENCE + ACCESS_TEAM_DOMAIN:` +
-		`\n     pnpm setup:access${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain> --aud <aud-tag> \\` +
-		`\n       --team-domain https://<team>.cloudflareaccess.com --apply`,
+	"\n2. The web login needs its machine-generated secret (entropy no human transcribes):",
+);
+console.log(
+	`     openssl rand -base64 32 | pnpm wrangler secret put BETTER_AUTH_SECRET${targetEnv ? ` --env ${targetEnv}` : ""}` +
+		"\n   The login page lives at /login; sign-in codes ride the transactional stream.",
 );
 console.log("\n3. Email Routing must deliver to this Worker (DNS lives on your zone):");
 if (mailFrom) {
