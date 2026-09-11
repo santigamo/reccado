@@ -18,9 +18,15 @@
  * SAFETY: dry-run by default. Pass `--apply` to upload the secret (and create
  * the WAF rule when a token is present).
  *
- * Rotating a live BETTER_AUTH_SECRET signs out every current session, so it is
- * never a side effect of asking for something else: `--apply` writes the secret
- * only when the worker does not already have one. Re-running it on a configured
+ * Rotating a live BETTER_AUTH_SECRET does more than sign out every session, and
+ * the extra part is not self-announcing: the secret also ENCRYPTS DATA AT REST.
+ * The jwt() plugin's private key in `jwks` and the TOTP secrets in `twoFactor`
+ * are written encrypted with it, and a rotation orphans them -- the whole web
+ * perimeter then answers 503 with "Failed to decrypt private key", which nobody
+ * sees until the next sign-in. Recovering means deleting the orphaned `jwks`
+ * rows (the plugin mints a fresh keypair) and re-enrolling any authenticator.
+ * So rotation is never a side effect of asking for something else: `--apply`
+ * writes the secret only when the worker does not already have one. Re-running it on a configured
  * deployment -- which is how you add the WAF rule after the fact -- leaves the
  * secret alone. Replacing one is a separate, named request: `--rotate-secret`.
  *
@@ -285,7 +291,9 @@ const rotateCommand = `pnpm setup:auth${targetEnv ? ` --env ${targetEnv}` : ""}$
 if (secretAlreadySet && !rotateSecret) {
 	console.log(`▸ BETTER_AUTH_SECRET is already set on ${worker} — left untouched.`);
 	console.log(
-		`  Replacing it signs out every current session, so it is not done as a side effect.\n` +
+		`  Replacing it signs out every session AND orphans what it encrypts at rest --\n` +
+			`  the jwks signing key and any enrolled TOTP secret -- so it is not done as a\n` +
+			`  side effect. Recovery is deleting the jwks rows and re-enrolling.\n` +
 			`  To replace it deliberately:\n` +
 			`    $ ${rotateCommand}`,
 	);
@@ -317,7 +325,10 @@ if (secretAlreadySet && !rotateSecret) {
 		});
 		console.log(
 			secretAlreadySet
-				? "\n  ✓ BETTER_AUTH_SECRET rotated — every session that existed before now is signed out."
+				? "\n  ✓ BETTER_AUTH_SECRET rotated — every session that existed before now is signed\n" +
+						"    out, and anything encrypted with the old secret is now unreadable. Delete the\n" +
+						"    jwks rows so a fresh keypair is minted, and re-enrol any authenticator:\n" +
+						'      pnpm wrangler d1 execute <index-db> --remote --command "DELETE FROM jwks"'
 				: "\n  ✓ BETTER_AUTH_SECRET uploaded.",
 		);
 	}
