@@ -136,6 +136,10 @@ function wafRule(): WafRule {
 		enabled: true,
 		ratelimit: {
 			characteristics: ["ip.src"],
+			// A Free zone cannot take these: it is fixed at a 10s window and a 10s
+			// mitigation timeout (and one rule for the whole zone). The API rejects
+			// the request there, which falls through to printWafManualSteps, where
+			// the Free-plan shape is spelled out.
 			period: 60,
 			requests_per_period: 30,
 			mitigation_timeout: 600,
@@ -160,6 +164,13 @@ function printWafManualSteps(baseUrl: string): void {
 			`\n    - With the same characteristics: IP` +
 			`\n    - When rate exceeds: 30 requests / 1 minute` +
 			`\n    - Then take action: Block, Duration 10 minutes` +
+			`\n` +
+			`\n    On a Free zone the period and the duration are both fixed at 10s and you` +
+			`\n    get one rule for the entire zone. Use 20 requests / 10 seconds there: it` +
+			`\n    caps a hammering caller at 2 req/s while leaving a real sign-in (a handful` +
+			`\n    of requests) far below the line. The short block makes it a throttle rather` +
+			`\n    than a ban, which is the right shape anyway -- this rule exists to bound` +
+			`\n    cost, not to keep anyone out.` +
 			`\n\n  Or via the API (phase http_ratelimit entrypoint ruleset for the zone):` +
 			`\n    ZONE_ID=<your-zone-id>  # Security → WAF, or GET /zones?name=<domain>` +
 			`\n    curl -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/phases/http_ratelimit/entrypoint" \\` +
