@@ -9,6 +9,7 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as SecurityRouteImport } from './routes/security'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as DomainsRouteImport } from './routes/domains'
 import { Route as ConsentRouteImport } from './routes/consent'
@@ -21,6 +22,11 @@ import { Route as MailboxesMailboxIdKeysRouteImport } from './routes/mailboxes/$
 import { Route as MailboxesMailboxIdComposeRouteImport } from './routes/mailboxes/$mailboxId/compose'
 import { Route as MailboxesMailboxIdThreadIdRouteImport } from './routes/mailboxes/$mailboxId/$threadId'
 
+const SecurityRoute = SecurityRouteImport.update({
+  id: '/security',
+  path: '/security',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
@@ -85,6 +91,7 @@ export interface FileRoutesByFullPath {
   '/consent': typeof ConsentRoute
   '/domains': typeof DomainsRoute
   '/login': typeof LoginRoute
+  '/security': typeof SecurityRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdRouteWithChildren
   '/mailboxes/': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
@@ -98,6 +105,7 @@ export interface FileRoutesByTo {
   '/consent': typeof ConsentRoute
   '/domains': typeof DomainsRoute
   '/login': typeof LoginRoute
+  '/security': typeof SecurityRoute
   '/mailboxes': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
@@ -111,6 +119,7 @@ export interface FileRoutesById {
   '/consent': typeof ConsentRoute
   '/domains': typeof DomainsRoute
   '/login': typeof LoginRoute
+  '/security': typeof SecurityRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdRouteWithChildren
   '/mailboxes/': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
@@ -126,6 +135,7 @@ export interface FileRouteTypes {
     | '/consent'
     | '/domains'
     | '/login'
+    | '/security'
     | '/mailboxes/$mailboxId'
     | '/mailboxes/'
     | '/mailboxes/$mailboxId/$threadId'
@@ -139,6 +149,7 @@ export interface FileRouteTypes {
     | '/consent'
     | '/domains'
     | '/login'
+    | '/security'
     | '/mailboxes'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
@@ -151,6 +162,7 @@ export interface FileRouteTypes {
     | '/consent'
     | '/domains'
     | '/login'
+    | '/security'
     | '/mailboxes/$mailboxId'
     | '/mailboxes/'
     | '/mailboxes/$mailboxId/$threadId'
@@ -165,12 +177,20 @@ export interface RootRouteChildren {
   ConsentRoute: typeof ConsentRoute
   DomainsRoute: typeof DomainsRoute
   LoginRoute: typeof LoginRoute
+  SecurityRoute: typeof SecurityRoute
   MailboxesMailboxIdRoute: typeof MailboxesMailboxIdRouteWithChildren
   MailboxesIndexRoute: typeof MailboxesIndexRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/security': {
+      id: '/security'
+      path: '/security'
+      fullPath: '/security'
+      preLoaderRoute: typeof SecurityRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/login': {
       id: '/login'
       path: '/login'
@@ -274,6 +294,7 @@ const rootRouteChildren: RootRouteChildren = {
   ConsentRoute: ConsentRoute,
   DomainsRoute: DomainsRoute,
   LoginRoute: LoginRoute,
+  SecurityRoute: SecurityRoute,
   MailboxesMailboxIdRoute: MailboxesMailboxIdRouteWithChildren,
   MailboxesIndexRoute: MailboxesIndexRoute,
 }
