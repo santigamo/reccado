@@ -7,6 +7,7 @@ import worker from "../../src/server";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationBetterAuth from "../../migrations/d1/0016_better_auth.sql?raw";
 import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql?raw";
+import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import { applyMigrations } from "../helpers/migrations";
@@ -25,6 +26,7 @@ beforeAll(async () => {
 		migrationOwnerRegistry as string,
 		migrationBetterAuth as string,
 		migrationBetterAuthMcp as string,
+		migrationTwoFactor as string,
 	);
 });
 
@@ -189,5 +191,160 @@ describe("pairing-code rescue endpoint", () => {
 			`SELECT event_type, severity, subject FROM ops_events WHERE event_type = 'owner.pairing_rejected'`,
 		).first<{ event_type: string; severity: string; subject: string }>();
 		expect(rejected).toMatchObject({ event_type: "owner.pairing_rejected", severity: "warning" });
+	});
+});
+
+/**
+ * RFC 6238 in the test, so the second factor is proved end to end rather than
+ * mocked: a code this file computes from the enrolment secret is one an
+ * authenticator app would show at the same instant. Without it the test could
+ * only assert that rows were written, which is exactly the half that looked fine
+ * in 0017 while the other half failed in production.
+ */
+function base32Decode(input: string): Uint8Array {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+	const clean = input.replace(/=+$/, "").toUpperCase();
+	let bits = 0;
+	let value = 0;
+	const out: number[] = [];
+	for (const char of clean) {
+		const index = alphabet.indexOf(char);
+		if (index < 0) continue;
+		value = (value << 5) | index;
+		bits += 5;
+		if (bits >= 8) {
+			bits -= 8;
+			out.push((value >>> bits) & 0xff);
+		}
+	}
+	return Uint8Array.from(out);
+}
+
+async function totpCode(secret: string, atMs: number = Date.now()): Promise<string> {
+	const key = await crypto.subtle.importKey(
+		"raw",
+		base32Decode(secret) as unknown as ArrayBuffer,
+		{ name: "HMAC", hash: "SHA-1" },
+		false,
+		["sign"],
+	);
+	const counter = Math.floor(atMs / 1000 / 30);
+	const buffer = new ArrayBuffer(8);
+	new DataView(buffer).setUint32(4, counter, false);
+	const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, buffer));
+	const offset = mac[mac.length - 1]! & 0x0f;
+	const binary =
+		((mac[offset]! & 0x7f) << 24) |
+		((mac[offset + 1]! & 0xff) << 16) |
+		((mac[offset + 2]! & 0xff) << 8) |
+		(mac[offset + 3]! & 0xff);
+	return (binary % 1_000_000).toString().padStart(6, "0");
+}
+
+describe("password as the first factor, TOTP as the second", () => {
+	const PASSWORD = "a-generated-password-nobody-types";
+
+	async function openOwnerSession(code: string): Promise<string> {
+		await mintPairingCode(code);
+		const response = await postJson("/api/auth/pairing", { email: OWNER, code });
+		expect(response.status).toBe(200);
+		const setCookie = response.headers.get("set-cookie") ?? "";
+		expect(setCookie).toContain("session_token=");
+		return setCookie.split(";")[0]!;
+	}
+
+	it("sets the first factor only for a session that has none, and enrols TOTP against it", async () => {
+		const cookie = await openOwnerSession("TESTTWOFACTOR001");
+
+		// Too short is refused by the same floor the issuer config uses.
+		const short = await run(
+			new Request("https://example.com/api/account/password", {
+				method: "POST",
+				headers: { cookie, "content-type": "application/json", origin: "https://example.com" },
+				body: JSON.stringify({ newPassword: "short" }),
+			}),
+		);
+		expect(short.status).toBe(400);
+		expect(await short.json()).toMatchObject({ reason: "too_short" });
+
+		const set = await run(
+			new Request("https://example.com/api/account/password", {
+				method: "POST",
+				headers: { cookie, "content-type": "application/json", origin: "https://example.com" },
+				body: JSON.stringify({ newPassword: PASSWORD }),
+			}),
+		);
+		expect(set.status).toBe(200);
+		expect(await set.json()).toEqual({ ok: true });
+
+		// Enrolment writes the twoFactor row and hands back a URI an app can read.
+		const enable = await run(
+			new Request("https://example.com/api/auth/two-factor/enable", {
+				method: "POST",
+				headers: { cookie, "content-type": "application/json", origin: "https://example.com" },
+				body: JSON.stringify({ password: PASSWORD }),
+			}),
+		);
+		expect(enable.status).toBe(200);
+		const enabled = (await enable.json()) as { totpURI?: string; backupCodes?: string[] };
+		expect(enabled.totpURI).toContain("otpauth://totp/");
+		expect(enabled.backupCodes?.length).toBeGreaterThan(0);
+
+		const secret = new URL(enabled.totpURI!).searchParams.get("secret");
+		expect(secret).toBeTruthy();
+
+		// A code computed here is accepted, which is the whole schema proved: the
+		// secret round-tripped through the twoFactor table and back out.
+		const verify = await run(
+			new Request("https://example.com/api/auth/two-factor/verify-totp", {
+				method: "POST",
+				headers: { cookie, "content-type": "application/json", origin: "https://example.com" },
+				body: JSON.stringify({ code: await totpCode(secret!), trustDevice: true }),
+			}),
+		);
+		expect(verify.status).toBe(200);
+
+		const row = await testEnv.INDEX_DB.prepare(`SELECT userId FROM "twoFactor" LIMIT 1`).first<{
+			userId: string;
+		}>();
+		expect(row?.userId).toBeTruthy();
+		const user = await testEnv.INDEX_DB.prepare(
+			`SELECT "twoFactorEnabled" AS enabled FROM "user" WHERE email = ?`,
+		)
+			.bind(OWNER)
+			.first<{ enabled: number | null }>();
+		expect(user?.enabled).toBeTruthy();
+	});
+
+	it("refuses a wrong TOTP code", async () => {
+		const cookie = await openOwnerSession("TESTTWOFACTOR002");
+		const verify = await run(
+			new Request("https://example.com/api/auth/two-factor/verify-totp", {
+				method: "POST",
+				headers: { cookie, "content-type": "application/json", origin: "https://example.com" },
+				body: JSON.stringify({ code: "000000" }),
+			}),
+		);
+		expect(verify.status).not.toBe(200);
+	});
+
+	it("keeps password sign-up closed even though password sign-in is open", async () => {
+		const signUp = await run(
+			new Request("https://example.com/api/auth/sign-up/email", {
+				method: "POST",
+				headers: { "content-type": "application/json", origin: "https://example.com" },
+				body: JSON.stringify({
+					email: "stranger@example.com",
+					password: "a-generated-password-nobody-types",
+					name: "stranger",
+				}),
+			}),
+		);
+		expect(signUp.status).not.toBe(200);
+
+		const stranger = await testEnv.INDEX_DB.prepare(
+			`SELECT id FROM "user" WHERE email = 'stranger@example.com'`,
+		).first<{ id: string }>();
+		expect(stranger).toBeNull();
 	});
 });
