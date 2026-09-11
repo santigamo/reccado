@@ -348,3 +348,53 @@ describe("password as the first factor, TOTP as the second", () => {
 		expect(stranger).toBeNull();
 	});
 });
+
+describe("attaching a second hostname", () => {
+	it("accepts a same-origin sign-in from a host that is not the recorded canonical origin", async () => {
+		// The deployment has learned one origin; the request arrives on another --
+		// the shape of putting a custom domain in front of a worker that has been
+		// reached on workers.dev until now.
+		const previous = await testEnv.INDEX_DB.prepare(
+			`SELECT value FROM runtime_config WHERE key = 'deployment.origin'`,
+		).first<{ value: string }>();
+		await testEnv.INDEX_DB.prepare(
+			`INSERT INTO runtime_config (key, value, updated_at) VALUES ('deployment.origin', ?, ?)
+			 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		)
+			.bind("https://canonical.example.net", nowIso())
+			.run();
+
+		try {
+			const response = await run(
+				new Request("https://example.com/api/auth/sign-in/email", {
+					method: "POST",
+					headers: { "content-type": "application/json", origin: "https://example.com" },
+					body: JSON.stringify({ email: OWNER, password: "not-the-real-password-but-long" }),
+				}),
+			);
+			// Wrong credentials is the correct rejection here. A 403 would mean the
+			// issuer refused the host itself, which is the one-way door: nobody could
+			// ever authenticate on the new hostname to teach the deployment about it.
+			expect(response.status).toBe(401);
+			expect(await response.json()).toMatchObject({ code: "INVALID_EMAIL_OR_PASSWORD" });
+		} finally {
+			await testEnv.INDEX_DB.prepare(
+				`INSERT INTO runtime_config (key, value, updated_at) VALUES ('deployment.origin', ?, ?)
+				 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+			)
+				.bind(previous?.value ?? "https://example.com", nowIso())
+				.run();
+		}
+	});
+
+	it("still refuses a genuinely cross-site origin", async () => {
+		const response = await run(
+			new Request("https://example.com/api/auth/sign-in/email", {
+				method: "POST",
+				headers: { "content-type": "application/json", origin: "https://evil.example.org" },
+				body: JSON.stringify({ email: OWNER, password: "not-the-real-password-but-long" }),
+			}),
+		);
+		expect(response.status).toBe(403);
+	});
+});

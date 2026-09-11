@@ -99,7 +99,8 @@ export async function createAuth(
 	// The config value the system can observe (learned from authenticated traffic);
 	// the request origin is the fallback, never an invention.
 	const observedOrigin = await getDeploymentOriginForAuth(env.INDEX_DB);
-	const baseURL = observedOrigin ?? (opts.request ? new URL(opts.request.url).origin : undefined);
+	const requestOrigin = opts.request ? new URL(opts.request.url).origin : undefined;
+	const baseURL = observedOrigin ?? requestOrigin;
 	if (!baseURL) {
 		// The MCP/OAuth plugins mint issuer- and audience-bound tokens: without a
 		// canonical origin there is nothing to bind them to, and guessing (Host
@@ -111,7 +112,25 @@ export async function createAuth(
 		database: env.INDEX_DB as never,
 		secret,
 		baseURL,
-		trustedOrigins: baseURL ? [baseURL] : undefined,
+		// The canonical origin plus the one this request actually arrived on.
+		//
+		// Trusting only the canonical origin makes attaching a second hostname a
+		// one-way door: the deployment learns its origin from authenticated traffic,
+		// but sign-in from the new host is refused for not being the origin it has
+		// not learned yet, so nobody can ever authenticate there to teach it. That is
+		// precisely the move this project makes when it puts a custom domain in front
+		// of a worker that has been reached on workers.dev.
+		//
+		// It gives nothing away. This check exists to reject a cross-site request, and
+		// a request whose Origin equals its own URL's origin is by definition not one
+		// -- a browser sets Origin honestly, so a page on evil.com hitting this host
+		// still presents evil.com and is still refused. It is the same rule the API's
+		// own CSRF middleware already applies in hono.ts.
+		//
+		// baseURL deliberately stays the canonical origin: it is what MCP tokens are
+		// bound to, and re-anchoring that per request would mint tokens for whichever
+		// hostname a client happened to use.
+		trustedOrigins: [...new Set([baseURL, requestOrigin].filter(Boolean))] as string[],
 		// A password is the first factor, TOTP the second, and a password manager
 		// fills both in one gesture. The original design had no password at all --
 		// the argument being that there is then no credential to steal and no
