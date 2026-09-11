@@ -27,8 +27,8 @@ Current repo status:
 - Tier A is the implemented product surface today: inbound Email Routing, mailbox Durable Objects,
   R2 raw storage, Queue ingest, D1 cross-mailbox index, realtime UI, and human-confirmed outbound
   send.
-- A minimal MCP endpoint (`/mcp`, Access + `ACCESS_ALLOWED_EMAILS`) ships read/search/draft tools
-  with no send capability; see `src/mcp/*`.
+- A minimal MCP endpoint (`/mcp`, OAuth 2.1 bearer tokens plus the owner registry) ships
+  read/search/draft tools with no send capability; see `src/mcp/*`.
 - A transactional REST API MVP (`/v1/.../transactional/...`) ships scoped, mailbox-bound API keys
   for operator-authorized programmatic sends; see `docs/plans/transactional-api.md`,
   `src/do/transactional-*`, and `docs/OPERATIONS.md`.

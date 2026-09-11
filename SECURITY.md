@@ -86,13 +86,30 @@ your Cloudflare account's Email Routing rule calls.
 
 Reccado relies on **Cloudflare's platform-level encryption at rest** for R2 (raw MIME,
 attachments, backups), D1 (the control-plane index), and Durable Object SQLite storage (canonical
-mailbox state). There is no separate, application-level encryption layer on top of that — this is
-an explicit trade-off, not an oversight. It means:
+mailbox state). For mailbox content there is no separate, application-level encryption layer on top
+of that — this is an explicit trade-off, not an oversight. It means:
 
 - Anyone with sufficient access to your Cloudflare account (account owner, or a token with broad
   R2/D1/Durable Objects scopes) can read mailbox contents directly, bypassing the app's auth
   layer entirely. Scope Cloudflare API tokens narrowly and treat account-level access as
   equivalent to mailbox access.
+
+**One exception, and it is a sharp one.** The auth issuer *does* encrypt two things at the
+application level, both with `BETTER_AUTH_SECRET`:
+
+| Encrypted with `BETTER_AUTH_SECRET` | Table | What its loss costs |
+|---|---|---|
+| The `jwt()` plugin's signing key | `jwks` | Every `/api/*` request answers `503 auth_unavailable` with "Failed to decrypt private key" |
+| Enrolled TOTP secrets | `twoFactor` | The authenticator is silently un-enrolled |
+
+So **rotating `BETTER_AUTH_SECRET` is not the routine operation the word "rotate" suggests.** It
+does not merely sign out live sessions: it orphans the ciphertext above, and the damage does not
+announce itself — the perimeter simply starts failing closed at the next sign-in, which may be days
+later. Recovery means deleting the `jwks` rows so the plugin mints a fresh keypair, and re-enrolling
+every authenticator. There is no way to recover the old TOTP secrets.
+
+`pnpm setup:auth` will not replace an existing secret for this reason; doing so requires
+`--rotate-secret` by name. See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the recovery runbook.
 - There is currently no per-mailbox or per-message application-level encryption, no
   envelope-encryption scheme, and no support for bring-your-own-key. If your threat model
   requires protecting mail content from someone with Cloudflare account access, this product does

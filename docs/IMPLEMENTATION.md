@@ -413,21 +413,23 @@ Checklist:
 - [ ] Outbound sends require explicit human confirmation in Tier A.
 - [ ] Outbound sends use idempotency keys to avoid double-send.
 
-### Access And Secrets
+### The Auth Perimeter And Secrets
 
 Secrets:
 
 ```sh
 pnpm wrangler secret put CLOUDFLARE_API_TOKEN
-pnpm wrangler secret put ACCESS_JWT_AUDIENCE
-pnpm wrangler secret put ACCESS_TEAM_DOMAIN
+pnpm setup:auth --url https://<your-host> --apply   # generates BETTER_AUTH_SECRET
+pnpm wrangler secret put OWNER_BOOTSTRAP_EMAILS
 ```
 
 Checklist:
 
 - [ ] `.dev.vars*` and `.env*` are in `.gitignore`.
-- [ ] Access protects UI and `/api/*`.
-- [ ] Service token policy exists for automation if needed.
+- [ ] An unauthenticated request to `/api/*` and `/mcp` returns `401`, never `200`.
+- [ ] At least one owner is registered (`owner_identities`, or the bootstrap variable).
+- [ ] `BETTER_AUTH_SECRET` is recorded somewhere it will not be "rotated for hygiene" — it
+      encrypts the signing key and any enrolled TOTP secret at rest (see SECURITY.md).
 - [ ] Worker validates Access identity headers/JWT for API writes, not just UI pages.
 - [ ] Cloudflare API token is least privilege for DNS, Email Routing, Workers deploy resources, and only zones needed.
 
