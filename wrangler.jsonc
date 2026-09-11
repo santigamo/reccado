@@ -144,9 +144,13 @@
 	"env": {
 		"dev": {
 			"name": "reccado-dev",
-			// Dev keeps workers.dev available for smoke tests. Cloudflare Access still
-			// needs a custom domain; use `pnpm setup:domain` for the protected UI.
-			"workers_dev": true,
+			// Off, like production. Not for secrecy -- the perimeter is in the worker
+			// now, so both hostnames were equally protected -- but because the
+			// deployment learns its canonical origin from whichever host an
+			// authenticated request last arrived on, and that origin is what MCP
+			// tokens are bound to. A stale workers.dev tab loading one mailbox was
+			// enough to silently re-point it away from the custom domain.
+			"workers_dev": false,
 			// Who may drive the bot is still a trust declaration a human makes — but a
 			// personal Telegram user id committed to a public repository, changeable
 			// only by redeploy, was a bad way to write one down. The declaration moved
