@@ -34,7 +34,7 @@ import {
 	isAbortTimeoutError,
 	isLocalRequest,
 } from "../lib/runtime-config";
-import { handleAuthRequest } from "./better-auth";
+import { handleAuthRequest, handleSetPasswordRequest } from "./better-auth";
 import { assertMailboxAccess, type getAuthContext, requireAuth } from "./auth";
 import {
 	registerAdminRoutes,
@@ -398,6 +398,12 @@ export function createApiApp(): Hono<ApiBindings> {
 		const auth = c.get("auth");
 		return c.json({ userId: auth?.userId, email: auth?.email });
 	});
+
+	// Set the first factor for an owner who signed in by OTP or pairing code and
+	// has no password yet. Under /api/* on purpose: it acts on the caller's own
+	// session, so it must be behind the same perimeter as everything else here,
+	// not alongside the unauthenticated /api/auth/* endpoints.
+	api.post("/api/account/password", (c) => handleSetPasswordRequest(c.req.raw, c.env));
 
 	// Protected setup diagnostic (behind the auth perimeter, like the rest of /api/*): runtime
 	// facts the CLI `pnpm doctor` cannot infer — index health plus control-plane completeness.

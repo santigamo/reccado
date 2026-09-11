@@ -46,6 +46,26 @@ export function createAuthMailSender(env: AuthMailEnv): AuthMailSender {
 	};
 }
 
+/**
+ * The password-reset mail. The password path needs a way back in that does not
+ * depend on remembering the password: sign-in by OTP proves the address, but
+ * better-auth's changePassword still wants the old one, so without this a
+ * forgotten password would be a dead end with a live session behind it.
+ */
+export function renderPasswordResetEmail(url: string): { subject: string; text: string } {
+	return {
+		subject: "Reset your Reccado password",
+		text: [
+			"Someone (hopefully you) asked to reset the Reccado password for this address.",
+			"",
+			url,
+			"",
+			"The link expires in an hour and can be used once. If you did not request it, ignore this email — nothing else will happen.",
+			"Your two-factor code is still required after the reset, so this link alone does not open the account.",
+		].join("\n"),
+	};
+}
+
 export function renderOtpEmail(otp: string): { subject: string; text: string } {
 	return {
 		subject: "Your Reccado sign-in code",
