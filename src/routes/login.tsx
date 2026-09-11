@@ -60,7 +60,12 @@ function LoginPage(): ReactElement {
 	const [pairingBusy, setPairingBusy] = useState(false);
 
 	// Full navigation so the new session cookie is part of the next load.
-	const enter = () => window.location.assign("/");
+	//
+	// To /mailboxes rather than /: the landing page makes no authenticated API
+	// call, and the deployment learns its own canonical origin from one. Signing
+	// in and stopping at / therefore left the origin pointing at whatever
+	// hostname was used last -- which is what MCP tokens get bound to.
+	const enter = () => window.location.assign("/mailboxes");
 
 	async function signInWithPassword(event: React.FormEvent): Promise<void> {
 		event.preventDefault();

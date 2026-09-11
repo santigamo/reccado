@@ -1,9 +1,42 @@
 import { Link, useLocation } from "@tanstack/react-router";
-import { Archive, FileText, Inbox, KeyRound, Mail, Pencil, Send, Trash2 } from "lucide-react";
+import {
+	Archive,
+	FileText,
+	Inbox,
+	KeyRound,
+	LogOut,
+	Mail,
+	Pencil,
+	Send,
+	ShieldCheck,
+	Trash2,
+} from "lucide-react";
 import type { ReactElement } from "react";
 import { cn } from "#/lib/cn";
 import { FOLDERS, type FolderKey } from "#/lib/mail";
 import { useMailboxes } from "#/lib/use-mail";
+
+/**
+ * Ends the session and returns to the door.
+ *
+ * A full navigation rather than a router push: the session cookie is cleared by
+ * the response, and anything the client already holds in memory should not
+ * outlive it.
+ */
+async function signOut(): Promise<void> {
+	try {
+		await fetch("/api/auth/sign-out", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: "{}",
+		});
+	} catch {
+		// Offline, or the endpoint refused. Send them to /login anyway: the cookie
+		// may well be gone, and stranding someone on a signed-in-looking screen is
+		// the worse failure.
+	}
+	window.location.assign("/login");
+}
 
 const FOLDER_ICONS: Record<FolderKey, typeof Inbox> = {
 	inbox: Inbox,
@@ -94,7 +127,9 @@ export function Sidebar({
 				</Link>
 			</div>
 
-			{/* Mailbox switcher */}
+			{/* Mailbox switcher, then the account itself. Sign-in security and signing
+			    out belong to the person, not to the mailbox they happen to be reading,
+			    so they sit below the switcher rather than under mailbox settings. */}
 			<div className="mt-auto border-t border-[var(--app-border)] px-3 pt-3">
 				{mailboxesLoading ? null : (
 					<div className="flex items-center gap-2 px-1 text-xs text-[var(--app-text-soft)]">
@@ -110,6 +145,24 @@ export function Sidebar({
 						Switch mailbox
 					</Link>
 				) : null}
+
+				<div className="mt-3 flex items-center justify-between gap-2 border-t border-[var(--app-border)] pt-3">
+					<Link
+						to="/security"
+						className="flex items-center gap-2 rounded-full px-1 py-1 text-xs text-[var(--app-text-faint)] transition hover:text-[var(--app-text-soft)]"
+					>
+						<ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+						<span>Sign-in security</span>
+					</Link>
+					<button
+						type="button"
+						onClick={signOut}
+						className="flex items-center gap-2 rounded-full px-1 py-1 text-xs text-[var(--app-text-faint)] transition hover:text-[var(--app-text-soft)] active:scale-[0.98]"
+					>
+						<LogOut className="h-3.5 w-3.5 shrink-0" />
+						<span>Sign out</span>
+					</button>
+				</div>
 			</div>
 		</div>
 	);
