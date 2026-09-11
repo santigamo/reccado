@@ -151,12 +151,15 @@ function printWafManualSteps(baseUrl: string): void {
 		`\n▸ WAF rate-limit rule for /api/auth/* (manual — no zone-scoped CLOUDFLARE_API_TOKEN found)` +
 			`\n  Better Auth's database-backed rate limiter still applies; this WAF rule is the` +
 			`\n  outer layer that drops brute-force traffic before it reaches the worker.` +
-			`\n\n  Dashboard: ${baseUrl ? new URL(baseUrl).hostname : "<your-zone>"} → Security → WAF →` +
-			`\n  Rate limiting rules → Create rule:` +
-			`\n    - Name: ${WAF_RULE_DESCRIPTION}` +
-			`\n    - Expression: (http.request.uri.path matches "^/api/auth/")` +
-			`\n    - Rate: > 30 requests / 60 seconds, characteristics: IP address (ip.src)` +
-			`\n    - Action: Block, mitigation timeout 600s, count requests to origin` +
+			`\n\n  Dashboard: the zone of ${baseUrl ? new URL(baseUrl).hostname : "<your-zone>"} → Security rules →` +
+			`\n  Create rule → Rate limiting rules:` +
+			`\n    - Rule name: ${WAF_RULE_DESCRIPTION}` +
+			`\n    - Field: URI Path | Operator: starts with | Value: /api/auth/` +
+			`\n      (the equivalent regex form, "matches ^/api/auth/", needs a plan with regex` +
+			`\n       matching; "starts with" is the same rule on any plan)` +
+			`\n    - With the same characteristics: IP` +
+			`\n    - When rate exceeds: 30 requests / 1 minute` +
+			`\n    - Then take action: Block, Duration 10 minutes` +
 			`\n\n  Or via the API (phase http_ratelimit entrypoint ruleset for the zone):` +
 			`\n    ZONE_ID=<your-zone-id>  # Security → WAF, or GET /zones?name=<domain>` +
 			`\n    curl -X PUT "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/rulesets/phases/http_ratelimit/entrypoint" \\` +
