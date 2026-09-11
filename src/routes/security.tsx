@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import type { ReactElement } from "react";
 import { useState } from "react";
+import { renderSVG } from "uqr";
 
 export const Route = createFileRoute("/security")({ component: SecurityPage });
 
@@ -15,6 +16,74 @@ async function postJson(url: string, body: Record<string, unknown>): Promise<Res
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
 	});
+}
+
+/**
+ * The enrolment URI as a scannable QR, inlined as a data URI rather than drawn
+ * through dangerouslySetInnerHTML so it stays an image with alt text.
+ *
+ * Colours are fixed rather than themed: a QR is read by a camera, not by a
+ * person, and inverting it on a dark background is a known way to make scanners
+ * fail. White quiet zone, dark modules, in both themes.
+ */
+function qrDataUri(value: string): string {
+	const svg = renderSVG(value, {
+		border: 2,
+		pixelSize: 8,
+		whiteColor: "#ffffff",
+		blackColor: "#0b2b2e",
+	});
+	return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+type CopyState = "idle" | "copied" | "failed";
+
+/**
+ * A value that copies itself when clicked. Both things this page hands over --
+ * a setup URI and a list of backup codes -- are going straight into a password
+ * manager, and selecting wrapped monospace text by hand is the kind of small
+ * friction that ends with a half-copied secret.
+ *
+ * A button rather than a div with a click handler, so it is reachable by
+ * keyboard and announced as actionable.
+ */
+function CopyField({ label, value }: { label: string; value: string }): ReactElement {
+	const [state, setState] = useState<CopyState>("idle");
+
+	async function copy(): Promise<void> {
+		try {
+			await navigator.clipboard.writeText(value);
+			setState("copied");
+			window.setTimeout(() => setState("idle"), 1500);
+		} catch {
+			// Clipboard access can be refused outright (permissions, an insecure
+			// context). Saying so beats a button that silently does nothing.
+			setState("failed");
+		}
+	}
+
+	const hint =
+		state === "copied"
+			? "Copied"
+			: state === "failed"
+				? "Copy failed — select it"
+				: "Click to copy";
+
+	return (
+		<div>
+			<div className="flex items-baseline justify-between gap-3">
+				<p className="text-sm text-[var(--sea-ink-soft)]">{label}</p>
+				<span className="shrink-0 text-xs text-[var(--sea-ink-soft)]">{hint}</span>
+			</div>
+			<button
+				type="button"
+				onClick={copy}
+				className="mt-1 block w-full cursor-pointer break-all rounded-xl border border-[rgba(50,143,151,0.3)] px-3 py-2 text-left font-mono text-xs text-[var(--sea-ink)] transition hover:bg-[rgba(79,184,178,0.1)] active:scale-[0.99]"
+			>
+				{value}
+			</button>
+		</div>
+	);
 }
 
 /**
@@ -162,21 +231,22 @@ function SecurityPage(): ReactElement {
 					<div className="space-y-4">
 						<div>
 							<p className="text-sm text-[var(--sea-ink-soft)]">
-								Add this setup URI to your authenticator or password manager:
+								Scan this with your authenticator, or copy the URI below into a password manager:
 							</p>
-							<code className="mt-1 block break-all rounded-xl border border-[rgba(50,143,151,0.3)] px-3 py-2 font-mono text-xs text-[var(--sea-ink)]">
-								{totpUri}
-							</code>
+							<img
+								src={qrDataUri(totpUri)}
+								alt="QR code containing the two-factor setup URI"
+								width={208}
+								height={208}
+								className="mx-auto mt-3 rounded-xl border border-[rgba(50,143,151,0.3)] bg-white p-2"
+							/>
 						</div>
+						<CopyField label="Setup URI" value={totpUri} />
 						{backupCodes.length > 0 && (
-							<div>
-								<p className="text-sm text-[var(--sea-ink-soft)]">
-									Backup codes — shown once, store them now:
-								</p>
-								<code className="mt-1 block rounded-xl border border-[rgba(50,143,151,0.3)] px-3 py-2 font-mono text-xs text-[var(--sea-ink)]">
-									{backupCodes.join("  ")}
-								</code>
-							</div>
+							<CopyField
+								label="Backup codes — shown once, store them now"
+								value={backupCodes.join(" ")}
+							/>
 						)}
 						<form onSubmit={confirmEnrolment} className="space-y-3">
 							<label className="block text-sm text-[var(--sea-ink-soft)]">
