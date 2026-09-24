@@ -107,6 +107,16 @@ read/search/draft endpoint.
 
 ### Added
 
+- **`pnpm operator login|whoami|logout` — control-plane sessions from the terminal.** Automates
+  the pairing-code rescue: mints a single-use 256-bit code into `owner_pairing_codes` via
+  `wrangler d1 execute` (only if the email is already in `owner_identities`, unless
+  `--allow-new-owner`), spends it at `/api/auth/pairing`, verifies it with `get-session`, and
+  stores only the Better Auth session cookie in `~/.config/reccado/sessions/<host>.json` (0600 in
+  a 0700 dir). A failure after minting force-expires the code. `logout` signs out server-side and
+  deletes the file even if that fails. The reusable API (`login`, `loadSession`, `logout`,
+  `operatorFetch`, `operatorJson`, typed `OperatorAuthError` on 401) lives in
+  `scripts/lib/operator-session.ts` for later operator scripts. Neither the code nor the cookie is
+  ever printed.
 - **Telegram: one forum topic per mailbox, not per email thread.** When the bound chat is a
   supergroup with forum mode, each mailbox gets a topic named after the mailbox. Previously a
   topic was created per email thread, named with the email's subject — which let anyone who sent

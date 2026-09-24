@@ -305,6 +305,27 @@ wrangler d1 execute inbox-mcp-index-dev --remote --env dev --command \
   "INSERT INTO owner_pairing_codes (code, created_at, expires_at, issued_by) VALUES ('<code>', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now','+2 hours'), 'manual')"
 ```
 
+**From the terminal (scripts and agents)**, `pnpm operator` does that same pairing ladder for you
+and keeps the resulting session so you can call the `/api/*` control plane without a browser:
+
+```bash
+pnpm operator login  --env dev --host inbox.<you.com> --email you@<you.com>  # mint → spend → store
+pnpm operator whoami --host inbox.<you.com>   # signed-in owner + expiry, or "not signed in"
+pnpm operator logout --host inbox.<you.com>   # server sign-out + delete the local session file
+```
+
+`login` mints a single-use code (10-minute TTL, `--ttl` 1–60) into the D1 of the given `--env`
+(read from `wrangler.generated.<env>.json` or `wrangler.jsonc`; a `localhost` host uses the local
+D1), but only when the email is already a registered owner — spending a pairing code *links* any
+email as an owner, so a typo would otherwise grant access; `--allow-new-owner` is the explicit
+bootstrap override. The session cookie is stored owner-only in
+`~/.config/reccado/sessions/<host>.json` (0600, dir 0700) and is never printed; the code is
+force-expired if anything after minting fails. `--host` defaults to `$RECCADO_HOST`, `--email` to
+the first `OWNER_BOOTSTRAP_EMAILS` entry when set locally. Scripts reuse
+`scripts/lib/operator-session.ts` (`loadSession` + `operatorFetch`/`operatorJson`, which add the
+cookie and the `Origin` header mutating `/api/*` routes require, and throw `OperatorAuthError`
+on a 401).
+
 See [`SECURITY.md`](SECURITY.md) for the model.
 
 ### 3. Verify

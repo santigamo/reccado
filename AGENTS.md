@@ -147,6 +147,10 @@ actual repo state, fix this section rather than trusting it blindly.
   `ingest_events`, `outbound_sends`, `ops_events` are written on every ingest/send; transactional
   key/request projections are written on admin ops and send outcomes) — it is not authoritative
   (the mailbox Durable Object is), but it is no longer merely "bound and unused."
+- For control-plane `/api/*` access from the terminal (creating domains, mailboxes, aliases,
+  templates, API keys), use `pnpm operator login --env <env> --host <host> --email <owner>` and
+  the session helpers in `scripts/lib/operator-session.ts` — not a browser, and not hand-minted
+  pairing codes plus `curl`. Run `pnpm operator logout --host <host>` when done.
 - Do not re-run a full Cloudflare-resource preflight unless the assigned task actually touches
   Cloudflare resources or auth. Do not advance beyond the assigned spike/milestone/task —
   validation gates are blocking.

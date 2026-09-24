@@ -540,6 +540,47 @@ still a manual Cloudflare operation plus an operator validation pass.
 If you cannot prove replay safety, do not replay. Keep the payload for investigation and treat the
 issue as unresolved.
 
+## Operator session from the terminal
+
+`pnpm operator` gives an operator (or an agent acting for one) an authenticated `/api/*` session
+without a browser, by automating the pairing-code rescue rung:
+
+```bash
+pnpm operator login  --env dev --host <custom-host> [--email <owner>] [--ttl 10] [--label <task>]
+pnpm operator whoami --host <custom-host>
+pnpm operator logout --host <custom-host>
+```
+
+What `login` does, in order:
+
+1. Generates a 256-bit hex code (`crypto.randomBytes`) and inserts it into
+   `owner_pairing_codes` with `wrangler d1 execute <INDEX_DB name> --remote [--config
+   wrangler.generated.<env>.json] --env <env>` (`--local` for a `localhost` host). `issued_by` is
+   `cli:<label>`, the label sanitized to `[A-Za-z0-9._:-]`. The insert is guarded by
+   `EXISTS (owner_identities WHERE kind='email' AND identity=<email>)`, because the pairing
+   endpoint links whatever email it is handed as an owner; `--allow-new-owner` drops the guard for
+   a genuine bootstrap.
+2. Spends it at `POST /api/auth/pairing` with `Origin: https://<host>`, keeps only the
+   `(__Secure-)better-auth.session_token` cookie, and confirms it with `GET
+   /api/auth/get-session` (email must match).
+3. Writes `{ host, cookie, createdAt, label, email, expiresAt }` to
+   `~/.config/reccado/sessions/<host>.json` (0600; dir 0700; `$XDG_CONFIG_HOME` honoured). A
+   session file with any group/other bit, or a symlink, is refused.
+
+If anything after the insert fails, the code is force-expired (`UPDATE ... SET expires_at = now
+WHERE consumed_at IS NULL`) and any session already created is signed out. `logout` calls
+`POST /api/auth/sign-out` and deletes the file regardless, reporting both outcomes.
+
+Known tradeoff: the code is passed to the wrangler child as `--command=<sql>`, so it is briefly
+visible in the local process table. It is single-use, lives minutes at most, and is spent or
+expired by the same command; `--file` would avoid it but loses the affected-row count the owner
+guard needs.
+
+Scripts should import `scripts/lib/operator-session.ts`: `requireSession(host)` /
+`loadSession(host)`, then `operatorFetch(session, "/api/...", init)` or `operatorJson(...)`, which
+add the cookie, the `Origin` header the CSRF check requires, and a JSON content-type, and throw
+`OperatorAuthError` (with the login command in its message) on a 401.
+
 ## Admin/ops endpoints
 
 All require an authenticated, authorized Access identity:
