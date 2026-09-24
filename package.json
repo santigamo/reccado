@@ -47,6 +47,7 @@
 		"setup:routing": "tsx scripts/setup-routing.ts",
 		"setup:sending": "tsx scripts/setup-sending.ts",
 		"smoke:routing": "tsx scripts/smoke-routing.ts",
+		"smoke:transactional": "tsx scripts/smoke-transactional.ts",
 		"generate-routes": "tsr generate",
 		"build": "vite build",
 		"preview": "pnpm run build && vite preview",
