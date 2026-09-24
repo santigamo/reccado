@@ -78,6 +78,7 @@ export function rowToApiKeyRecord(row: Record<string, unknown>): {
 	environment: "test" | "live";
 	mailboxId: string;
 	sender: string;
+	senderName: string | null;
 	scopes: string[];
 	templateAllowlist: string[] | null;
 	recipientPolicy: string | null;
@@ -96,6 +97,10 @@ export function rowToApiKeyRecord(row: Record<string, unknown>): {
 		environment: String(row.environment) as "test" | "live",
 		mailboxId: String(row.mailbox_id),
 		sender: String(row.sender),
+		// The From display phrase. Without it here the send path read `undefined`
+		// and every transactional mail went out as a bare address, whatever name
+		// the key was configured with.
+		senderName: row.sender_name ? String(row.sender_name) : null,
 		scopes: JSON.parse(String(row.scopes_json)) as string[],
 		templateAllowlist: row.template_allowlist_json
 			? (JSON.parse(String(row.template_allowlist_json)) as string[])

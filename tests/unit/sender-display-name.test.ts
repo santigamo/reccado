@@ -2,6 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { createApiKey, updateApiKeySenderName } from "#/do/transactional-key-ops";
+import { getApiKeyRecord } from "#/do/transactional-send-ops";
 import { resolveSenderIdentity } from "#/lib/sender-identity";
 import {
 	isValidSenderName,
@@ -107,6 +108,22 @@ describe("transactional key sender names", () => {
 		);
 		expect(result.key.senderName).toBe("Eccos");
 		expect(result.projection.senderName).toBe("Eccos");
+	});
+
+	it("reaches the send path, which reads the key through its own mapper", async () => {
+		// The key-management mapper carried the name; the one the send path uses
+		// did not, so a named key still sent as a bare address.
+		const record = await withMailbox("mbx-name-send-path", async (state) => {
+			const created = await createApiKey(state.storage.sql, PEPPER, "mbx-name-send-path", {
+				environment: "test",
+				sender: "hello@notify.example.test",
+				senderName: "Eccos",
+				scopes: ["transactional:send", "transactional:templates:use"],
+				templateAllowlist: ["verify-email"],
+			});
+			return getApiKeyRecord(state.storage.sql, created.key.keyId);
+		});
+		expect(record?.senderName).toBe("Eccos");
 	});
 
 	it("leaves the name null when none is given, which is what existing keys do", async () => {
