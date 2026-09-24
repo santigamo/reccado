@@ -171,6 +171,31 @@ read/search/draft endpoint.
   status endpoint and `deliveryFeedback`, template syntax/escaping/exact variable sets and repo
   sync, key scopes/policy/quota/rotation, and suppressions. Linked from the README and
   `OPERATIONS.md`.
+- **`pnpm onboard` — onboard a product from one JSON manifest.** Replaces the ~12 hand-run steps
+  (setup:sending for `send.<zone>` and the apex, `MAIL_SENDING_DOMAINS`, Email Routing rules,
+  domain / mailbox / aliases, template sync, API keys, the 1Password item) with
+  `pnpm onboard --env <env> --manifest <file> [--host <host>] [--apply]`. The manifest is
+  validated with zod up front (addresses on the zone, key senders on a provisioned name, recipient
+  policies through `validateRecipientPolicy`, key bodies through the create route's own schema;
+  `templates: "all"` = every id in the templates file). **Dry-run by default**: every step reads
+  current state (wrangler reads, public DNS over DoH, control-plane GETs, only the `key id` /
+  `RECCADO_ENDPOINT` fields of 1Password items) and reports `already` / `would do: <action>` /
+  `blocked: <reason>` with a remedy, writing nothing. `--apply` performs the missing steps in
+  dependency order with provision.ts's `already | done | skipped | blocked | failed`; a step that
+  cannot run skips only its dependents, and a second run is all `already`. Email Sending is
+  applied through `setup:sending --apply`; routing only creates missing literal rules and reports a
+  same-matcher/different-action rule as blocked (the catch-all is never touched); keys are
+  idempotent through the stored `key id` — a revoked/missing stored key is blocked, never a silent
+  second mint, a key without a `store` is refused, the plaintext reaches `op item create --template` through a
+  0600 temp file deleted in `finally` (never argv) and is never printed, and a key whose storage fails is revoked. Onboard never deploys: when the
+  generated config changed or the live Worker lacks a sending name, the report says a deploy is
+  required and prints `pnpm run deploy:dev --dry-run`. Placeholder manifest in
+  `examples/onboard/`; see docs/OPERATIONS.md "Onboarding a product".
+- Shared pieces factored out of the setup scripts for it, behaviour unchanged:
+  `scripts/lib/sending-config.ts` (the generated-config write `setup:sending` performs),
+  `scripts/lib/wrangler-cli.ts` (its token-stripping wrangler subprocess), and
+  `scripts/lib/routing.ts` (the literal-rule argv `setup:routing` uses, plus parsers for
+  `wrangler email routing rules list` / `settings`).
 
 - **`pnpm smoke:transactional` — an end-to-end smoke test against a deployed environment.** The
   four transactional bugs fixed above shipped with every unit/integration test green because those

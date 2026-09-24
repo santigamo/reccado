@@ -368,6 +368,23 @@ Confirm in the recipient's mailbox that From shows the sender name and SPF/DKIM/
 
 See [`SECURITY.md`](SECURITY.md) for the model.
 
+**Onboarding a product in one command** — once the deployment exists, `pnpm onboard` does
+everything above for one product (Email Sending on `send.<zone>` and optionally the apex, the
+`MAIL_SENDING_DOMAINS` write, Email Routing rules, domain + mailbox + aliases, templates, API keys
+stored straight into 1Password) from a single JSON manifest:
+
+```bash
+pnpm operator login --env dev --host inbox.<you.com> --email you@<you.com>
+pnpm onboard --env dev --manifest ./onboard.json --host inbox.<you.com>           # dry run: already / would do / blocked
+pnpm onboard --env dev --manifest ./onboard.json --host inbox.<you.com> --apply   # do the missing steps
+```
+
+Every step reads current state first, so a dry run is also a drift check, and a second `--apply`
+is all `already`. It never deploys, never overwrites a routing rule, and never mints a key it
+cannot store. Start from [`examples/onboard/onboard.example.json`](examples/onboard/onboard.example.json);
+details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#onboarding-a-product). The integrator side
+(using the key from the product) is in [`docs/INTEGRATING.md`](docs/INTEGRATING.md).
+
 ### 3. Verify
 
 ```bash

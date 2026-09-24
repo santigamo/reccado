@@ -156,6 +156,9 @@ actual repo state, fix this section rather than trusting it blindly.
   templates, API keys), use `pnpm operator login --env <env> --host <host> --email <owner>` and
   the session helpers in `scripts/lib/operator-session.ts` — not a browser, and not hand-minted
   pairing codes plus `curl`. Run `pnpm operator logout --host <host>` when done.
+- To onboard a whole product (sending names, routing rules, domain/mailbox/aliases, templates,
+  keys into 1Password), use `pnpm onboard --env <env> --manifest <file>` — dry-run by default,
+  `--apply` to perform; see `docs/OPERATIONS.md` ("Onboarding a product"). It never deploys.
 - Do not re-run a full Cloudflare-resource preflight unless the assigned task actually touches
   Cloudflare resources or auth. Do not advance beyond the assigned spike/milestone/task —
   validation gates are blocking.

@@ -618,6 +618,96 @@ Scripts should import `scripts/lib/operator-session.ts`: `requireSession(host)` 
 add the cookie, the `Origin` header the CSRF check requires, and a JSON content-type, and throw
 `OperatorAuthError` (with the login command in its message) on a 401.
 
+## Onboarding a product
+
+`pnpm onboard` takes one product from "has a zone" to "has a support mailbox that receives and
+replies as itself, templates, and stored API keys" from a single JSON manifest. It replaces the
+hand-run sequence of `setup:sending` (twice, subdomain and apex), `MAIL_SENDING_DOMAINS`, Email
+Routing rules, `POST /api/domains` / `mailboxes` / `aliases`, the template sync, key creation and
+the 1Password item.
+
+```bash
+pnpm operator login --env dev --host <custom-host> --email <owner>
+pnpm onboard --env dev --manifest ./onboard.json [--host <custom-host>]          # dry run
+pnpm onboard --env dev --manifest ./onboard.json [--host <custom-host>] --apply  # perform
+pnpm operator logout --host <custom-host>
+```
+
+The manifest (validated with zod before anything runs; relative paths resolve against the
+manifest's directory; placeholder example in `examples/onboard/`):
+
+```json
+{
+  "zone": "example.com",
+  "zoneId": "<optional; else discovered>",
+  "sending": { "subdomain": "send", "apex": true, "dmarc": { "policy": "none", "rua": "dmarc@example.com" } },
+  "mailbox": { "address": "support@example.com", "displayName": "Example", "aliases": ["privacy@example.com"] },
+  "templates": { "file": "./templates.json", "archiveMissing": false },
+  "keys": [
+    { "name": "preview", "sender": "hello@send.example.com", "senderName": "Example",
+      "scopes": ["transactional:send", "transactional:templates:use", "transactional:status"],
+      "templates": "all", "recipientPolicy": "me@example.org,@example.com", "quotaMax": 50,
+      "store": { "onePassword": { "vault": "Private", "title": "Example Reccado API key (preview)" } } }
+  ]
+}
+```
+
+Rules checked up front: mailbox and aliases are on the zone; each key's `sender` is on a name
+the manifest provisions (`send.<zone>`, or the apex when `apex` is true); `recipientPolicy`
+passes `validateRecipientPolicy`; `templates: "all"` means every id in the templates file, an
+explicit list must be ids from it; each key body is run through the create route's own schema.
+`sending.subdomain: false` provisions the apex only. `dmarc.policy` is required, because the
+apex has no safe default.
+
+**Dry run by default.** Each step reads current state and reports `already`, `would do: <exact
+action>` or `blocked: <reason>` plus a remedy. A dry run reads only: `wrangler` list/get
+commands, public DNS over DoH (so no token is needed to verify SPF/DKIM/MX/DMARC), `GET`s on the
+control plane, and `op item list` / `op item get --fields` for the `key id` and
+`RECCADO_ENDPOINT` fields (never the credential). It writes nothing — no Cloudflare mutation, no
+API write, no generated-config write, no 1Password write. `--apply` performs the missing steps and
+reports `already | done | skipped | blocked | failed` (the vocabulary of `src/lib/provision.ts`);
+a step that cannot run skips only its dependents. Exit status is non-zero when anything is
+blocked, failed or skipped.
+
+| Step | Checks | `--apply` does | Depends on |
+| --- | --- | --- | --- |
+| `sending:<name>` | Email Sending enabled; SPF, provider DKIM + MX and DMARC published exactly as `setup:sending` would leave them; all 6 lifecycle events reach the events queue | runs `pnpm setup:sending … --apply` (the one owner of those upserts), then re-verifies | — |
+| `config:MAIL_SENDING_DOMAINS` | a deploy would ship every provisioned name | writes `wrangler.generated.<env>.json` through `scripts/lib/sending-config.ts` (same union / default-sender / allow-list rules as `setup:sending`) | `sending:*` |
+| `deployed:MAIL_SENDING_DOMAINS` | the live version of the Worker carries them | nothing: **onboard never deploys**; blocked with the `deploy:dev --dry-run` command | `config` |
+| `routing:enable` | Email Routing enabled and `ready` on the zone | `wrangler email routing enable` | — |
+| `routing:<address>` | an enabled literal `to:<address>` → `worker:<env worker>` rule, for the mailbox and each alias | creates only missing rules; a rule with the same matcher and another action (or disabled) is **blocked, never overwritten**; the catch-all is never touched | `routing:enable` |
+| `domain` | registered, active, and its `zone_id` matches the zone | `POST /api/domains` | — |
+| `mailbox` | exists, active, owned by the signed-in owner, primary alias, display name | `POST /api/mailboxes` / `PATCH` display name | `domain` |
+| `alias:<address>` | routes to this mailbox and is active | `POST /api/aliases` | `mailbox` |
+| `templates` | the active templates equal the file | `PUT …/transactional/templates` (an id archived on the server is reported blocked, never revived) | `mailbox` |
+| `key:<name>` | see below | mint + store, or fix `senderName` / the stored endpoint | `mailbox`, `templates`, the sender's `sending:` step |
+
+**Keys are idempotent through the store.** Keys have no name server-side, so the 1Password item
+is the idempotency key: an item (exact title, in the vault) whose `key id` is `active` on this
+mailbox and whose fixed fields (sender, scopes, allowlist, policy, quota) match the manifest is
+`already`. No item: `--apply` mints exactly one key, re-checking the vault immediately before, and
+writes the item JSON to a 0600 file in a fresh 0700 temp dir for `op item create --template
+<file> --vault <v>`, deleting it in `finally` (the secret never goes in argv; `op`'s stdin mode is
+not used because `op` ignores a non-FIFO stdin and would create an empty item). The item is API_CREDENTIAL with `credential` (concealed), `RECCADO_ENDPOINT`, `key id` and notes.
+If storing fails the new key is revoked on the spot. An item whose key is revoked or missing, an
+item with no `key id`, two items with the same title, or a live key whose fixed fields differ from
+the manifest are all `blocked` with the remedy (delete the item and re-run, or revoke and re-mint)
+— a second key is never minted silently. A key with no `store` is refused: its plaintext is shown
+once, and a key that cannot be stored is a lost key. The plaintext is never printed.
+
+**Tokens.** `wrangler login` covers every read and the Routing/Sending/subscription writes. DNS
+writes happen inside `setup:sending` and need `CLOUDFLARE_API_TOKEN` (Zone · DNS · Edit); a
+sending step with anything DNS-shaped missing is `blocked` without it rather than enabling a
+name whose provider-created `p=reject` DMARC nobody chose. The zone id for `POST /api/domains`
+comes from the manifest, else from an existing `email.sending` event subscription in the zone,
+else from the Cloudflare API with the token.
+
+**After it runs.** The summary prints each step, the `RECCADO_ENDPOINT`
+(`https://<host>/v1/mailboxes/<id>/transactional/messages`) and where each key is stored. When
+the generated config changed (or the live Worker lacks a name), it says a deploy is required and
+prints `pnpm run deploy:dev --dry-run` then `pnpm run deploy:dev`. The integrator-facing side —
+what the product does with the key — is in [`docs/INTEGRATING.md`](INTEGRATING.md).
+
 ## Transactional smoke test
 
 `pnpm smoke:transactional` exercises the transactional API on a deployed environment through the
