@@ -220,19 +220,37 @@ export async function hashApiKey(pepper: string, keyId: string, secret: string):
 }
 
 /**
- * Verifies a candidate API key against a stored record.
- * Calls hashApiKey with the stored record's keyId and compares.
+ * Verifies a candidate API key against a stored record: usable (not revoked, not
+ * expired) AND holding the right secret. Returns a bare boolean, so it cannot
+ * tell the caller *why* a key failed.
  */
 export async function verifyApiKey(
 	pepper: string,
 	candidateKey: string,
 	record: TransactionalApiKeyRecord,
 ): Promise<boolean> {
-	// Reject revoked keys — future callers (Phase 3) cannot forget this check.
+	// The secret is checked first and unconditionally, so a revoked or expired
+	// key costs the same work as a live one.
+	const secretOk = await verifyApiKeySecret(pepper, candidateKey, record);
 	if (record.status === "revoked") return false;
-	// Reject expired keys — same reasoning.
-	if (record.expiresAt && new Date(record.expiresAt) <= new Date()) return false;
+	if (isApiKeyExpired(record)) return false;
+	return secretOk;
+}
 
+/**
+ * Proves possession of the key's secret, and nothing else — status and expiry are
+ * deliberately NOT checked here.
+ *
+ * That split exists so an authenticated caller can be told `key_revoked` or
+ * `key_expired`. Those codes are only safe to return *after* this has passed:
+ * the key id is public (it is in every send response), so answering "revoked"
+ * before the secret is verified would let anyone holding an id probe key state.
+ */
+export async function verifyApiKeySecret(
+	pepper: string,
+	candidateKey: string,
+	record: TransactionalApiKeyRecord,
+): Promise<boolean> {
 	const parsed = parseApiKey(candidateKey);
 	if (!parsed) return false;
 	if (parsed.environment !== record.environment) return false;
@@ -240,6 +258,10 @@ export async function verifyApiKey(
 	const computedHash = await hashApiKey(pepper, record.keyId, parsed.secret);
 	// Constant-time comparison to prevent timing attacks
 	return constantTimeEqual(computedHash, record.keyHash);
+}
+
+export function isApiKeyExpired(record: TransactionalApiKeyRecord, now: Date = new Date()): boolean {
+	return !!record.expiresAt && new Date(record.expiresAt) <= now;
 }
 
 /**

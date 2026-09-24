@@ -197,7 +197,7 @@ describe("Transactional send flow", () => {
 			expect(result.json.error).toBe("invalid_api_key");
 		});
 
-		it("rejects revoked key (verifyApiKey catches it as invalid)", async () => {
+		it("rejects a revoked key as key_revoked once its secret has verified", async () => {
 			const mailboxId = "mbx_send_revoked";
 			const { key, plaintextKey } = await createKey(mailboxId);
 
@@ -211,10 +211,19 @@ describe("Transactional send flow", () => {
 				to: "a@b.com",
 			});
 			expect(result.status).toBe(403);
-			expect(result.json.error).toBe("invalid_api_key");
+			expect(result.json.error).toBe("key_revoked");
+
+			// Without the secret, the key's state is not disclosed.
+			const forged = `${plaintextKey.slice(0, -1)}${plaintextKey.endsWith("a") ? "b" : "a"}`;
+			const probe = await sendTransactional(mailboxId, `Bearer ${forged}`, "ik-rev-2", {
+				template: "t",
+				to: "a@b.com",
+			});
+			expect(probe.status).toBe(403);
+			expect(probe.json.error).toBe("invalid_api_key");
 		});
 
-		it("rejects expired key (verifyApiKey catches it as invalid)", async () => {
+		it("rejects an expired key as key_expired once its secret has verified", async () => {
 			const mailboxId = "mbx_send_expired";
 			const { plaintextKey } = await createKey(mailboxId, {
 				expiresAt: "2020-01-01T00:00:00.000Z",
@@ -225,7 +234,7 @@ describe("Transactional send flow", () => {
 				to: "a@b.com",
 			});
 			expect(result.status).toBe(403);
-			expect(result.json.error).toBe("invalid_api_key");
+			expect(result.json.error).toBe("key_expired");
 		});
 
 		it("rejects key from wrong mailbox (key not found in DO B)", async () => {

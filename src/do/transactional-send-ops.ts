@@ -1,6 +1,6 @@
 import type { TransactionalRequestLogRow } from "../db/d1";
-import type { TransactionalApiKeyRecord } from "../lib/transactional-keys";
-import { verifyApiKey, parseApiKey } from "../lib/transactional-keys";
+import type { KeyScope, TransactionalApiKeyRecord } from "../lib/transactional-keys";
+import { isApiKeyExpired, parseApiKey, verifyApiKeySecret } from "../lib/transactional-keys";
 import {
 	MAX_TEMPLATE_SYNC_BATCH,
 	type TransactionalSendContext,
@@ -45,6 +45,79 @@ export function getApiKeyRecord(
 	return record as TransactionalApiKeyRecord;
 }
 
+export type TransactionalKeyAuthError =
+	| "missing_authorization"
+	| "invalid_api_key"
+	| "key_does_not_belong_to_mailbox"
+	| "key_revoked"
+	| "key_expired"
+	| "insufficient_scope";
+
+export type TransactionalKeyAuth =
+	| { ok: true; keyId: string; record: TransactionalApiKeyRecord }
+	| { ok: false; keyId: string; error: TransactionalKeyAuthError };
+
+/**
+ * The one authentication path for every public transactional route (send and
+ * status). Both routes call this so they cannot drift apart again — the status
+ * route once checked key id, revocation and scope but never the secret, which
+ * made any published key id a read credential.
+ *
+ * Order is load-bearing:
+ *  1. Bearer header present → else `missing_authorization`.
+ *  2. Key parses and its id exists in this DO → else `invalid_api_key`.
+ *  3. The peppered secret verifies (constant time) → else `invalid_api_key`.
+ *     Nothing about the key's state is revealed before this passes: the key id
+ *     is public, so a distinct answer for "revoked" or "other mailbox" ahead of
+ *     the secret check would be an oracle for anyone holding an id.
+ *  4. Only then the state the secret holder is entitled to learn: mailbox
+ *     binding, `key_revoked`, `key_expired`, and finally `insufficient_scope`.
+ */
+export async function authenticateTransactionalKey(
+	sql: DurableObjectState["storage"]["sql"],
+	pepper: string,
+	request: {
+		mailboxId: string;
+		authHeader: string | null;
+		requiredScopes: readonly KeyScope[];
+	},
+): Promise<TransactionalKeyAuth> {
+	if (!request.authHeader?.startsWith("Bearer ")) {
+		return { ok: false, keyId: "", error: "missing_authorization" };
+	}
+	const rawKey = request.authHeader.slice("Bearer ".length).trim();
+	if (!rawKey) {
+		return { ok: false, keyId: "", error: "missing_authorization" };
+	}
+	const parsed = parseApiKey(rawKey);
+	if (!parsed) {
+		return { ok: false, keyId: "", error: "invalid_api_key" };
+	}
+	const { keyId } = parsed;
+	const record = getApiKeyRecord(sql, keyId);
+	if (!record) {
+		return { ok: false, keyId, error: "invalid_api_key" };
+	}
+	if (!(await verifyApiKeySecret(pepper, rawKey, record))) {
+		return { ok: false, keyId, error: "invalid_api_key" };
+	}
+	if (record.mailboxId !== request.mailboxId) {
+		return { ok: false, keyId, error: "key_does_not_belong_to_mailbox" };
+	}
+	if (record.status === "revoked") {
+		return { ok: false, keyId, error: "key_revoked" };
+	}
+	if (isApiKeyExpired(record)) {
+		return { ok: false, keyId, error: "key_expired" };
+	}
+	for (const scope of request.requiredScopes) {
+		if (!record.scopes.includes(scope)) {
+			return { ok: false, keyId, error: "insufficient_scope" };
+		}
+	}
+	return { ok: true, keyId, record };
+}
+
 /**
  * Authenticates and authorizes a transactional API key from the Authorization header,
  * then executes the send if all gates pass.
@@ -68,55 +141,19 @@ export async function handleTransactionalSend(
 		body: unknown;
 	},
 ): Promise<TransactionalSendResult> {
-	// 1-2. Parse Authorization header
-	if (!request.authHeader?.startsWith("Bearer ")) {
-		return { status: "rejected", requestId: "", keyId: "", error: "missing_authorization" };
+	// 1-11. Authenticate the key (shared with the status route).
+	// Sending uses a template, so both scopes are required.
+	const auth = await authenticateTransactionalKey(ctx.sql, pepper, {
+		mailboxId: request.mailboxId,
+		authHeader: request.authHeader,
+		requiredScopes: ["transactional:send", "transactional:templates:use"],
+	});
+	if (!auth.ok) {
+		return { status: "rejected", requestId: "", keyId: auth.keyId, error: auth.error };
 	}
-	const rawKey = request.authHeader.slice("Bearer ".length).trim();
-	if (!rawKey) {
-		return { status: "rejected", requestId: "", keyId: "", error: "missing_authorization" };
-	}
+	const { record, keyId: activeKeyId } = auth;
 
-	// 3. Parse the API key
-	const parsed = parseApiKey(rawKey);
-	if (!parsed) {
-		return { status: "rejected", requestId: "", keyId: "", error: "invalid_api_key" };
-	}
-	const activeKeyId = parsed.keyId;
-
-	// 4. Look up the key record in DO sqlite
-	const record = getApiKeyRecord(ctx.sql, activeKeyId);
-	if (!record) {
-		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "invalid_api_key" };
-	}
-
-	// 5. Verify key belongs to this mailbox
-	if (record.mailboxId !== request.mailboxId) {
-		return {
-			status: "rejected",
-			requestId: "",
-			keyId: activeKeyId,
-			error: "key_does_not_belong_to_mailbox",
-		};
-	}
-
-	// 6. Verify the key hash (cryptographic auth)
-	const verified = await verifyApiKey(pepper, rawKey, record);
-	if (!verified) {
-		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "invalid_api_key" };
-	}
-
-	// 7. Check required scope
-	if (!record.scopes.includes("transactional:send")) {
-		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "insufficient_scope" };
-	}
-
-	// 8. Check scope for template use (template key is implied by the send action)
-	if (!record.scopes.includes("transactional:templates:use")) {
-		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "insufficient_scope" };
-	}
-
-	// 9. Reject test environment keys in the production send path.
+	// Reject test environment keys in the production send path.
 	if (record.environment === "test") {
 		return {
 			status: "rejected",
@@ -124,16 +161,6 @@ export async function handleTransactionalSend(
 			keyId: activeKeyId,
 			error: "test_key_not_allowed_in_production_send",
 		};
-	}
-
-	// 10. Check expiry
-	if (record.expiresAt && new Date(record.expiresAt) <= new Date()) {
-		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "key_expired" };
-	}
-
-	// 11. Check status
-	if (record.status === "revoked") {
-		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "key_revoked" };
 	}
 
 	// 12. Parse idempotency key (required)
@@ -223,7 +250,7 @@ export async function handleTransactionalSend(
 
 	// 19. Compute payload hash for idempotency
 	const payloadHash = await transactionalPayloadHash({
-		keyId: parsed.keyId,
+		keyId: activeKeyId,
 		clientIdempotencyKey,
 		template: templateId,
 		to,
@@ -236,7 +263,7 @@ export async function handleTransactionalSend(
 	const fromAddress = record.sender;
 
 	// Check for existing request
-	const existingRequest = getTransactionalRequest(ctx.sql, parsed.keyId, clientIdempotencyKey);
+	const existingRequest = getTransactionalRequest(ctx.sql, activeKeyId, clientIdempotencyKey);
 	if (existingRequest) {
 		if (existingRequest.payload_hash === payloadHash) {
 			return {
@@ -258,11 +285,11 @@ export async function handleTransactionalSend(
 	let quotaAllowed = true;
 	ctx.transactionSync(() => {
 		// Double-check inside transaction (no concurrent DO call, but safety)
-		const innerExisting = getTransactionalRequest(ctx.sql, parsed.keyId, clientIdempotencyKey);
+		const innerExisting = getTransactionalRequest(ctx.sql, activeKeyId, clientIdempotencyKey);
 		if (innerExisting) return; // will be caught by the post-check
 
 		// Check and increment quotas atomically with the insert
-		const quotaOk = checkAndIncrementQuota(ctx.sql, record, parsed.keyId);
+		const quotaOk = checkAndIncrementQuota(ctx.sql, record, activeKeyId);
 		if (!quotaOk.allowed) {
 			quotaAllowed = false;
 			return;
@@ -271,7 +298,7 @@ export async function handleTransactionalSend(
 		// Insert BEFORE provider call with status 'pending'
 		insertTransactionalRequest(ctx.sql, {
 			request_id: requestId,
-			key_id: parsed.keyId,
+			key_id: activeKeyId,
 			client_idempotency_key: clientIdempotencyKey,
 			payload_hash: payloadHash,
 			status: "pending",
@@ -291,11 +318,11 @@ export async function handleTransactionalSend(
 	}
 
 	// Verify the insert happened (handles the case where double-check found existing)
-	const insertedRequest = getTransactionalRequest(ctx.sql, parsed.keyId, clientIdempotencyKey);
+	const insertedRequest = getTransactionalRequest(ctx.sql, activeKeyId, clientIdempotencyKey);
 	if (!insertedRequest) {
 		// This can happen if the inner double-check found an existing request.
 		// Re-check for existing and handle accordingly.
-		const reExisting = getTransactionalRequest(ctx.sql, parsed.keyId, clientIdempotencyKey);
+		const reExisting = getTransactionalRequest(ctx.sql, activeKeyId, clientIdempotencyKey);
 		if (reExisting) {
 			if (reExisting.payload_hash === payloadHash) {
 				return {
@@ -319,7 +346,7 @@ export async function handleTransactionalSend(
 	const doSendResult = await doTransactionalSend(
 		ctx,
 		requestId,
-		parsed.keyId,
+		activeKeyId,
 		clientIdempotencyKey,
 		{
 			to,

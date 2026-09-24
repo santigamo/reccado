@@ -1334,36 +1334,27 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			if (!pepper) {
 				return Response.json({ error: "transactional_api_not_configured" }, { status: 503 });
 			}
-			const authHeader = request.headers.get("Authorization");
-			if (!authHeader?.startsWith("Bearer ")) {
-				return Response.json({ error: "missing_authorization" }, { status: 401 });
-			}
-			const rawKey = authHeader.slice("Bearer ".length).trim();
-			if (!rawKey) {
-				return Response.json({ error: "missing_authorization" }, { status: 401 });
-			}
-			const { parseApiKey } = await import("../lib/transactional-keys");
-			const parsed = parseApiKey(rawKey);
-			if (!parsed) {
-				return Response.json({ error: "invalid_api_key" }, { status: 403 });
-			}
-			const { getTransactionalRequestStatus, getApiKeyRecord } = await import(
+			const { getTransactionalRequestStatus, authenticateTransactionalKey } = await import(
 				"./transactional-send-ops"
 			);
-			const record = getApiKeyRecord(this.ctx.storage.sql, parsed.keyId);
-			if (!record) {
-				return Response.json({ error: "invalid_api_key" }, { status: 403 });
+			// Same authentication as the send path — secret, mailbox binding, status,
+			// expiry, scope — so a published key id alone reads nothing.
+			const auth = await authenticateTransactionalKey(this.ctx.storage.sql, pepper, {
+				mailboxId: this.ctx.id.name ?? "unknown",
+				authHeader: request.headers.get("Authorization"),
+				requiredScopes: ["transactional:status"],
+			});
+			if (!auth.ok) {
+				return Response.json(
+					{ error: auth.error },
+					{ status: httpStatusForTransactionalResult({ status: "rejected", error: auth.error }) },
+				);
 			}
-			if (record.status === "revoked") {
-				return Response.json({ error: "key_revoked" }, { status: 403 });
-			}
-			if (!record.scopes.includes("transactional:status")) {
-				return Response.json({ error: "insufficient_scope" }, { status: 403 });
-			}
+			// Scoped to the authenticated key: another key's request is a 404.
 			const statusRecord = getTransactionalRequestStatus(
 				this.ctx.storage.sql,
 				requestId,
-				parsed.keyId,
+				auth.keyId,
 			);
 			if (!statusRecord) {
 				return Response.json({ error: "not_found" }, { status: 404 });

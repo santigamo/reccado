@@ -157,3 +157,130 @@ describe("POST /v1/mailboxes/:id/transactional/messages — From display name", 
 		expect((calls[0] as { from: unknown }).from).toBe("hola@send.transcribo.example");
 	});
 });
+
+async function statusViaRouter(
+	mailboxId: string,
+	plaintextKey: string,
+	requestId: string,
+): Promise<{ status: number; json: Record<string, unknown> }> {
+	const ctx = createExecutionContext();
+	const response = await worker.fetch(
+		new Request(`http://localhost/v1/mailboxes/${mailboxId}/transactional/messages/${requestId}`, {
+			method: "GET",
+			headers: { authorization: `Bearer ${plaintextKey}` },
+		}),
+		env,
+		ctx,
+	);
+	await waitOnExecutionContext(ctx);
+	return { status: response.status, json: (await response.json()) as Record<string, unknown> };
+}
+
+async function statusKey(mailboxId: string): Promise<string> {
+	const created = await doJson(mailboxId, "/transactional/api-keys", {
+		environment: "live",
+		sender: "hola@send.transcribo.example",
+		scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+		templateAllowlist: ["welcome"],
+	});
+	expect(created.status).toBe(201);
+	return ((await created.json()) as { plaintextKey: string }).plaintextKey;
+}
+
+/** Same key id and environment — both public — with a secret that was never issued. */
+function withFabricatedSecret(plaintextKey: string): string {
+	const [prefix, environment, keyId, secret] = plaintextKey.split("_") as [
+		string,
+		string,
+		string,
+		string,
+	];
+	const forged = secret.slice(0, -1) + (secret.endsWith("a") ? "b" : "a");
+	return [prefix, environment, keyId, forged].join("_");
+}
+
+function keyIdOf(plaintextKey: string): string {
+	return plaintextKey.split("_")[2]!;
+}
+
+async function sentRequest(mailboxId: string, plaintextKey: string, ik: string): Promise<string> {
+	const sent = await sendViaRouter(mailboxId, plaintextKey, ik, {
+		template: "welcome",
+		to: "user@example.com",
+		variables: { name: "Ana" },
+	});
+	expect(sent.status).toBe(200);
+	return sent.json.requestId as string;
+}
+
+/** A mailbox with a status-scoped key, the welcome template and one sent request. */
+async function mailboxWithSentRequest(
+	mailboxId: string,
+): Promise<{ key: string; requestId: string }> {
+	const key = await statusKey(mailboxId);
+	await welcomeTemplate(mailboxId);
+	await recordEmail(mailboxId);
+	const requestId = await sentRequest(mailboxId, key, `ik-${mailboxId}`);
+	return { key, requestId };
+}
+
+describe("GET /v1/mailboxes/:id/transactional/messages/:requestId — key authentication", () => {
+	it("answers a valid key with the status of its own request", async () => {
+		const { key, requestId } = await mailboxWithSentRequest("mbx_status_auth_valid");
+		const status = await statusViaRouter("mbx_status_auth_valid", key, requestId);
+		expect(status.status).toBe(200);
+		expect(status.json.status).toBe("sent");
+		expect(status.json.requestId).toBe(requestId);
+	});
+
+	it("refuses a real key id carrying a fabricated secret", async () => {
+		const mailboxId = "mbx_status_auth_forged";
+		const { key, requestId } = await mailboxWithSentRequest(mailboxId);
+		const forged = await statusViaRouter(mailboxId, withFabricatedSecret(key), requestId);
+		expect(forged.status).toBe(403);
+		expect(forged.json).toEqual({ error: "invalid_api_key" });
+	});
+
+	it("refuses an expired key", async () => {
+		const mailboxId = "mbx_status_auth_expired";
+		const { key, requestId } = await mailboxWithSentRequest(mailboxId);
+		await runInDurableObject(mailboxStub(env, mailboxId), (_instance, state) => {
+			state.storage.sql.exec(
+				"UPDATE api_keys SET expires_at = ? WHERE key_id = ?",
+				"2020-01-01T00:00:00.000Z",
+				keyIdOf(key),
+			);
+		});
+		const expired = await statusViaRouter(mailboxId, key, requestId);
+		expect(expired.status).toBe(403);
+		expect(expired.json).toEqual({ error: "key_expired" });
+	});
+
+	it("refuses a revoked key", async () => {
+		const mailboxId = "mbx_status_auth_revoked";
+		const { key, requestId } = await mailboxWithSentRequest(mailboxId);
+		const revoked = await doJson(mailboxId, `/transactional/api-keys/${keyIdOf(key)}/revoke`, {});
+		expect(revoked.status).toBe(200);
+		const status = await statusViaRouter(mailboxId, key, requestId);
+		expect(status.status).toBe(403);
+		expect(status.json).toEqual({ error: "key_revoked" });
+	});
+
+	it("does not reveal that a key is revoked to a caller without its secret", async () => {
+		const mailboxId = "mbx_status_auth_revoked_forged";
+		const { key, requestId } = await mailboxWithSentRequest(mailboxId);
+		await doJson(mailboxId, `/transactional/api-keys/${keyIdOf(key)}/revoke`, {});
+		const status = await statusViaRouter(mailboxId, withFabricatedSecret(key), requestId);
+		expect(status.status).toBe(403);
+		expect(status.json).toEqual({ error: "invalid_api_key" });
+	});
+
+	it("answers 404 for another key's request on the same mailbox", async () => {
+		const mailboxId = "mbx_status_auth_cross_key";
+		const { requestId } = await mailboxWithSentRequest(mailboxId);
+		const other = await statusKey(mailboxId);
+		const status = await statusViaRouter(mailboxId, other, requestId);
+		expect(status.status).toBe(404);
+		expect(status.json).toEqual({ error: "not_found" });
+	});
+});
