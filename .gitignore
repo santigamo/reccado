@@ -22,3 +22,6 @@ wrangler.generated.*.json
 !.env.example
 # Local Pi runtime state
 .atl/
+
+# Agent worktrees (Claude Code isolation)
+.claude/worktrees/

@@ -12,6 +12,9 @@ export default defineConfig({
 	],
 	test: {
 		pool: "@cloudflare/vitest-pool-workers",
+		// Agent worktrees live under .claude/worktrees/ and carry a full copy of the
+		// suite; without this a run in the main checkout picks all of them up too.
+		exclude: ["**/node_modules/**", "**/dist/**", ".claude/**"],
 		coverage: {
 			provider: "istanbul",
 			reporter: ["text", "html", "lcov"],
