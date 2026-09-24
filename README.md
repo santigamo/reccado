@@ -541,9 +541,9 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
 - `Idempotency-Key` is mandatory; same key + same payload replays the original result, different
   payload → `409`. Request records are reserved (with quota) at `pending` before the provider call.
 - Outcomes: `sent`, `permanent_failure`, `unknown` (ambiguous, never auto-retried — review
-  manually), `accepted`, `rejected`, `duplicate`, `idempotency_conflict`. Provider error messages
-  are never stored.
-- **Only a message the provider accepted answers 2xx.** `sent`/`duplicate` → `200`, `accepted` → `202`;
+  manually), `accepted`, `rejected`, `idempotency_conflict`. A replay returns the original
+  outcome. Provider error messages are never stored.
+- **Only a message the provider accepted answers 2xx.** `sent` → `200`, `accepted` → `202`;
   `permanent_failure` → `502` and `unknown` → `504`, so a client that throws on non-2xx cannot
   mistake an undelivered message for a sent one, and can tell a definite failure from an unresolved
   one without parsing the body. Rejections are `401` (missing auth), `400` (missing

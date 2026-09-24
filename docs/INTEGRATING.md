@@ -45,7 +45,7 @@ session perimeter, and the Bearer key is the only authentication.
   example one limited to `@yourcompany.com` with a small daily quota.
 - **`rck_test_` keys cannot send.** A send with a test key answers
   `403 {"status":"rejected","error":"test_key_not_allowed_in_production_send"}`
-  (`src/do/transactional-send-ops.ts:119-127`). No simulated delivery sink exists. So preview
+  (`src/do/transactional-send-ops.ts:158-165`). No simulated delivery sink exists. So preview
   environments that need to send real mail need an `rck_live_` key with a restrictive policy.
 - A key only exists inside the mailbox that owns it. Calling another mailbox's URL with it
   answers `403 invalid_api_key` (`docs/OPERATIONS.md` "Key format and auth"). You can fold the
@@ -71,7 +71,7 @@ Content-Type: application/json
   (`src/lib/transactional-keys.ts:186-210`).
 - `Idempotency-Key` is **mandatory**. It is trimmed and must be 1–255 characters, with no charset
   restriction. A missing or empty key answers `400 idempotency_key_required`. A key over 255
-  characters answers `403 idempotency_key_too_long` (`transactional-send-ops.ts:139-156`).
+  characters answers `403 idempotency_key_too_long` (`transactional-send-ops.ts:167-186`).
   Derive the key from the business event (`<purpose>:<entity>:<version>`), never from a random
   value generated per attempt.
 
@@ -86,21 +86,23 @@ Content-Type: application/json
 A body that fails the schema answers `403 invalid_request_body`. A body that is not JSON answers
 `400 {"error":"invalid_json"}`.
 
-**Idempotency** (`transactional-send-ops.ts:224-255`, `transactional-send.ts:338-352`)
+**Idempotency** (`transactional-send-ops.ts:252-285`, `transactional-send.ts:334-410`)
 
 - Idempotency is scoped to **(key id, Idempotency-Key)**. The payload hash covers `template`,
   `to` and `variables`. The code shows no expiry on this record.
 - **Same key and same payload** replays the stored outcome with the original `requestId`, and
-  Reccado does not contact the provider again. A replay answers with the original status, not
-  `duplicate`. A replay of a request that is still in flight answers `202 accepted`.
+  Reccado does not contact the provider again. A replay answers with the original status (there
+  is no separate `duplicate` status). A replay of a request that is still in flight answers
+  `202 accepted`.
 - **Same key and a different payload** answers `409 idempotency_conflict` with error
   `idempotency_key_already_used_with_different_payload` and the original `requestId`.
-- Two things the hash does that you might not expect:
-  - The hash is taken over `JSON.stringify(variables)`, so **key order matters**. Retrying
-    with `{b, a}` after `{a, b}` is a `409`. Retry with the exact bytes you first sent.
-  - The whole canonical string is lower-cased before hashing. Two payloads that differ only in
-    letter case count as the *same* payload and replay the first result. Don't reuse an
-    idempotency key for a different message.
+- What counts as "the same payload":
+  - Variable **key order doesn't matter**: `{b, a}` after `{a, b}` replays.
+  - The recipient address is compared case-insensitively. The template id and variable names
+    and values are compared **exactly**, so a reused key with a token that differs only in
+    case is a `409`, not a replay.
+  - Requests stored before this hash format (v2) keep being compared with the old one, which
+    lower-cased everything. Retrying such a request with the same bytes still replays.
 - A replay still has to pass the gates that run before the idempotency lookup (§4): auth,
   scope, template allowlist, template active, variables, recipient policy and suppression. For
   example, a replay after the template was archived answers `template_not_found`, not the
@@ -135,7 +137,8 @@ A rejection carries `requestId: ""`. The HTTP status is derived from `status` an
 | 502 | `permanent_failure` | The provider definitively refused. Nothing was sent | Don't loop. Page the operator (usually a sender or domain setup problem). Once it is fixed, a **new** idempotency key is safe |
 | 409 | `idempotency_conflict` | Idempotency key reused with a different payload | A bug in your code. Don't retry |
 | 401 | `missing_authorization` | No `Bearer` header | Configuration bug |
-| 403 | `invalid_api_key` | Malformed, unknown, wrong mailbox, wrong secret, **revoked or expired** | Page the operator for a new key. Revoked and expired keys surface here: the `key_revoked`/`key_expired` codes at `transactional-send-ops.ts:129-137` are unreachable because `verifyApiKey` refuses them first (`transactional-keys.ts:231-234`) |
+| 403 | `invalid_api_key` | Malformed, unknown, wrong mailbox or wrong secret | Check the configured key. Page the operator if it is right |
+| 403 | `key_revoked` / `key_expired` | The secret is correct but the key was revoked (or rotated) or is past `expiresAt`. Only returned after the secret verifies, so a wrong secret never learns a key's state (`transactional-send-ops.ts:77-124`) | Page the operator for a new key |
 | 403 | `insufficient_scope` | The key lacks `transactional:send` or `transactional:templates:use` | Page the operator |
 | 403 | `test_key_not_allowed_in_production_send` | An `rck_test_` key was used to send | Use a live key |
 | 400 / 403 | `idempotency_key_required` / `idempotency_key_too_long` | Header missing or longer than 255 characters | Fix your client |
@@ -148,32 +151,28 @@ A rejection carries `requestId: ""`. The HTTP status is derived from `status` an
 | 403 | `denied_by_policy` | The recipient matched a `!` deny rule | Same as `not_allowed_by_policy` |
 | 403 | `recipient_suppressed` | The address previously hard-bounced or complained (§8) | **Don't retry.** Tell the user the address can't receive mail and ask for another |
 | 429 | `quota_exceeded` | Either the per-key limit of 60 requests per UTC minute or the key's daily quota per UTC day. The response doesn't say which | Back off. The minute window resets at the next UTC minute and the daily one at 00:00 UTC. If it persists, ask the operator for a higher quota |
-| 403 | `internal_error` | A reservation race the code could not resolve (`transactional-send-ops.ts:315`) | Replay the same key |
+| 403 | `internal_error` | A reservation race the code could not resolve (`transactional-send-ops.ts:345`) | Replay the same key |
 | 400 | `{"error":"invalid_json"}` | The body was not JSON | Fix your client |
 | 415 / 413 | plain text | Wrong Content-Type, or body over 100 000 bytes | Fix your client |
 | 404 / 405 | plain text | Wrong path or method | Fix the URL |
 | 503 | `{"error":"transactional_api_not_configured"}` | The deployment has no key pepper | Page the operator |
-| 500 | not the JSON contract | See the known issue below | Treat like `unknown`: replay the same key and don't resend |
+| other 5xx | not the JSON contract | An unexpected server error | Treat like `unknown`: replay the same key and don't resend |
 
 Rules of thumb: 2xx means the provider accepted the message. `502`/`504` must never be
 reported as sent. `429` means back off. Every other `4xx` needs a person: yours for client bugs
 and policy or suppression decisions, the operator's for keys and templates.
 
-**Known issue: a definite provider refusal does not produce a 502 today.** After a refusal, the
-send path stores the status `permanent_failure` (`transactional-send-ops.ts:346-353`). The
-`transactional_requests` table only allows `pending|sent|duplicate|rejected|failed|unknown`
-(`src/do/mailbox-schema-content.ts:241`), so that update throws and the request errors out as a
-5xx instead of the documented `502`. The row stays `pending`, a replay answers `202 accepted`,
-and the hourly reconciler moves the row to `unknown` (`error_code: stale_reconciled`) after 30
-minutes (`src/do/mailbox-do.ts:1322-1325`). The provider is never contacted twice. Until this is
-fixed, handle a non-JSON 5xx like `unknown`.
+A definite refusal is terminal: the request is stored as `failed` with `errorCode:
+"permanent_failure"`, its variables are dropped, a replay of the same key answers the same
+`502` without contacting the provider, and the stale reconciler leaves it alone.
 
 ## 5. Status: `GET .../messages/:requestId`
 
 This needs a key with `transactional:status`, and returns only requests made **by that same
-key id** (`transactional-send-ops.ts:1089-1146`, route at `src/do/mailbox-do.ts:1330-1372`).
-Errors: `401 missing_authorization`, `403 invalid_api_key | key_revoked | insufficient_scope`,
-`404 not_found`.
+key id** (`transactional-send-ops.ts:1132-1189`, route at `src/do/mailbox-do.ts:1329-1363`).
+The key is authenticated exactly as on the send route (same secret check, same codes). Errors:
+`401 missing_authorization`, `403 invalid_api_key | key_revoked | key_expired |
+insufficient_scope`, `404 not_found` (including another key's request).
 
 ```json
 { "requestId": "…", "status": "sent", "providerMessageId": "…", "createdAt": "…",
@@ -182,7 +181,8 @@ Errors: `401 missing_authorization`, `403 invalid_api_key | key_revoked | insuff
 ```
 
 - `status` uses the **stored** vocabulary, `pending | sent | failed | unknown`, which differs
-  from the send response (`accepted`, `permanent_failure`). `errorCode` is one of `ambiguous`,
+  from the send response (`accepted`, `permanent_failure`): a send that answered `502` reads
+  back as `failed` with `errorCode: "permanent_failure"`. `errorCode` is one of `ambiguous`,
   `permanent_failure`, `stale_reconciled` or `null`.
 - `deliveryStatus` comes from Cloudflare lifecycle events: `delivered`, `deferred`, `bounced`,
   `rejected`, `complained` or `failed` (`src/cloudflare/email-events.ts:160-219`). It is `null`
@@ -251,7 +251,7 @@ PUT https://<host>/api/mailboxes/<mailboxId>/transactional/templates
   your Bearer key cannot sync. Either the operator runs the sync, or your CI holds an operator
   session (`pnpm operator login`, see OPERATIONS.md "Operator session from the terminal").
 - The call is idempotent. Run it on every deploy. It takes at most 100 templates with unique ids
-  (`transactional-send-ops.ts:726-809`). An omitted body part counts as `null`, because the list
+  (`transactional-send-ops.ts:756-839`). An omitted body part counts as `null`, because the list
   is the full desired state for each listed id.
 - The response is `200 {ok, results:[{id, outcome, reason?}], summary}`, where `outcome` is one
   of:
@@ -296,17 +296,17 @@ Keys are defined in `src/lib/transactional-keys.ts` and created through
   Matching is case-insensitive. With no policy, every recipient is allowed
   (`transactional-send.ts:210-245`).
 - **Daily quota:** `quotaMax` is optional and counts sends per UTC day. The **rate limit** is
-  hard-coded at 60 per key per UTC minute (`transactional-send-ops.ts:482-513`). Both are charged
+  hard-coded at 60 per key per UTC minute (`transactional-send-ops.ts:512-543`). Both are charged
   when a request is reserved. That includes requests that later fail. It excludes rejections and
   replays.
 - **Sender name:** the From display phrase, set per key. It must be printable ASCII of at most
   64 characters, with no `<`, `>` or `"` (`transactional-keys.ts:148-153`). The operator can
   change it with `PATCH .../api-keys/:keyId` without reissuing the secret.
-- **Expiry:** `expiresAt` is optional. After it passes, the key answers `invalid_api_key`.
+- **Expiry:** `expiresAt` is optional. After it passes, the key answers `403 key_expired`.
 - **Rotation** (`src/do/transactional-key-ops.ts:311`) creates a new key id with the same
   properties and **revokes the old one immediately**, in the same transaction. There is no
   overlap window. A request that already passed authentication finishes. The next request with
-  the old key gets `403 invalid_api_key`. Two consequences:
+  the old key gets `403 key_revoked`. Two consequences:
   - Deploy the new secret right after rotating.
   - **Idempotency does not carry across rotation**, because it is scoped to the key id. Replaying
     an old idempotency key under the new key is a *new send*. Don't replay pre-rotation keys

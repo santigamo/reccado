@@ -201,8 +201,8 @@ integrator's contract (endpoint, idempotency, every response code, templates, su
   `test_key_not_allowed_in_production_send`. Test keys work for create/list/revoke/rotate only;
   there is no simulated/test delivery sink.
 - Provider outcomes: `sent`, `permanent_failure` (definitely not delivered), `unknown`
-  (ambiguous — never auto-retried), `accepted` (pending), `rejected`, `idempotency_conflict`,
-  `duplicate`. Raw provider error messages are never stored.
+  (ambiguous — never auto-retried), `accepted` (pending), `rejected`, `idempotency_conflict`.
+  A replay returns the original outcome. Raw provider error messages are never stored.
 - An `unknown` is no longer a dead end. Cloudflare mints the message id itself and rejects a
   sender-supplied `Message-ID` header, so a send that throws never learns the id of a message
   that may well have gone out, and its lifecycle events arrive unattributable. When an event's
@@ -227,7 +227,7 @@ integrator's contract (endpoint, idempotency, every response code, templates, su
 - D1 routes these events to a mailbox but never decides them: the DO repeats the candidate search
   against its own rows and answers `409` if the projection named a different request or if it
   sees a tie the projection did not.
-- HTTP status carries the outcome without the body: `200` (`sent`/`duplicate`), `202` (`accepted`),
+- HTTP status carries the outcome without the body: `200` (`sent`), `202` (`accepted`),
   `502` (`permanent_failure`), `504` (`unknown`), `409` (`idempotency_conflict`), and `401`/`400`/
   `429`/`403` for rejections. Nothing undelivered answers 2xx — an integration that throws on
   non-2xx is correct by default rather than by remembering an exception.

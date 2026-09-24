@@ -48,8 +48,29 @@ Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox,
 transactional API (Phases 2–4 of the `docs/plans/transactional-api.md` plan) and the MCP
 read/search/draft endpoint.
 
+### Security
+
+- **The transactional status route verifies the key secret.** `GET
+  /v1/.../transactional/messages/:requestId` checked the key id, revocation and scope but never
+  the secret, and ignored expiry — and key ids are public (every send response carries one). Send
+  and status now share one authentication path (peppered constant-time secret check, then mailbox
+  binding, revocation, expiry, scope). Nothing about a key's state is disclosed before its secret
+  verifies.
+
 ### Fixed
 
+- **A definite provider refusal answers `502`.** The send path wrote `permanent_failure` into a
+  column whose CHECK only allows `failed`, so the request errored as a `500`, stayed `pending`
+  with its variables, replayed as `202` and was later reconciled to `unknown`. It is now stored
+  as `failed` / `errorCode: "permanent_failure"`, variables dropped, and a replay answers `502`.
+- **Idempotency no longer depends on variable key order or folds case.** The payload hash is
+  now `v2:` over key-sorted variables, case-folding only the recipient. `{b, a}` after `{a, b}`
+  replays instead of `409`; a reused key with a token differing only in case is a `409` instead
+  of silently replaying the first send. Rows stored with the legacy hash are still compared with
+  it, so pre-upgrade retries keep replaying.
+- **`key_revoked` / `key_expired` are returned** (after the secret verifies) instead of being
+  unreachable behind `invalid_api_key`. Docs no longer list a `duplicate` outcome, which the API
+  never returns — a replay answers with the original outcome.
 - **Template routes require the mailbox to be yours.** Create, list, revise and archive
   (`/api/mailboxes/:id/transactional/templates[/:templateId[/archive]]`) checked only that the
   caller was an owner of the deployment, while the key routes — and the docs, for both — also
