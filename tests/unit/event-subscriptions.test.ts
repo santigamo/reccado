@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	crossCheckSendingDomains,
 	EMAIL_SENDING_EVENT_TYPES,
 	type EventSubscription,
 	evaluateFeedbackSubscription,
@@ -192,5 +193,69 @@ describe("parseQueueListTable", () => {
 			{ id: "q1", name: "inbox-mcp-email-events-dev", consumers: 1 },
 			{ id: "q2", name: "inbox-mcp-email-events-dlq-dev", consumers: 1 },
 		]);
+	});
+});
+
+describe("crossCheckSendingDomains", () => {
+	const enabled = [
+		{ zone: "example.com", name: "send.example.com", enabled: true },
+		{ zone: "example.com", name: "example.com", enabled: true },
+		{ zone: "other.test", name: "notify.other.test", enabled: true },
+		{ zone: "other.test", name: "mail.other.test", enabled: false },
+	];
+	const subs = [
+		subscription({ id: "a", source: { type: "email.sending", domain: "send.example.com" } }),
+		subscription({ id: "b", source: { type: "email.sending", domain: "example.com" } }),
+		// Another environment's queue: not ours to claim.
+		subscription({
+			id: "c",
+			source: { type: "email.sending", domain: "notify.other.test" },
+			destination: { type: "queues.queue", queue_id: "someone-else" },
+		}),
+	];
+
+	it("is clean when the declared list matches enabled + subscribed domains", () => {
+		expect(
+			crossCheckSendingDomains({
+				declared: ["send.example.com", "EXAMPLE.com"],
+				sendingDomains: enabled,
+				subscriptions: subs,
+				queueId: OUR_QUEUE,
+			}),
+		).toEqual({ undeclared: [], unverified: [] });
+	});
+
+	// The incident's first shape: the apex was enabled and subscribed by hand, and
+	// the var that lets a mailbox there reply as itself never shipped.
+	it("reports an enabled, subscribed domain missing from the var as undeclared", () => {
+		expect(
+			crossCheckSendingDomains({
+				declared: ["send.example.com"],
+				sendingDomains: enabled,
+				subscriptions: subs,
+				queueId: OUR_QUEUE,
+			}).undeclared,
+		).toEqual(["example.com"]);
+	});
+
+	it("does not claim domains that publish to another queue", () => {
+		const drift = crossCheckSendingDomains({
+			declared: [],
+			sendingDomains: enabled,
+			subscriptions: subs,
+			queueId: OUR_QUEUE,
+		});
+		expect(drift.undeclared).not.toContain("notify.other.test");
+	});
+
+	it("reports declared domains that are disabled or absent as unverified", () => {
+		expect(
+			crossCheckSendingDomains({
+				declared: ["send.example.com", "mail.other.test", "typo.example.com"],
+				sendingDomains: enabled,
+				subscriptions: subs,
+				queueId: OUR_QUEUE,
+			}).unverified,
+		).toEqual(["mail.other.test", "typo.example.com"]);
 	});
 });

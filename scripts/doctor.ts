@@ -17,8 +17,18 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { generatedConfigPathFor } from "./lib/built-config";
+import {
+	applyGeneratedOverlay,
+	deployedVars,
+	type WranglerConfig as DeployWranglerConfig,
+	effectiveBlock,
+	parseDomainList,
+} from "./lib/deploy-config";
+import { classifyDmarc, lookupTxt } from "./lib/dmarc";
 import {
 	type AccountQueue,
+	crossCheckSendingDomains,
 	describeFeedbackVerdict,
 	EMAIL_SENDING_EVENT_TYPES,
 	evaluateFeedbackSubscription,
@@ -325,6 +335,77 @@ if (!block) {
 			status: targetEnv ? "info" : "warn",
 			message: "No custom domain route is configured in tracked wrangler.jsonc.",
 			fix: `Use pnpm setup:domain${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain> (writes a gitignored generated config; doesn't edit wrangler.jsonc).`,
+		});
+	}
+}
+
+// --- Config that will actually deploy ------------------------------------------
+//
+// `pnpm run deploy[:dev]` ships wrangler.jsonc with the generated file's owned
+// fields overlaid (scripts/lib/deploy-config.ts). Every check below that reasons
+// about "the deployed config" reads it through the same function, so doctor and
+// the deploy cannot disagree about what ships.
+
+const generatedPath = generatedConfigPathFor(targetEnv);
+let generatedConfig: DeployWranglerConfig | undefined;
+try {
+	generatedConfig = existsSync(generatedPath)
+		? (JSON.parse(stripJsonc(readFileSync(generatedPath, "utf8"))) as DeployWranglerConfig)
+		: undefined;
+} catch {
+	add({
+		id: "config.deploy-overlay",
+		status: "fail",
+		message: `${generatedPath} exists but is not valid JSON — every deploy of ${envLabel} will refuse to run.`,
+		fix: `Fix or delete ${generatedPath}, then re-run the setup script that wrote it.`,
+	});
+}
+let deployVars: Record<string, unknown> = {};
+if (block) {
+	const trackedFull = wrangler as DeployWranglerConfig;
+	try {
+		deployVars = deployedVars(trackedFull, generatedConfig, targetEnv);
+		if (generatedConfig) {
+			const overlay = applyGeneratedOverlay({
+				base: effectiveBlock(trackedFull, targetEnv),
+				generated: effectiveBlock(generatedConfig, targetEnv),
+				tracked: effectiveBlock(trackedFull, targetEnv),
+			});
+			// A generated var that overrides a DIFFERENT tracked value is the drift a
+			// reader of wrangler.jsonc cannot see; one that only adds is the normal case.
+			const conflicting = overlay.applied.filter(
+				(change) => change.field.startsWith("vars.") && change.from !== undefined,
+			);
+			const ignoredNote =
+				overlay.ignored.length > 0
+					? ` Ignored there (wrangler.jsonc wins): ${overlay.ignored.join(", ")}.`
+					: "";
+			add(
+				conflicting.length > 0
+					? {
+							id: "config.deploy-overlay",
+							status: "warn",
+							message: `${generatedPath} overrides wrangler.jsonc on deploy: ${conflicting.map((c) => `${c.field} ${JSON.stringify(c.from)} -> ${JSON.stringify(c.to)}`).join("; ")}.${ignoredNote}`,
+							fix: "The generated value is what ships. Make the two agree (or delete the var from one file) so wrangler.jsonc does not mislead.",
+						}
+					: {
+							id: "config.deploy-overlay",
+							status: overlay.ignored.length > 0 ? "info" : "pass",
+							message: `Deploys overlay ${generatedPath} (${overlay.applied.length} owned field(s) applied, none contradicting wrangler.jsonc).${ignoredNote}`,
+						},
+			);
+		} else {
+			add({
+				id: "config.deploy-overlay",
+				status: "info",
+				message: `No ${generatedPath} — deploys ship wrangler.jsonc as built.`,
+			});
+		}
+	} catch (error) {
+		add({
+			id: "config.deploy-overlay",
+			status: "fail",
+			message: `Could not compute the deployed config: ${error instanceof Error ? error.message : error}.`,
 		});
 	}
 }
@@ -664,6 +745,131 @@ function checkSendingFeedbackRemote(): Check[] {
 	];
 }
 
+/**
+ * Whether MAIL_SENDING_DOMAINS — as the deploy will actually ship it, not as
+ * wrangler.jsonc alone says — agrees with what Cloudflare Email Sending honours.
+ *
+ * Declared but not enabled is a FAIL: a mailbox on that domain sends as itself
+ * and the provider refuses the From. Enabled and subscribed to our events queue
+ * but not declared is only a WARN: the account may host other projects' sending
+ * domains, and a mailbox there merely relays through MAIL_FROM_ADDRESS.
+ */
+/** Filled by checkSendingDomainsDeclared so the DMARC check covers them too. */
+let subscribedButUndeclared: string[] = [];
+
+function checkSendingDomainsDeclared(): Check[] {
+	const declared = parseDomainList(deployVars.MAIL_SENDING_DOMAINS);
+	const queueName = block?.queues?.producers?.find(
+		(producer) => producer.binding === "EMAIL_EVENTS_QUEUE",
+	)?.queue;
+	const queueId = queueName ? listAccountQueues()?.get(queueName)?.id : undefined;
+	let sendingDomains: ReturnType<typeof parseSendingDomainsTable>;
+	let subscriptions: ReturnType<typeof parseSubscriptionListJson> = [];
+	try {
+		sendingDomains = parseSendingDomainsTable(
+			execFileSync("pnpm", ["wrangler", "email", "sending", "list"], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			}),
+		);
+		if (queueName) {
+			subscriptions = parseSubscriptionListJson(
+				execFileSync("pnpm", ["wrangler", "queues", "subscription", "list", queueName, "--json"], {
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "pipe"],
+				}),
+			);
+		}
+	} catch {
+		return [
+			{
+				id: "cloud.sending-domains",
+				status: "warn",
+				message:
+					"Could not list Email Sending domains or event subscriptions, so MAIL_SENDING_DOMAINS is unchecked.",
+				fix: "pnpm wrangler email sending list",
+			},
+		];
+	}
+	const drift = crossCheckSendingDomains({
+		declared,
+		sendingDomains,
+		subscriptions: subscriptions ?? [],
+		queueId: queueId ?? "",
+	});
+	subscribedButUndeclared = queueId ? drift.undeclared : [];
+	const out: Check[] = [];
+	if (drift.unverified.length > 0) {
+		out.push({
+			id: "cloud.sending-domains",
+			status: "fail",
+			message: `MAIL_SENDING_DOMAINS (deployed) lists ${drift.unverified.join(", ")}, not enabled in Email Sending for this account — a mailbox there sends as itself and Cloudflare refuses the From.`,
+			fix: `pnpm setup:sending${targetEnv ? ` --env ${targetEnv}` : ""} --domain <zone> --subdomain <label>|--apex --apply, or drop the entry from ${generatedConfig ? generatedPath : "wrangler.jsonc"} and redeploy.`,
+		});
+	} else {
+		out.push({
+			id: "cloud.sending-domains",
+			status: "pass",
+			message:
+				declared.length > 0
+					? `All ${declared.length} deployed MAIL_SENDING_DOMAINS entr${declared.length === 1 ? "y is" : "ies are"} enabled in Email Sending.`
+					: "MAIL_SENDING_DOMAINS is empty in the deployed config; every mailbox relays through MAIL_FROM_ADDRESS.",
+		});
+	}
+	if (!queueId) {
+		out.push({
+			id: "cloud.sending-domains",
+			status: "warn",
+			message: `Could not resolve the events queue${queueName ? ` ${queueName}` : ""}, so undeclared sending domains are unchecked.`,
+		});
+	} else if (drift.undeclared.length > 0) {
+		out.push({
+			id: "cloud.sending-domains",
+			status: "warn",
+			message: `Enabled in Email Sending and subscribed to ${queueName}, but not in the deployed MAIL_SENDING_DOMAINS: ${drift.undeclared.join(", ")} — a mailbox on one of them would send via MAIL_FROM_ADDRESS, not as itself. (Fine if they belong to another app or are only a fallback sender.)`,
+			fix: `pnpm setup:sending${targetEnv ? ` --env ${targetEnv}` : ""} --domain <zone> --subdomain <label>|--apex --apply adds one to the generated config; then ${targetEnv === "dev" ? "pnpm run deploy:dev" : "pnpm run deploy"}.`,
+		});
+	}
+	return out;
+}
+
+/**
+ * What `_dmarc.<name>` publishes for each deployed MAIL_SENDING_DOMAINS entry,
+ * plus every sending domain that feeds our events queue without being declared
+ * — the names Email Sending was enabled on by hand, which is exactly where its
+ * auto-created `p=reject` survives. Resolved over DNS-over-HTTPS, so it reports
+ * what receivers see, not what the DNS API was last asked to write.
+ */
+async function checkDmarcRemote(): Promise<Check[]> {
+	const names = [
+		...new Set([...parseDomainList(deployVars.MAIL_SENDING_DOMAINS), ...subscribedButUndeclared]),
+	];
+	const out: Check[] = [];
+	for (const domain of names) {
+		const records = await lookupTxt(`_dmarc.${domain}`);
+		if (records === null) {
+			out.push({
+				id: "cloud.dmarc",
+				status: "warn",
+				message: `_dmarc.${domain}: could not resolve over DNS-over-HTTPS.`,
+				fix: `dig +short TXT _dmarc.${domain}`,
+			});
+			continue;
+		}
+		const verdict = classifyDmarc(domain, records);
+		out.push({
+			id: "cloud.dmarc",
+			status: verdict.status,
+			message: verdict.message,
+			fix:
+				verdict.status === "warn"
+					? `pnpm setup:sending${targetEnv ? ` --env ${targetEnv}` : ""} --domain <zone> (--subdomain <label> | --apex) --dmarc-policy <none|quarantine|reject> --dmarc-rua dmarc@<zone> --apply`
+					: undefined,
+		});
+	}
+	return out;
+}
+
 /** The zones Reccado has registered, lowercased. Null when D1 can't be read. */
 function listRegisteredDomains(): Set<string> | null {
 	try {
@@ -978,6 +1184,8 @@ if (args.cloud === "true") {
 	addAll(checkD1Remote());
 	addAll(checkQueuesRemote());
 	addAll(checkSendingFeedbackRemote());
+	addAll(checkSendingDomainsDeclared());
+	addAll(await checkDmarcRemote());
 	addAll(checkSecretsRemote());
 	if (args.url) {
 		addAll(await checkAuthEndpoints(args.url));

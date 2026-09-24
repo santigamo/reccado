@@ -213,3 +213,51 @@ export function parseQueueListTable(raw: string): AccountQueue[] {
 export function helpAdvertisesEmailSendingSource(help: string): boolean {
 	return /"email\.sending"/.test(help);
 }
+
+export type SendingDomainDrift = {
+	/**
+	 * Enabled in Email Sending with a subscription on our events queue, but not
+	 * declared: a mailbox on it would relay through the fallback From instead of
+	 * sending as itself. A warning only — the account may host other projects.
+	 */
+	undeclared: string[];
+	/**
+	 * Declared, but not an enabled Email Sending domain in this account: a
+	 * mailbox on it will send as itself and Cloudflare will refuse the From.
+	 */
+	unverified: string[];
+};
+
+/**
+ * Crosses the deployed MAIL_SENDING_DOMAINS against the provider's live lists.
+ *
+ * The var is a declaration a human (or setup:sending) wrote once; the lists are
+ * what Cloudflare will actually honour. Onboarding a domain by hand — enable,
+ * subscribe, forget the var — or a var that never reached the Worker produced
+ * the same symptom and neither was visible anywhere.
+ */
+export function crossCheckSendingDomains(opts: {
+	declared: string[];
+	sendingDomains: SendingDomain[];
+	subscriptions: EventSubscription[];
+	queueId: string;
+}): SendingDomainDrift {
+	const declared = new Set(opts.declared.map((domain) => domain.trim().toLowerCase()));
+	const enabled = new Set(
+		opts.sendingDomains.filter((domain) => domain.enabled).map((domain) => domain.name),
+	);
+	const subscribed = new Set(
+		opts.subscriptions
+			.filter(
+				(sub) =>
+					sub.source.type === "email.sending" &&
+					sub.destination.queue_id === opts.queueId &&
+					sub.source.domain,
+			)
+			.map((sub) => (sub.source.domain ?? "").toLowerCase()),
+	);
+	return {
+		undeclared: [...enabled].filter((name) => subscribed.has(name) && !declared.has(name)).sort(),
+		unverified: [...declared].filter((name) => !enabled.has(name)).sort(),
+	};
+}
