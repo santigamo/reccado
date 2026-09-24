@@ -211,4 +211,25 @@ describe("PUT /api/mailboxes/:id/transactional/templates", () => {
 		const denied = await call("PUT", base, { templates: [WELCOME] });
 		expect(denied.status).toBe(403);
 	});
+
+	// The per-id routes used to stop at "is an owner of this deployment"; they now
+	// require the mailbox's owner_email too, like the key routes and the sync route.
+	it("refuses the per-id template routes on a mailbox the caller does not own", async () => {
+		const base = await ownedMailbox("mbx_tpl_foreign", "someone-else@example.com");
+		const attempts = [
+			await call("POST", base, WELCOME),
+			await call("GET", base),
+			await call("PUT", `${base}/welcome`, { subject: "Hijacked" }),
+			await call("POST", `${base}/welcome/archive`),
+		];
+		expect(attempts.map((a) => a.status)).toEqual([403, 403, 403, 403]);
+	});
+
+	it("still serves the per-id template routes to the mailbox owner", async () => {
+		const base = await ownedMailbox("mbx_tpl_owned");
+		expect((await call("POST", base, WELCOME)).status).toBe(201);
+		expect((await call("GET", base)).status).toBe(200);
+		expect((await call("PUT", `${base}/welcome`, { subject: "Revised" })).status).toBe(200);
+		expect((await call("POST", `${base}/welcome/archive`)).status).toBe(200);
+	});
 });

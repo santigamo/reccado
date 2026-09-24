@@ -112,10 +112,30 @@ api.get("/api/mailboxes/:mailboxId/ws", async (c) => {
 
 // --- Transactional API: template management (session-protected, under /api/*) ---
 
-api.post("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
+/**
+ * Session + per-mailbox owner gate for the template routes.
+ *
+ * These routes used to stop at "is an owner of this deployment", while the key
+ * routes (and the docs, for both) also require the mailbox's D1 `owner_email` to be
+ * the caller. Templates decide what a live key sends, so they get the same gate.
+ * Returns a Response to send back, or null when the caller may proceed.
+ */
+async function templateRouteGate(
+	request: Request,
+	env: Env,
+	mailboxId: string,
+): Promise<Response | null> {
 	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
-	const auth = await requireAuth(c.req.raw, c.env);
-	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
+	const auth = await requireAuth(request, env);
+	assertMailboxAccess(auth, mailboxId, env);
+	const { getMailboxForOwner } = await import("./db/d1");
+	const mailbox = await getMailboxForOwner(env.INDEX_DB, mailboxId, auth.email);
+	return mailbox ? null : Response.json({ error: "forbidden" }, { status: 403 });
+}
+
+api.post("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
+	const denied = await templateRouteGate(c.req.raw, c.env, c.req.param("mailboxId"));
+	if (denied) return denied;
 	const mailboxId = c.req.param("mailboxId");
 	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch("https://mailbox-do/transactional/templates", {
@@ -126,18 +146,16 @@ api.post("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
 });
 
 api.get("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
-	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
-	const auth = await requireAuth(c.req.raw, c.env);
-	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
+	const denied = await templateRouteGate(c.req.raw, c.env, c.req.param("mailboxId"));
+	if (denied) return denied;
 	const mailboxId = c.req.param("mailboxId");
 	const stub = mailboxStub(c.env, mailboxId);
 	return stub.fetch("https://mailbox-do/transactional/templates");
 });
 
 api.put("/api/mailboxes/:mailboxId/transactional/templates/:templateId", async (c) => {
-	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
-	const auth = await requireAuth(c.req.raw, c.env);
-	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
+	const denied = await templateRouteGate(c.req.raw, c.env, c.req.param("mailboxId"));
+	if (denied) return denied;
 	const mailboxId = c.req.param("mailboxId");
 	const templateId = c.req.param("templateId");
 	const stub = mailboxStub(c.env, mailboxId);
@@ -149,9 +167,8 @@ api.put("/api/mailboxes/:mailboxId/transactional/templates/:templateId", async (
 });
 
 api.post("/api/mailboxes/:mailboxId/transactional/templates/:templateId/archive", async (c) => {
-	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
-	const auth = await requireAuth(c.req.raw, c.env);
-	assertMailboxAccess(auth, c.req.param("mailboxId"), c.env);
+	const denied = await templateRouteGate(c.req.raw, c.env, c.req.param("mailboxId"));
+	if (denied) return denied;
 	const mailboxId = c.req.param("mailboxId");
 	const templateId = c.req.param("templateId");
 	const stub = mailboxStub(c.env, mailboxId);
