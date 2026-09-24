@@ -6,6 +6,8 @@ const MAX_BODY_LENGTH = 100_000;
 const MAX_VARIABLE_COUNT = 50;
 const MAX_VARIABLE_VALUE_LENGTH = 10_000;
 const MAX_TEMPLATE_ID_LENGTH = 120;
+/** Largest template batch a single sync call (PUT .../transactional/templates) may carry. */
+export const MAX_TEMPLATE_SYNC_BATCH = 100;
 
 export const transactionalRequestSchema = z.object({
 	template: z.string().min(1).max(MAX_TEMPLATE_ID_LENGTH),

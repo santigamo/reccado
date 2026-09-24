@@ -2,6 +2,7 @@ import type { TransactionalRequestLogRow } from "../db/d1";
 import type { TransactionalApiKeyRecord } from "../lib/transactional-keys";
 import { verifyApiKey, parseApiKey } from "../lib/transactional-keys";
 import {
+	MAX_TEMPLATE_SYNC_BATCH,
 	type TransactionalSendContext,
 	transactionalRequestSchema,
 	interpolateTemplate,
@@ -649,6 +650,162 @@ export function archiveTemplate(
 		mailboxId,
 	);
 	return result.rowsWritten > 0;
+}
+
+// --- Template sync (collection-level PUT) ---
+
+export type TemplateInput = {
+	id: string;
+	subject: string;
+	body_text?: string | null;
+	body_html?: string | null;
+};
+
+/**
+ * Per-template rules shared by the create route and the sync route, returning
+ * the same error codes the create route has always answered with. Null = valid.
+ */
+export function templateInputProblem(input: TemplateInput): string | null {
+	if (!input.id || !input.subject) return "id_and_subject_required";
+	if (input.id.includes("..") || input.id.includes("/") || input.id.includes("\\")) {
+		return "invalid_template_id";
+	}
+	if (input.subject.includes("\r") || input.subject.includes("\n")) {
+		return "subject_contains_newline";
+	}
+	if (input.body_text && input.body_text.length > 100_000) return "body_text_too_long";
+	if (input.body_html && input.body_html.length > 100_000) return "body_html_too_long";
+	return null;
+}
+
+export type TemplateSyncOutcome = "created" | "updated" | "unchanged" | "archived";
+
+export type TemplateSyncResult = {
+	id: string;
+	outcome: TemplateSyncOutcome;
+	/**
+	 * Only on `archived`: `already_archived` = the id was in the batch but is
+	 * retired (nothing written); `missing_from_sync` = archived by this call
+	 * because `archiveMissing` was set and the id was not in the batch.
+	 */
+	reason?: "already_archived" | "missing_from_sync";
+};
+
+export class TemplateSyncError extends Error {
+	constructor(
+		readonly code: string,
+		readonly index: number | null,
+		readonly templateId: string | null,
+	) {
+		super(code);
+		this.name = "TemplateSyncError";
+	}
+}
+
+/**
+ * Bring the mailbox's templates in line with a caller-owned list in one call.
+ *
+ * The whole batch is validated before anything is written, and every write runs
+ * inside one `transactionSync`, so a bad entry (or a failure mid-way) changes
+ * nothing. Semantics per listed id:
+ *  - absent        → created (same insert as the create route)
+ *  - identical     → unchanged (subject, body_text, body_html; omitted = null)
+ *  - different     → updated in place via `updateTemplate`, as PUT-by-id does
+ *  - archived      → reported as `archived` / `already_archived`, left alone
+ *
+ * Archived ids are deliberately not revived or rewritten. The PUT-by-id path
+ * never touches status (it would rewrite an archived row's content but leave it
+ * archived), and there is no un-archive route: retiring a template is an
+ * operator decision, and a file sync should not quietly undo it — nor edit a
+ * row nobody can send. Reporting it lets the caller see that id is dead and
+ * pick a new one.
+ *
+ * `archiveMissing: true` archives every active template not in the list;
+ * the default never archives anything.
+ */
+export function syncTemplates(
+	sql: DurableObjectState["storage"]["sql"],
+	transactionSync: (fn: () => void) => void,
+	mailboxId: string,
+	input: { templates: TemplateInput[]; archiveMissing?: boolean },
+): TemplateSyncResult[] {
+	if (!Array.isArray(input.templates))
+		throw new TemplateSyncError("templates_required", null, null);
+	if (input.templates.length > MAX_TEMPLATE_SYNC_BATCH) {
+		throw new TemplateSyncError("too_many_templates", null, null);
+	}
+	const seen = new Set<string>();
+	input.templates.forEach((template, index) => {
+		const isOptionalString = (v: unknown) => v == null || typeof v === "string";
+		if (
+			typeof template !== "object" ||
+			template === null ||
+			typeof template.id !== "string" ||
+			typeof template.subject !== "string" ||
+			!isOptionalString(template.body_text) ||
+			!isOptionalString(template.body_html)
+		) {
+			throw new TemplateSyncError("invalid_template_shape", index, null);
+		}
+		const problem = templateInputProblem(template);
+		if (problem) throw new TemplateSyncError(problem, index, template.id ?? null);
+		if (seen.has(template.id)) {
+			throw new TemplateSyncError("duplicate_template_id", index, template.id);
+		}
+		seen.add(template.id);
+	});
+
+	const existing = new Map(
+		sql
+			.exec<{
+				id: string;
+				subject: string;
+				body_text: string | null;
+				body_html: string | null;
+				status: string;
+			}>(
+				"SELECT id, subject, body_text, body_html, status FROM templates WHERE mailbox_id = ?",
+				mailboxId,
+			)
+			.toArray()
+			.map((row) => [row.id, row]),
+	);
+
+	const results: TemplateSyncResult[] = [];
+	transactionSync(() => {
+		for (const template of input.templates) {
+			const desired = {
+				subject: template.subject,
+				body_text: template.body_text ?? null,
+				body_html: template.body_html ?? null,
+			};
+			const row = existing.get(template.id);
+			if (!row) {
+				createTemplate(sql, mailboxId, { id: template.id, ...desired });
+				results.push({ id: template.id, outcome: "created" });
+			} else if (row.status !== "active") {
+				results.push({ id: template.id, outcome: "archived", reason: "already_archived" });
+			} else if (
+				row.subject === desired.subject &&
+				row.body_text === desired.body_text &&
+				row.body_html === desired.body_html
+			) {
+				results.push({ id: template.id, outcome: "unchanged" });
+			} else {
+				updateTemplate(sql, mailboxId, template.id, desired);
+				results.push({ id: template.id, outcome: "updated" });
+			}
+		}
+		if (input.archiveMissing === true) {
+			for (const row of existing.values()) {
+				if (row.status === "active" && !seen.has(row.id)) {
+					archiveTemplate(sql, mailboxId, row.id);
+					results.push({ id: row.id, outcome: "archived", reason: "missing_from_sync" });
+				}
+			}
+		}
+	});
+	return results;
 }
 
 // --- Transactional request CRUD ---

@@ -8,7 +8,7 @@ import {
 	sendScopeHasTemplateAllowlist,
 	sendScopeHasTemplateUse,
 } from "../lib/transactional-keys";
-import { validateRecipientPolicy } from "../lib/transactional-send";
+import { MAX_TEMPLATE_SYNC_BATCH, validateRecipientPolicy } from "../lib/transactional-send";
 
 export const createMailboxSchema = z.object({
 	primaryAddress: z.string().email(),
@@ -168,20 +168,49 @@ export const transactionalApiKeyScopeSchema = z.enum([
  * or quotes would break the address form. Rejecting it at the edge means the
  * operator sees the problem on the form they typed it into.
  */
-const senderNameField = z
-	.string()
-	.trim()
-	.max(MAX_SENDER_NAME_LENGTH)
-	.refine(isValidSenderName, {
-		message:
-			"Sender name must be printable ASCII without angle brackets or double quotes",
-	});
+const senderNameField = z.string().trim().max(MAX_SENDER_NAME_LENGTH).refine(isValidSenderName, {
+	message: "Sender name must be printable ASCII without angle brackets or double quotes",
+});
 
 export const updateTransactionalApiKeySchema = z.object({
 	// Explicitly nullable: null clears the name back to sending the bare address,
 	// which an operator must be able to do without reissuing the key.
 	senderName: senderNameField.nullable(),
 });
+
+/**
+ * Collection-level template sync. Only the shape, the batch cap and duplicate ids
+ * are checked here; the per-template rules (id characters, CR/LF in subject, body
+ * length) are applied by the mailbox DO — the same function its create route
+ * uses — before it writes anything.
+ */
+export const syncTransactionalTemplatesSchema = z
+	.object({
+		templates: z
+			.array(
+				z.object({
+					id: z.string().min(1),
+					subject: z.string().min(1),
+					body_text: z.string().nullable().optional(),
+					body_html: z.string().nullable().optional(),
+				}),
+			)
+			.max(MAX_TEMPLATE_SYNC_BATCH),
+		archiveMissing: z.boolean().optional(),
+	})
+	.superRefine((body, ctx) => {
+		const seen = new Set<string>();
+		body.templates.forEach((template, index) => {
+			if (seen.has(template.id)) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["templates", index, "id"],
+					message: `duplicate_template_id: ${JSON.stringify(template.id)} appears more than once`,
+				});
+			}
+			seen.add(template.id);
+		});
+	});
 
 export const createTransactionalApiKeySchema = z
 	.object({

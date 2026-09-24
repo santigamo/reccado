@@ -968,9 +968,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			"INSERT INTO api_key_events SELECT id, key_id, event_type, metadata_json, created_at FROM api_key_events_old",
 		);
 		this.ctx.storage.sql.exec("DROP TABLE api_key_events_old");
-		this.ctx.storage.sql.exec(
-			"CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id)",
-		);
+		this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id)");
 	}
 
 	private migrateResolvedViaColumn(): void {
@@ -1151,10 +1149,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				return Response.json({ error: msg }, { status });
 			}
 		}
-		if (
-			url.pathname.match(/^\/transactional\/api-keys\/[^/]+$/) &&
-			request.method === "PATCH"
-		) {
+		if (url.pathname.match(/^\/transactional\/api-keys\/[^/]+$/) && request.method === "PATCH") {
 			const keyId = url.pathname.split("/")[3];
 			if (!keyId) {
 				return Response.json({ error: "key_not_found" }, { status: 404 });
@@ -1386,22 +1381,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 					body_text?: string | null;
 					body_html?: string | null;
 				};
-				if (!body.id || !body.subject) {
-					return Response.json({ error: "id_and_subject_required" }, { status: 400 });
-				}
-				if (body.id.includes("..") || body.id.includes("/") || body.id.includes("\\")) {
-					return Response.json({ error: "invalid_template_id" }, { status: 400 });
-				}
-				if (body.subject.includes("\r") || body.subject.includes("\n")) {
-					return Response.json({ error: "subject_contains_newline" }, { status: 400 });
-				}
-				if (body.body_text && body.body_text.length > 100_000) {
-					return Response.json({ error: "body_text_too_long" }, { status: 400 });
-				}
-				if (body.body_html && body.body_html.length > 100_000) {
-					return Response.json({ error: "body_html_too_long" }, { status: 400 });
-				}
-				const { createTemplate } = await import("./transactional-send-ops");
+				const { createTemplate, templateInputProblem } = await import("./transactional-send-ops");
+				const problem = templateInputProblem(body);
+				if (problem) return Response.json({ error: problem }, { status: 400 });
 				createTemplate(this.ctx.storage.sql, mailboxId, {
 					id: body.id!,
 					subject: body.subject!,
@@ -1445,6 +1427,44 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			} catch (error) {
 				const msg = error instanceof Error ? error.message : String(error);
 				return Response.json({ error: msg }, { status: 400 });
+			}
+		}
+		// Idempotent sync of a caller-owned template list; see `syncTemplates` for
+		// the per-id semantics and why archived ids are reported, not revived.
+		if (url.pathname === "/transactional/templates" && request.method === "PUT") {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const { syncTemplates, TemplateSyncError } = await import("./transactional-send-ops");
+			let body: {
+				templates: import("./transactional-send-ops").TemplateInput[];
+				archiveMissing?: boolean;
+			};
+			try {
+				body = (await request.json()) as typeof body;
+			} catch {
+				return Response.json({ error: "invalid_json" }, { status: 400 });
+			}
+			try {
+				const results = syncTemplates(
+					this.ctx.storage.sql,
+					(fn) => this.ctx.storage.transactionSync(fn),
+					mailboxId,
+					body ?? { templates: [] },
+				);
+				const summary = { created: 0, updated: 0, unchanged: 0, archived: 0 };
+				for (const result of results) summary[result.outcome] += 1;
+				return Response.json({ ok: true, results, summary });
+			} catch (error) {
+				if (error instanceof TemplateSyncError) {
+					return Response.json(
+						{ error: error.code, index: error.index, id: error.templateId },
+						{ status: 400 },
+					);
+				}
+				const msg = error instanceof Error ? error.message : String(error);
+				if (msg.includes("UNIQUE")) {
+					return Response.json({ error: "template_id_already_exists" }, { status: 409 });
+				}
+				return Response.json({ error: msg }, { status: 500 });
 			}
 		}
 		if (url.pathname === "/transactional/templates" && request.method === "GET") {

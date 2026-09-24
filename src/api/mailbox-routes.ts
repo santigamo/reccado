@@ -24,6 +24,7 @@ import {
 	updateTransactionalApiKeySchema,
 	messageActionSchema,
 	searchQuerySchema,
+	syncTransactionalTemplatesSchema,
 	threadListQuerySchema,
 	updateDraftSchema,
 } from "./schemas";
@@ -513,6 +514,26 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			await projectApiKey(c.env, data.key);
 		}
 		return response;
+	});
+
+	// Idempotent template sync: a product that owns its templates in a file sends
+	// the whole list and re-runs it on every deploy. Lives beside the key routes
+	// (not with the per-id template routes in server.ts) because it takes the same
+	// stronger gate they do — D1 owner check on top of the session — and it can
+	// create, rewrite and archive many templates in one call.
+	api.put("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
+		if (ownershipError) return ownershipError;
+		const body = syncTransactionalTemplatesSchema.parse(await c.req.json());
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		return stub.fetch("https://mailbox-do/transactional/templates", {
+			method: "PUT",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
 	});
 
 	api.post("/api/mailboxes/:mailboxId/transactional/reconcile-stale", async (c) => {
