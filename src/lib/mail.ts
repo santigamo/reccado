@@ -138,6 +138,12 @@ export function folderByKey(key: string | undefined): Folder {
 
 async function json<T>(res: Response): Promise<T> {
 	if (!res.ok) {
+		// No session: nothing on this page can work, and an "HTTP 401" card with a
+		// retry button is a dead end — there is no session to sign out of either.
+		// Send the person to the one page that can fix it.
+		if (res.status === 401 && typeof window !== "undefined") {
+			window.location.assign("/login");
+		}
 		throw new Error(`HTTP ${res.status}`);
 	}
 	return (await res.json()) as T;
