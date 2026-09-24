@@ -50,6 +50,11 @@ read/search/draft endpoint.
 
 ### Fixed
 
+- **Template routes require the mailbox to be yours.** Create, list, revise and archive
+  (`/api/mailboxes/:id/transactional/templates[/:templateId[/archive]]`) checked only that the
+  caller was an owner of the deployment, while the key routes — and the docs, for both — also
+  require the mailbox's `owner_email` to be the caller. Templates decide what a live key sends, so
+  they now get the same gate (403 otherwise).
 - **`senderName` is accepted when creating an API key.** The create schema had no such field, so
   zod stripped it: the dashboard form's sender name was silently dropped and operators had to
   create then PATCH. It now takes an optional (nullable) `senderName` with the PATCH route's
