@@ -468,8 +468,10 @@ ownership check):
 
 ```text
 POST/GET /api/mailboxes/{mailboxId}/transactional/templates
+PUT       /api/mailboxes/{mailboxId}/transactional/templates           # idempotent sync of a full list
+PUT       /api/mailboxes/{mailboxId}/transactional/templates/{templateId}
 POST      /api/mailboxes/{mailboxId}/transactional/templates/{templateId}/archive
-POST      /api/mailboxes/{mailboxId}/transactional/api-keys            # returns plaintext key once
+POST      /api/mailboxes/{mailboxId}/transactional/api-keys            # returns plaintext key once; accepts senderName
 GET       /api/mailboxes/{mailboxId}/transactional/api-keys
 POST      /api/mailboxes/{mailboxId}/transactional/api-keys/{keyId}/revoke
 POST      /api/mailboxes/{mailboxId}/transactional/api-keys/{keyId}/rotate

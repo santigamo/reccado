@@ -158,6 +158,17 @@ the UI, Telegram, and MCP surfaces still require `request-send` → `confirm-sen
 - `/api/mailboxes/:mailboxId/transactional/templates` (create/list) and
   `.../templates/:templateId/archive` — versioned per-mailbox templates; Access-protected with
   ownership check.
+- `PUT /api/mailboxes/:mailboxId/transactional/templates` — idempotent sync of a caller-owned
+  list. Body `{ "templates": [{ "id", "subject", "body_text"?, "body_html"? }], "archiveMissing"?:
+  false }` (max 100, unique ids); answers `200 { ok, results: [{ id, outcome, reason? }], summary }`
+  with `outcome` ∈ `created|updated|unchanged|archived`. An omitted body part counts as `null`
+  (the list is the full desired state). An archived id is reported (`reason: already_archived`)
+  and never revived; `archiveMissing: true` archives active templates not listed (`reason:
+  missing_from_sync`). The batch is validated before any write and applied in one DO transaction;
+  a bad entry answers `400 { error, index, id }` and changes nothing. Session + D1 owner gated.
+- Key creation accepts an optional `senderName` (the From display phrase, same validation as the
+  PATCH route) and validates `recipientPolicy`: comma-separated `@domain.tld`, exact address, or
+  `*` pattern with one `@`, each optionally `!`-prefixed to deny; a malformed rule is a `400`.
 
 ### Key format and auth
 

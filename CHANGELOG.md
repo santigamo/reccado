@@ -36,6 +36,13 @@ package.
   `/api/auth/*` created via the zone rulesets API when a zone-scoped `CLOUDFLARE_API_TOKEN` is
   present — or the exact dashboard steps and curl shape printed when it is not. The script never
   fails on a missing token.
+- **Recipient policies are validated when a key is created.** A policy is a comma-separated list
+  of `@domain`, exact-address or `*`-pattern rules (each optionally `!`-negated); a malformed rule
+  (empty entry, whitespace inside a rule, bare `!`, `@nodot`, `foo`) used to be stored and then
+  silently reject every recipient. It now answers `400 validation_error` naming the offending
+  rule, and no key is created. Deny-only policies remain valid. Nothing is normalized.
+- The template create route's per-template checks moved into a shared `templateInputProblem`
+  (same error codes), used by both create and the new sync route.
 
 Security hardening and public-readiness pass on top of the Phase 1 Tier A inbox, plus the
 transactional API (Phases 2–4 of the `docs/plans/transactional-api.md` plan) and the MCP
@@ -43,6 +50,11 @@ read/search/draft endpoint.
 
 ### Fixed
 
+- **`senderName` is accepted when creating an API key.** The create schema had no such field, so
+  zod stripped it: the dashboard form's sender name was silently dropped and operators had to
+  create then PATCH. It now takes an optional (nullable) `senderName` with the PATCH route's
+  header-injection-safe validation and returns it in the response; a bad name answers `400`, not
+  `500`.
 - **Creating an API key through the API no longer loses the key.** The key routes read the
   Durable Object's JSON to project it into D1 and then returned the already-read Response, so every
   successful create answered `500` after the key was stored — the one-time plaintext secret was
@@ -117,6 +129,17 @@ read/search/draft endpoint.
   `operatorFetch`, `operatorJson`, typed `OperatorAuthError` on 401) lives in
   `scripts/lib/operator-session.ts` for later operator scripts. Neither the code nor the cookie is
   ever printed.
+- **Idempotent template sync: `PUT /api/mailboxes/:id/transactional/templates`.** A product that
+  owns its templates in a file sends `{ templates: [{ id, subject, body_text?, body_html? }],
+  archiveMissing? }` on every deploy and gets per-id outcomes — `created`, `unchanged`, `updated`
+  (in place), or `archived`. An archived id in the list is reported (`already_archived`) and left
+  alone rather than revived; `archiveMissing: true` archives active templates not in the list
+  (`missing_from_sync`), the default never archives. The whole batch (max 100, no duplicate ids,
+  the create route's per-template rules) is validated before any write, and the writes run in one
+  DO transaction, so a bad entry changes nothing. Session + D1 owner gated like the key routes.
+- **Router-level coverage of the From display name** —
+  `tests/integration/transactional-send-route.test.ts` sends through `/v1/.../messages` and
+  asserts the provider received `from: { name, email }`.
 - **Telegram: one forum topic per mailbox, not per email thread.** When the bound chat is a
   supergroup with forum mode, each mailbox gets a topic named after the mailbox. Previously a
   topic was created per email thread, named with the email's subject — which let anyone who sent
