@@ -18,6 +18,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { canonicalPrimaryAddress } from "../src/lib/mailbox-id";
+import { literalRoutingRuleArgs } from "./lib/routing";
 
 type WranglerConfig = {
 	name?: string;
@@ -329,23 +330,10 @@ if (catchAll) {
 		await ensureCatchAllRule(worker);
 	}
 } else {
-	runIdempotent("Create the send-to-Worker rule", [
-		"email",
-		"routing",
-		"rules",
-		"create",
-		resolvedDomain,
-		"--match-type",
-		"literal",
-		"--match-field",
-		"to",
-		"--match-value",
-		address,
-		"--action-type",
-		"worker",
-		"--action-value",
-		worker,
-	]);
+	runIdempotent(
+		"Create the send-to-Worker rule",
+		literalRoutingRuleArgs({ zone: resolvedDomain, address, worker }),
+	);
 }
 
 // DNS is the irreducible part — show the records the user must add on their zone.

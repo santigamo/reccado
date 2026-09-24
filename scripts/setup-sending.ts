@@ -77,10 +77,9 @@
  *   - DNS upserts (SPF, DMARC, and — unless --skip-provider-records — DKIM + MX) need
  *     CLOUDFLARE_API_TOKEN in the environment with zone DNS edit access
  */
-import { execFileSync } from "node:child_process";
 import { normalizeTxtContent } from "#/lib/dns-gate";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { deployedVars, parseDomainList } from "./lib/deploy-config";
+import { stripJsonc, type WranglerBlock, type WranglerConfig } from "./lib/deploy-config";
 import { lookupTxt, parseDmarcTags } from "./lib/dmarc";
 import {
 	describeFeedbackVerdict,
@@ -100,22 +99,8 @@ import {
 	SPF_VALUE,
 	selectProviderRecords,
 } from "./lib/sending-plan";
-
-type SendEmailBinding = {
-	name?: string;
-	allowed_sender_addresses?: string[];
-};
-
-type WranglerBlock = {
-	name?: string;
-	vars?: { MAIL_FROM_ADDRESS?: string; MAIL_SENDING_DOMAINS?: string };
-	send_email?: SendEmailBinding[];
-	queues?: { producers?: Array<{ binding: string; queue: string }> };
-};
-
-type WranglerConfig = WranglerBlock & {
-	env?: Record<string, WranglerBlock>;
-};
+import { planSendingConfigUpdate } from "./lib/sending-config";
+import { wrangler, wranglerCapture } from "./lib/wrangler-cli";
 
 type MutableRecord = {
 	id: string;
@@ -172,10 +157,6 @@ function parseArgs(argv: string[]): Record<string, string> {
 	return args;
 }
 
-function stripJsonc(input: string): string {
-	return input.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
-}
-
 function normalizeLocalPart(raw: string | undefined): string {
 	const value = (raw?.trim() || "hello").toLowerCase();
 	if (!/^[a-z0-9._%+-]+$/i.test(value)) {
@@ -183,25 +164,6 @@ function normalizeLocalPart(raw: string | undefined): string {
 		process.exit(1);
 	}
 	return value;
-}
-
-function wrangler(argv: string[], opts: { capture?: boolean } = {}): string {
-	// wrangler prefers CLOUDFLARE_API_TOKEN over the `wrangler login` OAuth session, but this
-	// script sets that token ONLY for its own DNS REST calls (a least-privilege Zone·DNS·Edit
-	// token). wrangler's `email sending` commands need the operator's full account auth, so strip
-	// the token (and the legacy global-key vars) from wrangler's env — it then falls back to the
-	// OAuth session, while the script's own fetch() DNS calls keep using the token.
-	// Node's child_process omits env keys whose value is undefined, so this removes them for the
-	// wrangler subprocess without a `delete` (which trips strict-mode TS on the augmented ProcessEnv).
-	const env: Record<string, string | undefined> = { ...process.env };
-	env.CLOUDFLARE_API_TOKEN = undefined;
-	env.CLOUDFLARE_API_KEY = undefined;
-	env.CLOUDFLARE_EMAIL = undefined;
-	return execFileSync("pnpm", ["wrangler", ...argv], {
-		encoding: "utf8",
-		stdio: opts.capture ? ["ignore", "pipe", "pipe"] : ["ignore", "inherit", "pipe"],
-		env: env as NodeJS.ProcessEnv,
-	});
 }
 
 function runIdempotent(title: string, argv: string[], apply: boolean): void {
@@ -225,26 +187,6 @@ function runIdempotent(title: string, argv: string[], apply: boolean): void {
 		}
 		if (stderr) console.error(stderr);
 		throw error;
-	}
-}
-
-/**
- * Runs wrangler for its output and reports failure as a value. `runIdempotent`
- * throws, which is right for a mutation the operator asked for; the subscription
- * phase instead has to distinguish "not there yet" from "this CLI cannot do it",
- * and both of those are answers, not crashes.
- */
-function wranglerCapture(argv: string[]): { ok: boolean; out: string; err: string } {
-	try {
-		return { ok: true, out: wrangler(argv, { capture: true }), err: "" };
-	} catch (error) {
-		const stderr = (error as { stderr?: unknown })?.stderr;
-		const stdout = (error as { stdout?: unknown })?.stdout;
-		return {
-			ok: false,
-			out: typeof stdout === "string" ? stdout : "",
-			err: typeof stderr === "string" ? stderr : String(error),
-		};
 	}
 }
 
@@ -500,16 +442,9 @@ if (!worker) {
 
 const generatedConfigPath = `wrangler.generated.${envLabel}.json`;
 const sourceConfigPath = existsSync(generatedConfigPath) ? generatedConfigPath : "wrangler.jsonc";
-const mutableConfig = JSON.parse(
-	stripJsonc(readFileSync(sourceConfigPath, "utf8")),
-) as WranglerConfig;
-const mutableBlock: WranglerBlock | undefined = targetEnv
-	? mutableConfig.env?.[targetEnv]
-	: mutableConfig;
-if (!mutableBlock) {
-	console.error(`setup:sending: no config block for env "${envLabel}" in ${sourceConfigPath}.`);
-	process.exit(1);
-}
+const generatedConfig = existsSync(generatedConfigPath)
+	? (JSON.parse(stripJsonc(readFileSync(generatedConfigPath, "utf8"))) as WranglerConfig)
+	: undefined;
 
 /**
  * Adding a sending domain must not reconfigure the ones already there.
@@ -537,41 +472,31 @@ const restrictSenders = Boolean(args["restrict-senders"]);
 // overlay applied — scripts/lib/deploy-config.ts), not from whichever single file
 // happens to exist: a value declared only in wrangler.jsonc must survive this
 // write, or the next deploy would drop it.
-const currentVars = deployedVars(
-	trackedConfig,
-	existsSync(generatedConfigPath) ? mutableConfig : undefined,
-	targetEnv,
-);
-const previousFrom =
-	typeof currentVars.MAIL_FROM_ADDRESS === "string" ? currentVars.MAIL_FROM_ADDRESS : undefined;
-const nextFrom = previousFrom && !setDefaultFrom ? previousFrom : fromAddress;
-const fromAddressPreserved = nextFrom !== fromAddress;
-
-// The list of domains verified for outbound. A mailbox on a listed domain sends
-// as itself; anything else falls back to MAIL_FROM_ADDRESS with a Reply-To. This
-// is a union and never a replacement — it is the one var here that is genuinely
-// additive, and forgetting to extend it is why a freshly provisioned domain would
-// otherwise be verified at Cloudflare but still send under someone else's name.
-const sendingDomains = new Set(parseDomainList(currentVars.MAIL_SENDING_DOMAINS));
-sendingDomains.add(sendingDomain.toLowerCase());
-
-mutableBlock.vars = {
-	...(mutableBlock.vars ?? {}),
-	MAIL_FROM_ADDRESS: nextFrom,
-	MAIL_SENDING_DOMAINS: [...sendingDomains].sort().join(","),
-};
-
-const emailBinding =
-	mutableBlock.send_email?.find((binding) => binding.name === "EMAIL") ??
-	mutableBlock.send_email?.[0];
-const senderAllowListWasUnbounded = emailBinding
-	? emailBinding.allowed_sender_addresses === undefined
-	: false;
-if (emailBinding && (!senderAllowListWasUnbounded || restrictSenders)) {
-	const nextAllowed = new Set(emailBinding.allowed_sender_addresses ?? []);
-	nextAllowed.add(fromAddress);
-	emailBinding.allowed_sender_addresses = [...nextAllowed].sort();
+//
+// MAIL_SENDING_DOMAINS is the list of domains verified for outbound. A mailbox on
+// a listed domain sends as itself; anything else falls back to MAIL_FROM_ADDRESS
+// with a Reply-To. It is a union and never a replacement — forgetting to extend it
+// is why a freshly provisioned domain would otherwise be verified at Cloudflare but
+// still send under someone else's name. The rules live in scripts/lib/sending-config.ts,
+// shared with `pnpm onboard`.
+const configUpdate = planSendingConfigUpdate({
+	tracked: trackedConfig,
+	generated: generatedConfig,
+	env: targetEnv,
+	addDomains: [sendingDomain],
+	fromAddress,
+	addSenders: [fromAddress],
+	setDefaultFrom,
+	restrictSenders,
+});
+if (!configUpdate.ok) {
+	console.error(`setup:sending: ${configUpdate.error} in ${sourceConfigPath}.`);
+	process.exit(1);
 }
+const mutableConfig = configUpdate.value.config;
+const nextFrom = configUpdate.value.nextFrom;
+const fromAddressPreserved = configUpdate.value.fromAddressPreserved;
+const sendingDomains = configUpdate.value.sendingDomains;
 
 console.log(
 	`\nReccado setup:sending — env: ${envLabel} · worker: ${worker}` +
@@ -642,18 +567,16 @@ if (fromAddressPreserved) {
 			"   global fallback. Pass --set-default-from if that is what you want.)",
 	);
 }
-console.log(`  MAIL_SENDING_DOMAINS=${[...sendingDomains].sort().join(",")}`);
-if (!emailBinding) {
+console.log(`  MAIL_SENDING_DOMAINS=${sendingDomains.join(",")}`);
+if (configUpdate.value.emailBinding === "absent") {
 	console.log("  EMAIL.allowed_sender_addresses not updated (no send_email binding found).");
-} else if (senderAllowListWasUnbounded && !restrictSenders) {
+} else if (configUpdate.value.emailBinding === "unbounded" && !restrictSenders) {
 	console.log(
 		"  EMAIL.allowed_sender_addresses left unrestricted (any sender). Narrowing it here would\n" +
 			"   cut off every address already sending. Pass --restrict-senders to opt in.",
 	);
 } else {
-	console.log(
-		`  EMAIL.allowed_sender_addresses=${emailBinding.allowed_sender_addresses?.join(", ")}`,
-	);
+	console.log(`  EMAIL.allowed_sender_addresses=${configUpdate.value.allowedSenders?.join(", ")}`);
 }
 if (apply) {
 	writeFileSync(generatedConfigPath, `${JSON.stringify(mutableConfig, null, 2)}\n`);
