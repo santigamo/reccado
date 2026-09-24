@@ -10,6 +10,7 @@ import {
 	upsertMessageIndex,
 } from "../db/d1";
 import { AppError } from "../lib/errors";
+import type { TransactionalApiKeyProjection } from "../lib/transactional-keys";
 import { confirmDraftSend } from "../lib/outbound-send";
 import { backupManifestR2Key } from "../lib/r2-keys";
 import { CARD_STATUS_FOR_ACTION, enqueueTelegramCardRefresh } from "../telegram/cards";
@@ -312,52 +313,69 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	/**
 	 * Best-effort D1 projection write. Catches and logs failures — D1 is a
 	 * rebuildable index, never the source of truth for API key state.
+	 *
+	 * Takes the key in the camelCase shape the Durable Object returns it in. This
+	 * used to take a snake_case row while every caller handed it the DO's
+	 * camelCase projection, so every column arrived as `undefined` and D1 refused
+	 * the write — the projection had silently never been written by these routes.
 	 */
 	async function projectApiKey(
 		env: Env,
-		row: {
-			key_id: string;
-			mailbox_id: string;
-			sender: string;
-			display_suffix: string;
-			environment: string;
-			scopes: string[];
-			template_allowlist: string[] | null;
-			recipient_policy: string | null;
-			status: string;
-			quota_max: number | null;
-			expires_at: string | null;
-			created_at: string;
-			updated_at: string;
-			revoked_at: string | null;
-		},
+		key: Omit<TransactionalApiKeyProjection, "quotaUsed" | "senderName">,
 	): Promise<void> {
 		try {
 			await upsertApiKeyProjection(env.INDEX_DB, {
-				key_id: row.key_id,
-				mailbox_id: row.mailbox_id,
-				sender: row.sender,
-				display_suffix: row.display_suffix,
-				environment: row.environment as "test" | "live",
-				scopes_json: JSON.stringify(row.scopes),
-				template_allowlist_json: row.template_allowlist
-					? JSON.stringify(row.template_allowlist)
+				key_id: key.keyId,
+				mailbox_id: key.mailboxId,
+				sender: key.sender,
+				display_suffix: key.displaySuffix,
+				environment: key.environment,
+				scopes_json: JSON.stringify(key.scopes),
+				template_allowlist_json: key.templateAllowlist
+					? JSON.stringify(key.templateAllowlist)
 					: null,
-				recipient_policy: row.recipient_policy,
-				quota_max: row.quota_max,
+				recipient_policy: key.recipientPolicy ?? null,
+				quota_max: key.quotaMax ?? null,
 				quota_used: 0,
-				expires_at: row.expires_at,
-				status: row.status as "active" | "revoked",
-				created_at: row.created_at,
-				updated_at: row.updated_at,
-				revoked_at: row.revoked_at,
+				expires_at: key.expiresAt ?? null,
+				status: key.status as "active" | "revoked",
+				created_at: key.createdAt,
+				updated_at: key.updatedAt,
+				revoked_at: key.revokedAt ?? null,
 			});
 		} catch (error) {
 			console.error("api_key_projection_failed", {
-				keyId: row.key_id,
+				keyId: key.keyId,
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+	}
+
+	/**
+	 * Reads a Durable Object JSON response once and hands back both the parsed
+	 * body and a fresh Response carrying the same bytes.
+	 *
+	 * The key routes need to look inside the DO's answer (to project it into D1)
+	 * and then return it. Returning the original Response after `.json()` throws
+	 * "ReadableStream is disturbed" — which turned every successful key creation
+	 * into a 500 AFTER the key was stored, losing the one-time plaintext secret.
+	 */
+	async function readDoJson<T>(
+		doResponse: Response,
+	): Promise<{ data: T | null; response: Response }> {
+		const body = await doResponse.text();
+		let data: T | null = null;
+		if (doResponse.ok) {
+			try {
+				data = JSON.parse(body) as T;
+			} catch {
+				data = null;
+			}
+		}
+		return {
+			data,
+			response: new Response(body, { status: doResponse.status, headers: doResponse.headers }),
+		};
 	}
 
 	async function enforceMailboxOwnership(
@@ -388,50 +406,15 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
 		});
-		if (doResponse.ok) {
-			const data = (await doResponse.json()) as {
-				key?: {
-					keyId?: string;
-					mailboxId?: string;
-					sender?: string;
-					displaySuffix?: string;
-					environment?: string;
-					scopes?: string[];
-					templateAllowlist?: string[] | null;
-					recipientPolicy?: string | null;
-					status?: string;
-					quotaMax?: number | null;
-					expiresAt?: string | null;
-					createdAt?: string;
-					updatedAt?: string;
-					revokedAt?: string | null;
-				};
-				plaintextKey?: string;
-				projection?: unknown;
-			};
-			if (data.projection) {
-				await projectApiKey(c.env, data.projection as Parameters<typeof projectApiKey>[1]);
-			} else if (data.key) {
-				const k = data.key;
-				await projectApiKey(c.env, {
-					key_id: k.keyId!,
-					mailbox_id: k.mailboxId!,
-					sender: k.sender!,
-					display_suffix: k.displaySuffix!,
-					environment: k.environment!,
-					scopes: k.scopes!,
-					template_allowlist: k.templateAllowlist ?? null,
-					recipient_policy: k.recipientPolicy ?? null,
-					status: k.status!,
-					quota_max: k.quotaMax ?? null,
-					expires_at: k.expiresAt ?? null,
-					created_at: k.createdAt!,
-					updated_at: k.updatedAt!,
-					revoked_at: k.revokedAt ?? null,
-				});
-			}
+		const { data, response } = await readDoJson<{
+			key?: TransactionalApiKeyProjection;
+			projection?: TransactionalApiKeyProjection;
+		}>(doResponse);
+		const projection = data?.projection ?? data?.key;
+		if (projection) {
+			await projectApiKey(c.env, projection);
 		}
-		return doResponse;
+		return response;
 	});
 
 	api.get("/api/mailboxes/:mailboxId/transactional/api-keys", async (c) => {
@@ -460,15 +443,13 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 				method: "POST",
 			},
 		);
-		if (doResponse.ok) {
-			const data = (await doResponse.json()) as {
-				key?: { key?: Record<string, unknown>; projection?: unknown };
-			};
-			if (data.key?.projection) {
-				await projectApiKey(c.env, data.key.projection as Parameters<typeof projectApiKey>[1]);
-			}
+		const { data, response } = await readDoJson<{
+			key?: { projection?: TransactionalApiKeyProjection };
+		}>(doResponse);
+		if (data?.key?.projection) {
+			await projectApiKey(c.env, data.key.projection);
 		}
-		return doResponse;
+		return response;
 	});
 
 	/**
@@ -496,14 +477,14 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 				body: JSON.stringify({ senderName: body.senderName }),
 			},
 		);
-		if (doResponse.ok) {
-			const data = (await doResponse.json()) as { key?: { projection?: unknown } };
-			if (data.key?.projection) {
-				// Keep the D1 projection in step; the list view reads from there.
-				await projectApiKey(c.env, data.key.projection as Parameters<typeof projectApiKey>[1]);
-			}
+		const { data, response } = await readDoJson<{
+			key?: { projection?: TransactionalApiKeyProjection };
+		}>(doResponse);
+		if (data?.key?.projection) {
+			// Keep the D1 projection in step; the list view reads from there.
+			await projectApiKey(c.env, data.key.projection);
 		}
-		return doResponse;
+		return response;
 	});
 
 	api.post("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId/rotate", async (c) => {
@@ -520,53 +501,18 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 				method: "POST",
 			},
 		);
-		if (doResponse.ok) {
-			const data = (await doResponse.json()) as {
-				key?: {
-					keyId?: string;
-					mailboxId?: string;
-					sender?: string;
-					displaySuffix?: string;
-					environment?: string;
-					scopes?: string[];
-					templateAllowlist?: string[] | null;
-					recipientPolicy?: string | null;
-					status?: string;
-					quotaMax?: number | null;
-					expiresAt?: string | null;
-					createdAt?: string;
-					updatedAt?: string;
-					revokedAt?: string | null;
-				};
-				previousKeyId?: string;
-				previousKeyProjection?: Parameters<typeof projectApiKey>[1];
-			};
-			// Project old (revoked) key
-			if (data.previousKeyProjection) {
-				await projectApiKey(c.env, data.previousKeyProjection);
-			}
-			// Project new (active) key
-			if (data.key) {
-				const k = data.key;
-				await projectApiKey(c.env, {
-					key_id: k.keyId!,
-					mailbox_id: k.mailboxId!,
-					sender: k.sender!,
-					display_suffix: k.displaySuffix!,
-					environment: k.environment!,
-					scopes: k.scopes!,
-					template_allowlist: k.templateAllowlist ?? null,
-					recipient_policy: k.recipientPolicy ?? null,
-					status: k.status!,
-					quota_max: k.quotaMax ?? null,
-					expires_at: k.expiresAt ?? null,
-					created_at: k.createdAt!,
-					updated_at: k.updatedAt!,
-					revoked_at: k.revokedAt ?? null,
-				});
-			}
+		const { data, response } = await readDoJson<{
+			key?: TransactionalApiKeyProjection;
+			previousKeyProjection?: TransactionalApiKeyProjection;
+		}>(doResponse);
+		// Project old (revoked) key, then the new (active) one.
+		if (data?.previousKeyProjection) {
+			await projectApiKey(c.env, data.previousKeyProjection);
 		}
-		return doResponse;
+		if (data?.key) {
+			await projectApiKey(c.env, data.key);
+		}
+		return response;
 	});
 
 	api.post("/api/mailboxes/:mailboxId/transactional/reconcile-stale", async (c) => {
