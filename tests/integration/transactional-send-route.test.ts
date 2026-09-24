@@ -284,3 +284,92 @@ describe("GET /v1/mailboxes/:id/transactional/messages/:requestId — key authen
 		expect(status.json).toEqual({ error: "not_found" });
 	});
 });
+
+/** Swap this DO instance's EMAIL binding for one that throws `error`; returns the attempt count. */
+async function refuseEmail(mailboxId: string, error: Error): Promise<{ attempts: number }> {
+	const counter = { attempts: 0 };
+	await runInDurableObject(mailboxStub(env, mailboxId), (instance) => {
+		const holder = instance as unknown as { env: Env };
+		const original = holder.env;
+		const fake = {
+			send: async () => {
+				counter.attempts += 1;
+				throw error;
+			},
+		};
+		holder.env = new Proxy(original, {
+			get: (target, prop) => (prop === "EMAIL" ? fake : Reflect.get(target, prop)),
+		});
+	});
+	return counter;
+}
+
+type RequestRow = {
+	status: string;
+	error_code: string | null;
+	variables_json: string | null;
+};
+
+async function requestRow(mailboxId: string, requestId: string): Promise<RequestRow | undefined> {
+	return runInDurableObject(mailboxStub(env, mailboxId), (_instance, state) => {
+		return state.storage.sql
+			.exec<RequestRow>(
+				"SELECT status, error_code, variables_json FROM transactional_requests WHERE request_id = ?",
+				requestId,
+			)
+			.toArray()[0];
+	});
+}
+
+describe("POST /v1/mailboxes/:id/transactional/messages — definite provider refusal", () => {
+	it("answers 502 permanent_failure, settles the row and replays the same result", async () => {
+		const mailboxId = "mbx_route_permanent_failure";
+		const key = await statusKey(mailboxId);
+		await welcomeTemplate(mailboxId);
+		// "rejected" is a non-delivery signal, so isAmbiguousProviderError says definite.
+		const provider = await refuseEmail(mailboxId, new Error("550 5.1.1 recipient rejected"));
+		const payload = { template: "welcome", to: "user@example.com", variables: { name: "Ana" } };
+
+		const first = await sendViaRouter(mailboxId, key, "ik-permanent-1", payload);
+		expect(first.status).toBe(502);
+		expect(first.json).toMatchObject({
+			status: "permanent_failure",
+			keyId: keyIdOf(key),
+			providerMessageId: null,
+			error: "permanent_failure",
+		});
+		const requestId = first.json.requestId as string;
+		expect(requestId).toMatch(/.+/);
+		expect(provider.attempts).toBe(1);
+
+		// Terminal, with the variables purged — they can carry live tokens.
+		expect(await requestRow(mailboxId, requestId)).toEqual({
+			status: "failed",
+			error_code: "permanent_failure",
+			variables_json: null,
+		});
+
+		// A replay answers the same terminal result, not 202, and does not resend.
+		const replay = await sendViaRouter(mailboxId, key, "ik-permanent-1", payload);
+		expect(replay.status).toBe(502);
+		expect(replay.json).toMatchObject({ status: "permanent_failure", requestId });
+		expect(provider.attempts).toBe(1);
+
+		// The stale reconciler only looks at pending/sending rows; a settled one is not its business.
+		const reconciled = await runInDurableObject(
+			mailboxStub(env, mailboxId),
+			async (_instance, state) => {
+				const { reconcileStaleTransactionalRequests } = await import(
+					"#/do/transactional-send-ops"
+				);
+				return reconcileStaleTransactionalRequests(state.storage.sql, "9999-12-31T00:00:00.000Z");
+			},
+		);
+		expect(reconciled.reconciled).toBe(0);
+		expect((await requestRow(mailboxId, requestId))?.status).toBe("failed");
+
+		const status = await statusViaRouter(mailboxId, key, requestId);
+		expect(status.status).toBe(200);
+		expect(status.json).toMatchObject({ status: "failed", errorCode: "permanent_failure" });
+	});
+});

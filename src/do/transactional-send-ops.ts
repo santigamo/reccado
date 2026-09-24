@@ -372,7 +372,7 @@ export async function handleTransactionalSend(
 	const errorCategory = doSendResult.errorCategory ?? null;
 	ctx.sql.exec(
 		"UPDATE transactional_requests SET status = ?, provider_message_id = ?, error_code = ?, variables_json = NULL, updated_at = ? WHERE request_id = ?",
-		doSendResult.status,
+		dbStatusForSendOutcome(doSendResult.status),
 		doSendResult.providerMessageId,
 		errorCategory,
 		new Date().toISOString(),
@@ -901,6 +901,19 @@ function insertTransactionalRequest(
 		row.created_at,
 		row.updated_at,
 	);
+}
+
+/**
+ * The stored status for a send outcome — the inverse of `mapDbStatusToResponse`.
+ *
+ * The two vocabularies differ on one word: the response says `permanent_failure`,
+ * the row says `failed` (the only failure value its CHECK constraint allows, and
+ * the one delivery-event resolution already writes for a provider refusal). The
+ * send path once wrote the response word into the row; the UPDATE threw, the
+ * request surfaced as a 500, and the row stayed `pending` with its variables.
+ */
+function dbStatusForSendOutcome(status: TransactionalResponseStatus): string {
+	return status === "permanent_failure" ? "failed" : status;
 }
 
 function mapDbStatusToResponse(dbStatus: string): TransactionalResponseStatus {
