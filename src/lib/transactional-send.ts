@@ -331,17 +331,54 @@ export type TransactionalSendContext = {
 	fromAddress: string;
 };
 
-/**
- * Payload string used for idempotency hash: key_id + client idempotency key
- * + serialized request body (template, to, variables).
- */
-export async function transactionalPayloadHash(input: {
+export type TransactionalPayloadHashInput = {
 	keyId: string;
 	clientIdempotencyKey: string;
 	template: string;
 	to: string;
 	variables: Record<string, string>;
-}): Promise<string> {
+};
+
+/**
+ * Prefix of the current payload-hash format. Stored hashes without it are
+ * legacy (bare hex) and are compared with `legacyTransactionalPayloadHash`, so a
+ * client retrying a request made before the format changed still replays
+ * instead of hitting a spurious 409.
+ */
+const PAYLOAD_HASH_V2 = "v2:";
+
+/**
+ * Idempotency hash over key id, client idempotency key and the request body
+ * (template, to, variables).
+ *
+ * Variables are hashed as key-sorted `[name, value]` pairs, so the same variables
+ * in a different key order are the same payload — JSON object order is not
+ * something a client retrying a request can be expected to reproduce.
+ */
+export async function transactionalPayloadHash(
+	input: TransactionalPayloadHashInput,
+): Promise<string> {
+	const variables = Object.keys(input.variables)
+		.sort()
+		.map((name) => [name, input.variables[name]]);
+	const canonical = JSON.stringify([
+		input.keyId,
+		input.clientIdempotencyKey,
+		input.template,
+		input.to,
+		variables,
+	]).toLowerCase();
+	return PAYLOAD_HASH_V2 + (await sha256Hex(new TextEncoder().encode(canonical)));
+}
+
+/**
+ * The pre-v2 hash, kept only to recognise rows written before the format
+ * changed. It depended on variable key order (`JSON.stringify` of the object as
+ * received). Never write it.
+ */
+export async function legacyTransactionalPayloadHash(
+	input: TransactionalPayloadHashInput,
+): Promise<string> {
 	const canonical = `${input.keyId}:${input.clientIdempotencyKey}:${JSON.stringify({
 		template: input.template,
 		to: input.to.toLowerCase(),
@@ -349,6 +386,17 @@ export async function transactionalPayloadHash(input: {
 		sortKeys: true,
 	})}`.toLowerCase();
 	return sha256Hex(new TextEncoder().encode(canonical));
+}
+
+/** Whether a stored payload hash — of either format — describes this payload. */
+export async function payloadHashMatches(
+	stored: string,
+	input: TransactionalPayloadHashInput,
+): Promise<boolean> {
+	if (stored.startsWith(PAYLOAD_HASH_V2)) {
+		return stored === (await transactionalPayloadHash(input));
+	}
+	return stored === (await legacyTransactionalPayloadHash(input));
 }
 
 /**

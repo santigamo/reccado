@@ -373,3 +373,88 @@ describe("POST /v1/mailboxes/:id/transactional/messages — definite provider re
 		expect(status.json).toMatchObject({ status: "failed", errorCode: "permanent_failure" });
 	});
 });
+
+/** A `welcome` template with two placeholders, so variable order can differ. */
+async function twoVariableTemplate(mailboxId: string): Promise<void> {
+	const created = await doJson(mailboxId, "/transactional/templates", {
+		id: "welcome",
+		subject: "Hola {{name}}",
+		body_text: "Confirma: {{link}}",
+	});
+	expect(created.status).toBe(201);
+}
+
+describe("POST /v1/mailboxes/:id/transactional/messages — idempotency payload hash", () => {
+	it("replays a retry whose variables arrive in a different key order", async () => {
+		const mailboxId = "mbx_route_idem_order";
+		const key = await liveKey(mailboxId);
+		await twoVariableTemplate(mailboxId);
+		const calls = await recordEmail(mailboxId);
+
+		const first = await sendViaRouter(mailboxId, key, "ik-order-1", {
+			template: "welcome",
+			to: "user@example.com",
+			variables: { name: "Ana", link: "https://x.example/t/1" },
+		});
+		expect(first.status).toBe(200);
+
+		const retry = await sendViaRouter(mailboxId, key, "ik-order-1", {
+			template: "welcome",
+			to: "user@example.com",
+			variables: { link: "https://x.example/t/1", name: "Ana" },
+		});
+		expect(retry.status).toBe(200);
+		expect(retry.json).toMatchObject({ status: "sent", requestId: first.json.requestId });
+		expect(calls).toHaveLength(1);
+	});
+
+	it("still replays a request stored with the pre-v2 hash", async () => {
+		const mailboxId = "mbx_route_idem_legacy";
+		const key = await liveKey(mailboxId);
+		await twoVariableTemplate(mailboxId);
+		const calls = await recordEmail(mailboxId);
+		const payload = {
+			template: "welcome",
+			to: "User@Example.com",
+			variables: { name: "Ana", link: "https://x.example/t/Abc" },
+		};
+		const first = await sendViaRouter(mailboxId, key, "ik-legacy-1", payload);
+		expect(first.status).toBe(200);
+		const requestId = first.json.requestId as string;
+
+		// Rewrite the row as a pre-upgrade deploy would have stored it. The formula is
+		// restated here rather than imported, so this pins what old rows actually hold.
+		const legacyCanonical = `${keyIdOf(key)}:ik-legacy-1:${JSON.stringify({
+			template: payload.template,
+			to: payload.to.toLowerCase(),
+			variables: payload.variables,
+			sortKeys: true,
+		})}`.toLowerCase();
+		const digest = await crypto.subtle.digest(
+			"SHA-256",
+			new TextEncoder().encode(legacyCanonical),
+		);
+		const legacyHash = [...new Uint8Array(digest)]
+			.map((byte) => byte.toString(16).padStart(2, "0"))
+			.join("");
+		await runInDurableObject(mailboxStub(env, mailboxId), (_instance, state) => {
+			state.storage.sql.exec(
+				"UPDATE transactional_requests SET payload_hash = ? WHERE request_id = ?",
+				legacyHash,
+				requestId,
+			);
+		});
+
+		const replay = await sendViaRouter(mailboxId, key, "ik-legacy-1", payload);
+		expect(replay.status).toBe(200);
+		expect(replay.json).toMatchObject({ status: "sent", requestId });
+		expect(calls).toHaveLength(1);
+
+		const different = await sendViaRouter(mailboxId, key, "ik-legacy-1", {
+			...payload,
+			variables: { name: "Eva", link: "https://x.example/t/Abc" },
+		});
+		expect(different.status).toBe(409);
+		expect(calls).toHaveLength(1);
+	});
+});

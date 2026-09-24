@@ -4,6 +4,8 @@ import {
 	transactionalRequestSchema,
 	checkRecipientPolicy,
 	transactionalPayloadHash,
+	legacyTransactionalPayloadHash,
+	payloadHashMatches,
 	validateTemplateVariables,
 	extractTemplateVariables,
 	httpStatusForTransactionalResult,
@@ -410,6 +412,44 @@ describe("transactionalPayloadHash", () => {
 			variables: {},
 		});
 		expect(hash1).not.toBe(hash2);
+	});
+
+	it("does not depend on the order of the variables' keys", async () => {
+		const base = { keyId: "k1", clientIdempotencyKey: "ik1", template: "t1", to: "a@b.com" };
+		const hash1 = await transactionalPayloadHash({ ...base, variables: { a: "1", b: "2" } });
+		const hash2 = await transactionalPayloadHash({ ...base, variables: { b: "2", a: "1" } });
+		expect(hash1).toBe(hash2);
+	});
+
+	it("marks the current format with a v2: prefix", async () => {
+		const hash = await transactionalPayloadHash({
+			keyId: "k1",
+			clientIdempotencyKey: "ik1",
+			template: "t1",
+			to: "a@b.com",
+			variables: {},
+		});
+		expect(hash).toMatch(/^v2:[0-9a-f]{64}$/);
+	});
+
+	it("matches a stored hash in either format, and only for the same payload", async () => {
+		const input = {
+			keyId: "k1",
+			clientIdempotencyKey: "ik1",
+			template: "t1",
+			to: "a@b.com",
+			variables: { a: "1", b: "2" },
+		};
+		const other = { ...input, variables: { a: "1", b: "3" } };
+		const current = await transactionalPayloadHash(input);
+		const legacy = await legacyTransactionalPayloadHash(input);
+		expect(legacy).toMatch(/^[0-9a-f]{64}$/);
+		expect(await payloadHashMatches(current, input)).toBe(true);
+		expect(await payloadHashMatches(legacy, input)).toBe(true);
+		expect(await payloadHashMatches(current, other)).toBe(false);
+		expect(await payloadHashMatches(legacy, other)).toBe(false);
+		// A legacy hash is never mistaken for the current format or vice versa.
+		expect(await payloadHashMatches(`v2:${legacy}`, input)).toBe(false);
 	});
 
 	it("is case-insensitive for email and canonical string", async () => {

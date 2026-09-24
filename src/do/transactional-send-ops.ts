@@ -9,6 +9,7 @@ import {
 	validateTemplateVariables,
 	checkRecipientPolicy,
 	transactionalPayloadHash,
+	payloadHashMatches,
 	type TransactionalSendResult,
 	type TransactionalResponseStatus,
 } from "../lib/transactional-send";
@@ -248,14 +249,16 @@ export async function handleTransactionalSend(
 		};
 	}
 
-	// 19. Compute payload hash for idempotency
-	const payloadHash = await transactionalPayloadHash({
+	// 19. Compute payload hash for idempotency. New rows always get the current
+	// format; a stored row is compared in whichever format it was written in.
+	const hashInput = {
 		keyId: activeKeyId,
 		clientIdempotencyKey,
 		template: templateId,
 		to,
 		variables,
-	});
+	};
+	const payloadHash = await transactionalPayloadHash(hashInput);
 
 	// 20. Idempotency check — atomic reservation
 	const requestId = crypto.randomUUID();
@@ -265,7 +268,7 @@ export async function handleTransactionalSend(
 	// Check for existing request
 	const existingRequest = getTransactionalRequest(ctx.sql, activeKeyId, clientIdempotencyKey);
 	if (existingRequest) {
-		if (existingRequest.payload_hash === payloadHash) {
+		if (await payloadHashMatches(existingRequest.payload_hash, hashInput)) {
 			return {
 				status: mapDbStatusToResponse(existingRequest.status),
 				requestId: existingRequest.request_id,
@@ -324,7 +327,7 @@ export async function handleTransactionalSend(
 		// Re-check for existing and handle accordingly.
 		const reExisting = getTransactionalRequest(ctx.sql, activeKeyId, clientIdempotencyKey);
 		if (reExisting) {
-			if (reExisting.payload_hash === payloadHash) {
+			if (await payloadHashMatches(reExisting.payload_hash, hashInput)) {
 				return {
 					status: mapDbStatusToResponse(reExisting.status),
 					requestId: reExisting.request_id,
