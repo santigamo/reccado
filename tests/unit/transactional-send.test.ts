@@ -286,6 +286,28 @@ describe("checkRecipientPolicy", () => {
 		const result = checkRecipientPolicy("other@example.com", "!blocked@example.com");
 		expect(result.allowed).toBe(true);
 	});
+
+	// The wildcard used to escape the dot of the `.*` it had just produced, so
+	// `*@example.com` compiled to `\.*@example\.com` and matched nothing real.
+	it("matches a wildcard local part", () => {
+		expect(checkRecipientPolicy("user@example.com", "*@example.com").allowed).toBe(true);
+		expect(checkRecipientPolicy("user@other.com", "*@example.com").allowed).toBe(false);
+	});
+
+	it("matches a wildcard inside the local part", () => {
+		expect(checkRecipientPolicy("qa+run1@example.com", "qa+*@example.com").allowed).toBe(true);
+		expect(checkRecipientPolicy("qa@example.com", "qa+*@example.com").allowed).toBe(false);
+	});
+
+	it("treats dots in a wildcard rule literally", () => {
+		expect(checkRecipientPolicy("user@exampleXcom", "*@example.com").allowed).toBe(false);
+	});
+
+	it("applies a wildcard deny rule", () => {
+		const result = checkRecipientPolicy("bot@example.com", "!*@example.com,user@other.com");
+		expect(result.allowed).toBe(false);
+		expect(result.reason).toBe("denied_by_policy");
+	});
 });
 
 describe("transactionalPayloadHash", () => {

@@ -251,7 +251,11 @@ function matchRule(canonical: string, rule: string): boolean {
 		return canonical.endsWith(normalized);
 	}
 	if (normalized.includes("*")) {
-		const pattern = new RegExp(`^${normalized.replace(/\*/g, ".*").replace(/\./g, "\\.")}$`);
+		// Escape every regex metacharacter first, then turn the (now escaped) `*`
+		// back into `.*`. The other order escaped the dot of the `.*` it had just
+		// produced, so `*@example.com` matched nothing a real address looks like.
+		const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		const pattern = new RegExp(`^${escaped.replace(/\\\*/g, ".*")}$`);
 		return pattern.test(canonical);
 	}
 	return canonical === normalized;
