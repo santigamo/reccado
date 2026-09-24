@@ -1,0 +1,14 @@
+[
+	{
+		"id": "magic-link",
+		"subject": "Your sign-in link for Example",
+		"body_text": "Sign in to Example:\n{{url}}\n\nThe link expires in {{expires_in}} and works once. If you did not ask for it, ignore this email.",
+		"body_html": "<p>Sign in to Example:</p><p><a href=\"{{url}}\">Sign in</a></p><p>The link expires in {{expires_in}} and works once. If you did not ask for it, ignore this email.</p>"
+	},
+	{
+		"id": "receipt",
+		"subject": "Your Example receipt",
+		"body_text": "Thanks for your purchase of {{item}}.\nTotal: {{total}}\n\nQuestions? Reply to this email.",
+		"body_html": null
+	}
+]

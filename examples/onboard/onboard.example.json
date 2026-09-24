@@ -1,0 +1,38 @@
+{
+	"zone": "example.com",
+	"sending": {
+		"subdomain": "send",
+		"apex": true,
+		"dmarc": { "policy": "none", "rua": "dmarc@example.com" }
+	},
+	"mailbox": {
+		"address": "support@example.com",
+		"displayName": "Example",
+		"aliases": ["privacy@example.com", "dmarc@example.com"]
+	},
+	"templates": { "file": "./templates.example.json", "archiveMissing": false },
+	"keys": [
+		{
+			"name": "preview",
+			"sender": "hello@send.example.com",
+			"senderName": "Example",
+			"scopes": ["transactional:send", "transactional:templates:use", "transactional:status"],
+			"templates": "all",
+			"recipientPolicy": "me@example.org,@example.com",
+			"quotaMax": 50,
+			"store": {
+				"onePassword": { "vault": "Private", "title": "Example Reccado API key (preview)" }
+			}
+		},
+		{
+			"name": "production",
+			"sender": "hello@send.example.com",
+			"senderName": "Example",
+			"scopes": ["transactional:send", "transactional:templates:use", "transactional:status"],
+			"templates": "all",
+			"store": {
+				"onePassword": { "vault": "Private", "title": "Example Reccado API key (production)" }
+			}
+		}
+	]
+}
