@@ -43,6 +43,21 @@ read/search/draft endpoint.
 
 ### Fixed
 
+- **Creating an API key through the API no longer loses the key.** The key routes read the
+  Durable Object's JSON to project it into D1 and then returned the already-read Response, so every
+  successful create answered `500` after the key was stored — the one-time plaintext secret was
+  gone and the key had to be revoked. Revoke, rotate and the sender-name PATCH had the same shape.
+  The D1 projection was also built from snake_case fields the DO never sends, so it was never
+  written by these routes. Covered end to end through the router in
+  `tests/integration/transactional-api-key-routes.test.ts`.
+- **Transactional mail now carries the key's From display name.** The send path loaded the key
+  through a mapper that dropped `sender_name`, so every key sent as a bare address whatever name it
+  was configured with (`Eccos <…>` and `Transcribo <…>` went out as the address alone).
+- **Wildcard recipient policies match.** `*@example.com` compiled to `\.*@example\.com` — the
+  escape ran after the `*` → `.*` substitution and escaped its dot — so a wildcard rule matched no
+  real address and an allow-list written that way rejected everyone. `@example.com` was unaffected.
+- **Signed-out pages send you to `/login`** instead of a "Failed to load mailboxes: HTTP 401" card
+  with no way forward and no session to sign out of.
 - **Reccado no longer reads "no delivery event" as evidence about a message.** Delivery outcomes
   arrive through Cloudflare Email Sending event subscriptions, and a sending domain without one
   produces no events for anything — so `delivery_status` stays null forever, an `unknown` never
