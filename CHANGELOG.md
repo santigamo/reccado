@@ -124,6 +124,20 @@ read/search/draft endpoint.
 
 ### Added
 
+- **`pnpm smoke:transactional` — an end-to-end smoke test against a deployed environment.** The
+  four transactional bugs fixed above shipped with every unit/integration test green because those
+  tests call the mailbox Durable Object directly; this drives the real HTTP surface instead, as
+  the operator (`pnpm operator` session, `/api/*`) and as an integrator (Bearer key, `/v1/*`).
+  Without `--send` it only checks the session and that the mailbox answers, and prints the plan.
+  With `--send` it creates a throwaway template and a narrow LIVE key (recipient policy = exactly
+  `--to`, quota 5, expires in 1h), asserts 201 + `plaintextKey` + listed, sets `senderName` via
+  PATCH, sends one real message, replays it with the same `Idempotency-Key` (same `requestId` and
+  `providerMessageId`), proves an off-policy recipient is refused `not_allowed_by_policy`, reads
+  status and `deliveryFeedback` (optionally polling with `--wait-delivery N`; silence is only a
+  failure when feedback liveness is `live`), and always revokes the key and archives the template,
+  printing hand-cleanup commands if that fails. The plaintext key is never printed. Pure logic in
+  `scripts/lib/smoke-transactional-core.ts`, tested in `tests/unit/smoke-transactional.test.ts`.
+
 - **`pnpm operator login|whoami|logout` — control-plane sessions from the terminal.** Automates
   the pairing-code rescue: mints a single-use 256-bit code into `owner_pairing_codes` via
   `wrangler d1 execute` (only if the email is already in `owner_identities`, unless

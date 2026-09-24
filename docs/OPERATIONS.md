@@ -592,6 +592,51 @@ Scripts should import `scripts/lib/operator-session.ts`: `requireSession(host)` 
 add the cookie, the `Origin` header the CSRF check requires, and a JSON content-type, and throw
 `OperatorAuthError` (with the login command in its message) on a 401.
 
+## Transactional smoke test
+
+`pnpm smoke:transactional` exercises the transactional API on a deployed environment through the
+same HTTP surface people use: the operator session (`pnpm operator login`) for `/api/*` key and
+template admin, and a Bearer key for the integrator's `/v1/*` calls. It exists because the unit
+and integration suites call the mailbox Durable Object directly and so could not see the create-
+key 500, the missing From display name, or the wildcard policy bug.
+
+```bash
+pnpm operator login --env dev --host <custom-host>
+pnpm smoke:transactional --env dev --host <custom-host> --mailbox <mbx_...> \
+  --sender <address on a verified sending domain> --to <recipient> \
+  [--sender-name "Reccado smoke"] [--send] [--wait-delivery <seconds>]
+pnpm operator logout --host <custom-host>
+```
+
+Without `--send` it checks the session (`get-session`) and that the mailbox answers
+`GET .../transactional/api-keys`, prints the plan, and exits; nothing is created or sent. With
+`--send`, each step prints `PASS`/`FAIL`/`WARN` with its evidence:
+
+1. `POST .../templates` a throwaway `smoke-<ms>` template (unique token in the subject, `{{token}}`
+   in both bodies).
+2. `POST .../api-keys` a LIVE key: scopes `send`, `templates:use`, `status`; allowlist = that
+   template; `recipientPolicy` = exactly `--to`; `quotaMax` 5; `expiresAt` now + 1h. Asserts 201,
+   a `plaintextKey` in the body, and that `GET .../api-keys` lists it active.
+3. `PATCH .../api-keys/:keyId { senderName }`; asserts both the PATCH and a re-read report it.
+4. `POST /v1/.../messages` to `--to`; asserts 200 `sent` with a `providerMessageId`.
+5. The identical request with the same `Idempotency-Key`; asserts the same `requestId` and
+   `providerMessageId` (a real second send always gets a fresh `requestId`).
+6. Same key, new `Idempotency-Key`, `to` = `smoke-reject@example.invalid`; asserts 403
+   `not_allowed_by_policy` with no request reserved.
+7. `GET /v1/.../messages/:requestId`; prints `status`, `deliveryStatus` and `deliveryFeedback`.
+   With `--wait-delivery N` it polls every 5 s for a terminal delivery event. `delivered` passes,
+   `bounced`/`complained`/`rejected`/`failed` fail, and **no event is a `FAIL` only when
+   `deliveryFeedback.state` is `live`**; otherwise it is a `WARN` naming the liveness state,
+   because silence on a domain without a working feedback channel says nothing about the message.
+8. Always, even after a failure: revoke the key and archive the template. If either fails it
+   prints the ids and `curl` commands (reading the cookie from the session file) to finish by hand.
+
+It exits non-zero if any step failed. The plaintext key lives only in memory and is redacted from
+every error. What it cannot check: the From display name and SPF/DKIM/DMARC are only visible in
+the delivered message, so it ends with the `providerMessageId` and a reminder to confirm those in
+the recipient's mailbox. Each `--send` run sends exactly one real message and leaves a revoked key
+and an archived template in the mailbox's history.
+
 ## Admin/ops endpoints
 
 All require an authenticated, authorized Access identity:

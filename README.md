@@ -326,6 +326,20 @@ the first `OWNER_BOOTSTRAP_EMAILS` entry when set locally. Scripts reuse
 cookie and the `Origin` header mutating `/api/*` routes require, and throw `OperatorAuthError`
 on a 401).
 
+To prove the transactional API works end to end on a **deployed** environment (not just against
+the Durable Object, which is all the test suite exercises), run the smoke test with that session:
+
+```bash
+pnpm smoke:transactional --env dev --host inbox.<you.com> --mailbox <mbx_...> \
+  --sender hello@send.<you.com> --to you@<you.com>            # read-only checks + plan
+pnpm smoke:transactional ... --send [--wait-delivery 60]    # one real send, then cleanup
+```
+
+`--send` creates a throwaway template and a live key locked to `--to` (quota 5, 1h), sends one
+message, checks replay, policy rejection and status, and always revokes and archives what it made.
+Confirm in the recipient's mailbox that From shows the sender name and SPF/DKIM/DMARC pass. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-smoke-test).
+
 See [`SECURITY.md`](SECURITY.md) for the model.
 
 ### 3. Verify
