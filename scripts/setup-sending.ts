@@ -6,7 +6,8 @@
  * SAFETY: dry-run by default. It prints the exact commands and DNS/API mutations it would make.
  * Pass `--apply` to enable Email Sending for the target subdomain, upsert the DNS records Reccado
  * can own confidently (SPF + DMARC, and — with a token — the provider-generated DKIM + MX records
- * too), and write `wrangler.generated.<env>.json` with MAIL_FROM_ADDRESS + allowed_sender_addresses.
+ * too), and write `wrangler.generated.<env>.json` with MAIL_FROM_ADDRESS, MAIL_SENDING_DOMAINS
+ * and (only with --restrict-senders, or an existing list) allowed_sender_addresses.
  *
  * PREFLIGHT: sending to arbitrary external recipients requires a Workers Paid plan (free-plan
  * accounts can only send to verified destination addresses). The script prints a loud reminder
@@ -56,6 +57,20 @@
  *   pnpm setup:sending --env dev --domain example.com --dmarc-rua dmarc@example.com --apply
  *   pnpm setup:sending --env dev --domain example.com --dmarc-policy quarantine --dmarc-alignment strict --apply
  *   pnpm setup:sending --env dev --domain example.com --skip-provider-records --apply
+ *   pnpm setup:sending --env dev --domain example.com --apex --dmarc-policy none --dmarc-rua dmarc@example.com
+ *
+ * Zone apex (`--apex`, or `--subdomain @`): for a mailbox on the organizational domain itself
+ * (support@example.com) that should reply as itself. Same steps — enable, SPF/DKIM/MX on
+ * `cf-bounce.<zone>` / `cf-bounce._domainkey.<zone>`, the 6-event subscription, the
+ * MAIL_SENDING_DOMAINS union — with one difference: `_dmarc.<zone>` governs EVERY sender using the
+ * domain, so there is no default policy. `--dmarc-policy` is required, the current record is
+ * printed (read before Email Sending auto-creates its `p=reject`) next to the planned one, and a
+ * dropped `rua` is called out. This is a human declaration at the CLI; the Worker's own DMARC
+ * ramp (src/lib/dns-gate.ts) still never touches an apex.
+ *
+ * Shipping: nothing here reaches the running Worker until `pnpm run deploy:dev` (or
+ * `pnpm run deploy`) overlays `wrangler.generated.<env>.json` onto the build — see
+ * scripts/lib/deploy-config.ts for which fields that file owns.
  *
  * Apply mode notes:
  *   - `wrangler email sending enable/get` uses your local Wrangler auth (`pnpm wrangler login`)
@@ -63,14 +78,10 @@
  *     CLOUDFLARE_API_TOKEN in the environment with zone DNS edit access
  */
 import { execFileSync } from "node:child_process";
-import {
-	buildDmarcValue,
-	type DmarcAlignment,
-	type DmarcPolicy,
-	normalizeTxtContent,
-} from "#/lib/dns-gate";
+import { normalizeTxtContent } from "#/lib/dns-gate";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { deployedVars, parseDomainList } from "./lib/deploy-config";
+import { lookupTxt, parseDmarcTags } from "./lib/dmarc";
 import {
 	describeFeedbackVerdict,
 	EMAIL_SENDING_EVENT_TYPES,
@@ -80,6 +91,15 @@ import {
 	parseQueueListTable,
 	parseSubscriptionListJson,
 } from "./lib/event-subscriptions";
+import {
+	normalizeZone,
+	type ParsedDnsRecord,
+	parseWranglerDnsGetOutput,
+	resolveDmarcPlan,
+	resolveSendingTarget,
+	SPF_VALUE,
+	selectProviderRecords,
+} from "./lib/sending-plan";
 
 type SendEmailBinding = {
 	name?: string;
@@ -124,15 +144,6 @@ type MxRecordRequest = {
 	comment?: string;
 };
 
-// A record parsed out of `wrangler email sending dns get <domain>`'s plain-text output (there is
-// no --json mode for this open-beta command). `priority` is only present on MX records.
-type ParsedDnsRecord = {
-	type: "MX" | "TXT";
-	name: string;
-	content: string;
-	priority?: number;
-};
-
 type CloudflareEnvelope<T> = {
 	success: boolean;
 	errors: Array<{ code: number; message: string }>;
@@ -165,41 +176,6 @@ function stripJsonc(input: string): string {
 	return input.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 }
 
-function requireArg(value: string | undefined, flag: string): string {
-	const trimmed = value?.trim();
-	if (!trimmed) {
-		console.error(`setup:sending: ${flag} is required.`);
-		process.exit(1);
-	}
-	return trimmed;
-}
-
-function assertDomain(value: string, flag: string): string {
-	const normalized = value.trim().toLowerCase().replace(/\.$/, "");
-	if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(normalized)) {
-		console.error(`setup:sending: invalid ${flag} "${value}".`);
-		process.exit(1);
-	}
-	return normalized;
-}
-
-function normalizeSubdomain(raw: string | undefined, zoneDomain: string): string {
-	const fallback = raw?.trim() || "send";
-	const lowered = fallback.toLowerCase().replace(/\.$/, "");
-	const relative = lowered.endsWith(`.${zoneDomain}`)
-		? lowered.slice(0, -`.${zoneDomain}`.length)
-		: lowered;
-	if (!relative || relative === "@" || relative.includes("@")) {
-		console.error(`setup:sending: invalid --subdomain "${fallback}".`);
-		process.exit(1);
-	}
-	if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/i.test(relative)) {
-		console.error(`setup:sending: invalid --subdomain "${fallback}".`);
-		process.exit(1);
-	}
-	return relative;
-}
-
 function normalizeLocalPart(raw: string | undefined): string {
 	const value = (raw?.trim() || "hello").toLowerCase();
 	if (!/^[a-z0-9._%+-]+$/i.test(value)) {
@@ -207,30 +183,6 @@ function normalizeLocalPart(raw: string | undefined): string {
 		process.exit(1);
 	}
 	return value;
-}
-
-function buildDmarcValueFromArgs(policy: string, alignment: string, rua?: string): string {
-	const normalizedPolicy = policy.toLowerCase();
-	if (!["none", "quarantine", "reject"].includes(normalizedPolicy)) {
-		console.error(
-			`setup:sending: invalid --dmarc-policy "${policy}" (use none|quarantine|reject).`,
-		);
-		process.exit(1);
-	}
-	const normalizedAlignment = alignment.toLowerCase();
-	if (!["relaxed", "strict"].includes(normalizedAlignment)) {
-		console.error(`setup:sending: invalid --dmarc-alignment "${alignment}" (use relaxed|strict).`);
-		process.exit(1);
-	}
-	// The string itself is built by the gate, not here. If the CLI and the Worker
-	// spelled the same policy differently by so much as a space, each would see the
-	// other's record as foreign and rewrite it, and the domain would flap between
-	// two policies on every run.
-	return buildDmarcValue(
-		normalizedPolicy as DmarcPolicy,
-		normalizedAlignment as DmarcAlignment,
-		rua,
-	);
 }
 
 function wrangler(argv: string[], opts: { capture?: boolean } = {}): string {
@@ -487,122 +439,46 @@ async function upsertMxRecord(opts: {
 	console.log("  Created MX record.");
 }
 
-function stripSurroundingQuotes(value: string): string {
-	const trimmed = value.trim();
-	if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
-		return trimmed.slice(1, -1);
-	}
-	return trimmed;
-}
-
-/**
- * Parses the plain-text output of `wrangler email sending dns get <sending-domain>`. This is an
- * open-beta Wrangler command with no `--json` mode (passing `--json` errors with
- * "Unknown argument: json"), so this is the only way to get structured data out of it. The output
- * looks like:
- *
- *   MX record:
- *     Name:     cf-bounce.send.example.com
- *     Content:  route1.mx.cloudflare.net.
- *     Priority: 71
- *     TTL:      1
- *
- * We key off the stable "MX record:" / "TXT record:" block headers and the indented
- * "Name:"/"Content:"/"Priority:"/"TTL:" field labels. That naturally skips the Wrangler version
- * banner and open-beta notice printed above the first block, since neither line matches either
- * pattern — no separate banner-stripping step is needed. Blocks missing a Name/Content (or, for
- * MX, a parseable Priority) are skipped rather than throwing, since this is scraping a
- * human-readable CLI format that could change shape without notice.
- */
-function parseWranglerDnsGetOutput(output: string): ParsedDnsRecord[] {
-	const records: ParsedDnsRecord[] = [];
-	let current: { type: "MX" | "TXT"; fields: Record<string, string> } | null = null;
-
-	const flush = () => {
-		const block = current;
-		current = null;
-		if (!block) return;
-		const name = block.fields.name?.trim();
-		const rawContent = block.fields.content?.trim();
-		if (!name || !rawContent) return; // malformed block — skip defensively
-		if (block.type === "MX") {
-			const priority = Number.parseInt(block.fields.priority ?? "", 10);
-			if (Number.isNaN(priority)) return; // malformed MX block — skip defensively
-			records.push({ type: "MX", name, content: rawContent, priority });
-			return;
-		}
-		records.push({ type: "TXT", name, content: stripSurroundingQuotes(rawContent) });
-	};
-
-	for (const line of output.split(/\r?\n/)) {
-		const header = line.trim().match(/^(MX|TXT) record:$/i);
-		if (header) {
-			flush();
-			const label = header[1]?.toUpperCase();
-			current = label === "MX" || label === "TXT" ? { type: label, fields: {} } : null;
-			continue;
-		}
-		if (!current) continue;
-		const field = line.match(/^\s{2,}(Name|Content|Priority|TTL):\s*(.*)$/);
-		if (field?.[1]) {
-			current.fields[field[1].toLowerCase()] = field[2] ?? "";
-		}
-	}
-	flush();
-	return records;
-}
-
-/**
- * Selects only the provider-generated records this script does not already own: the DKIM TXT
- * (`*._domainkey.<sending-domain>`, content `v=DKIM1...`) and the MX records on
- * `cf-bounce.<sending-domain>`. This is an allowlist, not a denylist, so the SPF TXT
- * (`cf-bounce.<sending-domain>`, `v=spf1...`, already upserted separately above) and the DMARC TXT
- * (`_dmarc.<sending-domain>`) are excluded by construction — never by matching against the
- * provider's suggested policy value — which is what guarantees the provider's `p=reject` DMARC
- * suggestion can never overwrite this script's own DMARC ramp.
- */
-function selectProviderRecords(
-	records: ParsedDnsRecord[],
-	sendingDomain: string,
-): { dkim?: ParsedDnsRecord; mx: ParsedDnsRecord[] } {
-	const bounceDomain = `cf-bounce.${sendingDomain}`.toLowerCase();
-	const dkim = records.find(
-		(record) =>
-			record.type === "TXT" &&
-			record.name.toLowerCase().includes("._domainkey.") &&
-			record.content.trim().toLowerCase().startsWith("v=dkim1"),
-	);
-	const mx = records.filter(
-		(record) => record.type === "MX" && record.name.toLowerCase() === bounceDomain,
-	);
-	return { dkim, mx };
-}
-
 const args = parseArgs(process.argv.slice(2));
 const apply = args.apply === "true";
 const skipProviderRecords = args["skip-provider-records"] === "true";
 const skipEventSubscription = args["skip-event-subscription"] === "true";
 const targetEnv = args.env;
 const envLabel = targetEnv ?? "production";
-const zoneDomain = assertDomain(requireArg(args.domain, "--domain"), "--domain");
-const subdomain = normalizeSubdomain(args.subdomain, zoneDomain);
+function orExit<T>(result: { ok: true; value: T } | { ok: false; error: string }): T {
+	if (!result.ok) {
+		console.error(`setup:sending: ${result.error}`);
+		process.exit(1);
+	}
+	return result.value;
+}
+const zoneDomain = orExit(normalizeZone(args.domain));
+const target = orExit(
+	resolveSendingTarget({
+		zone: zoneDomain,
+		subdomain: args.subdomain,
+		apex: args.apex === "true",
+	}),
+);
 const fromLocalPart = normalizeLocalPart(args["from-local-part"]);
 const rua = args["dmarc-rua"]?.trim();
-const dmarcPolicy = (args["dmarc-policy"] ?? "none").trim().toLowerCase();
-const dmarcAlignment = (args["dmarc-alignment"] ?? "relaxed").trim().toLowerCase();
-const dmarcValue = buildDmarcValueFromArgs(dmarcPolicy, dmarcAlignment, rua);
-if (dmarcPolicy === "none" && !rua) {
-	console.warn(
-		'\nWARNING: --dmarc-policy is "none" (monitor mode) and no --dmarc-rua was provided, so ' +
-			"you will receive no DMARC aggregate reports and won't be able to observe DKIM/SPF " +
-			"alignment before ramping to quarantine/reject. Pass --dmarc-rua you@example.com to fix this.\n",
-	);
+const dmarcPlan = orExit(
+	resolveDmarcPlan({
+		target,
+		policy: args["dmarc-policy"],
+		alignment: args["dmarc-alignment"],
+		rua,
+	}),
+);
+const dmarcValue = dmarcPlan.value;
+for (const warning of dmarcPlan.warnings) {
+	console.warn(`\nWARNING: ${warning}\n`);
 }
-const sendingDomain = `${subdomain}.${zoneDomain}`;
+const sendingDomain = target.sendingDomain;
 const fromAddress = `${fromLocalPart}@${sendingDomain}`;
-const bounceDomain = `cf-bounce.${sendingDomain}`;
-const dmarcDomain = `_dmarc.${sendingDomain}`;
-const spfValue = "v=spf1 include:_spf.mx.cloudflare.net ~all";
+const bounceDomain = target.bounceDomain;
+const dmarcDomain = target.dmarcDomain;
+const spfValue = SPF_VALUE;
 const token = process.env.CLOUDFLARE_API_TOKEN?.trim();
 
 const trackedConfig = JSON.parse(
@@ -700,7 +576,7 @@ if (emailBinding && (!senderAllowListWasUnbounded || restrictSenders)) {
 console.log(
 	`\nReccado setup:sending — env: ${envLabel} · worker: ${worker}` +
 		`\nzone: ${zoneDomain}` +
-		`\nsending domain: ${sendingDomain}` +
+		`\nsending domain: ${sendingDomain}${target.isApex ? " (ZONE APEX)" : ""}` +
 		`\nfrom address: ${fromAddress}` +
 		`\nmode: ${apply ? "APPLY (mutating Cloudflare + generated config)" : "dry run (no changes)"}\n`,
 );
@@ -719,8 +595,37 @@ console.log(
 );
 console.log(`${"═".repeat(72)}\n`);
 
+// The apex DMARC is read BEFORE anything is enabled: enabling Email Sending on a
+// name is what auto-creates `v=DMARC1; p=reject;` there, so reading afterwards
+// would show the provider's record and hide what the operator actually had.
+if (target.isApex) {
+	const current = await lookupTxt(dmarcDomain);
+	const currentDmarc = (current ?? []).filter((txt) => parseDmarcTags(txt) !== null);
+	const currentText =
+		current === null
+			? `(could not resolve — check it yourself: dig +short TXT ${dmarcDomain})`
+			: currentDmarc.length === 0
+				? "(none)"
+				: currentDmarc.join("  |  ");
+	console.log(`${"═".repeat(72)}`);
+	console.log(`APEX: ${zoneDomain} — its DMARC governs every sender using @${zoneDomain}`);
+	console.log(`${"═".repeat(72)}`);
+	console.log(`  current ${dmarcDomain}: ${currentText}`);
+	console.log(`  planned ${dmarcDomain}: ${dmarcValue}`);
+	const droppedRua = currentDmarc
+		.map((txt) => parseDmarcTags(txt)?.rua)
+		.filter((value): value is string => Boolean(value));
+	if (droppedRua.length > 0 && !rua) {
+		console.warn(
+			`  WARNING: the current record sends aggregate reports to ${droppedRua.join(", ")}; the planned\n` +
+				"  one sends them nowhere. Pass --dmarc-rua to keep them (the mailto: prefix is added for you).",
+		);
+	}
+	console.log(`${"═".repeat(72)}\n`);
+}
+
 runIdempotent(
-	"Enable Cloudflare Email Sending for the sending subdomain",
+	`Enable Cloudflare Email Sending for ${target.isApex ? "the zone apex" : "the sending subdomain"} ${sendingDomain}`,
 	["email", "sending", "enable", sendingDomain],
 	apply,
 );
@@ -783,7 +688,9 @@ if (apply && token && zoneId) {
 		name: dmarcDomain,
 		styleLabel: "DMARC",
 		desiredContent: dmarcValue,
-		comment: "Reccado setup:sending managed DMARC for dedicated sending subdomain",
+		comment: target.isApex
+			? "Reccado setup:sending managed DMARC for the zone apex (explicit --dmarc-policy)"
+			: "Reccado setup:sending managed DMARC for dedicated sending subdomain",
 		ownsRecord: (record) =>
 			normalizeTxtContent(record.content).toLowerCase().startsWith("v=dmarc1"),
 		// Cloudflare Email Sending provisions its own DMARC; collapse to a single record.
