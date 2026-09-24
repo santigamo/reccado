@@ -32,8 +32,8 @@
  *   pnpm setup:cloud --env dev --domain you.com --address inbox@you.com --apply  # provision + deploy + seed
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { BUILT_CONFIG_PATH, patchBuiltConfig } from "./lib/built-config";
 
 type WranglerBlock = {
 	name?: string;
@@ -193,78 +193,6 @@ for (const queueToCreate of allQueues) {
 }
 runIdempotent("Create D1 database", ["d1", "create", d1Name]);
 
-// 5. Resolve the real D1 id and render a gitignored deploy config with it — we never edit the
-// tracked wrangler.jsonc, and the env-scoped binding gets the real id (not a placeholder).
-type MutableBlock = {
-	name?: string;
-	vars?: WranglerBlock["vars"];
-	workers_dev?: WranglerBlock["workers_dev"];
-	triggers?: WranglerBlock["triggers"];
-	send_email?: WranglerBlock["send_email"];
-	durable_objects?: WranglerBlock["durable_objects"];
-	r2_buckets?: WranglerBlock["r2_buckets"];
-	queues?: WranglerBlock["queues"];
-	d1_databases?: Array<{
-		binding?: string;
-		database_name?: string;
-		database_id?: string;
-		migrations_dir?: string;
-	}>;
-	migrations?: WranglerBlock["migrations"];
-	compatibility_date?: WranglerBlock["compatibility_date"];
-	compatibility_flags?: WranglerBlock["compatibility_flags"];
-	observability?: WranglerBlock["observability"];
-	upload_source_maps?: WranglerBlock["upload_source_maps"];
-	configPath?: string;
-	userConfigPath?: string;
-	[k: string]: unknown;
-};
-type MutableConfig = MutableBlock & { env?: Record<string, MutableBlock> };
-
-function readJson<T>(path: string): T {
-	return JSON.parse(readFileSync(path, "utf8")) as T;
-}
-
-function buildEffectiveWranglerBlock(config: MutableConfig, env: string | undefined): MutableBlock {
-	if (!env) return config;
-	const envBlock = config.env?.[env];
-	if (!envBlock) {
-		throw new Error(`No config block for env "${env}" in generated Wrangler config.`);
-	}
-	return {
-		...config,
-		...envBlock,
-		vars: envBlock.vars ?? config.vars,
-		workers_dev: envBlock.workers_dev ?? config.workers_dev,
-		triggers: envBlock.triggers ?? config.triggers,
-		send_email: envBlock.send_email ?? config.send_email,
-		durable_objects: envBlock.durable_objects ?? config.durable_objects,
-		r2_buckets: envBlock.r2_buckets ?? config.r2_buckets,
-		queues: envBlock.queues ?? config.queues,
-		d1_databases: envBlock.d1_databases ?? config.d1_databases,
-		migrations: envBlock.migrations ?? config.migrations,
-		compatibility_date: envBlock.compatibility_date ?? config.compatibility_date,
-		compatibility_flags: envBlock.compatibility_flags ?? config.compatibility_flags,
-		observability: envBlock.observability ?? config.observability,
-		upload_source_maps: envBlock.upload_source_maps ?? config.upload_source_maps,
-	};
-}
-
-function patchD1Databases(builtConfig: MutableBlock, generatedBlock: MutableBlock): void {
-	if (!generatedBlock.d1_databases) return;
-	const builtDbs = builtConfig.d1_databases ?? [];
-	builtConfig.d1_databases = generatedBlock.d1_databases.map((generatedDb) => {
-		const builtDb = builtDbs.find((db) => db.binding === generatedDb.binding);
-		return {
-			...generatedDb,
-			// Vite rewrites this path for dist/server/wrangler.json. Keep that relative path,
-			// otherwise `wrangler d1 migrations apply --config dist/server/wrangler.json`
-			// looks under dist/server/migrations instead of the repo's migrations directory.
-			migrations_dir: builtDb?.migrations_dir ?? generatedDb.migrations_dir,
-		};
-	});
-}
-
 function buildAppForDeploy(): void {
 	const displayPrefix = targetEnv ? `CLOUDFLARE_ENV=${targetEnv} ` : "";
 	console.log(`\n▸ Build app for deploy\n  $ ${displayPrefix}pnpm run build`);
@@ -276,43 +204,15 @@ function buildAppForDeploy(): void {
 }
 
 function patchBuiltWranglerConfig(generatedConfigPath: string): void {
-	const builtConfigPath = "dist/server/wrangler.json";
-	console.log(
-		`\n▸ Patch built Wrangler config\n  source: ${generatedConfigPath}\n  target: ${builtConfigPath}`,
-	);
 	if (!apply) {
 		console.log(
-			"  → would copy real bindings + ids into the built Worker config before migrate/deploy",
+			`\n▸ Overlay generated config onto the build\n  source: ${generatedConfigPath}\n  target: ${BUILT_CONFIG_PATH}\n  → would apply the real D1 id (and any vars/route other setup scripts wrote) before migrate/deploy`,
 		);
 		return;
 	}
-	const generatedConfig = readJson<MutableConfig>(generatedConfigPath);
-	const generatedBlock = buildEffectiveWranglerBlock(generatedConfig, targetEnv);
-	const builtConfig = readJson<MutableBlock>(builtConfigPath);
-	for (const key of [
-		"name",
-		"vars",
-		"workers_dev",
-		"triggers",
-		"send_email",
-		"durable_objects",
-		"r2_buckets",
-		"queues",
-		"migrations",
-		"compatibility_date",
-		"compatibility_flags",
-		"observability",
-		"upload_source_maps",
-	] as const) {
-		const nextValue = generatedBlock[key];
-		if (nextValue !== undefined) {
-			(builtConfig as Record<string, unknown>)[key] = nextValue;
-		}
-	}
-	patchD1Databases(builtConfig, generatedBlock);
-	builtConfig.configPath = resolve(generatedConfigPath);
-	builtConfig.userConfigPath = resolve(generatedConfigPath);
-	writeFileSync(builtConfigPath, `${JSON.stringify(builtConfig, null, 2)}\n`);
+	// The one overlay every deploy path uses (scripts/lib/built-config.ts): the
+	// generated file wins for the fields it owns, wrangler.jsonc for the rest.
+	patchBuiltConfig(targetEnv);
 }
 
 function collectConsumerWorkerNames(value: unknown, names = new Set<string>()): Set<string> {
@@ -389,7 +289,10 @@ if (apply) {
 		);
 		process.exit(1);
 	}
-	const full = JSON.parse(stripJsonc(readFileSync("wrangler.jsonc", "utf8"))) as MutableConfig;
+	// Update the existing generated file rather than re-snapshotting wrangler.jsonc over it:
+	// a fresh snapshot silently erased what setup:sending / setup:domain had written there.
+	const renderSource = existsSync(generatedConfigPath) ? generatedConfigPath : "wrangler.jsonc";
+	const full = JSON.parse(stripJsonc(readFileSync(renderSource, "utf8"))) as WranglerConfig;
 	const targetBlock = targetEnv ? full.env?.[targetEnv] : full;
 	const d1Entry = targetBlock?.d1_databases?.find((d) => d.binding === "INDEX_DB");
 	if (d1Entry) d1Entry.database_id = resolvedD1Id;
@@ -402,8 +305,7 @@ if (apply) {
 	);
 }
 
-const builtConfigPath = "dist/server/wrangler.json";
-const builtConfigFlag = ["--config", builtConfigPath];
+const builtConfigFlag = ["--config", BUILT_CONFIG_PATH];
 
 // 6. Build the app for the chosen env so deploy targets the TanStack/Vite output.
 buildAppForDeploy();

@@ -13,6 +13,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { BUILT_CONFIG_PATH, patchBuiltConfig } from "./lib/built-config";
 
 type Route = {
 	pattern: string;
@@ -183,52 +184,7 @@ if (!worker || !d1Name) {
 
 const generatedConfigPath = `wrangler.generated.${envLabel}.json`;
 const sourceConfigPath = existsSync(generatedConfigPath) ? generatedConfigPath : "wrangler.jsonc";
-const builtConfigPath = "dist/server/wrangler.json";
-
-function readJson<T>(path: string): T {
-	return JSON.parse(readFileSync(path, "utf8")) as T;
-}
-
-function buildEffectiveWranglerBlock(
-	config: WranglerConfig,
-	env: string | undefined,
-): WranglerBlock {
-	if (!env) return config;
-	const envBlock = config.env?.[env];
-	if (!envBlock) {
-		throw new Error(`No config block for env "${env}" in ${generatedConfigPath}.`);
-	}
-	return {
-		...config,
-		...envBlock,
-		vars: envBlock.vars ?? config.vars,
-		workers_dev: envBlock.workers_dev ?? config.workers_dev,
-		routes: envBlock.routes ?? config.routes,
-		triggers: envBlock.triggers ?? config.triggers,
-		send_email: envBlock.send_email ?? config.send_email,
-		durable_objects: envBlock.durable_objects ?? config.durable_objects,
-		r2_buckets: envBlock.r2_buckets ?? config.r2_buckets,
-		queues: envBlock.queues ?? config.queues,
-		d1_databases: envBlock.d1_databases ?? config.d1_databases,
-		migrations: envBlock.migrations ?? config.migrations,
-		compatibility_date: envBlock.compatibility_date ?? config.compatibility_date,
-		compatibility_flags: envBlock.compatibility_flags ?? config.compatibility_flags,
-		observability: envBlock.observability ?? config.observability,
-		upload_source_maps: envBlock.upload_source_maps ?? config.upload_source_maps,
-	};
-}
-
-function patchD1Databases(builtConfig: WranglerBlock, generatedBlock: WranglerBlock): void {
-	if (!generatedBlock.d1_databases) return;
-	const builtDbs = builtConfig.d1_databases ?? [];
-	builtConfig.d1_databases = generatedBlock.d1_databases.map((generatedDb) => {
-		const builtDb = builtDbs.find((db) => db.binding === generatedDb.binding);
-		return {
-			...generatedDb,
-			migrations_dir: builtDb?.migrations_dir ?? generatedDb.migrations_dir,
-		};
-	});
-}
+const builtConfigPath = BUILT_CONFIG_PATH;
 
 function buildAppForDeploy(): void {
 	const displayPrefix = targetEnv ? `CLOUDFLARE_ENV=${targetEnv} ` : "";
@@ -241,41 +197,15 @@ function buildAppForDeploy(): void {
 }
 
 function patchBuiltWranglerConfig(): void {
-	console.log(
-		`\n▸ Patch built Wrangler config\n  source: ${generatedConfigPath}\n  target: ${builtConfigPath}`,
-	);
 	if (!apply) {
-		console.log("  → would copy the custom-domain route into the built Worker config");
+		console.log(
+			`\n▸ Overlay generated config onto the build\n  source: ${generatedConfigPath}\n  target: ${builtConfigPath}\n  → would apply the fields ${generatedConfigPath} owns (vars, D1 id, sender allow-list,\n    custom-domain route); wrangler.jsonc keeps owning every binding and queue`,
+		);
 		return;
 	}
-	const generatedConfig = readJson<WranglerConfig>(generatedConfigPath);
-	const generatedBlock = buildEffectiveWranglerBlock(generatedConfig, targetEnv);
-	const builtConfig = readJson<WranglerBlock>(builtConfigPath);
-	for (const key of [
-		"name",
-		"vars",
-		"workers_dev",
-		"routes",
-		"triggers",
-		"send_email",
-		"durable_objects",
-		"r2_buckets",
-		"queues",
-		"migrations",
-		"compatibility_date",
-		"compatibility_flags",
-		"observability",
-		"upload_source_maps",
-	] as const) {
-		const nextValue = generatedBlock[key];
-		if (nextValue !== undefined) {
-			(builtConfig as Record<string, unknown>)[key] = nextValue;
-		}
-	}
-	patchD1Databases(builtConfig, generatedBlock);
-	builtConfig.configPath = generatedConfigPath;
-	builtConfig.userConfigPath = generatedConfigPath;
-	writeFileSync(builtConfigPath, `${JSON.stringify(builtConfig, null, 2)}\n`);
+	// Same overlay `pnpm run deploy[:dev]` uses, so the custom-domain deploy and
+	// every later routine deploy ship the same thing.
+	patchBuiltConfig(targetEnv);
 }
 
 console.log(

@@ -70,6 +70,7 @@ import {
 	normalizeTxtContent,
 } from "#/lib/dns-gate";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { deployedVars, parseDomainList } from "./lib/deploy-config";
 import {
 	describeFeedbackVerdict,
 	EMAIL_SENDING_EVENT_TYPES,
@@ -656,7 +657,17 @@ if (!mutableBlock) {
 const setDefaultFrom = Boolean(args["set-default-from"]);
 const restrictSenders = Boolean(args["restrict-senders"]);
 
-const previousFrom = mutableBlock.vars?.MAIL_FROM_ADDRESS;
+// Read from what a deploy of this env WILL ship (tracked vars with the generated
+// overlay applied — scripts/lib/deploy-config.ts), not from whichever single file
+// happens to exist: a value declared only in wrangler.jsonc must survive this
+// write, or the next deploy would drop it.
+const currentVars = deployedVars(
+	trackedConfig,
+	existsSync(generatedConfigPath) ? mutableConfig : undefined,
+	targetEnv,
+);
+const previousFrom =
+	typeof currentVars.MAIL_FROM_ADDRESS === "string" ? currentVars.MAIL_FROM_ADDRESS : undefined;
 const nextFrom = previousFrom && !setDefaultFrom ? previousFrom : fromAddress;
 const fromAddressPreserved = nextFrom !== fromAddress;
 
@@ -665,12 +676,7 @@ const fromAddressPreserved = nextFrom !== fromAddress;
 // is a union and never a replacement — it is the one var here that is genuinely
 // additive, and forgetting to extend it is why a freshly provisioned domain would
 // otherwise be verified at Cloudflare but still send under someone else's name.
-const sendingDomains = new Set(
-	(mutableBlock.vars?.MAIL_SENDING_DOMAINS ?? "")
-		.split(",")
-		.map((entry) => entry.trim().toLowerCase())
-		.filter(Boolean),
-);
+const sendingDomains = new Set(parseDomainList(currentVars.MAIL_SENDING_DOMAINS));
 sendingDomains.add(sendingDomain.toLowerCase());
 
 mutableBlock.vars = {
@@ -1115,11 +1121,23 @@ if (skipEventSubscription) {
 			"ever reaches the suppression mirror.",
 	);
 }
+// Nothing above reaches the running Worker: MAIL_SENDING_DOMAINS and friends live in
+// the generated file until a deploy overlays it onto the build. Say exactly which
+// command does that — the previous wording pointed at setup:domain while the
+// command operators actually ran (deploy:dev) ignored the generated file.
+const deployCommand =
+	targetEnv === "dev"
+		? "pnpm run deploy:dev"
+		: targetEnv
+			? `pnpm exec tsx scripts/deploy.ts --env ${targetEnv}`
+			: "pnpm run deploy";
 console.log(
-	`- Re-deploy through the setup scripts when you want the Worker to use ${fromAddress}; they build the TanStack app and patch dist/server/wrangler.json from ${generatedConfigPath}.`,
+	`- ${apply ? "Ship it" : "After --apply, ship it"}: the Worker only sees MAIL_SENDING_DOMAINS=${[...sendingDomains].sort().join(",")} after a deploy that overlays ${generatedConfigPath} onto the build.`,
 );
+console.log(`    ${deployCommand} --dry-run   # prints the overlay + bindings, uploads nothing`);
+console.log(`    ${deployCommand}`);
 console.log(
-	`    pnpm setup:domain${targetEnv ? ` --env ${targetEnv}` : ""} --hostname app.<your-domain> --apply`,
+	`  Then confirm the deployed config agrees with Email Sending: pnpm doctor${targetEnv ? ` --env ${targetEnv}` : ""} --cloud`,
 );
 console.log(
 	"- Sending to arbitrary recipients still requires a Workers Paid plan; verified-destination-only accounts remain limited by Cloudflare.",
