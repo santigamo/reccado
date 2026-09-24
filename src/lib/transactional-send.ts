@@ -354,6 +354,12 @@ const PAYLOAD_HASH_V2 = "v2:";
  * Variables are hashed as key-sorted `[name, value]` pairs, so the same variables
  * in a different key order are the same payload — JSON object order is not
  * something a client retrying a request can be expected to reproduce.
+ *
+ * Only the recipient is case-folded, the same canonical form the recipient
+ * policy matches on. Everything else is hashed exactly: the legacy hash
+ * lower-cased the whole string, so a reused idempotency key carrying a
+ * different magic-link token (`…/t/Token` vs `…/t/TOKEN`) replayed the first
+ * result and the new email was silently never sent.
  */
 export async function transactionalPayloadHash(
 	input: TransactionalPayloadHashInput,
@@ -365,16 +371,19 @@ export async function transactionalPayloadHash(
 		input.keyId,
 		input.clientIdempotencyKey,
 		input.template,
-		input.to,
+		input.to.trim().toLowerCase(),
 		variables,
-	]).toLowerCase();
+	]);
 	return PAYLOAD_HASH_V2 + (await sha256Hex(new TextEncoder().encode(canonical)));
 }
 
 /**
  * The pre-v2 hash, kept only to recognise rows written before the format
  * changed. It depended on variable key order (`JSON.stringify` of the object as
- * received). Never write it.
+ * received) and lower-cased everything, values included. Never write it. A
+ * legacy row therefore still treats case-only variable differences as the same
+ * payload — the stored hash cannot tell them apart — which ages out with the
+ * rows themselves.
  */
 export async function legacyTransactionalPayloadHash(
 	input: TransactionalPayloadHashInput,

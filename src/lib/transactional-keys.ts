@@ -260,7 +260,10 @@ export async function verifyApiKeySecret(
 	return constantTimeEqual(computedHash, record.keyHash);
 }
 
-export function isApiKeyExpired(record: TransactionalApiKeyRecord, now: Date = new Date()): boolean {
+export function isApiKeyExpired(
+	record: TransactionalApiKeyRecord,
+	now: Date = new Date(),
+): boolean {
 	return !!record.expiresAt && new Date(record.expiresAt) <= now;
 }
 

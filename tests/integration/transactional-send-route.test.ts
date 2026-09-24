@@ -359,9 +359,7 @@ describe("POST /v1/mailboxes/:id/transactional/messages — definite provider re
 		const reconciled = await runInDurableObject(
 			mailboxStub(env, mailboxId),
 			async (_instance, state) => {
-				const { reconcileStaleTransactionalRequests } = await import(
-					"#/do/transactional-send-ops"
-				);
+				const { reconcileStaleTransactionalRequests } = await import("#/do/transactional-send-ops");
 				return reconcileStaleTransactionalRequests(state.storage.sql, "9999-12-31T00:00:00.000Z");
 			},
 		);
@@ -408,6 +406,41 @@ describe("POST /v1/mailboxes/:id/transactional/messages — idempotency payload 
 		expect(calls).toHaveLength(1);
 	});
 
+	it("treats variables that differ only in letter case as a different payload", async () => {
+		const mailboxId = "mbx_route_idem_case";
+		const key = await liveKey(mailboxId);
+		await twoVariableTemplate(mailboxId);
+		const calls = await recordEmail(mailboxId);
+
+		const first = await sendViaRouter(mailboxId, key, "ik-case-1", {
+			template: "welcome",
+			to: "user@example.com",
+			variables: { name: "Ana", link: "https://x.example/t/Token" },
+		});
+		expect(first.status).toBe(200);
+
+		// A different magic-link token under a reused key must not silently replay
+		// the first result — that would report "sent" for an email never sent.
+		const reused = await sendViaRouter(mailboxId, key, "ik-case-1", {
+			template: "welcome",
+			to: "user@example.com",
+			variables: { name: "Ana", link: "https://x.example/t/TOKEN" },
+		});
+		expect(reused.status).toBe(409);
+		expect(reused.json.error).toBe("idempotency_key_already_used_with_different_payload");
+		expect(calls).toHaveLength(1);
+
+		// The recipient address is still compared case-insensitively.
+		const sameRecipient = await sendViaRouter(mailboxId, key, "ik-case-1", {
+			template: "welcome",
+			to: "User@Example.COM",
+			variables: { name: "Ana", link: "https://x.example/t/Token" },
+		});
+		expect(sameRecipient.status).toBe(200);
+		expect(sameRecipient.json.requestId).toBe(first.json.requestId);
+		expect(calls).toHaveLength(1);
+	});
+
 	it("still replays a request stored with the pre-v2 hash", async () => {
 		const mailboxId = "mbx_route_idem_legacy";
 		const key = await liveKey(mailboxId);
@@ -430,10 +463,7 @@ describe("POST /v1/mailboxes/:id/transactional/messages — idempotency payload 
 			variables: payload.variables,
 			sortKeys: true,
 		})}`.toLowerCase();
-		const digest = await crypto.subtle.digest(
-			"SHA-256",
-			new TextEncoder().encode(legacyCanonical),
-		);
+		const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(legacyCanonical));
 		const legacyHash = [...new Uint8Array(digest)]
 			.map((byte) => byte.toString(16).padStart(2, "0"))
 			.join("");

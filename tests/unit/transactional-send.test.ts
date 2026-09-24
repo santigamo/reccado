@@ -452,7 +452,7 @@ describe("transactionalPayloadHash", () => {
 		expect(await payloadHashMatches(`v2:${legacy}`, input)).toBe(false);
 	});
 
-	it("is case-insensitive for email and canonical string", async () => {
+	it("is case-insensitive for the recipient address", async () => {
 		const hash1 = await transactionalPayloadHash({
 			keyId: "k1",
 			clientIdempotencyKey: "ik1",
@@ -468,6 +468,39 @@ describe("transactionalPayloadHash", () => {
 			variables: {},
 		});
 		expect(hash1).toBe(hash2);
+	});
+
+	it("hashes variable values exactly — a token differing only in case is a different payload", async () => {
+		const base = { keyId: "k1", clientIdempotencyKey: "ik1", template: "t1", to: "a@b.com" };
+		const hash1 = await transactionalPayloadHash({ ...base, variables: { token: "Token" } });
+		const hash2 = await transactionalPayloadHash({ ...base, variables: { token: "TOKEN" } });
+		expect(hash1).not.toBe(hash2);
+	});
+
+	it("hashes variable names and the template id exactly", async () => {
+		const base = { keyId: "k1", clientIdempotencyKey: "ik1", to: "a@b.com" };
+		const byName1 = await transactionalPayloadHash({
+			...base,
+			template: "t1",
+			variables: { a: "1" },
+		});
+		const byName2 = await transactionalPayloadHash({
+			...base,
+			template: "t1",
+			variables: { A: "1" },
+		});
+		expect(byName1).not.toBe(byName2);
+		const byTemplate1 = await transactionalPayloadHash({
+			...base,
+			template: "welcome",
+			variables: {},
+		});
+		const byTemplate2 = await transactionalPayloadHash({
+			...base,
+			template: "Welcome",
+			variables: {},
+		});
+		expect(byTemplate1).not.toBe(byTemplate2);
 	});
 });
 
