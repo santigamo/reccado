@@ -159,6 +159,7 @@
 			// deliberately not set here.
 			"vars": {
 				"MAIL_FROM_ADDRESS": "noreply@send.imsanti.dev",
+				"MAIL_SENDING_DOMAINS": "send.transcribo.es,transcribo.es",
 				"MAILBOX_JURISDICTION": "eu"
 			},
 			"triggers": {
