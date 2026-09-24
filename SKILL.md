@@ -228,11 +228,16 @@ If you use the manual path, you own the two sharp edges the scripted flow is des
   `MAIL_FROM_ADDRESS`. DMARC defaults to `p=none` (monitor mode, relaxed alignment) as the start of
   a none → quarantine → reject ramp (`--dmarc-policy`, `--dmarc-alignment strict`); with
   `CLOUDFLARE_API_TOKEN` it also auto-adds the provider's DKIM/MX records unless
-  `--skip-provider-records` is passed. It does not alter the send-security invariant.
-- **`wrangler --env` still using the placeholder D1 id**: `--env` alone still reads the tracked
-  `wrangler.jsonc`. Prefer `setup:cloud`, which patches the built deploy config from
-  `wrangler.generated.<env>.json`; use `deploy:dev` only after the config path Wrangler reads has a
-  real D1 id.
+  `--skip-provider-records` is passed. `--apex` (or `--subdomain @`) targets the zone apex for a
+  mailbox that must reply as itself; there `--dmarc-policy` is required, because the apex DMARC
+  governs every sender on the domain. Ship with `pnpm run deploy:dev` afterwards, then check with
+  `pnpm doctor --env dev --cloud`. It does not alter the send-security invariant.
+- **Generated config not reaching the Worker**: raw `wrangler deploy --env <env>` reads only the
+  tracked `wrangler.jsonc` — not the real D1 id, not the `MAIL_SENDING_DOMAINS` `setup:sending`
+  wrote. Always ship with `pnpm run deploy:dev` / `pnpm run deploy`: they build, overlay
+  `wrangler.generated.<env>.json` (generated wins for vars, D1 id, sender allow-list and a
+  `setup:domain` route; `wrangler.jsonc` wins for every binding and queue), print what was applied,
+  and refuse to deploy if the patched file does not carry it. `--dry-run` previews without upload.
 - **Old seed data when seeding a mailbox**: current `setup:mailbox` reuses the existing
   `domains.id` by domain name. If it still fails after manual/older seeds, inspect
   `mailboxes`, `aliases`, and `routing_rules`. D1 is the only source of truth for `mailbox_id`:

@@ -60,6 +60,24 @@ read/search/draft endpoint.
   create then PATCH. It now takes an optional (nullable) `senderName` with the PATCH route's
   header-injection-safe validation and returns it in the response; a bad name answers `400`, not
   `500`.
+- **`pnpm run deploy:dev` ships what `setup:sending` wrote.** It ran `wrangler deploy --env dev`
+  against the tracked `wrangler.jsonc` and never read `wrangler.generated.<env>.json`, so
+  `MAIL_SENDING_DOMAINS` written there never reached the Worker — for any domain — and
+  `setup:sending`'s closing text pointed at a different deploy path (`setup:domain`). Both
+  `deploy` and `deploy:dev` now run `scripts/deploy.ts`: build, overlay the generated file onto
+  `dist/server/wrangler.json`, print every value applied, re-read the file and refuse to deploy if
+  it does not carry them, then `wrangler deploy --config dist/server/wrangler.json`. `--dry-run`
+  stops at `wrangler deploy --dry-run`. **Precedence:** the generated file wins for the fields it
+  owns (`vars` per variable, D1 `database_id`, `send_email[].allowed_sender_addresses`, and
+  `routes` + `workers_dev` when `setup:domain` wrote routes); `wrangler.jsonc` wins for everything
+  structural, and disagreements there are printed as ignored.
+- **`setup:domain` and `setup:cloud` no longer deploy a stale snapshot's bindings.** Their patch
+  step copied queues, Durable Objects, migrations and vars wholesale from the generated file — a
+  snapshot of `wrangler.jsonc` taken whenever it was first rendered. The live dev one still had a
+  single queue producer, so the next `setup:domain --apply` would have deployed without
+  `EMAIL_EVENTS_QUEUE` and `NOTIFY_QUEUE` and reopened workers.dev. They now use the same overlay
+  as `deploy`, and `setup:cloud` updates the D1 id in an existing generated file instead of
+  re-snapshotting over what `setup:sending`/`setup:domain` wrote.
 - **Creating an API key through the API no longer loses the key.** The key routes read the
   Durable Object's JSON to project it into D1 and then returned the already-read Response, so every
   successful create answered `500` after the key was stored — the one-time plaintext secret was
@@ -159,6 +177,18 @@ read/search/draft endpoint.
 - **Router-level coverage of the From display name** —
   `tests/integration/transactional-send-route.test.ts` sends through `/v1/.../messages` and
   asserts the provider received `from: { name, email }`.
+- **`setup:sending --apex`** (or `--subdomain @`) provisions Email Sending on the zone apex, for a
+  mailbox on the organizational domain that replies as itself — previously rejected and done by
+  hand. Same enable / SPF / DKIM / MX / 6-event subscription / `MAIL_SENDING_DOMAINS` steps; the
+  apex DMARC governs every sender on the domain, so `--dmarc-policy` is required there, the
+  current record is printed next to the planned one before Email Sending auto-creates its
+  `p=reject`, and a `rua` the new record would drop is called out. Dry-run stays the default.
+- **`pnpm doctor --cloud` checks the deployed `MAIL_SENDING_DOMAINS` against Email Sending**
+  (fail: an entry not enabled in the account; warn: an enabled domain subscribed to the events
+  queue but not declared) **and each `_dmarc.<name>`** over DNS-over-HTTPS (warn on the provider's
+  auto-created `v=DMARC1; p=reject;`, on `quarantine`/`reject` without `rua`, and on zero or
+  multiple records). Offline `pnpm doctor` gains `config.deploy-overlay`, which shows what the
+  generated file overrides at deploy time.
 - **Telegram: one forum topic per mailbox, not per email thread.** When the bound chat is a
   supergroup with forum mode, each mailbox gets a topic named after the mailbox. Previously a
   topic was created per email thread, named with the email's subject — which let anyone who sent

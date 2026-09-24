@@ -215,12 +215,23 @@ pnpm wrangler queues create <your-inbound-dlq>
 pnpm wrangler d1 create <your-index-db-name> --location=weur   # or maintain your own deploy config
 pnpm d1:migrate:dev                                            # D1_DB_NAME_DEV=<db> to override the name
 pnpm setup:auth --env dev --url https://inbox-dev.<you.com>    # generates + uploads BETTER_AUTH_SECRET (step 2)
-pnpm run deploy:dev                                           # build + wrangler deploy --env dev --name reccado-dev
+pnpm run deploy:dev                                           # build, overlay wrangler.generated.dev.json, deploy (--dry-run to preview)
 ```
 
 The Durable Object (`MAILBOX_DO`) needs no create step — Wrangler provisions it from the
 `migrations` block on first deploy. Seed the first mailbox with `pnpm setup:mailbox` once D1 is
-migrated. Drop `--env dev` (and use `deploy` / `d1:migrate:prod`) for production. Every secret is
+migrated. Drop `--env dev` (and use `deploy` / `d1:migrate:prod`) for production.
+
+`pnpm run deploy[:dev]` is the one deploy path (`scripts/deploy.ts`): it builds, then overlays the
+gitignored `wrangler.generated.<env>.json` the setup scripts write onto `dist/server/wrangler.json`.
+**Precedence:** the generated file wins for the fields it owns — `vars` (per variable; tracked-only
+vars are kept), the real D1 `database_id`, `send_email[].allowed_sender_addresses`, and
+`routes` + `workers_dev` (only when `setup:domain` wrote routes). `wrangler.jsonc` wins for
+everything structural (bindings, queues, Durable Objects, migrations, compat flags), and any
+structural field where the generated file disagrees is printed as *ignored*. Every value it applies
+is printed, the patched file is re-read, and the deploy refuses to run if it does not carry them.
+`pnpm run deploy:dev --dry-run` does the build and overlay for real and runs
+`wrangler deploy --dry-run` (prints bindings, uploads nothing). Every secret is
 documented in [`.dev.vars.example`](.dev.vars.example) and
 [Configuration](#configuration); full detail in [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md).
 
@@ -257,7 +268,22 @@ part you must add yourself** (check status with `pnpm wrangler email routing set
 ```bash
 pnpm setup:sending --env dev --domain <you.com>                                     # dry run, hello@send.<you.com>
 pnpm setup:sending --env dev --domain <you.com> --dmarc-rua you@<you.com> --apply   # start the DMARC ramp with reports
+pnpm setup:sending --env dev --domain <you.com> --apex --from-local-part support \
+  --dmarc-policy none --dmarc-rua dmarc@<you.com>                                   # zone apex (support@<you.com>); dry run
+pnpm run deploy:dev                                                                 # ship MAIL_SENDING_DOMAINS to the Worker
 ```
+
+Nothing `setup:sending` writes reaches the running Worker until `pnpm run deploy[:dev]` overlays
+`wrangler.generated.<env>.json` onto the build (see [Provision and deploy](#1-provision-and-deploy-pick-one) for the precedence).
+
+**Zone apex** (`--apex`, or `--subdomain @`) is for a mailbox on the organizational domain itself
+that should reply as itself. Same steps as a subdomain — Email Sending enabled on the zone name,
+SPF/DKIM/MX on `cf-bounce.<zone>` / `cf-bounce._domainkey.<zone>`, the 6-event subscription, the
+`MAIL_SENDING_DOMAINS` union — except DMARC: `_dmarc.<zone>` governs **every** sender using the
+domain, so `--dmarc-policy` is **required** (no default), the current record is printed next to the
+planned one, and a `rua` the new record would drop is called out. Enabling Email Sending on any name
+auto-creates `v=DMARC1; p=reject;` there; the script overrides it only for the name it manages, and
+`pnpm doctor --cloud` flags it anywhere else.
 
 Every run prints a loud **Workers Paid** preflight first: Cloudflare Email Sending on a free plan
 can only send to *verified destination addresses* — sending to arbitrary recipients requires a
@@ -594,14 +620,15 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
 | A message shows up with no parsed body/search hits | MIME parsing failed inside the Durable Object | Expected degraded behavior: the message row is kept with `parse_status='failed'` and the raw R2 key preserved (the email is never dropped); check `/api/admin/ops-events` for the parse-failure event. |
 | `confirm-send` returns an error and nothing sends | Outbound send failed at the provider, or recipient/size limits exceeded | Check `outbound_sends.status='failed'` and `error_code` for the draft; fix the underlying issue (recipient count, size, sender verification) and retry — `confirm-send` is idempotency-keyed, so retries with the same key never double-send. |
 | An unauthenticated UI visit never lands on `/login`, or `/api/*` answers `503 auth_not_configured` | `BETTER_AUTH_SECRET` is unset (or shorter than 32 characters), so the issuer refuses to start | Upload it with `pnpm setup:auth --env <env> --url https://<host> --apply`, re-run `pnpm doctor --cloud --url https://<host>`, then reload the UI. |
-| `pnpm wrangler deploy --env dev` deploys the wrong Worker name | The Cloudflare Vite plugin can redirect Wrangler to its own generated config and drop the `--env` name override | Always deploy with both flags explicit: `pnpm wrangler deploy --env dev --name reccado-dev` (this is exactly what `pnpm run deploy:dev` does). |
+| `pnpm wrangler deploy --env dev` deploys the wrong Worker name | The Cloudflare Vite plugin can redirect Wrangler to its own generated config and drop the `--env` name override | Deploy with `pnpm run deploy:dev`: it deploys `--config dist/server/wrangler.json` built for the env and refuses to run if that build names a different Worker than `wrangler.jsonc`. |
+| A var `setup:sending` wrote (e.g. `MAIL_SENDING_DOMAINS`) never reaches the Worker | Deployed with raw `wrangler deploy`, which reads only the tracked `wrangler.jsonc` and never the gitignored `wrangler.generated.<env>.json` | Deploy with `pnpm run deploy[:dev]` (overlays the generated file and prints every value it applied). `pnpm doctor --env <env>` shows the overlay; `--cloud` fails when a deployed `MAIL_SENDING_DOMAINS` entry is not enabled in Email Sending. |
 | `pnpm setup:cloud --apply` fails while building or patching `dist/server/wrangler.json` | The TanStack/Vite build failed, or the build output was not produced before Wrangler deploy | Fix the build error first (`pnpm run build` should pass), then rerun the same `setup:cloud` command. Do not hand-edit the tracked `wrangler.jsonc`; `setup:cloud` patches the built config from `wrangler.generated.<env>.json`. |
 | `pnpm setup:auth --apply` ran but `/login` still cannot sign anyone in | The owner registry is empty and `OWNER_BOOTSTRAP_EMAILS` is unset, so the issuer closes registration (`503 owner_not_configured`) | Register the owner in D1 or set `OWNER_BOOTSTRAP_EMAILS`, or spend a pairing code minted with `wrangler d1 execute` (see [Wire your domain](#2-wire-your-domain)). Verify with `pnpm doctor --cloud --url https://<custom-host>`. |
 | `pnpm setup:domain --apply` refuses to attach the hostname | The hostname is already a Workers Custom Domain on a **different** Worker (e.g. left over from a rename) | The script won't silently steal it. Detach it from the other Worker first (Cloudflare dashboard → Workers & Pages → Custom Domains, or redeploy that Worker without the route), or choose a different hostname. Re-running for the *same* Worker is idempotent and safe. |
 | `pnpm setup:routing --catch-all --apply` asks for `CLOUDFLARE_API_TOKEN` | Wrangler can enable routing and create explicit-address worker rules, but its catch-all command rejects `worker` client-side | Set a token with Zone Read + Email Routing Write for the zone and rerun. The script uses Cloudflare's REST `catch_all` endpoint, which supports `worker`. |
 | `pnpm setup:sending --apply` only prints DKIM/MX records instead of adding them | No `CLOUDFLARE_API_TOKEN` is set, or `--skip-provider-records` was passed | Set `CLOUDFLARE_API_TOKEN` (DNS edit) and re-run `--apply` to auto-add the provider-generated DKIM TXT + MX records parsed from `wrangler email sending dns get <sending-domain>`. Drop `--skip-provider-records` if you passed it and want the script to manage them after all. |
 | `setup:cloud` aborts because the queue is already consumed by another Worker | Cloudflare can leave the Queue consumer attached to the old Worker name after a rename | Run the exact `pnpm wrangler queues consumer remove <queue> <old-worker>` command that `setup:cloud` prints, then rerun `setup:cloud`. Queues support one Worker consumer, so this is safer than letting deploy fail at trigger registration. |
-| `wrangler --env dev` still uses the placeholder D1 id | `--env` alone still reads the tracked `wrangler.jsonc`, which intentionally keeps the public placeholder id | Use `pnpm setup:cloud`, which patches the built deploy config from `wrangler.generated.dev.json`. Use `pnpm run deploy:dev` only after your Wrangler config path contains a real D1 id; do not assume `--env` swaps in the generated id. |
+| `wrangler --env dev` still uses the placeholder D1 id | `--env` alone still reads the tracked `wrangler.jsonc`, which intentionally keeps the public placeholder id | Use `pnpm setup:cloud`, which writes the real id into `wrangler.generated.dev.json`; `pnpm run deploy:dev` then overlays it onto the build. Raw `wrangler deploy --env dev` does not swap in the generated id. |
 | `pnpm setup:mailbox --apply` still fails after you already inserted domain rows manually | Older/manual seed data can contain conflicting mailbox, alias, or routing rows even though the current script reuses the existing `domains.id` by domain name | Inspect `domains`, `mailboxes`, `aliases`, and `routing_rules` for that address. The script binds the alias and catch-all rule to whatever `mailbox_id` D1 already stores for that `primary_address`, so a stale row is corrected by cleaning the pre-live D1 data, not by rerunning with different inputs. |
 | Telegram bot token is set but no new-mail card ever arrives | The bridge is configured but not yet delivering: no operator is linked, and/or nobody has sent `/start` so no chat is adopted, and/or the worker has not observed its public origin yet, so the cron cannot register the webhook | `GET /api/health` → `dependencies.telegram` reports `mode: "partial"` and lists exactly what is missing. Read the live pairing code out of `owner_pairing_codes` and send `/start <code>`, load the authenticated UI once on the custom domain to teach the worker its origin, then wait for the hourly cron to register the webhook. |
 | Local large-MIME smoke (`pnpm smoke:email:large`) fails around 1 MiB | Cloudflare's local Email Routing test path enforces a much lower size limit (~1 MiB) than the 25 MiB production inbound limit | Expected local-tooling behavior, not a bug — generate a fixture under ~1 MiB for local smoke (`pnpm generate:large-mime`), and trust the documented 25 MiB production limit (see [`docs/validation/PHASE0_VALIDATION.md`](docs/validation/PHASE0_VALIDATION.md)). |

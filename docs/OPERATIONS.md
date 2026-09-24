@@ -277,6 +277,19 @@ consulted for authorization, quota, or idempotency.
   `unobserved` means not enough evidence yet, and is deliberately not a fault. The read is bounded
   to the last 30 days of provider-acknowledged sends, so a domain nobody has used in a month
   simply drops out rather than staying red on stale evidence.
+- `pnpm doctor --env <env> --cloud` also crosses `MAIL_SENDING_DOMAINS` — as the deploy will
+  actually ship it (tracked `wrangler.jsonc` with `wrangler.generated.<env>.json` overlaid) —
+  against the live Email Sending list: an entry that is not an enabled sending domain **fails**
+  (a mailbox there sends as itself and Cloudflare refuses the From); an enabled domain subscribed
+  to this environment's events queue but not declared **warns** (the account may host other apps;
+  a mailbox there relays through `MAIL_FROM_ADDRESS`). It then resolves `_dmarc.<name>` over
+  DNS-over-HTTPS for all of those names and warns on the provider's auto-created
+  `v=DMARC1; p=reject;` (enforcing, no `rua`, chosen by nobody), on `p=quarantine`/`p=reject`
+  without `rua`, and on zero or multiple DMARC records.
+- A support mailbox on the zone apex that replies as itself needs Email Sending on the apex:
+  `pnpm setup:sending --env <env> --domain <zone> --apex --dmarc-policy <none|quarantine|reject>
+  --dmarc-rua dmarc@<zone> [--apply]`. The apex DMARC governs every sender on the domain, so the
+  policy is mandatory there; see [`EMAIL-DELIVERABILITY.md`](EMAIL-DELIVERABILITY.md#sending-from-the-zone-apex).
 - Owner-gated suppression administration is available at
   `/api/mailboxes/:mailboxId/suppressions` and
   `/api/mailboxes/:mailboxId/suppressions/remove`. Provider-originated
@@ -312,6 +325,14 @@ Sending, and Access end-to-end in one call. Readiness is still an operator check
 2. Deploy with the environment-specific command:
    - `pnpm run deploy:dev`
    - `pnpm run deploy`
+
+   Both run `scripts/deploy.ts`: build, overlay `wrangler.generated.<env>.json` onto
+   `dist/server/wrangler.json` (the generated file wins for vars, the D1 id, the sender
+   allow-list and a `setup:domain` route; `wrangler.jsonc` wins for every binding and queue),
+   print every value applied and every structural field ignored, re-read the file and refuse to
+   deploy if it does not carry them, then `wrangler deploy --config dist/server/wrangler.json`.
+   Add `--dry-run` to do all of that locally and stop at `wrangler deploy --dry-run`. Do not
+   deploy with raw `wrangler deploy --env <env>`: it never reads the generated file.
 3. Verify Access, `/api/health`, and at least one mailbox/API path.
 4. Tail logs and Cloudflare dashboards for the first inbound message and the next cron window if
    the change touched ingest, indexing, or scheduled work.

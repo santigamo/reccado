@@ -67,8 +67,9 @@ Every run also prints a **Workers Paid** preflight: Email Sending on a free plan
 verified destination addresses, and this script cannot detect your plan for you.
 
 The script enables Cloudflare Email Sending for the sending subdomain, writes
-`MAIL_FROM_ADDRESS` into `wrangler.generated.<env>.json`, adds the sender to
-`send_email[].allowed_sender_addresses`, and upserts SPF (always) and DMARC (per the ramp) when
+`MAIL_FROM_ADDRESS` (kept if already set, unless `--set-default-from`) and the
+`MAIL_SENDING_DOMAINS` union into `wrangler.generated.<env>.json`, adds the sender to
+`send_email[].allowed_sender_addresses` only with `--restrict-senders` (or an existing list), and upserts SPF (always) and DMARC (per the ramp) when
 `CLOUDFLARE_API_TOKEN` has DNS edit access — the two records it keeps under its own control. That
 token only needs **Zone · DNS · Edit** (plus **Zone · Read** to resolve the zone); it does *not*
 need account or Email Sending scope, because the `wrangler email sending` calls authenticate with
@@ -89,12 +90,45 @@ pnpm wrangler email sending dns get send.example.com
 pnpm wrangler email sending settings send.example.com
 ```
 
-After `setup:sending`, deploy through a setup script that builds and patches
-`dist/server/wrangler.json` from the generated config, for example:
+After `setup:sending`, ship it — nothing it writes reaches the running Worker until a deploy
+overlays `wrangler.generated.<env>.json` onto the build:
 
 ```bash
-pnpm setup:domain --env dev --hostname inbox.example.com --apply
+pnpm run deploy:dev --dry-run   # build + overlay for real, prints every value applied, uploads nothing
+pnpm run deploy:dev             # or `pnpm run deploy` for the top-level (production) config
+pnpm doctor --env dev --cloud   # deployed MAIL_SENDING_DOMAINS vs Email Sending, and each _dmarc
 ```
+
+The generated file wins for the fields it owns (vars, D1 id, sender allow-list, custom-domain
+route); `wrangler.jsonc` wins for every binding and queue. Raw `wrangler deploy` reads only the
+tracked config and ships none of it.
+
+### Sending from the zone apex
+
+A mailbox on the organizational domain itself (`support@example.com`) that should reply as itself
+needs Email Sending on `example.com`, not on a subdomain:
+
+```bash
+pnpm setup:sending --env dev --domain example.com --apex --from-local-part support \
+  --dmarc-policy none --dmarc-rua dmarc@example.com            # dry run; add --apply
+```
+
+Everything else is identical to a subdomain (SPF/DKIM/MX on `cf-bounce.example.com` /
+`cf-bounce._domainkey.example.com`, the 6-event subscription, the `MAIL_SENDING_DOMAINS` union), but
+`_dmarc.example.com` governs **every** sender using `@example.com` — your personal mail, other
+SaaS, and any subdomain without its own record. So for the apex:
+
+- `--dmarc-policy` is **required**; there is no default.
+- The current apex record is resolved and printed next to the planned one *before* Email Sending is
+  enabled (enabling it auto-creates `v=DMARC1; p=reject;`), and a `rua` the new record would drop is
+  called out — pass `--dmarc-rua` to keep reports flowing.
+- The Worker's own DMARC ramp (`src/lib/dns-gate.ts`) still never acts on an apex; this is a human
+  declaration at the CLI.
+
+`pnpm doctor --cloud` resolves `_dmarc.<name>` for every deployed `MAIL_SENDING_DOMAINS` entry and
+every sending domain subscribed to the events queue, and warns on the provider's
+`v=DMARC1; p=reject;` signature (enforcing, no `rua`, chosen by nobody) and on any
+`p=quarantine`/`p=reject` without `rua`.
 
 ## Reputation isolation by stream
 

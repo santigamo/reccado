@@ -128,6 +128,11 @@ actual repo state, fix this section rather than trusting it blindly.
   status response as `deliveryFeedback`. A domain with no subscription produces no events at all,
   so **never read the absence of a delivery event as evidence about a message without checking
   that domain's feedback liveness first** — see `src/lib/feedback-liveness.ts`.
+- Deploys go through `scripts/deploy.ts` (`pnpm run deploy:dev` / `pnpm run deploy`, `--dry-run`
+  to preview): build, then overlay the gitignored `wrangler.generated.<env>.json` onto
+  `dist/server/wrangler.json`. The generated file wins only for the fields it owns (vars, D1 id,
+  sender allow-list, a `setup:domain` route) — `scripts/lib/deploy-config.ts`; `setup:domain`
+  and `setup:cloud` use the same overlay. Never deploy with raw `wrangler deploy --env <env>`.
 - Transactional API current gap: no simulated delivery sink for test keys; test keys are rejected
   by the production send path. `reconcileStaleTransactionalRequests` is wired into the hourly
   cron and an auth-protected operator endpoint, and unknown outcomes remain manual-review-only.
