@@ -142,6 +142,15 @@ read/search/draft endpoint.
 
 ### Added
 
+- **`docs/INTEGRATING.md` — the integrator's guide to the transactional API.** Written from the
+  code for a product team sending through Reccado: who provisions what (mailbox on the zone,
+  sending identity on `send.`), one endpoint per mailbox with the key selecting the environment,
+  the mandatory `Idempotency-Key` and its replay/conflict rules, a table of every `status`/`error`
+  with its HTTP code and the right reaction (branch on `error`, never on `status` alone), the
+  status endpoint and `deliveryFeedback`, template syntax/escaping/exact variable sets and repo
+  sync, key scopes/policy/quota/rotation, and suppressions. Linked from the README and
+  `OPERATIONS.md`.
+
 - **`pnpm smoke:transactional` — an end-to-end smoke test against a deployed environment.** The
   four transactional bugs fixed above shipped with every unit/integration test green because those
   tests call the mailbox Durable Object directly; this drives the real HTTP surface instead, as

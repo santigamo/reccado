@@ -110,7 +110,9 @@ automatic retries.
 
 Per-key rate limits and quotas, revocation and rotation tests, redacted ops events, and
 DO-local stale-send reconciliation are implemented. Bounces, complaints, and suppression lists
-remain an explicit production limitation because no provider event integration exists yet.
+were originally left as a production limitation; they have since landed (Cloudflare Email Sending
+events via the `inbox-mcp-email-events` Queue, mailbox-local suppressions — see
+[`../OPERATIONS.md`](../OPERATIONS.md#guarantees-and-current-limits)).
 
 ## Acceptance criteria
 

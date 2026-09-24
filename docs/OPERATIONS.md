@@ -153,11 +153,11 @@ the UI, Telegram, and MCP surfaces still require `request-send` → `confirm-sen
 - `GET /v1/mailboxes/:mailboxId/transactional/messages/:requestId` — request status; key must carry
   `transactional:status`.
 - `/api/mailboxes/:mailboxId/transactional/api-keys` (create/list) and
-  `.../api-keys/:keyId/revoke`, `.../rotate` — Access-protected with an explicit mailbox-ownership
+  `.../api-keys/:keyId/revoke`, `.../rotate` — session-protected with an explicit mailbox-ownership
   check (D1 `mailboxes.owner_email`).
 - `/api/mailboxes/:mailboxId/transactional/templates` (create/list) and
-  `.../templates/:templateId/archive` — versioned per-mailbox templates; Access-protected with
-  ownership check.
+  `.../templates/:templateId/archive` — per-mailbox templates (revised in place under the same id
+  via `PUT .../templates/:templateId`, not versioned); session-protected with ownership check.
 - `PUT /api/mailboxes/:mailboxId/transactional/templates` — idempotent sync of a caller-owned
   list. Body `{ "templates": [{ "id", "subject", "body_text"?, "body_html"? }], "archiveMissing"?:
   false }` (max 100, unique ids); answers `200 { ok, results: [{ id, outcome, reason? }], summary }`
@@ -187,6 +187,11 @@ shown once at creation. Only the keyed hash
 keys carry scopes, a template allowlist (null/empty = nothing sendable), a recipient policy,
 optional daily quota, and optional expiry. All auth decisions are DO-authoritative — D1 is never
 consulted for authorization, quota, or idempotency.
+
+**Handing a key to a product team:** deliver the plaintext out of band (a password-manager entry),
+together with the host, the mailbox id, the key's sender/display name, template allowlist,
+recipient policy and quota, and point them at [`INTEGRATING.md`](INTEGRATING.md), the
+integrator's contract (endpoint, idempotency, every response code, templates, suppressions).
 
 ### Guarantees and current limits
 
@@ -294,7 +299,7 @@ consulted for authorization, quota, or idempotency.
   `/api/mailboxes/:mailboxId/suppressions` and
   `/api/mailboxes/:mailboxId/suppressions/remove`. Provider-originated
   hard-bounce/complaint entries require explicit override to remove.
-- The `/v1/...` routes are the only path outside the Access perimeter: JSON-only, 100 KB body cap,
+- The `/v1/...` routes are the only path outside the session perimeter: JSON-only, 100 KB body cap,
   `Cache-Control: no-store`, no CORS, no cookies, no query-param credentials.
 
 ## Readiness before a deploy
