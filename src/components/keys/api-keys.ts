@@ -82,6 +82,8 @@ export type TransactionalApiKey = {
 export type CreateApiKeyInput = {
 	environment: KeyEnvironment;
 	sender: string;
+	/** From display phrase; accepted by create directly, no follow-up PATCH needed. */
+	senderName?: string;
 	scopes: KeyScope[];
 	templateAllowlist?: string[];
 	recipientPolicy?: string;

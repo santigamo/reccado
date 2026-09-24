@@ -242,6 +242,67 @@ export function checkRecipientPolicy(
 	return { allowed: false, reason: "not_allowed_by_policy" };
 }
 
+export type RecipientPolicyIssue = {
+	/** The offending entry exactly as written (untrimmed), so the operator can find it. */
+	rule: string;
+	reason: string;
+};
+
+const DOMAIN_RE = /^[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
+
+/**
+ * Checks that a recipient policy is made only of rules `matchRule` can actually
+ * match, so a typo is refused at key creation instead of silently rejecting
+ * every recipient at send time.
+ *
+ * Accepted rule shapes (each optionally prefixed by a single `!` to deny):
+ *  - `@domain.tld`       domain rule — needs a dot, no `*`, no second `@`
+ *  - `local@domain.tld`  exact address
+ *  - `qa+*@domain.tld`   pattern — contains `*` and exactly one `@`
+ *
+ * Whitespace around an entry is tolerated because `checkRecipientPolicy` trims
+ * it too; whitespace inside a rule is refused (it can never match an address).
+ * A deny-only policy is legitimate — "everyone except these" — and passes.
+ *
+ * Returns every issue found; an empty array means the policy is valid. Nothing is
+ * normalized: the caller stores exactly what it sent or gets an error.
+ */
+export function validateRecipientPolicy(policy: string): RecipientPolicyIssue[] {
+	const issues: RecipientPolicyIssue[] = [];
+	for (const raw of policy.split(",")) {
+		const reason = recipientRuleProblem(raw.trim());
+		if (reason) issues.push({ rule: raw, reason });
+	}
+	return issues;
+}
+
+function recipientRuleProblem(entry: string): string | null {
+	if (entry.length === 0) return "empty rule (check for a doubled or trailing comma)";
+	if (/\s/.test(entry)) return "whitespace inside a rule";
+	const rule = entry.startsWith("!") ? entry.slice(1) : entry;
+	if (rule.length === 0) return "a bare `!` denies nothing";
+	if (rule.includes("!")) return "`!` is only valid once, at the start of a rule";
+	const atCount = rule.split("@").length - 1;
+	if (rule.startsWith("@")) {
+		const domain = rule.slice(1);
+		if (domain.length === 0) return "domain rule has no domain";
+		if (atCount > 1) return "domain rule contains a second `@`";
+		if (domain.includes("*")) return "wildcards are not supported in `@domain` rules";
+		if (!DOMAIN_RE.test(domain)) return "domain rule must be a dotted domain like `@example.com`";
+		return null;
+	}
+	if (atCount !== 1) {
+		return "rule must be `@domain`, an email address, or a `*` pattern containing one `@`";
+	}
+	const [local = "", domain = ""] = rule.split("@");
+	if (local.length === 0 || domain.length === 0) {
+		return "rule must have text on both sides of the `@`";
+	}
+	if (rule.includes("*")) return null;
+	if (!DOMAIN_RE.test(domain)) return "address domain must be a dotted domain like `example.com`";
+	return null;
+}
+
 function matchRule(canonical: string, rule: string): boolean {
 	const normalized = rule.trim().toLowerCase();
 	if (normalized.startsWith("@")) {

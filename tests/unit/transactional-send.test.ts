@@ -8,6 +8,7 @@ import {
 	extractTemplateVariables,
 	httpStatusForTransactionalResult,
 	transactionalResponseStatuses,
+	validateRecipientPolicy,
 } from "#/lib/transactional-send";
 
 describe("transactionalRequestSchema", () => {
@@ -307,6 +308,52 @@ describe("checkRecipientPolicy", () => {
 		const result = checkRecipientPolicy("bot@example.com", "!*@example.com,user@other.com");
 		expect(result.allowed).toBe(false);
 		expect(result.reason).toBe("denied_by_policy");
+	});
+});
+
+describe("validateRecipientPolicy", () => {
+	it.each([
+		"santi@x.com,@transcribo.es",
+		"!bot@x.com,@x.com",
+		"*@x.com",
+		"qa+*@x.com",
+		// Deny-only is legitimate: "everyone except these".
+		"!bot@x.com",
+		// Whitespace around an entry is what checkRecipientPolicy trims too.
+		"a@b.com, @c.com",
+	])("accepts %s", (policy) => {
+		expect(validateRecipientPolicy(policy)).toEqual([]);
+	});
+
+	it.each([
+		["@", "@"],
+		["@nodot", "@nodot"],
+		["foo", "foo"],
+		["a@b.com,,@c.com", ""],
+		["! a@b.com", "! a@b.com"],
+		["a b@c.com", "a b@c.com"],
+		["!", "!"],
+		["a@b.com,", ""],
+		["@*.x.com", "@*.x.com"],
+		["a@nodot", "a@nodot"],
+	])("rejects %s, naming the offending rule", (policy, rule) => {
+		const issues = validateRecipientPolicy(policy);
+		expect(issues.length).toBeGreaterThan(0);
+		expect(issues.map((i) => i.rule)).toContain(rule);
+	});
+
+	it("reports only the bad rule of an otherwise valid policy", () => {
+		expect(validateRecipientPolicy("ok@x.com,foo,@y.com")).toEqual([
+			{ rule: "foo", reason: expect.any(String) },
+		]);
+	});
+
+	it("accepts only policies whose rules checkRecipientPolicy can match", () => {
+		// Each valid rule must be able to allow at least one plausible address.
+		expect(checkRecipientPolicy("qa+run1@x.com", "qa+*@x.com").allowed).toBe(true);
+		expect(checkRecipientPolicy("anyone@transcribo.es", "santi@x.com,@transcribo.es").allowed).toBe(
+			true,
+		);
 	});
 });
 

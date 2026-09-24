@@ -1145,7 +1145,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				return Response.json(result, { status: 201 });
 			} catch (error) {
 				const msg = error instanceof Error ? error.message : String(error);
-				const status = msg === "invalid_scopes" ? 400 : 500;
+				// invalid_sender_name is a value that cannot go in a header — the
+				// caller's mistake, like a bad scope, not a server fault.
+				const status = msg === "invalid_scopes" || msg === "invalid_sender_name" ? 400 : 500;
 				return Response.json({ error: msg }, { status });
 			}
 		}

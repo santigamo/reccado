@@ -35,7 +35,13 @@ const DEFAULT_SCOPES: KeyScope[] = [
 
 type FieldErrors = Partial<
 	Record<
-		"sender" | "senderName" | "scopes" | "templateAllowlist" | "quotaMax" | "expiresAt",
+		| "sender"
+		| "senderName"
+		| "scopes"
+		| "templateAllowlist"
+		| "recipientPolicy"
+		| "quotaMax"
+		| "expiresAt",
 		string
 	>
 >;
@@ -198,6 +204,7 @@ export function CreateApiKeyForm({
 					field === "senderName" ||
 					field === "scopes" ||
 					field === "templateAllowlist" ||
+					field === "recipientPolicy" ||
 					field === "quotaMax"
 				) {
 					mapped[field] = messages.join(" ");
@@ -206,6 +213,8 @@ export function CreateApiKeyForm({
 				}
 			}
 			if (Object.keys(mapped).length > 0) setFieldErrors((prev) => ({ ...prev, ...mapped }));
+			// The policy field lives in the collapsed section; open it so its error shows.
+			if (mapped.recipientPolicy) setAdvancedOpen(true);
 		} finally {
 			setBusy(false);
 		}
@@ -380,7 +389,8 @@ export function CreateApiKeyForm({
 					<Field
 						label="Recipient policy"
 						htmlFor={`${formId}-policy`}
-						hint="Free-form policy string enforced by the mailbox, e.g. a domain restriction."
+						hint="Comma-separated rules: @domain.com, an exact address, or a * pattern (qa+*@example.com). Prefix ! to deny."
+						error={fieldErrors.recipientPolicy}
 					>
 						<input
 							id={`${formId}-policy`}

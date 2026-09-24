@@ -107,4 +107,67 @@ describe("transactional API key routes", () => {
 			expect((await getApiKeyProjection(env.INDEX_DB, newKeyId))?.status).toBe("revoked");
 		},
 	);
+
+	it("accepts senderName on create, with no follow-up PATCH", { timeout: 20_000 }, async () => {
+		const mailboxId = "mbx_key_routes_name";
+		await insertMailbox(env.INDEX_DB, {
+			mailbox_id: mailboxId,
+			primary_address: "name@routes.example",
+			display_name: null,
+			status: "active",
+			owner_email: "dev@local",
+		});
+		const base = `/api/mailboxes/${mailboxId}/transactional/api-keys`;
+		const created = await call("POST", base, {
+			environment: "live",
+			sender: "hola@send.routes.example",
+			senderName: "Transcribo",
+			scopes: ["transactional:send", "transactional:templates:use"],
+			templateAllowlist: ["magic-link"],
+		});
+		expect(created.status).toBe(201);
+		expect((created.body.key as { senderName: string }).senderName).toBe("Transcribo");
+		expect((created.body.projection as { senderName: string }).senderName).toBe("Transcribo");
+
+		const listed = await call("GET", base);
+		expect((listed.body.keys as Array<{ senderName: string }>)[0]?.senderName).toBe("Transcribo");
+
+		// Header-injection guard: the same validation as the PATCH route.
+		const injected = await call("POST", base, {
+			environment: "live",
+			sender: "hola@send.routes.example",
+			senderName: "Evil\r\nBcc: x@y.com",
+			scopes: ["transactional:status"],
+		});
+		expect(injected.status).toBe(400);
+		expect((await call("GET", base)).body.keys).toHaveLength(1);
+	});
+
+	it("refuses a malformed recipient policy and creates no key", { timeout: 20_000 }, async () => {
+		const mailboxId = "mbx_key_routes_policy";
+		await insertMailbox(env.INDEX_DB, {
+			mailbox_id: mailboxId,
+			primary_address: "policy@routes.example",
+			display_name: null,
+			status: "active",
+			owner_email: "dev@local",
+		});
+		const base = `/api/mailboxes/${mailboxId}/transactional/api-keys`;
+		const rejected = await call("POST", base, {
+			environment: "live",
+			sender: "hola@send.routes.example",
+			scopes: ["transactional:send", "transactional:templates:use"],
+			templateAllowlist: ["magic-link"],
+			recipientPolicy: "santi@x.com,@nodot",
+		});
+		expect(rejected.status).toBe(400);
+		expect(rejected.body.error).toBe("validation_error");
+		const fieldErrors = (rejected.body.issues as { fieldErrors: Record<string, string[]> })
+			.fieldErrors;
+		expect(fieldErrors.recipientPolicy?.join(" ")).toContain('"@nodot"');
+
+		const listed = await call("GET", base);
+		expect(listed.status).toBe(200);
+		expect(listed.body.keys).toEqual([]);
+	});
 });

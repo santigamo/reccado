@@ -8,6 +8,7 @@ import {
 	sendScopeHasTemplateAllowlist,
 	sendScopeHasTemplateUse,
 } from "../lib/transactional-keys";
+import { validateRecipientPolicy } from "../lib/transactional-send";
 
 export const createMailboxSchema = z.object({
 	primaryAddress: z.string().email(),
@@ -186,6 +187,10 @@ export const createTransactionalApiKeySchema = z
 	.object({
 		environment: z.enum(["test", "live"]),
 		sender: z.string().email(),
+		// Accepted at creation so an operator does not have to create and then
+		// PATCH. Same validation as the PATCH route: this lands in a mail header.
+		// null (or omitted) means the bare address, as on PATCH.
+		senderName: senderNameField.nullable().optional(),
 		scopes: z.array(transactionalApiKeyScopeSchema).min(1),
 		// `.min(1)` per entry so a blank line cannot pad the allowlist into looking non-empty.
 		templateAllowlist: z.array(z.string().min(1)).optional(),
@@ -194,6 +199,17 @@ export const createTransactionalApiKeySchema = z
 		expiresAt: z.string().datetime().optional(),
 	})
 	.superRefine((body, ctx) => {
+		// A malformed policy is not an error at send time — it is a rule that never
+		// matches, so every recipient is rejected with no hint why. Refuse it here.
+		if (body.recipientPolicy !== undefined) {
+			for (const issue of validateRecipientPolicy(body.recipientPolicy)) {
+				ctx.addIssue({
+					code: "custom",
+					path: ["recipientPolicy"],
+					message: `invalid_recipient_policy: rule ${JSON.stringify(issue.rule)}: ${issue.reason}`,
+				});
+			}
+		}
 		if (!sendScopeHasTemplateUse(body.scopes)) {
 			ctx.addIssue({
 				code: "custom",
