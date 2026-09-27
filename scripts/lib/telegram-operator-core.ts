@@ -10,7 +10,58 @@
  * worker secret, so every Telegram call happens inside the worker, behind the
  * owner session.
  */
+import type { RebindResult } from "../../src/telegram/admin/rebind";
 import type { TelegramOperatorStatus } from "../../src/telegram/admin/status";
+import { OperatorInputError } from "./operator-session-core";
+
+/**
+ * `--chat` as typed: a numeric chat id or a public @username. The same rule
+ * the route enforces, checked first so a typo fails before any request.
+ */
+export function parseChatFlag(value: string | undefined): string {
+	const chat = value?.trim();
+	if (!chat || chat === "true") {
+		throw new OperatorInputError("--chat <id> is required (e.g. --chat -1001234567890).");
+	}
+	if (!/^(-?\d{1,20}|@[A-Za-z0-9_]{4,32})$/.test(chat)) {
+		throw new OperatorInputError(
+			`--chat ${chat}: expected a numeric Telegram chat id (e.g. -1001234567890) or a public @username.`,
+		);
+	}
+	return chat;
+}
+
+function describeBinding(binding: { chatId: string | null; isForum: boolean | null }): string {
+	if (!binding.chatId) return "(no chat bound)";
+	return `${binding.chatId} (forum: ${yesNo(binding.isForum)})`;
+}
+
+export function formatRebind(result: RebindResult): string[] {
+	const heading: Record<RebindResult["outcome"], string> = {
+		would_rebind: "Dry run — would rebind the Telegram bridge:",
+		would_be_unchanged: "Dry run — already bound to that chat; nothing would change:",
+		rebound: "Rebound the Telegram bridge:",
+		unchanged: "Already bound to that chat; nothing changed:",
+	};
+	const lines = [heading[result.outcome]];
+	lines.push(`  current: ${describeBinding(result.previous)}`);
+	lines.push(
+		`  new:     ${describeBinding(result.current)} · ${result.current.type}${result.current.title ? ` "${result.current.title}"` : ""}`,
+	);
+	if (result.membership) {
+		lines.push(
+			`  bot:     ${result.membership.status} · can_manage_topics: ${yesNo(result.membership.canManageTopics)}`,
+		);
+	}
+	lines.push(
+		`  topics:  ${result.topics.mappedInNewChat} mapped in the new chat; ${result.topics.keptForOtherChats} kept for other chats`,
+	);
+	for (const note of result.notes) lines.push(`  note: ${note}`);
+	if (result.dryRun && result.outcome === "would_rebind") {
+		lines.push("", "Re-run with --apply to rebind.");
+	}
+	return lines;
+}
 
 /**
  * A non-2xx answer from /api/telegram/* as one line: the route's own

@@ -1,6 +1,9 @@
 import type { Hono } from "hono";
+import { rebindTelegramChat } from "../telegram/admin/rebind";
+import type { AdminResult } from "../telegram/admin/shared";
 import { getTelegramOperatorStatus } from "../telegram/admin/status";
 import type { ApiBindings } from "./hono";
+import { telegramRebindSchema } from "./schemas";
 
 /**
  * Operator control of the Telegram bridge, under /api/telegram/*.
@@ -17,7 +20,17 @@ import type { ApiBindings } from "./hono";
  * bot. No response ever contains the token.
  */
 export function registerTelegramRoutes(api: Hono<ApiBindings>): void {
+	const answer = <T>(result: AdminResult<T>) =>
+		Response.json(result.body, { status: result.status });
+
 	api.get("/api/telegram/status", async (c) => {
 		return c.json(await getTelegramOperatorStatus(c.env));
+	});
+
+	api.post("/api/telegram/rebind", async (c) => {
+		const body = telegramRebindSchema.parse(await c.req.json());
+		return answer(
+			await rebindTelegramChat(c.env, { chatId: body.chatId, dryRun: body.dryRun ?? false }),
+		);
 	});
 }

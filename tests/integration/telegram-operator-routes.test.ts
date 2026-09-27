@@ -218,6 +218,22 @@ async function mapTopic(
 		.run();
 }
 
+async function configValue(key: string): Promise<string | null> {
+	const row = await env.INDEX_DB.prepare("SELECT value FROM runtime_config WHERE key = ?")
+		.bind(key)
+		.first<{ value: string }>();
+	return row?.value ?? null;
+}
+
+async function opsEvents(type: string): Promise<Array<{ subject: string; payload_json: string }>> {
+	const result = await env.INDEX_DB.prepare(
+		"SELECT subject, payload_json FROM ops_events WHERE event_type = ? ORDER BY created_at",
+	)
+		.bind(type)
+		.all<{ subject: string; payload_json: string }>();
+	return result.results ?? [];
+}
+
 describe("GET /api/telegram/status", () => {
 	it("reports the bot, the bound forum, the bot's rights and each active mailbox's topic", async () => {
 		await bind(FORUM_CHAT_ID, true);
@@ -346,5 +362,196 @@ describe("GET /api/telegram/status", () => {
 		expect([401, 503]).toContain(status);
 		expect(raw).not.toContain("reccado_bot");
 		expect(calls).toHaveLength(0);
+	});
+});
+
+describe("POST /api/telegram/rebind", () => {
+	it("dry run: checks the target with Telegram and writes nothing", async () => {
+		await bind(PRIVATE_CHAT_ID, false);
+		const calls = stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/rebind", {
+			chatId: FORUM_CHAT_ID,
+			dryRun: true,
+		});
+
+		expect(status).toBe(200);
+		expect(body).toMatchObject({
+			outcome: "would_rebind",
+			dryRun: true,
+			previous: { chatId: PRIVATE_CHAT_ID, isForum: false },
+			current: { chatId: FORUM_CHAT_ID, isForum: true, type: "supergroup", title: "Santi HQ" },
+			membership: { status: "administrator", canManageTopics: true, eligible: true },
+		});
+		expect(await configValue("telegram.chat_id")).toBe(PRIVATE_CHAT_ID);
+		expect(await configValue("telegram.chat_is_forum")).toBe("0");
+		expect(await opsEvents("telegram.rebound")).toHaveLength(0);
+		expect(calls.map((c) => c.method)).toEqual(["getChat", "getMe", "getChatMember"]);
+		expect(calls[2]?.body).toEqual({ chat_id: FORUM_CHAT_ID, user_id: BOT_ID });
+	});
+
+	it("overrides the sticky binding, audits it, keeps old topics, and the next card goes to the new chat", async () => {
+		await bind(PRIVATE_CHAT_ID, false);
+		await mapTopic(PRIVATE_CHAT_ID, "mbx_hello", 3);
+		stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/rebind", { chatId: FORUM_CHAT_ID });
+
+		expect(status).toBe(200);
+		expect(body.outcome).toBe("rebound");
+		expect(body.topics).toEqual({ mappedInNewChat: 0, keptForOtherChats: 1 });
+		expect(await configValue("telegram.chat_id")).toBe(FORUM_CHAT_ID);
+		expect(await configValue("telegram.chat_is_forum")).toBe("1");
+		const events = await opsEvents("telegram.rebound");
+		expect(events).toHaveLength(1);
+		// Old and new ids, nothing else -- no title, no token.
+		expect(JSON.parse(events[0]!.payload_json)).toEqual({
+			oldChatId: PRIVATE_CHAT_ID,
+			newChatId: FORUM_CHAT_ID,
+		});
+		const kept = await env.INDEX_DB.prepare(
+			"SELECT topic_id FROM telegram_topics WHERE chat_id = ? AND mailbox_id = 'mbx_hello'",
+		)
+			.bind(PRIVATE_CHAT_ID)
+			.first<{ topic_id: number }>();
+		expect(kept?.topic_id).toBe(3);
+
+		// No cache between the binding and its readers: the notifier's very next
+		// card lands in the new forum, in a topic of its own.
+		const { deliverInboundNotification } = await import("#/telegram/notify");
+		const calls = stubTelegram();
+		const outcome = await deliverInboundNotification(bridgeEnv(), {
+			mailboxId: "mbx_hello",
+			mailboxAddress: "hello@imsanti.dev",
+			messageLocalId: "msg_after_rebind",
+			threadId: "thread_after_rebind",
+			subject: "Hola",
+			fromAddr: "someone@example.org",
+			snippet: "hola",
+			hasAttachments: false,
+		});
+		expect(outcome.status).toBe("sent");
+		const send = calls.find((c) => c.method === "sendMessage");
+		expect(send?.body.chat_id).toBe(FORUM_CHAT_ID);
+		expect(send?.body.message_thread_id).toBeGreaterThan(500);
+	});
+
+	it("binds a chat no /start ever adopted, storing the numeric id for an @username", async () => {
+		const calls = stubTelegram({
+			respond: (c) =>
+				c.method === "getChat" && c.body.chat_id === "@santihq"
+					? Response.json({ ok: true, result: FORUM })
+					: null,
+		});
+
+		const { status, body } = await call("POST", "/api/telegram/rebind", { chatId: "@santihq" });
+
+		expect(status).toBe(200);
+		expect(body.previous).toEqual({ chatId: null, isForum: null });
+		expect(await configValue("telegram.chat_id")).toBe(FORUM_CHAT_ID);
+		expect(calls.find((c) => c.method === "getChatMember")?.body.chat_id).toBe(FORUM_CHAT_ID);
+	});
+
+	it("is a no-op, with no audit row, for the chat already bound", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		stubTelegram();
+
+		const { body } = await call("POST", "/api/telegram/rebind", { chatId: FORUM_CHAT_ID });
+
+		expect(body.outcome).toBe("unchanged");
+		expect(await opsEvents("telegram.rebound")).toHaveLength(0);
+	});
+
+	it("re-observes the forum flag of the chat already bound", async () => {
+		await bind(FORUM_CHAT_ID, false);
+		stubTelegram();
+
+		const { body } = await call("POST", "/api/telegram/rebind", { chatId: FORUM_CHAT_ID });
+
+		expect(body.outcome).toBe("rebound");
+		expect(await configValue("telegram.chat_is_forum")).toBe("1");
+	});
+
+	it("skips the membership check for a private chat", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		const calls = stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/rebind", {
+			chatId: PRIVATE_CHAT_ID,
+		});
+
+		expect(status).toBe(200);
+		expect(body.membership).toBeNull();
+		expect(body.current).toMatchObject({ chatId: PRIVATE_CHAT_ID, isForum: false });
+		expect(calls.map((c) => c.method)).toEqual(["getChat"]);
+	});
+
+	it("refuses a chat where the bot cannot post, and writes nothing", async () => {
+		await bind(PRIVATE_CHAT_ID, false);
+		stubTelegram({ member: { status: "left" } });
+
+		const { status, body } = await call("POST", "/api/telegram/rebind", { chatId: FORUM_CHAT_ID });
+
+		expect(status).toBe(409);
+		expect(body.error).toBe("bot_not_eligible");
+		expect(body.membership).toMatchObject({ status: "left", eligible: false });
+		expect(await configValue("telegram.chat_id")).toBe(PRIVATE_CHAT_ID);
+		expect(await opsEvents("telegram.rebound")).toHaveLength(0);
+	});
+
+	it("accepts a member with send rights and reports that it cannot manage topics", async () => {
+		stubTelegram({ member: { status: "member" } });
+
+		const { status, body } = await call("POST", "/api/telegram/rebind", { chatId: FORUM_CHAT_ID });
+
+		expect(status).toBe(200);
+		expect(body.membership).toMatchObject({ status: "member", canManageTopics: false });
+		expect(String((body.notes as string[])[0])).toContain("--adopt");
+	});
+
+	it("answers 404 for a chat Telegram does not know", async () => {
+		stubTelegram();
+
+		const { status, body, raw } = await call("POST", "/api/telegram/rebind", {
+			chatId: "-100999",
+		});
+
+		expect(status).toBe(404);
+		expect(body.error).toBe("chat_not_found");
+		expect(raw).not.toContain(BOT_TOKEN);
+	});
+
+	it("refuses a channel", async () => {
+		stubTelegram({ chats: [{ id: -100777, type: "channel", title: "News" }] });
+
+		const { status, body } = await call("POST", "/api/telegram/rebind", { chatId: "-100777" });
+
+		expect(status).toBe(409);
+		expect(body.error).toBe("unsupported_chat_type");
+	});
+
+	it("rejects a malformed chat id before calling Telegram", async () => {
+		const calls = stubTelegram();
+
+		const { status } = await call("POST", "/api/telegram/rebind", { chatId: "hq; DROP" });
+
+		expect(status).toBe(400);
+		expect(calls).toHaveLength(0);
+	});
+
+	it("is behind the Origin CSRF check", async () => {
+		await bind(PRIVATE_CHAT_ID, false);
+		const calls = stubTelegram();
+
+		const { status } = await call(
+			"POST",
+			"/api/telegram/rebind",
+			{ chatId: FORUM_CHAT_ID },
+			{ origin: "https://evil.example" },
+		);
+
+		expect(status).toBe(403);
+		expect(calls).toHaveLength(0);
+		expect(await configValue("telegram.chat_id")).toBe(PRIVATE_CHAT_ID);
 	});
 });

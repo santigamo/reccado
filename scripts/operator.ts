@@ -12,6 +12,7 @@
  *   pnpm operator whoami --host inbox.example.com
  *   pnpm operator logout --host inbox.example.com
  *   pnpm operator telegram status [--json]       bot, bound chat, rights, topics per mailbox
+ *   pnpm operator telegram rebind --chat <id> [--apply]
  *
  * The telegram subcommands call /api/telegram/* with the stored session; the
  * worker makes every Bot API call with its own (write-only) token. Mutating
@@ -23,6 +24,7 @@
  *
  * Never prints the pairing code or the session cookie.
  */
+import type { RebindResult } from "../src/telegram/admin/rebind";
 import type { TelegramOperatorStatus } from "../src/telegram/admin/status";
 import {
 	getSessionInfo,
@@ -36,7 +38,12 @@ import {
 	resolveOwnerEmail,
 	sessionPathFor,
 } from "./lib/operator-session";
-import { describeApiRefusal, formatTelegramStatus } from "./lib/telegram-operator-core";
+import {
+	describeApiRefusal,
+	formatRebind,
+	formatTelegramStatus,
+	parseChatFlag,
+} from "./lib/telegram-operator-core";
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string> } {
 	const positional: string[] = [];
@@ -72,7 +79,10 @@ const USAGE = `Usage: pnpm operator <login|whoami|logout|telegram> [--env <env>]
   logout  sign the session out on the server and delete the local session file
   telegram status [--json]
           the bot (@username), the bound chat and the bot's rights there, the webhook,
-          and each active mailbox's topic`;
+          and each active mailbox's topic
+  telegram rebind --chat <id|@username> [--apply] [--json]
+          move the bridge to another chat (dry run by default: checks the chat and the
+          bot's rights with Telegram and prints current -> new; --apply writes it)`;
 
 type Flags = Record<string, string>;
 
@@ -85,6 +95,7 @@ async function runTelegram(
 ): Promise<number> {
 	const session = requireSession(host, env);
 	const json = flags.json === "true";
+	const apply = flags.apply === "true";
 	switch (sub) {
 		case "status": {
 			const status = await operatorJson<TelegramOperatorStatus>(
@@ -96,6 +107,18 @@ async function runTelegram(
 			if (json) console.log(JSON.stringify(status, null, 2));
 			else for (const line of formatTelegramStatus(status)) console.log(line);
 			return status.bridge.ok ? 0 : 1;
+		}
+		case "rebind": {
+			const chatId = parseChatFlag(flags.chat);
+			const result = await operatorJson<RebindResult>(
+				session,
+				"/api/telegram/rebind",
+				{ method: "POST", body: { chatId, dryRun: !apply } },
+				{ env },
+			);
+			if (json) console.log(JSON.stringify(result, null, 2));
+			else for (const line of formatRebind(result)) console.log(line);
+			return 0;
 		}
 		default:
 			console.error(`Unknown telegram subcommand "${sub ?? ""}".\n${USAGE}`);

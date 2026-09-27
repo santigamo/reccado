@@ -1,6 +1,59 @@
 import { describe, expect, it } from "vitest";
+import type { RebindResult } from "#/telegram/admin/rebind";
 import type { TelegramOperatorStatus } from "#/telegram/admin/status";
-import { describeApiRefusal, formatTelegramStatus } from "../../scripts/lib/telegram-operator-core";
+import {
+	describeApiRefusal,
+	formatRebind,
+	formatTelegramStatus,
+	parseChatFlag,
+} from "../../scripts/lib/telegram-operator-core";
+
+describe("parseChatFlag", () => {
+	it("accepts numeric ids and public usernames", () => {
+		expect(parseChatFlag("-1004344536018")).toBe("-1004344536018");
+		expect(parseChatFlag("424242")).toBe("424242");
+		expect(parseChatFlag("@santihq")).toBe("@santihq");
+	});
+
+	it("rejects a missing or malformed chat", () => {
+		expect(() => parseChatFlag(undefined)).toThrow(/--chat <id> is required/);
+		expect(() => parseChatFlag("true")).toThrow(/--chat <id> is required/);
+		expect(() => parseChatFlag("santi hq")).toThrow(/expected a numeric/);
+	});
+});
+
+describe("formatRebind", () => {
+	const result: RebindResult = {
+		outcome: "would_rebind",
+		dryRun: true,
+		previous: { chatId: "424242", isForum: false },
+		current: { chatId: "-100", isForum: true, type: "supergroup", title: "Santi HQ" },
+		membership: {
+			status: "administrator",
+			canManageTopics: true,
+			canSendMessages: true,
+			eligible: true,
+			reason: "ok",
+		},
+		topics: { mappedInNewChat: 0, keptForOtherChats: 2 },
+		notes: [],
+	};
+
+	it("prints current -> new and how to apply", () => {
+		const text = formatRebind(result).join("\n");
+		expect(text).toContain("Dry run — would rebind");
+		expect(text).toContain("current: 424242 (forum: no)");
+		expect(text).toContain('new:     -100 (forum: yes) · supergroup "Santi HQ"');
+		expect(text).toContain("2 kept for other chats");
+		expect(text).toContain("--apply");
+	});
+
+	it("does not ask to apply what already happened", () => {
+		const text = formatRebind({ ...result, outcome: "rebound", dryRun: false }).join("\n");
+		expect(text).toContain("Rebound the Telegram bridge");
+		expect(text).not.toContain("Re-run with --apply");
+	});
+});
 
 function status(overrides: Partial<TelegramOperatorStatus> = {}): TelegramOperatorStatus {
 	return {

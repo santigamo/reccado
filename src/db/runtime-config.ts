@@ -161,18 +161,30 @@ export async function getRuntimeConfig(
 	return row?.value ?? null;
 }
 
+/**
+ * The upsert as a prepared statement, so a caller that must change several keys
+ * together can put them in one D1 batch (one transaction) instead of risking a
+ * half-applied pair.
+ */
+export function runtimeConfigUpsert(
+	db: D1Database,
+	key: RuntimeConfigKey,
+	value: string,
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`INSERT INTO runtime_config (key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		)
+		.bind(key, value, nowIso());
+}
+
 export async function setRuntimeConfig(
 	db: D1Database,
 	key: RuntimeConfigKey,
 	value: string,
 ): Promise<void> {
-	await db
-		.prepare(
-			`INSERT INTO runtime_config (key, value, updated_at) VALUES (?, ?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		)
-		.bind(key, value, nowIso())
-		.run();
+	await runtimeConfigUpsert(db, key, value).run();
 }
 
 /**
@@ -182,6 +194,11 @@ export async function setRuntimeConfig(
  * /start from a group they were added to would otherwise silently move every
  * future new-mail card out of the chat they actually watch. The caller compares
  * the returned value against what it tried to claim to tell the two cases apart.
+ *
+ * The one sanctioned way past first-write-wins is the operator rebind
+ * (rebindTelegramChat in src/telegram/admin.ts): authenticated, owner-only,
+ * audited, and a deliberate act rather than a side effect of someone typing
+ * /start in the wrong group.
  */
 export async function adoptRuntimeConfig(
 	db: D1Database,

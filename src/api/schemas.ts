@@ -254,3 +254,28 @@ export const createTransactionalApiKeySchema = z
 			});
 		}
 	});
+
+/**
+ * A Telegram chat id as the operator types it: the numeric id (negative for
+ * groups, -100... for supergroups) or a public @username. The route stores the
+ * numeric id getChat answers with, never the typed form.
+ */
+const telegramChatIdSchema = z
+	.union([z.number().int(), z.string().trim()])
+	.transform((value) => String(value))
+	.pipe(
+		z
+			.string()
+			.regex(
+				/^(-?\d{1,20}|@[A-Za-z0-9_]{4,32})$/,
+				"a numeric Telegram chat id (e.g. -1001234567890) or a public @username",
+			),
+	);
+
+export const telegramRebindSchema = z
+	.object({
+		chatId: telegramChatIdSchema,
+		/** Check everything with Telegram and report, but write nothing. */
+		dryRun: z.boolean().optional(),
+	})
+	.strict();
