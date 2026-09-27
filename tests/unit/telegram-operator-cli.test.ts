@@ -4,6 +4,7 @@ import type { TelegramOperatorStatus } from "#/telegram/admin/status";
 import type { TopicMappingResult } from "#/telegram/admin/topics";
 import {
 	describeApiRefusal,
+	formatDeliveryTest,
 	formatRebind,
 	formatTelegramStatus,
 	formatTopicListing,
@@ -12,6 +13,39 @@ import {
 	parseTopicCommand,
 	resolveMailboxRef,
 } from "../../scripts/lib/telegram-operator-core";
+
+describe("formatDeliveryTest", () => {
+	it("prints PASS/FAIL per mailbox with the reason", () => {
+		const text = formatDeliveryTest({
+			chatId: "-100",
+			isForum: true,
+			ok: false,
+			results: [
+				{
+					mailboxId: "mbx_1",
+					address: "hello@imsanti.dev",
+					topicId: 7,
+					outcome: "delivered_to_topic",
+					reason: null,
+					messageId: 1,
+					landedThreadId: 7,
+				},
+				{
+					mailboxId: "mbx_2",
+					address: "billing@imsanti.dev",
+					topicId: 8,
+					outcome: "fell_back_to_general",
+					reason: "Addressed to topic 8, but Telegram filed it under General.",
+					messageId: 2,
+					landedThreadId: null,
+				},
+			],
+		}).join("\n");
+		expect(text).toMatch(/PASS {2}hello@imsanti\.dev\s+topic 7/);
+		expect(text).toMatch(/FAIL {2}billing@imsanti\.dev\s+fell_back_to_general — Addressed/);
+		expect(text).toContain("Some mailboxes");
+	});
+});
 
 describe("parseTopicCommand", () => {
 	it("reads a create, an adopt with a label, and --replace", () => {

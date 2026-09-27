@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { classifyTopicDelivery, renderDeliveryTestMessage } from "#/telegram/admin/delivery-test";
 import { describeTelegramError, evaluateBotMembership, isForumChat } from "#/telegram/admin/shared";
 import { decideTopicMapping } from "#/telegram/admin/topics";
 import { TelegramApiError } from "#/telegram/api";
@@ -115,5 +116,29 @@ describe("decideTopicMapping", () => {
 		expect(
 			decideTopicMapping({ mailboxId: "mbx_1", name: "imsanti", replace: true }, row(7, null)),
 		).toEqual({ kind: "create", name: "imsanti", replacing: row(7, null) });
+	});
+});
+
+describe("classifyTopicDelivery", () => {
+	it("trusts only the thread id Telegram hands back", () => {
+		expect(classifyTopicDelivery(7, true, { message_thread_id: 7 }).outcome).toBe(
+			"delivered_to_topic",
+		);
+		expect(classifyTopicDelivery(7, true, {}).outcome).toBe("fell_back_to_general");
+		expect(classifyTopicDelivery(null, true, {}).outcome).toBe("fell_back_to_general");
+		expect(classifyTopicDelivery(7, true, { message_thread_id: 9 })).toMatchObject({
+			outcome: "failed",
+			reason: expect.stringContaining("thread 9"),
+		});
+		expect(classifyTopicDelivery(null, false, {}).outcome).toBe("delivered_to_chat");
+	});
+});
+
+describe("renderDeliveryTestMessage", () => {
+	it("is labelled as a test and escapes the address", () => {
+		const text = renderDeliveryTestMessage({ address: "a<b>@x.dev", topicId: 7 });
+		expect(text).toContain("prueba de entrega");
+		expect(text).toContain("a&lt;b&gt;@x.dev");
+		expect(text).toContain("<code>7</code>");
 	});
 });

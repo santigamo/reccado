@@ -291,6 +291,11 @@ export const telegramTopicSchema = z
 		path: ["name"],
 	});
 
+/** POST /api/telegram/test: every active mailbox, or just this one. */
+export const telegramDeliveryTestSchema = z
+	.object({ mailboxId: z.string().trim().min(1).optional() })
+	.strict();
+
 export const telegramRebindSchema = z
 	.object({
 		chatId: telegramChatIdSchema,

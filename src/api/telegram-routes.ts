@@ -1,11 +1,12 @@
 import type { Hono } from "hono";
+import { sendTelegramDeliveryTest } from "../telegram/admin/delivery-test";
 import { rebindTelegramChat } from "../telegram/admin/rebind";
 import type { AdminResult } from "../telegram/admin/shared";
 import { getTelegramOperatorStatus } from "../telegram/admin/status";
 import { listTelegramTopicMappings, mapTelegramTopic } from "../telegram/admin/topics";
 import { assertMailboxAccess } from "./auth";
 import type { ApiBindings } from "./hono";
-import { telegramRebindSchema, telegramTopicSchema } from "./schemas";
+import { telegramDeliveryTestSchema, telegramRebindSchema, telegramTopicSchema } from "./schemas";
 
 /**
  * Operator control of the Telegram bridge, under /api/telegram/*.
@@ -44,5 +45,15 @@ export function registerTelegramRoutes(api: Hono<ApiBindings>): void {
 		const body = telegramTopicSchema.parse(await c.req.json());
 		assertMailboxAccess(c.get("auth")!, body.mailboxId, c.env);
 		return answer(await mapTelegramTopic(c.env, { ...body, dryRun: body.dryRun ?? false }));
+	});
+
+	// Posts real (labelled) messages, so it is a POST behind the CSRF check even
+	// though it changes no state of ours beyond an ops_event.
+	api.post("/api/telegram/test", async (c) => {
+		// The body is optional: no body means every active mailbox.
+		const text = await c.req.text();
+		const body = telegramDeliveryTestSchema.parse(text.trim() ? JSON.parse(text) : {});
+		if (body.mailboxId) assertMailboxAccess(c.get("auth")!, body.mailboxId, c.env);
+		return answer(await sendTelegramDeliveryTest(c.env, { mailboxId: body.mailboxId }));
 	});
 }

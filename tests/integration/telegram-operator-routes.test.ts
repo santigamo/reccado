@@ -823,3 +823,145 @@ describe("GET /api/telegram/topics", () => {
 		expect(topics.find((t) => t.topicId === 3)).toMatchObject({ inBoundChat: false });
 	});
 });
+
+async function telegramLinkCount(): Promise<number> {
+	const row = await env.INDEX_DB.prepare("SELECT COUNT(*) AS n FROM telegram_links").first<{
+		n: number;
+	}>();
+	return row?.n ?? 0;
+}
+
+describe("POST /api/telegram/test", () => {
+	it("posts a labelled message into each mailbox's topic and confirms where it landed", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		await mapTopic(FORUM_CHAT_ID, "mbx_hello", 7, "imsanti");
+		await mapTopic(FORUM_CHAT_ID, "mbx_billing", 8);
+		const calls = stubTelegram();
+
+		// No body at all: every active mailbox.
+		const { status, body } = await call("POST", "/api/telegram/test");
+
+		expect(status).toBe(200);
+		expect(body).toMatchObject({ chatId: FORUM_CHAT_ID, isForum: true, ok: true });
+		expect(body.results).toEqual([
+			expect.objectContaining({
+				mailboxId: "mbx_hello",
+				topicId: 7,
+				outcome: "delivered_to_topic",
+				landedThreadId: 7,
+			}),
+			expect.objectContaining({
+				mailboxId: "mbx_billing",
+				topicId: 8,
+				outcome: "delivered_to_topic",
+			}),
+		]);
+		const sends = calls.filter((c) => c.method === "sendMessage");
+		expect(sends.map((c) => c.body.message_thread_id)).toEqual([7, 8]);
+		expect(String(sends[0]?.body.text)).toContain("prueba de entrega");
+		expect(String(sends[0]?.body.text)).toContain("hello@imsanti.dev");
+		// A reply to a test message must never become an email reply.
+		expect(await telegramLinkCount()).toBe(0);
+		expect(await opsEvents("telegram.delivery_test")).toHaveLength(1);
+	});
+
+	it("reports a message Telegram filed under General despite the thread id", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		await mapTopic(FORUM_CHAT_ID, "mbx_hello", 7);
+		stubTelegram({
+			respond: (c) =>
+				c.method === "sendMessage"
+					? Response.json({
+							ok: true,
+							result: { message_id: 1, chat: { id: Number(FORUM_CHAT_ID), type: "supergroup" } },
+						})
+					: null,
+		});
+
+		const { body } = await call("POST", "/api/telegram/test", { mailboxId: "mbx_hello" });
+
+		expect(body.ok).toBe(false);
+		expect(body.results).toEqual([
+			expect.objectContaining({
+				outcome: "fell_back_to_general",
+				landedThreadId: null,
+				reason: expect.stringContaining("General"),
+			}),
+		]);
+	});
+
+	it("reports a message that landed in another thread as failed", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		await mapTopic(FORUM_CHAT_ID, "mbx_hello", 7);
+		stubTelegram({
+			respond: (c) =>
+				c.method === "sendMessage"
+					? Response.json({
+							ok: true,
+							result: { message_id: 1, message_thread_id: 99, chat: { id: 1, type: "supergroup" } },
+						})
+					: null,
+		});
+
+		const { body } = await call("POST", "/api/telegram/test", { mailboxId: "mbx_hello" });
+
+		expect(body.results).toEqual([
+			expect.objectContaining({ outcome: "failed", landedThreadId: 99 }),
+		]);
+	});
+
+	it("reports a missing mapping or a deleted topic without creating or forgetting anything", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		await mapTopic(FORUM_CHAT_ID, "mbx_hello", 7);
+		const calls = stubTelegram({
+			respond: (c) =>
+				c.method === "sendMessage" && c.body.message_thread_id === 7
+					? Response.json({
+							ok: false,
+							error_code: 400,
+							description: "Bad Request: message thread not found",
+						})
+					: null,
+		});
+
+		const { status, body } = await call("POST", "/api/telegram/test", {});
+
+		expect(status).toBe(200);
+		expect(body.ok).toBe(false);
+		const results = body.results as Array<Record<string, unknown>>;
+		expect(results[0]).toMatchObject({ mailboxId: "mbx_hello", outcome: "failed" });
+		expect(String(results[0]?.reason)).toContain("no longer exists");
+		expect(results[1]).toMatchObject({
+			mailboxId: "mbx_billing",
+			outcome: "failed",
+			topicId: null,
+		});
+		expect(String(results[1]?.reason)).toContain("No topic is mapped");
+		// The self-heal belongs to real cards; the test only looks.
+		expect(calls.some((c) => c.method === "createForumTopic")).toBe(false);
+		expect(calls.filter((c) => c.method === "sendMessage")).toHaveLength(1);
+		expect(await storedMapping(FORUM_CHAT_ID, "mbx_hello")).toMatchObject({ topic_id: 7 });
+	});
+
+	it("posts flat into a chat without topics", async () => {
+		await bind(PRIVATE_CHAT_ID, false);
+		const calls = stubTelegram();
+
+		const { body } = await call("POST", "/api/telegram/test", { mailboxId: "mbx_billing" });
+
+		expect(body).toMatchObject({ isForum: false, ok: true });
+		expect(body.results).toEqual([
+			expect.objectContaining({ outcome: "delivered_to_chat", topicId: null }),
+		]);
+		expect(calls.find((c) => c.method === "sendMessage")?.body.message_thread_id).toBeUndefined();
+	});
+
+	it("refuses with no bound chat, and for an unknown mailbox", async () => {
+		stubTelegram();
+		expect((await call("POST", "/api/telegram/test", {})).body.error).toBe("no_chat_bound");
+
+		await bind(FORUM_CHAT_ID, true);
+		const unknown = await call("POST", "/api/telegram/test", { mailboxId: "mbx_nope" });
+		expect(unknown.status).toBe(404);
+	});
+});

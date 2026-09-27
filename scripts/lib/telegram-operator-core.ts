@@ -10,6 +10,7 @@
  * worker secret, so every Telegram call happens inside the worker, behind the
  * owner session.
  */
+import type { DeliveryTestResult } from "../../src/telegram/admin/delivery-test";
 import type { RebindResult } from "../../src/telegram/admin/rebind";
 import type { TelegramOperatorStatus } from "../../src/telegram/admin/status";
 import type { TopicListing, TopicMappingResult } from "../../src/telegram/admin/topics";
@@ -69,6 +70,34 @@ export function parseTopicCommand(
 		...(adoptThreadId !== undefined ? { adoptThreadId } : {}),
 		replace: flags.replace === "true",
 	};
+}
+
+/** One line per mailbox, `PASS`/`FAIL` first, so a scroll-back reads at a glance. */
+export function formatDeliveryTest(result: DeliveryTestResult): string[] {
+	const lines = [
+		`Delivery test in ${result.chatId} (${result.isForum ? "forum: one topic per mailbox" : "no topics: flat chat"})`,
+	];
+	if (result.results.length === 0) lines.push("  (no active mailboxes to test)");
+	for (const entry of result.results) {
+		const pass = entry.outcome === "delivered_to_topic" || entry.outcome === "delivered_to_chat";
+		const where =
+			entry.outcome === "delivered_to_topic"
+				? `topic ${entry.topicId}`
+				: entry.outcome === "delivered_to_chat"
+					? "the chat"
+					: entry.outcome;
+		lines.push(
+			`  ${pass ? "PASS" : "FAIL"}  ${entry.address.padEnd(32)} ${where}${entry.reason ? ` — ${entry.reason}` : ""}`,
+		);
+	}
+	lines.push(
+		"",
+		result.ok
+			? "All test messages landed where real cards would."
+			: "Some mailboxes would not get their cards where expected (see FAIL lines).",
+		"Test messages create no reply link: answering one in Telegram sends no email.",
+	);
+	return lines;
 }
 
 /** A mailbox id, or a primary address resolved against GET /api/mailboxes. */
