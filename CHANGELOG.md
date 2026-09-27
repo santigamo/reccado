@@ -189,6 +189,12 @@ read/search/draft endpoint.
 
 ### Added
 
+- **`pnpm doctor --cloud` compares the tg-hq topic registry with D1 (`cloud.telegram-topics`).**
+  For the bound chat, each `telegram_topics` mapping is checked against the thread ids the owner's
+  `tg-hq` registry (1Password) records: match, missing from the registry, or thread id mismatch.
+  Mailbox-looking registry entries that no D1 row delivers to get a warning. The check is
+  read-only and never calls Telegram, and it prints only an info line when `op` is unavailable or
+  the bridge is bound to a different chat.
 - **`docs/INTEGRATING.md` — the integrator's guide to the transactional API.** Written from the
   code for a product team sending through Reccado: who provisions what (mailbox on the zone,
   sending identity on `send.`), one endpoint per mailbox with the key selecting the environment,

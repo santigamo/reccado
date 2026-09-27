@@ -317,6 +317,20 @@ integrator's contract (endpoint, idempotency, every response code, templates, su
   DNS-over-HTTPS for all of those names and warns on the provider's auto-created
   `v=DMARC1; p=reject;` (enforcing, no `rua`, chosen by nobody), on `p=quarantine`/`p=reject`
   without `rua`, and on zero or multiple DMARC records.
+- `pnpm doctor --env <env> --cloud` also checks `cloud.telegram-topics`, which compares the forum
+  topic ids in two places. One is the `tg-hq` registry: the `topics` and `chat_id` fields of the
+  1Password item "Telegram - Santi HQ bot", read with `op read`, with `TG_HQ_TOPICS` /
+  `TG_HQ_CHAT_ID` taking priority as they do in tg-hq. The other is D1 `telegram_topics` for the
+  bound chat (`runtime_config` `telegram.chat_id`). For each D1 mapping it reports whether the
+  registry records the same thread id: **pass** when it does, **warn** when the thread is missing
+  from the registry, and **warn** on a thread id mismatch, meaning a mailbox-named entry such as
+  `correo-imsanti` points somewhere else. It also warns on registry entries that look like mailbox
+  topics (`correo-…`, `mail-…`, `inbox-…` slugs, or a "Correo …" name) but that no D1 row delivers to.
+  It prints only an info line when `op` is missing, the item cannot be read, or the bound chat is
+  not the registry's forum. In that last case it names the bound chat and the D1 rows already
+  staged for the forum, which stay unused until the bridge is rebound there. The check is
+  read-only and never calls Telegram, because the Bot API's only topic probe, `editForumTopic`,
+  renames the topic. The comparison lives in `scripts/lib/telegram-topic-registry.ts`.
 - A support mailbox on the zone apex that replies as itself needs Email Sending on the apex:
   `pnpm setup:sending --env <env> --domain <zone> --apex --dmarc-policy <none|quarantine|reject>
   --dmarc-rua dmarc@<zone> [--apply]`. The apex DMARC governs every sender on the domain, so the

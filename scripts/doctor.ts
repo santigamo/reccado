@@ -6,7 +6,7 @@
  * Default run is offline and deterministic (toolchain + local dev + config placeholders).
  * Pass `--cloud` to add remote checks (auth, D1 exists + id match, every declared Queue exists and
  * its DLQs are consumed, every sending domain publishes its lifecycle events to the events queue,
- * required secrets, and — with `--url` — that the deployed login page and /api/health answer).
+ * required secrets, the tg-hq forum topic registry agrees with D1's topic mappings, and — with `--url` — that the deployed login page and /api/health answer).
  * Exhaustive R2/queue/Email-Routing *binding* wiring lives in `pnpm verify:cf`.
  *
  * Usage:
@@ -37,6 +37,11 @@ import {
 	parseSendingDomainsTable,
 	parseSubscriptionListJson,
 } from "./lib/event-subscriptions";
+import {
+	compareTopicRegistry,
+	parseTopicRegistry,
+	type TopicMapping,
+} from "./lib/telegram-topic-registry";
 
 type Status = "pass" | "warn" | "fail" | "info";
 type Check = { id: string; status: Status; message: string; fix?: string };
@@ -1023,6 +1028,120 @@ function checkTelegramBridge(): Check {
 	};
 }
 
+const TG_HQ_ITEM = "op://Personal/Telegram - Santi HQ bot";
+
+/**
+ * One field of the tg-hq 1Password item. Env first (TG_HQ_TOPICS, TG_HQ_CHAT_ID),
+ * as tg-hq itself reads it, for machines without `op`. Only the non-secret
+ * fields are ever read here; the bot token (`credential`) never is.
+ */
+function readTgHqField(field: "topics" | "chat_id"): { value: string } | { skip: string } {
+	const fromEnv = process.env[field === "topics" ? "TG_HQ_TOPICS" : "TG_HQ_CHAT_ID"];
+	if (fromEnv?.trim()) return { value: fromEnv.trim() };
+	try {
+		const value = execFileSync("op", ["read", `${TG_HQ_ITEM}/${field}`], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			timeout: 30_000,
+		}).trim();
+		return { value };
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return { skip: "the 1Password CLI (`op`) is not installed" };
+		if (code === "ETIMEDOUT") return { skip: "`op` did not answer in 30 s (1Password locked?)" };
+		return {
+			skip: `could not read "${field}" from the tg-hq 1Password item (missing, or op signed out)`,
+		};
+	}
+}
+
+/**
+ * `cloud.telegram-topics`: the tg-hq registry of the owner's HQ forum against
+ * D1 `telegram_topics` for the bound chat. Read-only on both sides, and it never
+ * calls Telegram — the Bot API's only topic probe is `editForumTopic`, which
+ * renames the topic it touches.
+ */
+function checkTelegramTopicsRemote(): Check[] {
+	const id = "cloud.telegram-topics";
+	const topicsField = readTgHqField("topics");
+	if ("skip" in topicsField) {
+		return [{ id, status: "info", message: `Skipped: ${topicsField.skip}.` }];
+	}
+	const chatField = readTgHqField("chat_id");
+	if ("skip" in chatField || !chatField.value) {
+		return [
+			{
+				id,
+				status: "info",
+				message: `Skipped: ${"skip" in chatField ? chatField.skip : "the tg-hq item has no chat_id"}.`,
+			},
+		];
+	}
+	const registry = parseTopicRegistry(topicsField.value);
+	if (!registry.ok) {
+		return [
+			{
+				id,
+				status: "warn",
+				message: `tg-hq registry is unreadable: ${registry.error}.`,
+				fix: "Run `tg-hq topics` to see what tg-hq itself makes of it.",
+			},
+		];
+	}
+	let bound: string | null;
+	let mappings: TopicMapping[];
+	try {
+		const raw = execFileSync(
+			"pnpm",
+			[
+				"wrangler",
+				"d1",
+				"execute",
+				"INDEX_DB",
+				"--remote",
+				"--json",
+				"--command",
+				"SELECT value FROM runtime_config WHERE key = 'telegram.chat_id'; SELECT t.chat_id, t.mailbox_id, t.topic_id, m.primary_address FROM telegram_topics t LEFT JOIN mailboxes m ON m.mailbox_id = t.mailbox_id",
+				...(targetEnv ? ["--env", targetEnv] : []),
+			],
+			{ encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+		);
+		const parsed = JSON.parse(raw.slice(raw.indexOf("["))) as [
+			{ results: Array<{ value: string }> },
+			{
+				results: Array<{
+					chat_id: string | number;
+					mailbox_id: string;
+					topic_id: number;
+					primary_address: string | null;
+				}>;
+			},
+		];
+		bound = parsed[0]?.results?.[0]?.value ?? null;
+		mappings = (parsed[1]?.results ?? []).map((row) => ({
+			chatId: String(row.chat_id),
+			mailboxId: row.mailbox_id,
+			address: row.primary_address,
+			topicId: Number(row.topic_id),
+		}));
+	} catch {
+		return [
+			{
+				id,
+				status: "warn",
+				message: "Could not read runtime_config / telegram_topics from D1.",
+				fix: `pnpm d1:migrate:${targetEnv ?? "prod"} — the telegram_topics table may be missing.`,
+			},
+		];
+	}
+	return compareTopicRegistry({
+		boundChatId: bound,
+		registryChatId: chatField.value,
+		registry: registry.topics,
+		mappings,
+	}).map((finding) => ({ id, ...finding }));
+}
+
 /** Runtime-config JSON values, read leniently: a malformed row is not a diagnosis. */
 function parseJsonValue(raw: string | undefined): Record<string, unknown> | null {
 	if (!raw) return null;
@@ -1187,6 +1306,7 @@ if (args.cloud === "true") {
 	addAll(checkSendingDomainsDeclared());
 	addAll(await checkDmarcRemote());
 	addAll(checkSecretsRemote());
+	addAll(checkTelegramTopicsRemote());
 	if (args.url) {
 		addAll(await checkAuthEndpoints(args.url));
 	} else {
