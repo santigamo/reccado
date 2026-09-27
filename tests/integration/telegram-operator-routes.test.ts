@@ -555,3 +555,271 @@ describe("POST /api/telegram/rebind", () => {
 		expect(await configValue("telegram.chat_id")).toBe(PRIVATE_CHAT_ID);
 	});
 });
+
+async function storedMapping(
+	chatId: string,
+	mailboxId: string,
+): Promise<{ topic_id: number; topic_name: string | null } | null> {
+	return env.INDEX_DB.prepare(
+		"SELECT topic_id, topic_name FROM telegram_topics WHERE chat_id = ? AND mailbox_id = ?",
+	)
+		.bind(chatId, mailboxId)
+		.first<{ topic_id: number; topic_name: string | null }>();
+}
+
+describe("POST /api/telegram/topics", () => {
+	it("creates a named topic, stores the name with the mapping, and real cards use it", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		const calls = stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+		});
+
+		expect(status).toBe(201);
+		expect(body).toMatchObject({
+			outcome: "created",
+			chatId: FORUM_CHAT_ID,
+			mapping: {
+				mailboxId: "mbx_hello",
+				topicId: 501,
+				topicName: "imsanti",
+				effectiveName: "imsanti",
+			},
+			replaced: null,
+			topicVerified: true,
+		});
+		expect(calls.find((c) => c.method === "createForumTopic")?.body).toEqual({
+			chat_id: FORUM_CHAT_ID,
+			name: "imsanti",
+		});
+		expect(await storedMapping(FORUM_CHAT_ID, "mbx_hello")).toEqual({
+			topic_id: 501,
+			topic_name: "imsanti",
+		});
+		// display_name ("Santi Gamo") is untouched: it is still how replies are signed.
+		const mailbox = await env.INDEX_DB.prepare(
+			"SELECT display_name FROM mailboxes WHERE mailbox_id = 'mbx_hello'",
+		).first<{ display_name: string }>();
+		expect(mailbox?.display_name).toBe("Santi Gamo");
+		expect(await opsEvents("telegram.topic_mapped")).toHaveLength(1);
+
+		const { deliverInboundNotification } = await import("#/telegram/notify");
+		const cardCalls = stubTelegram();
+		await deliverInboundNotification(bridgeEnv(), {
+			mailboxId: "mbx_hello",
+			mailboxAddress: "hello@imsanti.dev",
+			messageLocalId: "msg_named_topic",
+			threadId: "thread_named_topic",
+			subject: "Hola",
+			fromAddr: "someone@example.org",
+			snippet: null,
+			hasAttachments: false,
+		});
+		expect(cardCalls.some((c) => c.method === "createForumTopic")).toBe(false);
+		expect(cardCalls.find((c) => c.method === "sendMessage")?.body.message_thread_id).toBe(501);
+	});
+
+	it("is idempotent: the same request again is `already`, with no second topic", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		await mapTopic(FORUM_CHAT_ID, "mbx_hello", 7, "imsanti");
+		const calls = stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+		});
+
+		expect(status).toBe(200);
+		expect(body.outcome).toBe("already");
+		expect(body.topicVerified).toBe(false);
+		expect(calls.some((c) => c.method === "createForumTopic")).toBe(false);
+	});
+
+	it("answers 409 for a different mapping unless replace is set, then replaces it", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		await mapTopic(FORUM_CHAT_ID, "mbx_hello", 7);
+		const calls = stubTelegram();
+
+		const conflict = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+		});
+		expect(conflict.status).toBe(409);
+		expect(conflict.body.error).toBe("topic_mapping_exists");
+		expect(conflict.body.existing).toMatchObject({ topicId: 7, topicName: null });
+		expect(calls.some((c) => c.method === "createForumTopic")).toBe(false);
+
+		const replaced = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+			replace: true,
+		});
+		expect(replaced.status).toBe(201);
+		expect(replaced.body.replaced).toMatchObject({ topicId: 7 });
+		expect(await storedMapping(FORUM_CHAT_ID, "mbx_hello")).toEqual({
+			topic_id: 501,
+			topic_name: "imsanti",
+		});
+	});
+
+	it("adopts an existing thread without creating anything, and says it is unverified", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		const calls = stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_billing",
+			adoptThreadId: 42,
+			name: "facturas",
+		});
+
+		expect(status).toBe(201);
+		expect(body).toMatchObject({
+			outcome: "adopted",
+			mapping: { topicId: 42, topicName: "facturas" },
+			topicVerified: false,
+		});
+		expect(String(body.reason)).toContain("editForumTopic");
+		expect(calls.map((c) => c.method)).toEqual(["getChat"]);
+		expect(await storedMapping(FORUM_CHAT_ID, "mbx_billing")).toEqual({
+			topic_id: 42,
+			topic_name: "facturas",
+		});
+
+		const again = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_billing",
+			adoptThreadId: 42,
+		});
+		expect(again.body.outcome).toBe("already");
+	});
+
+	it("dry run: reports what it would do and writes nothing", async () => {
+		await bind(FORUM_CHAT_ID, false);
+		const calls = stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+			dryRun: true,
+		});
+
+		expect(status).toBe(200);
+		expect(body).toMatchObject({ outcome: "would_create", mapping: null, dryRun: true });
+		expect(calls.map((c) => c.method)).toEqual(["getChat"]);
+		expect(await storedMapping(FORUM_CHAT_ID, "mbx_hello")).toBeNull();
+		// Even the re-observed forum flag is not written by a dry run.
+		expect(await configValue("telegram.chat_is_forum")).toBe("0");
+	});
+
+	it("re-observes a stale forum flag instead of refusing", async () => {
+		await bind(FORUM_CHAT_ID, false);
+		stubTelegram();
+
+		const { status } = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+		});
+
+		expect(status).toBe(201);
+		expect(await configValue("telegram.chat_is_forum")).toBe("1");
+	});
+
+	it("refuses a chat that is not a forum", async () => {
+		await bind(PRIVATE_CHAT_ID, false);
+		stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+		});
+
+		expect(status).toBe(409);
+		expect(body.error).toBe("chat_not_forum");
+	});
+
+	it("refuses when no chat is bound", async () => {
+		stubTelegram();
+
+		const { status, body } = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+		});
+
+		expect(status).toBe(409);
+		expect(body.error).toBe("no_chat_bound");
+	});
+
+	it("reports a topic Telegram refused to create, and stores nothing", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		stubTelegram({
+			respond: (c) =>
+				c.method === "createForumTopic"
+					? Response.json({
+							ok: false,
+							error_code: 400,
+							description: "Bad Request: not enough rights to create a topic",
+						})
+					: null,
+		});
+
+		const { status, body } = await call("POST", "/api/telegram/topics", {
+			mailboxId: "mbx_hello",
+			name: "imsanti",
+		});
+
+		expect(status).toBe(409);
+		expect(body.error).toBe("topic_create_refused");
+		expect(await storedMapping(FORUM_CHAT_ID, "mbx_hello")).toBeNull();
+	});
+
+	it("rejects an unknown or disabled mailbox and a body with neither name nor thread", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		stubTelegram();
+
+		expect(
+			(await call("POST", "/api/telegram/topics", { mailboxId: "mbx_nope", name: "x" })).status,
+		).toBe(404);
+		expect(
+			(await call("POST", "/api/telegram/topics", { mailboxId: "mbx_off", name: "x" })).status,
+		).toBe(404);
+		expect((await call("POST", "/api/telegram/topics", { mailboxId: "mbx_hello" })).status).toBe(
+			400,
+		);
+		expect(
+			(
+				await call("POST", "/api/telegram/topics", {
+					mailboxId: "mbx_hello",
+					name: "x".repeat(129),
+				})
+			).status,
+		).toBe(400);
+	});
+});
+
+describe("GET /api/telegram/topics", () => {
+	it("lists every mapping with its effective name and whether it is in the bound chat", async () => {
+		await bind(FORUM_CHAT_ID, true);
+		await mapTopic(FORUM_CHAT_ID, "mbx_hello", 7, "imsanti");
+		await mapTopic(FORUM_CHAT_ID, "mbx_billing", 8);
+		await mapTopic(PRIVATE_CHAT_ID, "mbx_hello", 3);
+
+		const { status, body } = await call("GET", "/api/telegram/topics");
+
+		expect(status).toBe(200);
+		expect(body.binding).toEqual({ chatId: FORUM_CHAT_ID, isForum: true });
+		const topics = body.topics as Array<Record<string, unknown>>;
+		expect(topics).toHaveLength(3);
+		expect(topics.find((t) => t.topicId === 7)).toMatchObject({
+			effectiveName: "imsanti",
+			mailboxAddress: "hello@imsanti.dev",
+			inBoundChat: true,
+		});
+		// NULL name: follows the mailbox, which has no display_name -> the address.
+		expect(topics.find((t) => t.topicId === 8)).toMatchObject({
+			topicName: null,
+			effectiveName: "billing@imsanti.dev",
+		});
+		expect(topics.find((t) => t.topicId === 3)).toMatchObject({ inBoundChat: false });
+	});
+});

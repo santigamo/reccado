@@ -12,7 +12,123 @@
  */
 import type { RebindResult } from "../../src/telegram/admin/rebind";
 import type { TelegramOperatorStatus } from "../../src/telegram/admin/status";
+import type { TopicListing, TopicMappingResult } from "../../src/telegram/admin/topics";
 import { OperatorInputError } from "./operator-session-core";
+
+/** Telegram's own limit on a forum topic name (the route enforces it too). */
+const TOPIC_NAME_MAX = 128;
+
+export type TopicCommand = {
+	/** A mailbox id or its primary address, as typed. */
+	mailboxRef: string;
+	name?: string;
+	adoptThreadId?: number;
+	replace: boolean;
+};
+
+/**
+ * `telegram topic <mailboxId|address> (--name "..." | --adopt <threadId>) [--replace]`.
+ * --adopt may carry a --name too: the label stored for that thread (and reused
+ * if the topic is ever recreated).
+ */
+export function parseTopicCommand(
+	mailboxRef: string | undefined,
+	flags: Record<string, string>,
+): TopicCommand {
+	if (!mailboxRef) {
+		throw new OperatorInputError(
+			'telegram topic needs a mailbox: pnpm operator telegram topic <mailboxId|address> (--name "..." | --adopt <threadId>).',
+		);
+	}
+	const name = flags.name === undefined || flags.name === "true" ? undefined : flags.name.trim();
+	if (flags.name !== undefined && !name) {
+		throw new OperatorInputError('--name needs a value, e.g. --name "imsanti".');
+	}
+	if (name && name.length > TOPIC_NAME_MAX) {
+		throw new OperatorInputError(
+			`--name is ${name.length} characters; Telegram allows ${TOPIC_NAME_MAX}.`,
+		);
+	}
+	let adoptThreadId: number | undefined;
+	if (flags.adopt !== undefined) {
+		adoptThreadId = Number(flags.adopt);
+		if (!Number.isInteger(adoptThreadId) || adoptThreadId <= 0) {
+			throw new OperatorInputError(
+				`--adopt ${flags.adopt}: expected the topic's positive message_thread_id.`,
+			);
+		}
+	}
+	if (name === undefined && adoptThreadId === undefined) {
+		throw new OperatorInputError(
+			'Give --name "..." to create a topic, or --adopt <threadId> to map an existing one.',
+		);
+	}
+	return {
+		mailboxRef,
+		...(name !== undefined ? { name } : {}),
+		...(adoptThreadId !== undefined ? { adoptThreadId } : {}),
+		replace: flags.replace === "true",
+	};
+}
+
+/** A mailbox id, or a primary address resolved against GET /api/mailboxes. */
+export function resolveMailboxRef(
+	ref: string,
+	mailboxes: ReadonlyArray<{ mailbox_id: string; primary_address: string; status?: string }>,
+): string {
+	const trimmed = ref.trim();
+	if (!trimmed.includes("@")) {
+		if (mailboxes.some((m) => m.mailbox_id === trimmed)) return trimmed;
+		throw new OperatorInputError(`No mailbox with id ${trimmed}.`);
+	}
+	const match = mailboxes.find((m) => m.primary_address.toLowerCase() === trimmed.toLowerCase());
+	if (!match) {
+		throw new OperatorInputError(
+			`No mailbox has the primary address ${trimmed} (aliases are not accepted here).`,
+		);
+	}
+	return match.mailbox_id;
+}
+
+export function formatTopicResult(result: TopicMappingResult): string[] {
+	const heading: Record<TopicMappingResult["outcome"], string> = {
+		would_create: "Dry run — would create a forum topic and map it:",
+		would_adopt: "Dry run — would map an existing forum topic:",
+		created: "Created the forum topic and mapped it:",
+		adopted: "Mapped the existing forum topic:",
+		already: "Already mapped; nothing to do:",
+	};
+	const lines = [heading[result.outcome], `  chat:     ${result.chatId}`];
+	if (result.mapping) {
+		lines.push(
+			`  mapping:  ${result.mapping.mailboxId} -> topic ${result.mapping.topicId} "${result.mapping.effectiveName}"${result.mapping.topicName ? "" : " (follows the mailbox name)"}`,
+		);
+	}
+	if (result.replaced) {
+		lines.push(
+			`  replaces: topic ${result.replaced.topicId} "${result.replaced.effectiveName}" (left in Telegram, no longer used)`,
+		);
+	}
+	if (result.reason) lines.push(`  note:     ${result.reason}`);
+	if (result.dryRun && result.outcome !== "already") {
+		lines.push("", "Re-run with --apply to perform it.");
+	}
+	return lines;
+}
+
+export function formatTopicListing(listing: TopicListing): string[] {
+	const lines = [
+		`bound chat: ${listing.binding.chatId ?? "(none)"} (forum: ${yesNo(listing.binding.isForum)})`,
+	];
+	if (listing.topics.length === 0) lines.push("  (no topic mappings)");
+	for (const topic of listing.topics) {
+		lines.push(
+			`  ${topic.inBoundChat ? "*" : " "} ${topic.chatId.padEnd(16)} ${(topic.mailboxAddress ?? topic.mailboxId).padEnd(32)} topic ${String(topic.topicId).padEnd(6)} "${topic.effectiveName}"${topic.topicName ? "" : " (follows the mailbox name)"}`,
+		);
+	}
+	lines.push("  (* = in the bound chat; others are kept for a rebind back)");
+	return lines;
+}
 
 /**
  * `--chat` as typed: a numeric chat id or a public @username. The same rule

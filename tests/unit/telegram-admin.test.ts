@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { describeTelegramError, evaluateBotMembership, isForumChat } from "#/telegram/admin/shared";
+import { decideTopicMapping } from "#/telegram/admin/topics";
 import { TelegramApiError } from "#/telegram/api";
 
 describe("describeTelegramError", () => {
@@ -61,5 +62,58 @@ describe("evaluateBotMembership", () => {
 	it("refuses a bot that left or was removed", () => {
 		expect(evaluateBotMembership({ status: "left" }, {}).eligible).toBe(false);
 		expect(evaluateBotMembership({ status: "kicked" }, {}).eligible).toBe(false);
+	});
+});
+
+describe("decideTopicMapping", () => {
+	const row = (topicId: number, name: string | null) => ({
+		chat_id: "-100",
+		mailbox_id: "mbx_1",
+		topic_id: topicId,
+		topic_name: name,
+		created_at: "2026-09-27T00:00:00.000Z",
+	});
+
+	it("creates or adopts when nothing is mapped", () => {
+		expect(decideTopicMapping({ mailboxId: "mbx_1", name: " imsanti " }, null)).toEqual({
+			kind: "create",
+			name: "imsanti",
+			replacing: null,
+		});
+		expect(decideTopicMapping({ mailboxId: "mbx_1", adoptThreadId: 9 }, null)).toEqual({
+			kind: "adopt",
+			topicId: 9,
+			name: null,
+			replacing: null,
+		});
+	});
+
+	it("treats the same request again as already", () => {
+		expect(
+			decideTopicMapping({ mailboxId: "mbx_1", name: "imsanti" }, row(7, "imsanti")).kind,
+		).toBe("already");
+		expect(decideTopicMapping({ mailboxId: "mbx_1", adoptThreadId: 7 }, row(7, "x")).kind).toBe(
+			"already",
+		);
+		expect(
+			decideTopicMapping({ mailboxId: "mbx_1", adoptThreadId: 7, name: "x" }, row(7, "x")).kind,
+		).toBe("already");
+	});
+
+	it("is a conflict for anything else unless replace is set", () => {
+		// A NULL-named (auto-created) topic is not "the same" as a named request:
+		// its real name in Telegram is unknown.
+		expect(decideTopicMapping({ mailboxId: "mbx_1", name: "imsanti" }, row(7, null)).kind).toBe(
+			"conflict",
+		);
+		expect(decideTopicMapping({ mailboxId: "mbx_1", adoptThreadId: 8 }, row(7, null)).kind).toBe(
+			"conflict",
+		);
+		expect(
+			decideTopicMapping({ mailboxId: "mbx_1", adoptThreadId: 7, name: "y" }, row(7, "x")).kind,
+		).toBe("conflict");
+		expect(
+			decideTopicMapping({ mailboxId: "mbx_1", name: "imsanti", replace: true }, row(7, null)),
+		).toEqual({ kind: "create", name: "imsanti", replacing: row(7, null) });
 	});
 });

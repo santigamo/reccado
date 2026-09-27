@@ -1,12 +1,115 @@
 import { describe, expect, it } from "vitest";
 import type { RebindResult } from "#/telegram/admin/rebind";
 import type { TelegramOperatorStatus } from "#/telegram/admin/status";
+import type { TopicMappingResult } from "#/telegram/admin/topics";
 import {
 	describeApiRefusal,
 	formatRebind,
 	formatTelegramStatus,
+	formatTopicListing,
+	formatTopicResult,
 	parseChatFlag,
+	parseTopicCommand,
+	resolveMailboxRef,
 } from "../../scripts/lib/telegram-operator-core";
+
+describe("parseTopicCommand", () => {
+	it("reads a create, an adopt with a label, and --replace", () => {
+		expect(parseTopicCommand("hello@imsanti.dev", { name: "imsanti" })).toEqual({
+			mailboxRef: "hello@imsanti.dev",
+			name: "imsanti",
+			replace: false,
+		});
+		expect(parseTopicCommand("mbx_1", { adopt: "42", name: "facturas", replace: "true" })).toEqual({
+			mailboxRef: "mbx_1",
+			name: "facturas",
+			adoptThreadId: 42,
+			replace: true,
+		});
+	});
+
+	it("refuses what the route would refuse, before any request", () => {
+		expect(() => parseTopicCommand(undefined, { name: "x" })).toThrow(/needs a mailbox/);
+		expect(() => parseTopicCommand("mbx_1", {})).toThrow(/--name .* or --adopt/);
+		expect(() => parseTopicCommand("mbx_1", { name: "true" })).toThrow(/--name needs a value/);
+		expect(() => parseTopicCommand("mbx_1", { adopt: "abc" })).toThrow(
+			/positive message_thread_id/,
+		);
+		expect(() => parseTopicCommand("mbx_1", { adopt: "0" })).toThrow(/positive/);
+		expect(() => parseTopicCommand("mbx_1", { name: "x".repeat(129) })).toThrow(/128/);
+	});
+});
+
+describe("resolveMailboxRef", () => {
+	const mailboxes = [
+		{ mailbox_id: "mbx_1", primary_address: "hello@imsanti.dev" },
+		{ mailbox_id: "mbx_2", primary_address: "billing@imsanti.dev" },
+	];
+
+	it("accepts an id or a primary address, case-insensitively", () => {
+		expect(resolveMailboxRef("mbx_2", mailboxes)).toBe("mbx_2");
+		expect(resolveMailboxRef("Hello@IMSANTI.dev", mailboxes)).toBe("mbx_1");
+	});
+
+	it("names what it could not find", () => {
+		expect(() => resolveMailboxRef("nope@imsanti.dev", mailboxes)).toThrow(/primary address/);
+		expect(() => resolveMailboxRef("mbx_9", mailboxes)).toThrow(/No mailbox with id mbx_9/);
+	});
+});
+
+describe("formatTopicResult / formatTopicListing", () => {
+	const mapping = {
+		chatId: "-100",
+		mailboxId: "mbx_1",
+		topicId: 7,
+		topicName: "imsanti",
+		effectiveName: "imsanti",
+		createdAt: "2026-09-27T00:00:00.000Z",
+	};
+
+	it("prints a dry-run create and how to apply it", () => {
+		const result: TopicMappingResult = {
+			outcome: "would_create",
+			dryRun: true,
+			chatId: "-100",
+			mapping: null,
+			replaced: { ...mapping, topicName: null, effectiveName: "Santi Gamo" },
+			topicVerified: false,
+			reason: 'Would create a topic named "imsanti".',
+		};
+		const text = formatTopicResult(result).join("\n");
+		expect(text).toContain("Dry run — would create");
+		expect(text).toContain('replaces: topic 7 "Santi Gamo"');
+		expect(text).toContain("--apply");
+	});
+
+	it("does not ask to apply an `already`", () => {
+		const text = formatTopicResult({
+			outcome: "already",
+			dryRun: true,
+			chatId: "-100",
+			mapping,
+			replaced: null,
+			topicVerified: false,
+			reason: null,
+		}).join("\n");
+		expect(text).toContain("Already mapped");
+		expect(text).toContain('mbx_1 -> topic 7 "imsanti"');
+		expect(text).not.toContain("--apply");
+	});
+
+	it("marks the mappings in the bound chat", () => {
+		const text = formatTopicListing({
+			binding: { chatId: "-100", isForum: true },
+			topics: [
+				{ ...mapping, mailboxAddress: "hello@imsanti.dev", inBoundChat: true },
+				{ ...mapping, chatId: "424242", topicId: 3, mailboxAddress: null, inBoundChat: false },
+			],
+		});
+		expect(text[1]).toMatch(/^ {2}\* -100/);
+		expect(text[2]).toMatch(/^ {4}424242/);
+	});
+});
 
 describe("parseChatFlag", () => {
 	it("accepts numeric ids and public usernames", () => {

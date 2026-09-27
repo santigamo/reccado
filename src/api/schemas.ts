@@ -272,6 +272,25 @@ const telegramChatIdSchema = z
 			),
 	);
 
+/**
+ * Map a mailbox to a forum topic in the bound chat. `adoptThreadId` records an
+ * existing thread (with `name` as its optional stored label); otherwise `name`
+ * is required and a topic is created under it. 128 is Telegram's own limit.
+ */
+export const telegramTopicSchema = z
+	.object({
+		mailboxId: z.string().trim().min(1),
+		name: z.string().trim().min(1).max(128).optional(),
+		adoptThreadId: z.number().int().positive().optional(),
+		replace: z.boolean().optional(),
+		dryRun: z.boolean().optional(),
+	})
+	.strict()
+	.refine((body) => body.name !== undefined || body.adoptThreadId !== undefined, {
+		message: "give name (create a topic) or adoptThreadId (map an existing one)",
+		path: ["name"],
+	});
+
 export const telegramRebindSchema = z
 	.object({
 		chatId: telegramChatIdSchema,

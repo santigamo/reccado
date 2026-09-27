@@ -2,8 +2,10 @@ import type { Hono } from "hono";
 import { rebindTelegramChat } from "../telegram/admin/rebind";
 import type { AdminResult } from "../telegram/admin/shared";
 import { getTelegramOperatorStatus } from "../telegram/admin/status";
+import { listTelegramTopicMappings, mapTelegramTopic } from "../telegram/admin/topics";
+import { assertMailboxAccess } from "./auth";
 import type { ApiBindings } from "./hono";
-import { telegramRebindSchema } from "./schemas";
+import { telegramRebindSchema, telegramTopicSchema } from "./schemas";
 
 /**
  * Operator control of the Telegram bridge, under /api/telegram/*.
@@ -32,5 +34,15 @@ export function registerTelegramRoutes(api: Hono<ApiBindings>): void {
 		return answer(
 			await rebindTelegramChat(c.env, { chatId: body.chatId, dryRun: body.dryRun ?? false }),
 		);
+	});
+
+	api.get("/api/telegram/topics", async (c) => {
+		return c.json(await listTelegramTopicMappings(c.env));
+	});
+
+	api.post("/api/telegram/topics", async (c) => {
+		const body = telegramTopicSchema.parse(await c.req.json());
+		assertMailboxAccess(c.get("auth")!, body.mailboxId, c.env);
+		return answer(await mapTelegramTopic(c.env, { ...body, dryRun: body.dryRun ?? false }));
 	});
 }

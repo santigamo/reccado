@@ -13,6 +13,8 @@
  *   pnpm operator logout --host inbox.example.com
  *   pnpm operator telegram status [--json]       bot, bound chat, rights, topics per mailbox
  *   pnpm operator telegram rebind --chat <id> [--apply]
+ *   pnpm operator telegram topic <mailboxId|address> (--name "..." | --adopt <threadId>) [--replace] [--apply]
+ *   pnpm operator telegram topics
  *
  * The telegram subcommands call /api/telegram/* with the stored session; the
  * worker makes every Bot API call with its own (write-only) token. Mutating
@@ -26,6 +28,7 @@
  */
 import type { RebindResult } from "../src/telegram/admin/rebind";
 import type { TelegramOperatorStatus } from "../src/telegram/admin/status";
+import type { TopicListing, TopicMappingResult } from "../src/telegram/admin/topics";
 import {
 	getSessionInfo,
 	loadSession,
@@ -42,7 +45,11 @@ import {
 	describeApiRefusal,
 	formatRebind,
 	formatTelegramStatus,
+	formatTopicListing,
+	formatTopicResult,
 	parseChatFlag,
+	parseTopicCommand,
+	resolveMailboxRef,
 } from "./lib/telegram-operator-core";
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string> } {
@@ -82,13 +89,21 @@ const USAGE = `Usage: pnpm operator <login|whoami|logout|telegram> [--env <env>]
           and each active mailbox's topic
   telegram rebind --chat <id|@username> [--apply] [--json]
           move the bridge to another chat (dry run by default: checks the chat and the
-          bot's rights with Telegram and prints current -> new; --apply writes it)`;
+          bot's rights with Telegram and prints current -> new; --apply writes it)
+  telegram topic <mailboxId|address> (--name "..." | --adopt <threadId> [--name "..."])
+                 [--replace] [--apply] [--json]
+          map a mailbox to a forum topic in the bound chat: create one under --name, or
+          adopt an existing thread; the name is stored with the mapping, independent of
+          the mailbox's display name (dry run by default)
+  telegram topics [--json]
+          list every topic mapping, marking the ones in the bound chat`;
 
 type Flags = Record<string, string>;
 
 /** `pnpm operator telegram <sub>`: thin IO around /api/telegram/*; formatting is in the core. */
 async function runTelegram(
 	sub: string | undefined,
+	positional: string[],
 	flags: Flags,
 	host: string,
 	env: string | undefined,
@@ -118,6 +133,44 @@ async function runTelegram(
 			);
 			if (json) console.log(JSON.stringify(result, null, 2));
 			else for (const line of formatRebind(result)) console.log(line);
+			return 0;
+		}
+		case "topic": {
+			const command = parseTopicCommand(positional[2], flags);
+			const { mailboxes } = await operatorJson<{
+				mailboxes: Array<{ mailbox_id: string; primary_address: string }>;
+			}>(session, "/api/mailboxes", {}, { env });
+			const mailboxId = resolveMailboxRef(command.mailboxRef, mailboxes);
+			const result = await operatorJson<TopicMappingResult>(
+				session,
+				"/api/telegram/topics",
+				{
+					method: "POST",
+					body: {
+						mailboxId,
+						...(command.name !== undefined ? { name: command.name } : {}),
+						...(command.adoptThreadId !== undefined
+							? { adoptThreadId: command.adoptThreadId }
+							: {}),
+						...(command.replace ? { replace: true } : {}),
+						dryRun: !apply,
+					},
+				},
+				{ env },
+			);
+			if (json) console.log(JSON.stringify(result, null, 2));
+			else for (const line of formatTopicResult(result)) console.log(line);
+			return 0;
+		}
+		case "topics": {
+			const listing = await operatorJson<TopicListing>(
+				session,
+				"/api/telegram/topics",
+				{},
+				{ env },
+			);
+			if (json) console.log(JSON.stringify(listing, null, 2));
+			else for (const line of formatTopicListing(listing)) console.log(line);
 			return 0;
 		}
 		default:
@@ -184,7 +237,7 @@ async function main(): Promise<number> {
 		}
 		case "telegram":
 			try {
-				return await runTelegram(positional[1], flags, host, env);
+				return await runTelegram(positional[1], positional, flags, host, env);
 			} catch (error) {
 				// A refusal from the route (409 no_chat_bound, bot_not_eligible, ...) is an
 				// answer, not a crash: print its message, not a stack or a raw body dump.
