@@ -69,6 +69,15 @@ read/search/draft endpoint.
 
 ### Fixed
 
+- **Delivery events for mailbox sends no longer end in the DLQ.** The email-events consumer only
+  correlated against `transactional_request_log`, so every lifecycle event for mail confirmed
+  from a mailbox (request-send → confirm-send) was logged four times as
+  `email_events.unresolved` and dead-lettered. It now falls back to D1 `outbound_sends` by
+  provider message id (bare or angle-bracketed) and hands the event to a new internal DO route,
+  `/outbound/delivery-event`. The DO checks the id, sender and recipient against its own outbound
+  message row, records the event in the idempotent delivery-event ledger, and applies hard-bounce
+  and complaint suppressions to the DO mirror and the D1 projection exactly as for transactional
+  sends. Events that match nothing still retry and dead-letter as before.
 - **A definite provider refusal answers `502`.** The send path wrote `permanent_failure` into a
   column whose CHECK only allows `failed`, so the request errored as a `500`, stayed `pending`
   with its variables, replayed as `202` and was later reconciled to `unknown`. It is now stored

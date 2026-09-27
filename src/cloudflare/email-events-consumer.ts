@@ -1,8 +1,14 @@
-import { classifyEmailEvent, normalizeEmailSendingEvent, safeEventMetadata } from "./email-events";
 import { insertOpsEvent, upsertSuppressionProjection } from "../db/d1";
 import { mailboxStub } from "../lib/mailbox-stub";
+import { classifyEmailEvent, normalizeEmailSendingEvent, safeEventMetadata } from "./email-events";
 
 type ResolvedEventTarget = {
+	/**
+	 * `transactional`: an API send with a request row to settle.
+	 * `mailbox_send`: a human-confirmed send from a mailbox (request-send ->
+	 * confirm-send), known to D1 only through `outbound_sends`.
+	 */
+	kind: "transactional" | "mailbox_send";
 	mailboxId: string;
 	requestId: string | null;
 	correlation: "provider_id" | "envelope";
@@ -10,8 +16,9 @@ type ResolvedEventTarget = {
 
 /**
  * Resolves the mailbox DO for a delivery event by looking up the transactional
- * request via D1 using provider_message_id. If the D1 projection is absent,
- * we retry — the event may have raced the projection write.
+ * request via D1 using provider_message_id, then, failing that, the
+ * human-confirmed mailbox send in `outbound_sends` with the same id. If neither
+ * D1 projection has it, we retry — the event may have raced the projection write.
  *
  * A provider id we have never seen is not necessarily a stranger: an ambiguous
  * send never learns the id of a message that may well have gone out, so its
@@ -27,6 +34,7 @@ async function resolveMailboxIdFromEvent(
 ): Promise<ResolvedEventTarget | { ambiguous: true } | null> {
 	try {
 		const {
+			lookupOutboundSendByProviderMessageId,
 			lookupTransactionalRequestByProviderMessageId,
 			lookupUnresolvedTransactionalRequestsByEnvelope,
 		} = await import("../db/d1");
@@ -43,8 +51,25 @@ async function resolveMailboxIdFromEvent(
 				return null;
 			}
 			return {
+				kind: "transactional",
 				mailboxId: row.mailbox_id,
 				requestId: row.request_id,
+				correlation: "provider_id",
+			};
+		}
+
+		// Not an API send: it may be mail a person confirmed from a mailbox. Those
+		// are recorded in `outbound_sends`, not the transactional log, and without
+		// this lookup every one of their events retried to the DLQ.
+		const outbound = await lookupOutboundSendByProviderMessageId(
+			env.INDEX_DB,
+			event.provider_message_id,
+		);
+		if (outbound) {
+			return {
+				kind: "mailbox_send",
+				mailboxId: outbound.mailbox_id,
+				requestId: null,
 				correlation: "provider_id",
 			};
 		}
@@ -64,6 +89,7 @@ async function resolveMailboxIdFromEvent(
 		// attributing the event to a coin flip.
 		if (candidates.length > 1) return { ambiguous: true };
 		return {
+			kind: "transactional",
 			mailboxId: candidates[0]!.mailbox_id,
 			requestId: candidates[0]!.request_id,
 			correlation: "envelope",
@@ -152,17 +178,24 @@ export async function handleEmailEventsQueue(
 
 			// Forward to the mailbox DO for processing
 			const stub = mailboxStub(env, resolved.mailboxId);
-			const response = await stub.fetch("https://mailbox-do/transactional/delivery-event", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					event: safeEventMetadata(event),
-					eventType: event.event_type,
-					// A routing hint only — the DO re-derives the attribution itself and
-					// refuses this id if its own storage names a different request.
-					requestId: resolved.requestId,
-				}),
-			});
+			const response =
+				resolved.kind === "mailbox_send"
+					? await stub.fetch("https://mailbox-do/outbound/delivery-event", {
+							method: "POST",
+							headers: { "content-type": "application/json" },
+							body: JSON.stringify({ event: safeEventMetadata(event) }),
+						})
+					: await stub.fetch("https://mailbox-do/transactional/delivery-event", {
+							method: "POST",
+							headers: { "content-type": "application/json" },
+							body: JSON.stringify({
+								event: safeEventMetadata(event),
+								eventType: event.event_type,
+								// A routing hint only — the DO re-derives the attribution itself and
+								// refuses this id if its own storage names a different request.
+								requestId: resolved.requestId,
+							}),
+						});
 
 			if (!response.ok) {
 				const body = await response.text();
@@ -248,7 +281,9 @@ export async function handleEmailEventsQueue(
 					event.timestamp,
 				);
 			}
-			if (settledRequestId && classification.suppress) {
+			// Suppression is about the recipient, not the path: a hard bounce on a
+			// human-confirmed send reaches the mirror exactly like a transactional one.
+			if ((settledRequestId || resolved.kind === "mailbox_send") && classification.suppress) {
 				const reason =
 					event.event_type === "cf.email.sending.message.complained" ? "complaint" : "hard_bounce";
 				const now = new Date().toISOString();

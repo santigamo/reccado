@@ -374,6 +374,68 @@ export function suppressionExpiryFor(
 	return new Date(now.getTime() + HARD_BOUNCE_SUPPRESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
 }
 
+/** "Name <a@b>" or "a@b" -> "a@b", lowercased. */
+function bareAddress(value: string): string {
+	const angled = value.match(/<([^>]+)>/);
+	return (angled?.[1] ?? value).trim().toLowerCase();
+}
+
+function parseAddressList(json: string | null): string[] {
+	if (!json) return [];
+	try {
+		const parsed = JSON.parse(json) as unknown;
+		return Array.isArray(parsed)
+			? parsed.filter((entry): entry is string => typeof entry === "string").map(bareAddress)
+			: [];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Finds the human-confirmed outbound message a delivery event reports on.
+ *
+ * The confirm-send path stores the provider's id on the message row as its
+ * `rfc_message_id`, normalized bare (no angle brackets, original case). The event
+ * may carry either spelling, so it is normalized the same way before the lookup.
+ * Like the transactional path, the id alone is not enough: the event's sender
+ * must be the address the message went out from, and its recipient must be one
+ * the message was addressed to (To, Cc or Bcc). A mismatch is treated as no
+ * match rather than as a correction.
+ */
+export function findOutboundMessageForEvent(
+	sql: SqlStorage,
+	event: { provider_message_id: string; to: string; from: string },
+): { messageLocalId: string } | null {
+	const bareId = event.provider_message_id.trim().replace(/^<|>$/g, "");
+	if (!bareId) return null;
+	const row = sql
+		.exec<{
+			id: string;
+			from_addr: string;
+			to_json: string | null;
+			cc_json: string | null;
+			bcc_json: string | null;
+		}>(
+			`SELECT id, from_addr, to_json, cc_json, bcc_json
+	       FROM messages
+	       WHERE direction = 'outbound' AND rfc_message_id = ?
+	       LIMIT 1`,
+			bareId,
+		)
+		.toArray()[0];
+	if (!row) return null;
+	if (bareAddress(row.from_addr) !== bareAddress(event.from)) return null;
+	const recipient = bareAddress(event.to);
+	const recipients = [
+		...parseAddressList(row.to_json),
+		...parseAddressList(row.cc_json),
+		...parseAddressList(row.bcc_json),
+	];
+	if (!recipients.includes(recipient)) return null;
+	return { messageLocalId: row.id };
+}
+
 export function handleDeliveryEvent(
 	sql: SqlStorage,
 	event: EmailSendingEvent,

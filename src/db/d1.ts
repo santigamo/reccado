@@ -989,6 +989,32 @@ export async function upsertTransactionalRequestLog(
 }
 
 /**
+ * Finds the mailbox a human-confirmed send belongs to by the provider's message id.
+ *
+ * `outbound_sends.provider_message_id` holds whatever `send_email` returned,
+ * verbatim, and that may be angle-bracketed (`<id@host>`) while the event
+ * carries it bare, or the other way round. So every spelling is tried: the
+ * value as given, bare, and bracketed. Case is preserved, because msg-ids are
+ * case-sensitive (see `normalizeMessageId`).
+ *
+ * This routes; it does not decide. The mailbox DO checks the id, sender and
+ * recipient against its own outbound message row before recording anything.
+ */
+export async function lookupOutboundSendByProviderMessageId(
+	db: D1Database,
+	providerMessageId: string,
+): Promise<{ mailbox_id: string; draft_id: string } | null> {
+	const bare = providerMessageId.trim().replace(/^<|>$/g, "");
+	if (!bare) return null;
+	return db
+		.prepare(
+			"SELECT mailbox_id, draft_id FROM outbound_sends WHERE provider_message_id IN (?, ?, ?) LIMIT 1",
+		)
+		.bind(providerMessageId, bare, `<${bare}>`)
+		.first<{ mailbox_id: string; draft_id: string }>();
+}
+
+/**
  * Looks up a transactional request log by provider_message_id.
  * Used by the email-events queue consumer to resolve mailbox DO from delivery events.
  * Returns null if the projection is absent (event may race the write).

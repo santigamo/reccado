@@ -4,6 +4,7 @@ import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflar
 import { sha256Hex } from "../lib/crypto";
 import { buildReferences, messageIdHeader, referencesHeader } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
+import { AmbiguousSendError } from "../lib/errors";
 import { normalizeSubject } from "../lib/mime";
 import {
 	resolveDeliveredAlias,
@@ -11,7 +12,6 @@ import {
 	type SenderEnv,
 	type SenderIdentity,
 } from "../lib/sender-identity";
-import { AmbiguousSendError } from "../lib/errors";
 import { httpStatusForTransactionalResult } from "../lib/transactional-send";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
 import {
@@ -1497,6 +1497,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (url.pathname === "/transactional/delivery-event" && request.method === "POST") {
 			return this.handleDeliveryEvent(request);
 		}
+		if (url.pathname === "/outbound/delivery-event" && request.method === "POST") {
+			return this.handleOutboundDeliveryEvent(request);
+		}
 
 		// --- Suppression admin routes (internal, Access-protected via API layer) ---
 		if (url.pathname === "/transactional/suppressions" && request.method === "GET") {
@@ -2116,5 +2119,66 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 
 		return processEvent(requestRow.request_id, "provider_id");
+	}
+
+	/**
+	 * Handles a delivery event for a human-confirmed mailbox send (request-send ->
+	 * confirm-send), which has no transactional request row to settle.
+	 *
+	 * What it records is deliberately small: the event goes into the same
+	 * idempotent delivery-event ledger the transactional path uses (keyed by
+	 * `event_id`, with `request_id` NULL), and a hard bounce or complaint adds the
+	 * recipient to the suppression mirror exactly as a transactional one would.
+	 * Suppression is a fact about the recipient, not about which path sent to them.
+	 * The mailbox message row gets no delivery-status column: nothing reads one
+	 * today, and the ledger already holds the event per provider id should a
+	 * reader ever want it.
+	 *
+	 * Unmatched events return 404 so the consumer retries, as on the
+	 * transactional route.
+	 */
+	private async handleOutboundDeliveryEvent(request: Request): Promise<Response> {
+		let json: unknown;
+		try {
+			json = await request.json();
+		} catch {
+			return Response.json({ error: "invalid_json" }, { status: 400 });
+		}
+		const body = (typeof json === "object" && json !== null ? json : {}) as { event?: unknown };
+		const { classifyEmailEvent, emailSendingEventSchema } = await import(
+			"../cloudflare/email-events"
+		);
+		const { handleDeliveryEvent: processDeliveryEvent, findOutboundMessageForEvent } = await import(
+			"./mailbox-suppressions"
+		);
+		const parsed = emailSendingEventSchema.safeParse(body.event);
+		if (!parsed.success) {
+			return Response.json({ error: "invalid_event_schema" }, { status: 400 });
+		}
+		const event = parsed.data;
+
+		const existingEvent = this.ctx.storage.sql
+			.exec<{ event_id: string }>(
+				"SELECT event_id FROM transactional_delivery_events WHERE event_id = ?",
+				event.event_id,
+			)
+			.toArray()[0];
+		if (existingEvent) {
+			return Response.json({ ok: true, idempotent: true });
+		}
+
+		const match = findOutboundMessageForEvent(this.ctx.storage.sql, event);
+		if (!match) {
+			return Response.json({ error: "outbound_message_not_found" }, { status: 404 });
+		}
+
+		const classification = classifyEmailEvent(event);
+		processDeliveryEvent(this.ctx.storage.sql, event, classification, null);
+		return Response.json({
+			ok: true,
+			deliveryStatus: classification.deliveryStatus,
+			suppressed: classification.suppress,
+			messageLocalId: match.messageLocalId,
+		});
 	}
 }

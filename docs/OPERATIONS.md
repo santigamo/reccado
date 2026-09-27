@@ -249,6 +249,17 @@ integrator's contract (endpoint, idempotency, every response code, templates, su
   of service on a recipient who is reachable again. A **complaint never expires**: it is a
   statement of intent by a person, and intent does not lapse on a timer — only an explicit,
   owner-authorized removal lifts it. Manual and provider-rejected entries are likewise permanent.
+- Events for mail a person confirmed from a mailbox (request-send → confirm-send) are handled
+  too. When no transactional request matches an event's `provider_message_id`, the consumer looks
+  it up in D1 `outbound_sends` (trying the id as given, bare and angle-bracketed, since the
+  provider result is stored verbatim) and routes the event to that mailbox's DO. The DO accepts it
+  only if the id names one of its own outbound messages and the event's sender and recipient match
+  that message (To, Cc or Bcc). It records the event in the same idempotent delivery-event ledger
+  (`request_id` NULL), and a hard bounce or complaint adds the recipient to the suppression mirror
+  and the D1 projection exactly as for a transactional send, because suppression is about the
+  recipient, not the path. Mailbox sends have no delivery-status column or API field: the ledger
+  keeps the event, and nothing reads a per-message delivery status today. An event that matches
+  neither table still retries and then dead-letters.
 - **Every sending domain needs its own Email Sending event subscription.** Enabling Email Sending
   gives a domain the ability to send; only a subscription gives it the ability to *report*. A
   domain without one emits no events for anything, so every send from it stays
