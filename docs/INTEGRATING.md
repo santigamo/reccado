@@ -205,6 +205,18 @@ ever resolve and no bounce will ever create a suppression. Never mark a message 
 alert on silence, unless the state is `live`. For any other state, ask the operator to fix the
 feedback channel.
 
+**A recipient that is a verified Email Routing destination address never produces delivery
+events.** When `to` is an address verified as an Email Routing destination on the same Cloudflare
+account (typically the operator's own inbox), the `send_email` binding delivers through Email
+Routing, not Email Sending, and no lifecycle event is ever emitted for that message. The send is
+fine and the mail arrives; `deliveryStatus` just stays `null`, and if such sends are all a domain
+has seen, `deliveryFeedback.state` reads `unobserved`. Nothing is wrong. Liveness cannot tell these
+sends apart from others, so once one is more than 24 hours old it counts as a silent send: a
+domain used only for such recipients can then read `never_observed`, and one whose latest mature
+send went to such a recipient can read `went_dark`. Check the recipient before treating either as
+a fault. Test delivery feedback with a recipient outside the account's destination addresses.
+`pnpm smoke:transactional --wait-delivery` detects this case, warns, and skips the wait.
+
 Status is scoped to the key id. After a rotation or revocation, the old key answers
 `403 key_revoked`, and the new key cannot see the old key's requests. Keep what you need from
 the status before rotating.

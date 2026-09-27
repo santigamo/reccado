@@ -78,6 +78,13 @@ read/search/draft endpoint.
   message row, records the event in the idempotent delivery-event ledger, and applies hard-bounce
   and complaint suppressions to the DO mirror and the D1 projection exactly as for transactional
   sends. Events that match nothing still retry and dead-letter as before.
+- **`smoke:transactional --wait-delivery` no longer waits for an event that cannot come.** A
+  recipient that is a verified Email Routing destination address on the account is delivered
+  through Email Routing, which emits no Email Sending lifecycle event, so the wait could only time
+  out (and FAIL on a live domain). The smoke now reads the account's destination addresses
+  (`CLOUDFLARE_API_TOKEN`) and, for such a `--to`, prints a WARN and skips the wait.
+  `INTEGRATING.md` §5 and `OPERATIONS.md` document why feedback liveness can read `unobserved`
+  (or, after 24 h, `never_observed`/`went_dark`) for those sends without anything being wrong.
 - **A definite provider refusal answers `502`.** The send path wrote `permanent_failure` into a
   column whose CHECK only allows `failed`, so the request errored as a `500`, stayed `pending`
   with its variables, replayed as `202` and was later reconciled to `unknown`. It is now stored

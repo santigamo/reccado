@@ -293,6 +293,21 @@ integrator's contract (endpoint, idempotency, every response code, templates, su
   `unobserved` means not enough evidence yet, and is deliberately not a fault. The read is bounded
   to the last 30 days of provider-acknowledged sends, so a domain nobody has used in a month
   simply drops out rather than staying red on stale evidence.
+- **A verified Email Routing destination address never produces delivery events.** When the
+  recipient is an address verified as an Email Routing destination on the same account (your own
+  inbox, typically), the `send_email` binding delivers through Email Routing, and Cloudflare emits
+  no Email Sending lifecycle event for it. Account analytics show such sends only as Email Routing
+  `newEmail`, never under Email Sending. The mail arrives and nothing is wrong: `delivery_status`
+  stays null, and feedback liveness reads `unobserved` for a domain that has sent only to such
+  addresses. Liveness cannot tell these sends from others, so after 24 hours they count as silent
+  and can turn the domain `never_observed` (if they are all it has sent) or `went_dark` (if one is
+  its latest mature send). Check the recipients before chasing the subscription.
+  `pnpm smoke:transactional --wait-delivery` reads the account's destination addresses
+  (`GET /accounts/{account_id}/email/routing/addresses`, with `CLOUDFLARE_API_TOKEN` scoped to
+  Account · Email Routing Addresses · Read, and `CLOUDFLARE_ACCOUNT_ID` or `wrangler whoami` for
+  the account) and, when `--to` is a verified one, prints a WARN and skips the wait instead of
+  failing. Without the token it says so and waits as before. To exercise delivery events, smoke
+  against a recipient that is not a destination address on the account.
 - `pnpm doctor --env <env> --cloud` also crosses `MAIL_SENDING_DOMAINS` — as the deploy will
   actually ship it (tracked `wrangler.jsonc` with `wrangler.generated.<env>.json` overlaid) —
   against the live Email Sending list: an entry that is not an enabled sending domain **fails**
@@ -515,7 +530,7 @@ all related R2 prefixes.
 | `outbound_sends` row stuck at `status='sending'` | Crash/interruption mid-send | The hourly cron sweep marks stale sends `unknown` with `error_code='stale_sending_timeout_needs_review'` and an `outbound_send.stale_reconciled` ops event. Treat that as manual-review-required, not proof the message did or did not send. |
 | Transactional request stuck at `pending` | Crash mid-send in the transactional path | The hourly cron and the Access-protected `POST /api/mailboxes/:mailboxId/transactional/reconcile-stale` both run `reconcileStaleTransactionalRequests`, marking rows `unknown` / `stale_reconciled`. Those rows are then eligible for delivery-event correlation like any other `unknown`. |
 | Transactional send returns `unknown` | Provider outcome is ambiguous (may have accepted before erroring) | Never auto-retried. Wait before acting: if the message did leave, the delivery event resolves the row on its own and a replay with the original idempotency key returns the real outcome. A row that stays `unknown` means "most likely nothing was sent" **only if that sender domain's feedback channel is live** — on a domain with no event subscription no event ever arrives for anything, so the silence says nothing at all. Check `deliveryFeedback` on the status response (or `dependencies.sendingFeedback` in `/api/health`) first: `live` means the silence is evidence, `never_observed`/`went_dark` means it is not and the row needs the provider console, not an inference. |
-| A send returns `sent` but `delivery_status` stays null forever | Either the event has not arrived yet, or the sender's domain has no Email Sending event subscription and never will produce one | These are indistinguishable from the status row alone, which is why the response carries `deliveryFeedback`. `unobserved` = wait. `never_observed` = the channel, not the message: create the subscription (`pnpm setup:sending … --apply`, or the `queues subscription create` command above) and note that events are not backfilled — sends made while the domain was dark stay null forever. `went_dark` = it used to work; check the subscription's destination queue, that the events consumer is deployed, and the DLQ. |
+| A send returns `sent` but `delivery_status` stays null forever | Either the event has not arrived yet, the sender's domain has no Email Sending event subscription and never will produce one, or the recipient is a verified Email Routing destination address on the account (delivered through Email Routing, which emits no event: expected, not a fault) | These are indistinguishable from the status row alone, which is why the response carries `deliveryFeedback`. `unobserved` = wait. `never_observed` = the channel, not the message: create the subscription (`pnpm setup:sending … --apply`, or the `queues subscription create` command above) and note that events are not backfilled — sends made while the domain was dark stay null forever. `went_dark` = it used to work; check the subscription's destination queue, that the events consumer is deployed, and the DLQ. |
 | `email_events.correlation_ambiguous` or `email_events.correlation_rejected` ops event | Two ambiguous sends to the same recipient from the same sender inside the same window, or a stale D1 projection disagreeing with the DO | Deliberate refusal to guess. The event goes to the DLQ; decide by hand which request it belonged to using the DO rows and the provider console. Both requests stay `unknown` until then. |
 | `transactional.unknown_resolved` ops event | An ambiguous send was settled from an observed delivery event | Informational. Check `resolvedVia` on the request: `envelope_correlation` means inferred, not provider-acknowledged. |
 | Perimeter misconfiguration | A route reachable without the auth perimeter enforcing it | Treat as a security incident. Verify with an unauthenticated request: `/api/*` and `/mcp` must answer 401, never 200. The perimeter is in the worker now, so it is observable from outside — which is the reason it was moved there. |

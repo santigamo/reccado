@@ -1,11 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-	DEFAULT_SENDER_NAME,
-	KEY_QUOTA_MAX,
-	KEY_TTL_MS,
-	POLICY_REJECT_ADDRESS,
-	SmokeInputError,
-	type StatusView,
 	assessArchive,
 	assessDelivery,
 	assessKeyCreate,
@@ -13,6 +7,7 @@ import {
 	assessPolicyRejection,
 	assessReplay,
 	assessRevoke,
+	assessRoutingDestination,
 	assessSend,
 	assessSenderName,
 	assessStatus,
@@ -20,15 +15,22 @@ import {
 	buildKeyBody,
 	buildSendPayload,
 	buildTemplateBody,
+	DEFAULT_SENDER_NAME,
 	extractKey,
 	formatStep,
 	hasFailure,
 	isTerminalDelivery,
+	KEY_QUOTA_MAX,
+	KEY_TTL_MS,
 	makeRunIds,
 	manualCheckLine,
 	manualCleanupCommands,
+	POLICY_REJECT_ADDRESS,
+	parseRoutingDestinations,
 	parseSmokeArgs,
 	planLines,
+	SmokeInputError,
+	type StatusView,
 	step,
 	summaryLine,
 	toHttpResult,
@@ -454,5 +456,63 @@ describe("reporting", () => {
 		expect(check).toContain(`"${DEFAULT_SENDER_NAME} <hola@send.example.com>"`);
 		expect(check).toContain("SPF, DKIM and DMARC");
 		expect(check).toContain(ids.token);
+	});
+});
+
+describe("Email Routing destination guard for --wait-delivery", () => {
+	// Shaped like GET /accounts/{account_id}/email/routing/addresses `result`.
+	const apiResult = [
+		{
+			id: "ea95132c15732412d22c1476fa83f27a",
+			email: "Owner@Example.com",
+			verified: "2026-01-01T00:00:00Z",
+			created: "2026-01-01T00:00:00Z",
+			modified: "2026-01-01T00:00:00Z",
+		},
+		{ id: "b", email: "pending@example.com", verified: null },
+		{ id: "c" },
+	];
+
+	it("parses destinations, lowercased, verified only when the timestamp is set", () => {
+		expect(parseRoutingDestinations(apiResult)).toEqual([
+			{ email: "owner@example.com", verified: true },
+			{ email: "pending@example.com", verified: false },
+		]);
+		expect(parseRoutingDestinations(null)).toEqual([]);
+		expect(parseRoutingDestinations({ email: "x@example.com" })).toEqual([]);
+	});
+
+	it("skips the wait with a WARN when --to is a verified destination address", () => {
+		const decision = assessRoutingDestination("owner@example.com", {
+			ok: true,
+			destinations: parseRoutingDestinations(apiResult),
+		});
+		expect(decision.skipWait).toBe(true);
+		expect(decision.step.outcome).toBe("WARN");
+		const text = decision.step.evidence.join("\n");
+		expect(text).toContain("verified Email Routing destination address");
+		expect(text).toContain("never produces an Email Sending lifecycle event");
+		expect(text).toContain("unobserved");
+		// A WARN, never a FAIL: the send is fine, only the wait would be meaningless.
+		expect(hasFailure([decision.step])).toBe(false);
+	});
+
+	it("still waits for an unverified destination or any other recipient", () => {
+		const destinations = parseRoutingDestinations(apiResult);
+		for (const to of ["pending@example.com", "someone@elsewhere.example"]) {
+			const decision = assessRoutingDestination(to, { ok: true, destinations });
+			expect(decision.skipWait).toBe(false);
+			expect(decision.step.outcome).toBe("INFO");
+		}
+	});
+
+	it("still waits, with an INFO, when the destination list cannot be read", () => {
+		const decision = assessRoutingDestination("owner@example.com", {
+			ok: false,
+			reason: "CLOUDFLARE_API_TOKEN is not set",
+		});
+		expect(decision.skipWait).toBe(false);
+		expect(decision.step.outcome).toBe("INFO");
+		expect(decision.step.evidence.join("\n")).toContain("CLOUDFLARE_API_TOKEN is not set");
 	});
 });

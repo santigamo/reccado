@@ -18,22 +18,15 @@
 import { randomBytes } from "node:crypto";
 import {
 	type FetchLike,
+	getSessionInfo,
 	OperatorAuthError,
 	type OperatorSession,
-	getSessionInfo,
 	operatorFetch,
 	requireSession,
 	resolveHost,
 	sessionPathFor,
 } from "./lib/operator-session";
 import {
-	type HttpResult,
-	POLICY_REJECT_ADDRESS,
-	SMOKE_USAGE,
-	SmokeInputError,
-	type SendView,
-	type StatusView,
-	type StepResult,
 	assessArchive,
 	assessDelivery,
 	assessKeyCreate,
@@ -41,6 +34,7 @@ import {
 	assessPolicyRejection,
 	assessReplay,
 	assessRevoke,
+	assessRoutingDestination,
 	assessSend,
 	assessSenderName,
 	assessStatus,
@@ -52,19 +46,30 @@ import {
 	extractKeyList,
 	extractStatus,
 	formatStep,
+	type HttpResult,
 	hasFailure,
 	isTerminalDelivery,
 	mailboxApiPath,
 	makeRunIds,
 	manualCheckLine,
 	manualCleanupCommands,
+	POLICY_REJECT_ADDRESS,
+	parseRoutingDestinations,
 	parseSmokeArgs,
 	planLines,
+	type RoutingDestination,
+	type RoutingLookup,
 	redactSecrets,
+	type SendView,
+	SMOKE_USAGE,
+	SmokeInputError,
+	type StatusView,
+	type StepResult,
 	step,
 	summaryLine,
 	toHttpResult,
 } from "./lib/smoke-transactional-core";
+import { wranglerCapture } from "./lib/wrangler-cli";
 
 const POLL_INTERVAL_MS = 5_000;
 const fetchImpl: FetchLike = (input, init) => fetch(input, init);
@@ -102,6 +107,71 @@ async function integratorCall(request: { url: string; init: RequestInit }): Prom
 
 function errorText(error: unknown): string {
 	return redactSecrets(error instanceof Error ? error.message : String(error), secrets);
+}
+
+/** CLOUDFLARE_ACCOUNT_ID, else the single account `wrangler whoami --json` reports. */
+function resolveAccountId(): { id: string } | { error: string } {
+	const fromEnv = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
+	if (fromEnv) return { id: fromEnv };
+	const who = wranglerCapture(["whoami", "--json"]);
+	if (!who.ok) return { error: "`wrangler whoami --json` failed; set CLOUDFLARE_ACCOUNT_ID" };
+	try {
+		const parsed = JSON.parse(who.out) as {
+			account?: { id?: string };
+			accounts?: Array<{ id?: string }>;
+		};
+		if (parsed.account?.id) return { id: parsed.account.id };
+		const ids = (parsed.accounts ?? []).map((a) => a.id).filter((id): id is string => !!id);
+		if (ids.length === 1 && ids[0]) return { id: ids[0] };
+		return {
+			error: `wrangler reports ${ids.length} accounts; set CLOUDFLARE_ACCOUNT_ID to choose one`,
+		};
+	} catch {
+		return { error: "could not parse `wrangler whoami --json`; set CLOUDFLARE_ACCOUNT_ID" };
+	}
+}
+
+/**
+ * The account's Email Routing destination addresses, through the same REST
+ * auth `setup:routing` uses for its Email Routing calls (CLOUDFLARE_API_TOKEN).
+ * Read-only. Any failure is returned as a reason, never thrown: this only
+ * guards the delivery wait.
+ */
+async function lookupRoutingDestinations(): Promise<RoutingLookup> {
+	const token = process.env.CLOUDFLARE_API_TOKEN?.trim();
+	if (!token) {
+		return {
+			ok: false,
+			reason: "CLOUDFLARE_API_TOKEN is not set (needs Account · Email Routing Addresses · Read)",
+		};
+	}
+	secrets.push(token);
+	const account = resolveAccountId();
+	if ("error" in account) return { ok: false, reason: account.error };
+	const destinations: RoutingDestination[] = [];
+	try {
+		for (let page = 1; page <= 20; page += 1) {
+			const response = await fetchImpl(
+				`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account.id)}/email/routing/addresses?per_page=50&page=${page}`,
+				{ headers: { Authorization: `Bearer ${token}`, accept: "application/json" } },
+			);
+			const payload = (await response.json().catch(() => null)) as {
+				success?: boolean;
+				result?: unknown;
+				result_info?: { total_pages?: number };
+				errors?: Array<{ message?: string }>;
+			} | null;
+			if (!response.ok || payload?.success !== true) {
+				const message = payload?.errors?.map((e) => e.message).join("; ") || "no error detail";
+				return { ok: false, reason: `HTTP ${response.status}: ${message}` };
+			}
+			destinations.push(...parseRoutingDestinations(payload.result));
+			if (page >= (payload.result_info?.total_pages ?? 1)) break;
+		}
+	} catch (error) {
+		return { ok: false, reason: errorText(error) };
+	}
+	return { ok: true, destinations };
 }
 
 async function main(): Promise<number> {
@@ -147,6 +217,15 @@ async function main(): Promise<number> {
 				])
 			: step("mailbox reachable (GET api-keys)", "FAIL", [describeResponse(reach, secrets)]),
 	);
+
+	// A recipient that is a verified Email Routing destination address never
+	// produces a delivery event, so waiting for one could only time out.
+	let skipDeliveryWait = false;
+	if (opts.waitDeliverySeconds > 0) {
+		const routing = assessRoutingDestination(opts.to, await lookupRoutingDestinations());
+		skipDeliveryWait = routing.skipWait;
+		report(routing.step);
+	}
 
 	if (!opts.send) {
 		console.log("");
@@ -253,7 +332,13 @@ async function main(): Promise<number> {
 		});
 		const firstStatus = await integratorCall(statusRequest);
 		report(assessStatus(firstStatus, send));
-		if (opts.waitDeliverySeconds > 0 && firstStatus.status === 200) {
+		if (opts.waitDeliverySeconds > 0 && skipDeliveryWait) {
+			report(
+				step("delivery event", "SKIP", [
+					`not waited: ${opts.to} is a verified Email Routing destination address, which produces no Email Sending event (see the WARN above)`,
+				]),
+			);
+		} else if (opts.waitDeliverySeconds > 0 && firstStatus.status === 200) {
 			let view: StatusView = extractStatus(firstStatus.body);
 			const started = Date.now();
 			const deadline = started + opts.waitDeliverySeconds * 1000;

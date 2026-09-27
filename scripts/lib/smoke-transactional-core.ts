@@ -57,6 +57,10 @@ export const SMOKE_USAGE = `Usage: pnpm smoke:transactional --mailbox <mailboxId
                   sends ONE real message to --to, replays it, proves policy rejection, reads status,
                   then always revokes the key and archives the template.
   --wait-delivery N  poll the status up to N seconds (max ${MAX_WAIT_DELIVERY_SECONDS}) for a delivery event.
+                     Skipped with a WARN when --to is a verified Email Routing destination address on
+                     the account (those sends never produce an event). The check reads the account's
+                     destination addresses with CLOUDFLARE_API_TOKEN (Account · Email Routing
+                     Addresses · Read) and CLOUDFLARE_ACCOUNT_ID or \`wrangler whoami\`.
   Sign in first: pnpm operator login --env <env> --host <host>`;
 
 const BOOLEAN_FLAGS = new Set(["send", "help"]);
@@ -621,6 +625,82 @@ export function assessStatus(result: HttpResult, send: SendView): StepResult {
 	];
 	const ok = view.status === "sent" && view.providerMessageId === (send.providerMessageId ?? null);
 	return step(name, ok ? "PASS" : "FAIL", evidence);
+}
+
+// --- Email Routing destination addresses ---
+
+export type RoutingDestination = { email: string; verified: boolean };
+
+/**
+ * The account's Email Routing destination addresses out of
+ * `GET /accounts/{account_id}/email/routing/addresses` (`result`). An address
+ * counts as verified when its `verified` timestamp is set; one still awaiting its
+ * confirmation click is not a destination yet.
+ */
+export function parseRoutingDestinations(result: unknown): RoutingDestination[] {
+	if (!Array.isArray(result)) return [];
+	const destinations: RoutingDestination[] = [];
+	for (const entry of result) {
+		const r = record(entry);
+		const email = str(r?.email);
+		if (!email) continue;
+		destinations.push({
+			email: email.trim().toLowerCase(),
+			verified: typeof r?.verified === "string" && r.verified.length > 0,
+		});
+	}
+	return destinations;
+}
+
+export type RoutingLookup =
+	| { ok: true; destinations: RoutingDestination[] }
+	| { ok: false; reason: string };
+
+/**
+ * Decides whether waiting for a delivery event can mean anything for `--to`.
+ *
+ * When the recipient is a verified Email Routing destination address on the
+ * account, Cloudflare's `send_email` binding delivers through Email Routing, and
+ * Email Routing produces no Email Sending lifecycle event at all: account
+ * analytics showed every such send only as an Email Routing `newEmail`, never in
+ * Email Sending. Waiting would then time out and read as a missing event for a
+ * message that was delivered. So the wait is skipped with a WARN, not a FAIL.
+ *
+ * A failed lookup does not block the wait: it only means the guard could not run.
+ */
+export function assessRoutingDestination(
+	to: string,
+	lookup: RoutingLookup,
+): { skipWait: boolean; step: StepResult } {
+	const name = "recipient vs Email Routing destination addresses";
+	if (!lookup.ok) {
+		return {
+			skipWait: false,
+			step: step(name, "INFO", [
+				`could not read the account's Email Routing destination addresses: ${lookup.reason}`,
+				"waiting anyway; if --to is a verified destination address, no delivery event will arrive",
+			]),
+		};
+	}
+	const recipient = to.trim().toLowerCase();
+	const match = lookup.destinations.find((d) => d.email === recipient && d.verified);
+	if (!match) {
+		return {
+			skipWait: false,
+			step: step(name, "INFO", [
+				`${to} is not a verified destination address (${lookup.destinations.length} on the account); delivery events are expected`,
+			]),
+		};
+	}
+	return {
+		skipWait: true,
+		step: step(name, "WARN", [
+			`${to} is a verified Email Routing destination address on this account`,
+			"send_email delivers to it through Email Routing, which never produces an Email Sending lifecycle event",
+			"skipping the delivery wait: no event will arrive, and deliveryFeedback may read unobserved for this send without anything being wrong",
+			"to exercise delivery events, send to an address that is not a destination address on this account",
+		]),
+	};
 }
 
 /**
