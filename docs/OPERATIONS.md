@@ -698,6 +698,7 @@ manifest's directory; placeholder example in `examples/onboard/`):
   "sending": { "subdomain": "send", "apex": true, "dmarc": { "policy": "none", "rua": "dmarc@example.com" } },
   "mailbox": { "address": "support@example.com", "displayName": "Example", "aliases": ["privacy@example.com"] },
   "templates": { "file": "./templates.json", "archiveMissing": false },
+  "telegram": { "topicName": "example" },
   "keys": [
     { "name": "preview", "sender": "hello@send.example.com", "senderName": "Example",
       "scopes": ["transactional:send", "transactional:templates:use", "transactional:status"],
@@ -735,6 +736,7 @@ blocked, failed or skipped.
 | `mailbox` | exists, active, owned by the signed-in owner, primary alias, display name | `POST /api/mailboxes` / `PATCH` display name | `domain` |
 | `alias:<address>` | routes to this mailbox and is active | `POST /api/aliases` | `mailbox` |
 | `templates` | the active templates equal the file | `PUT …/transactional/templates` (an id archived on the server is reported blocked, never revived) | `mailbox` |
+| `telegram:topic` | only with a `telegram` block: `GET /api/telegram/status` shows a bound forum and the mailbox mapped as asked (`topicName` stored, or `adoptThreadId`) | `POST /api/telegram/topics` (creates the named topic, or adopts the thread); any *other* existing mapping is **blocked, never replaced** (the remedy prints the `--replace` command); no bridge, no bound chat, not a forum, or no `can_manage_topics` for a create are blocked with a remedy. `{}` names the topic after the mailbox | `mailbox` |
 | `key:<name>` | see below | mint + store, or fix `senderName` / the stored endpoint | `mailbox`, `templates`, the sender's `sending:` step |
 
 **Keys are idempotent through the store.** Keys have no name server-side, so the 1Password item
@@ -762,6 +764,87 @@ else from the Cloudflare API with the token.
 the generated config changed (or the live Worker lacks a name), it says a deploy is required and
 prints `pnpm run deploy:dev --dry-run` then `pnpm run deploy:dev`. The integrator-facing side —
 what the product does with the key — is in [`docs/INTEGRATING.md`](INTEGRATING.md).
+
+## Moving the Telegram bridge to a forum
+
+Everything here goes through `/api/telegram/*` with the operator session: the worker calls
+Telegram with its own `TELEGRAM_BOT_TOKEN`, which is write-only and never leaves it. No step
+needs raw D1, a second bot, or waiting for real mail. Every mutating command is a dry run unless
+`--apply` is given.
+
+**Apply D1 migration `0020_telegram_topic_name.sql` before deploying the code that ships these
+commands** (`pnpm d1:migrate:dev`, or `d1:migrate:prod`): the card path reads
+`telegram_topics.topic_name`, and without the column every forum card fails and is retried by the
+notification queue. `pnpm run deploy` does not apply migrations.
+
+```bash
+pnpm operator login --env dev --host <custom-host> --email <owner>
+
+# 1. Learn the bot (@username) and what it is bound to today.
+pnpm operator telegram status --host <custom-host>
+
+# 2. In Telegram: create the supergroup, turn on Topics, add @<bot username> as an
+#    administrator with "Manage Topics". Get the chat id (-100...) from any message
+#    link or from /id sent in the group.
+
+# 3. Move the binding. The dry run checks with Telegram that the chat exists, is a
+#    forum, and that the bot may post there, and prints current -> new.
+pnpm operator telegram rebind --host <custom-host> --chat -100XXXXXXXXXX
+pnpm operator telegram rebind --host <custom-host> --chat -100XXXXXXXXXX --apply
+
+# 4. One topic per mailbox, named as you like (independent of the display name its
+#    replies are signed with), or adopt a topic that already exists.
+pnpm operator telegram topic hello@example.com --host <custom-host> --name "imsanti"
+pnpm operator telegram topic hello@example.com --host <custom-host> --name "imsanti" --apply
+pnpm operator telegram topic billing@example.com --host <custom-host> --adopt 42 --apply
+
+# 5. Prove it: one labelled message per mailbox, checked against where it landed.
+pnpm smoke:telegram --host <custom-host>
+```
+
+What each piece does, and why it is safe:
+
+- **`status`** (`GET /api/telegram/status`) is read-only toward Telegram: `getMe`, `getChat`,
+  `getChatMember`. It reports the bot id and username, the bound chat as stored
+  (`telegram.chat_id`, `telegram.chat_is_forum`) and as Telegram sees it (with a warning when the
+  stored forum flag disagrees — cards follow the stored flag), the bot's status and
+  `can_manage_topics`, the webhook registration/observation the cron tracks, and each active
+  mailbox's topic in the bound chat. Topics are always reported **unverified**: the only Bot API
+  call that addresses a topic without posting is `editForumTopic`, which *renames* it, so
+  existence is checked by the delivery test instead.
+- **`rebind`** (`POST /api/telegram/rebind {chatId, dryRun?}`) is the explicit override of the
+  sticky `/start` adoption. It refuses a chat Telegram does not know (404), a channel, and a chat
+  where the bot is not an administrator or a member/restricted bot with send rights (409
+  `bot_not_eligible`); it stores the numeric id `getChat` returns (an `@username` works as input).
+  `telegram.chat_id`, `telegram.chat_is_forum` and a `telegram.rebound` ops_event (old and new
+  chat ids only) are written in one D1 batch. Nothing caches the binding, so the next update and
+  the next card see the new chat; orders from the old chat are ignored from then on. The old
+  chat's topic mappings are kept (the key is `(chat_id, mailbox_id)`), so rebinding back finds
+  them. Mail held for a quiet-hours digest of the old chat is not moved. Re-running `rebind` on the
+  chat already bound re-observes its forum flag — the way to pick up Topics being switched on.
+- **`topic`** (`POST /api/telegram/topics {mailboxId, name?, adoptThreadId?, replace?, dryRun?}`)
+  needs a bound forum (409 `no_chat_bound` / `chat_not_forum`; the forum flag is re-read with
+  `getChat`). `--name` alone creates the topic (`createForumTopic`; the bot needs
+  `can_manage_topics`, else 409 `topic_create_refused` and the remedy is to create it by hand and
+  adopt it). `--adopt <threadId>` records an existing thread without creating anything — it cannot
+  be verified from here, so run the smoke test after. The name is stored in
+  `telegram_topics.topic_name` (migration `0020`); NULL keeps the old rule (display name, else the
+  address). When a mapped topic is deleted in Telegram, the next card recreates it under the stored
+  name. The same request again is `already`; a *different* existing mapping is 409
+  `topic_mapping_exists` unless `--replace`, and the replaced topic is left in Telegram, unused.
+  `pnpm operator telegram topics` lists every mapping in every chat. Each write leaves a
+  `telegram.topic_mapped` ops_event.
+- **`smoke:telegram`** (`POST /api/telegram/test {mailboxId?}`) posts one message labelled
+  "Reccado · prueba de entrega" per active mailbox (or `--mailbox`) through the send path real
+  cards use, and compares the `message_thread_id` Telegram returns with the mapped topic —
+  Telegram answers `ok: true` and files a message under General when the thread id is missing or
+  wrong. Per mailbox: `delivered_to_topic`, `fell_back_to_general`, `delivered_to_chat` (the chat
+  has no topics), or `failed` with the reason (no mapping, deleted topic, other thread). It writes
+  no `telegram_links` row, so replying to a test message never becomes an email reply, and it never
+  creates or forgets a topic. Exit status 1 unless every message landed where a card would.
+
+`pnpm onboard` can do step 4 for a product's mailbox with a `telegram` block in the manifest
+(see [Onboarding a product](#onboarding-a-product)).
 
 ## Transactional smoke test
 
@@ -820,6 +903,10 @@ All require an authenticated, authorized Access identity:
   state.
 - `POST /api/admin/backups/run` — trigger the same backup-manifest export path used by the hourly
   cron sweep.
+- `GET /api/telegram/status`, `POST /api/telegram/rebind`, `GET|POST /api/telegram/topics`,
+  `POST /api/telegram/test` — the Telegram bridge's operator surface (owner session; POSTs behind
+  the Origin check). Driven by `pnpm operator telegram ...` and `pnpm smoke:telegram`; see
+  [Moving the Telegram bridge to a forum](#moving-the-telegram-bridge-to-a-forum).
 
 Transactional key management (create/list/revoke/rotate) and template CRUD are
 `/api/mailboxes/:mailboxId/transactional/*` routes behind the same Access perimeter plus a

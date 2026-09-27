@@ -429,6 +429,14 @@ usable answer to "which email is this reply for": a bare message in a topic gets
 the card instead. Forum support is detected once (`getChat` at `/start`, cached in
 `runtime_config`), not configured; a plain chat keeps getting plain messages.
 
+A topic can also be given its own name, independent of the mailbox's display name (which is the
+From name of its replies): `pnpm operator telegram topic <mailbox> --name "..."` creates it, or
+`--adopt <threadId>` maps one that already exists. `pnpm operator telegram status` shows the bot,
+the bound chat, the bot's rights and each mailbox's topic, and `pnpm smoke:telegram` posts a
+labelled test message into every topic and checks it landed there. The token never leaves the
+worker: these commands call `/api/telegram/*` with your operator session. See
+[docs/OPERATIONS.md](docs/OPERATIONS.md#moving-the-telegram-bridge-to-a-forum).
+
 ### Setup
 
 ```bash
@@ -473,7 +481,9 @@ asks you to confirm once with a code.
   Telegram delivers.
 - **The chat is adopted, not declared.** The first `/start` from an operator stores the chat in D1
   (`runtime_config`). First writer wins: a later `/start` from another chat does *not* move the
-  binding, and the bot says so.
+  binding, and the bot says so. Moving it on purpose is `pnpm operator telegram rebind --chat <id>`
+  (dry run, then `--apply`), which checks the chat and the bot's rights with Telegram first and
+  audits the move — no raw D1.
 - **The operator is paired, not committed.** Whom you trust is still your decision — whoever drives
   the bot can send mail as you — but it is recorded in `owner_identities` (D1) by spending a
   single-use, expiring code, not by putting a personal user id in a file and redeploying. Every

@@ -195,6 +195,33 @@ read/search/draft endpoint.
   Mailbox-looking registry entries that no D1 row delivers to get a warning. The check is
   read-only and never calls Telegram, and it prints only an info line when `op` is unavailable or
   the bridge is bound to a different chat.
+- **Operator control of the Telegram bridge — no raw D1, no second bot.** Four owner-session
+  routes under `/api/telegram/*` that use the worker's own (write-only) bot token, and the
+  commands that drive them:
+  - `GET /api/telegram/status` / `pnpm operator telegram status`: the bot's id and @username
+    (`getMe`), the bound chat as stored and as Telegram sees it, the bot's status and
+    `can_manage_topics` there, the tracked webhook state, and each active mailbox's topic.
+    Read-only toward Telegram; topics are reported unverified, because the only probe
+    (`editForumTopic`) renames.
+  - `POST /api/telegram/rebind` / `pnpm operator telegram rebind --chat <id> [--apply]`: the
+    audited override of the sticky `/start` adoption. Checks the chat and the bot's rights first,
+    writes `telegram.chat_id`, `telegram.chat_is_forum` and a `telegram.rebound` ops_event in one
+    D1 batch, keeps the old chat's topic mappings.
+  - `GET|POST /api/telegram/topics` / `pnpm operator telegram topic <mailbox> (--name … |
+    --adopt <threadId>) [--replace] [--apply]`: create a named topic or adopt an existing thread,
+    idempotently, 409 on a different mapping unless `--replace`.
+  - `POST /api/telegram/test` / `pnpm smoke:telegram [--mailbox …]`: one labelled test message per
+    mailbox through the real card send path, reporting `delivered_to_topic |
+    fell_back_to_general | delivered_to_chat | failed` from the `message_thread_id` Telegram
+    returns. Creates no reply link and no topic.
+- **Topic names independent of the mailbox display name** (migration
+  `0020_telegram_topic_name.sql`, nullable `telegram_topics.topic_name`). A stored name wins over
+  `display_name` — the From name of the mailbox's replies — and survives the self-heal that
+  recreates a deleted topic; NULL keeps the previous behaviour. **Apply the migration before
+  deploying**: the card path reads the column.
+- **`pnpm onboard` maps the mailbox's forum topic** with an optional
+  `telegram: { topicName?, adoptThreadId? }` manifest block and a `telegram:topic` step
+  (idempotent; blocked with a remedy when no forum is bound; never replaces a mapping).
 - **`docs/INTEGRATING.md` — the integrator's guide to the transactional API.** Written from the
   code for a product team sending through Reccado: who provisions what (mailbox on the zone,
   sending identity on `send.`), one endpoint per mailbox with the key selecting the environment,

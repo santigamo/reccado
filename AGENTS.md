@@ -159,6 +159,10 @@ actual repo state, fix this section rather than trusting it blindly.
 - To onboard a whole product (sending names, routing rules, domain/mailbox/aliases, templates,
   keys into 1Password), use `pnpm onboard --env <env> --manifest <file>` — dry-run by default,
   `--apply` to perform; see `docs/OPERATIONS.md` ("Onboarding a product"). It never deploys.
+- For the Telegram bridge (bot identity, rebinding the chat, forum topics per mailbox, delivery
+  checks) use `pnpm operator telegram status|rebind|topic|topics` and `pnpm smoke:telegram` —
+  never raw D1 on `runtime_config` / `telegram_topics`; see `docs/OPERATIONS.md` ("Moving the
+  Telegram bridge to a forum").
 - Do not re-run a full Cloudflare-resource preflight unless the assigned task actually touches
   Cloudflare resources or auth. Do not advance beyond the assigned spike/milestone/task —
   validation gates are blocking.
