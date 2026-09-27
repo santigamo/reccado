@@ -52,6 +52,7 @@ import {
 	updateMailboxSchema,
 	updateRoutingRuleSchema,
 } from "./schemas";
+import { registerTelegramRoutes } from "./telegram-routes";
 
 export type ApiBindings = {
 	Bindings: Env;
@@ -793,6 +794,7 @@ export function createApiApp(): Hono<ApiBindings> {
 	registerMailboxRoutes(api);
 	registerMailboxSuppressionRoutes(api);
 	registerAdminRoutes(api);
+	registerTelegramRoutes(api);
 
 	// MCP endpoint: forward all methods (GET/POST/OPTIONS) to the MCP handler.
 	api.all("/mcp", async (c) => {

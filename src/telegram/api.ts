@@ -367,9 +367,52 @@ export async function answerCallbackQuery(
 export type TelegramChat = {
 	id: number | string;
 	type: string;
+	/** Groups, supergroups and channels have one; a private chat does not. */
+	title?: string;
 	/** True only for a supergroup with topic mode turned on. */
 	is_forum?: boolean;
+	/** Default member permissions; decides whether a plain `member` may post. */
+	permissions?: { can_send_messages?: boolean; can_manage_topics?: boolean };
 };
+
+/** The bot's own account, from getMe. */
+export type TelegramBotUser = {
+	id: number;
+	is_bot: boolean;
+	first_name: string;
+	username?: string;
+};
+
+/**
+ * One chat member, as getChatMember reports it. Only the fields the operator
+ * routes read: which of the status variants this is, and the two rights that
+ * decide whether the bridge can post (and create topics) there.
+ */
+export type TelegramChatMember = {
+	status: "creator" | "administrator" | "member" | "restricted" | "left" | "kicked" | string;
+	/** Administrators, and restricted members when the restriction allows it. */
+	can_manage_topics?: boolean;
+	/** Restricted members only. */
+	can_send_messages?: boolean;
+	/** Restricted members only: false once they have left. */
+	is_member?: boolean;
+};
+
+/** Who this bot is. Read-only, and the only way to learn the @username from the token. */
+export async function getMe(config: TelegramConfig): Promise<TelegramBotUser> {
+	return callTelegram<TelegramBotUser>(config.botToken, "getMe", {});
+}
+
+/** What the bot may do in a chat. Read-only. */
+export async function getChatMember(
+	config: TelegramConfig,
+	input: { chatId: string; userId: number },
+): Promise<TelegramChatMember> {
+	return callTelegram<TelegramChatMember>(config.botToken, "getChatMember", {
+		chat_id: input.chatId,
+		user_id: input.userId,
+	});
+}
 
 /** What kind of chat this is — asked once at adoption, not once per email. */
 export async function getChat(

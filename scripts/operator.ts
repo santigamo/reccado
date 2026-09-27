@@ -11,6 +11,11 @@
  *                        [--ttl 10] [--label my-task] [--allow-new-owner]
  *   pnpm operator whoami --host inbox.example.com
  *   pnpm operator logout --host inbox.example.com
+ *   pnpm operator telegram status [--json]       bot, bound chat, rights, topics per mailbox
+ *
+ * The telegram subcommands call /api/telegram/* with the stored session; the
+ * worker makes every Bot API call with its own (write-only) token. Mutating
+ * ones are dry-run unless --apply is given.
  *
  * Defaults: --host from $RECCADO_HOST (or the env block's single custom-domain
  * route); --email from the first OWNER_BOOTSTRAP_EMAILS entry when set locally.
@@ -18,15 +23,20 @@
  *
  * Never prints the pairing code or the session cookie.
  */
+import type { TelegramOperatorStatus } from "../src/telegram/admin/status";
 import {
 	getSessionInfo,
 	loadSession,
 	login,
 	logout,
+	OperatorHttpError,
+	operatorJson,
+	requireSession,
 	resolveHost,
 	resolveOwnerEmail,
 	sessionPathFor,
 } from "./lib/operator-session";
+import { describeApiRefusal, formatTelegramStatus } from "./lib/telegram-operator-core";
 
 function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string> } {
 	const positional: string[] = [];
@@ -55,11 +65,43 @@ function parseArgs(argv: string[]): { positional: string[]; flags: Record<string
 	return { positional, flags };
 }
 
-const USAGE = `Usage: pnpm operator <login|whoami|logout> [--env <env>] [--host <host>] [--email <owner>]
+const USAGE = `Usage: pnpm operator <login|whoami|logout|telegram> [--env <env>] [--host <host>] [--email <owner>]
   login   mint a single-use pairing code in D1, exchange it for a session, store it (0600)
           flags: --ttl <minutes, 1-60, default 10> --label <text> --allow-new-owner
   whoami  show the signed-in owner and session expiry, or "not signed in"
-  logout  sign the session out on the server and delete the local session file`;
+  logout  sign the session out on the server and delete the local session file
+  telegram status [--json]
+          the bot (@username), the bound chat and the bot's rights there, the webhook,
+          and each active mailbox's topic`;
+
+type Flags = Record<string, string>;
+
+/** `pnpm operator telegram <sub>`: thin IO around /api/telegram/*; formatting is in the core. */
+async function runTelegram(
+	sub: string | undefined,
+	flags: Flags,
+	host: string,
+	env: string | undefined,
+): Promise<number> {
+	const session = requireSession(host, env);
+	const json = flags.json === "true";
+	switch (sub) {
+		case "status": {
+			const status = await operatorJson<TelegramOperatorStatus>(
+				session,
+				"/api/telegram/status",
+				{},
+				{ env },
+			);
+			if (json) console.log(JSON.stringify(status, null, 2));
+			else for (const line of formatTelegramStatus(status)) console.log(line);
+			return status.bridge.ok ? 0 : 1;
+		}
+		default:
+			console.error(`Unknown telegram subcommand "${sub ?? ""}".\n${USAGE}`);
+			return 1;
+	}
+}
 
 async function main(): Promise<number> {
 	const { positional, flags } = parseArgs(process.argv.slice(2));
@@ -117,6 +159,18 @@ async function main(): Promise<number> {
 			console.log(`session file:    ${result.fileRemoved ? "deleted" : "none"} (${result.path})`);
 			return result.serverSignOut.startsWith("failed") ? 1 : 0;
 		}
+		case "telegram":
+			try {
+				return await runTelegram(positional[1], flags, host, env);
+			} catch (error) {
+				// A refusal from the route (409 no_chat_bound, bot_not_eligible, ...) is an
+				// answer, not a crash: print its message, not a stack or a raw body dump.
+				if (error instanceof OperatorHttpError) {
+					console.error(`operator telegram: ${describeApiRefusal(error.status, error.body)}`);
+					return 1;
+				}
+				throw error;
+			}
 		default:
 			console.error(`Unknown command "${command}".\n${USAGE}`);
 			return 1;
