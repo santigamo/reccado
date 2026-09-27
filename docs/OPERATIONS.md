@@ -522,9 +522,24 @@ all related R2 prefixes.
 Every queue in this Worker has a dead-letter queue, and every dead-letter queue has a consumer:
 `src/cloudflare/dlq-consumer.ts` writes one `ops_events` row per dead message
 (`event_type='dlq.dead_letter'`, `severity='error'`, `subject` = the queue message id, payload
-`{ queue, attempts, body }`) and acks. Before that consumer existed a message that exhausted its
+`{ queue, attempts, summary }`) and acks. Before that consumer existed a message that exhausted its
 retries simply expired with the Queues retention window and left no trace anywhere an operator
 would look. The tombstone is the trace.
+
+The tombstone never stores the dead message's body. `summary` is an allow-list of identifiers per
+known shape, because ops events describe events, not recipients or content:
+
+| Body | `summary` keeps |
+| --- | --- |
+| Email Sending lifecycle event | `kind: "email_event"`, `event_type`, `event_id`, `provider_message_id`, `to_domain` (the recipient's domain, never the address), plus `schema_valid: false` when the event failed the schema |
+| Inbound envelope (`email.received.v1`) | `kind: "inbound"`, `traceId`, `mailboxId`, `rawR2Key`, `rawSha256`, `rawSize`, `recipientDomain` |
+| Notification / card refresh | `kind: "notify"`, `eventType`, `mailboxId`, `messageLocalId`, `threadId`, card `status` |
+| Anything else | `kind: "unrecognized"`, the body's type and its top-level key names only |
+
+Addresses, subjects, snippets, SMTP responses and bodies are never written. Any identifier
+containing `@` is dropped. The content is still where it already lived: raw MIME in R2 (use
+`rawR2Key`), the conversation in the mailbox DO (use `mailboxId` plus `threadId`), the event in the
+provider console (use `provider_message_id`).
 
 Two properties are deliberate:
 
@@ -555,7 +570,7 @@ still a manual Cloudflare operation plus an operator validation pass.
 1. Inspect the symptom:
    - check Queue/DLQ counts in Cloudflare;
    - query `ops_events` for `event_type='dlq.dead_letter'` (via `GET /api/admin/ops-events`) — the
-     rows carry the queue, attempt count and payload of every dead message;
+     rows carry the queue, attempt count and a metadata-only summary of every dead message;
    - inspect `GET /api/admin/dlq` and recent Worker logs.
 2. Classify the failure:
    - poison/schema bug;

@@ -56,6 +56,16 @@ read/search/draft endpoint.
   and status now share one authentication path (peppered constant-time secret check, then mailbox
   binding, revocation, expiry, scope). Nothing about a key's state is disclosed before its secret
   verifies.
+- **Dead-letter tombstones no longer copy the message body into `ops_events`.** The DLQ consumer
+  stored the whole dead message as `payload_json.body`, so a dead-lettered Email Sending event
+  wrote the recipient's full address and the rendered subject into the ops log (observed on a
+  live row), and a dead inbound or notification message would have written sender, recipient,
+  subject and snippet. The payload is now `{ queue, attempts, summary }`, where `summary` is an
+  allow-list of identifiers per known shape: event type, event id, provider message id and
+  recipient *domain* for email events; trace id, mailbox id, R2 key, hash and size for inbound;
+  mailbox, message and thread ids for notifications; key names only for anything unrecognised.
+  Identifiers containing `@` are dropped. Existing `dlq.dead_letter` rows written before this
+  change still hold the full body and should be purged by hand.
 
 ### Fixed
 
