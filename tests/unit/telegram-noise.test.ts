@@ -16,6 +16,7 @@ import migrationTelegram from "../../migrations/d1/0004_telegram.sql?raw";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationTelegramTopics from "../../migrations/d1/0010_telegram_topics.sql?raw";
 import migrationExperience from "../../migrations/d1/0014_telegram_experience.sql?raw";
+import migrationTelegramTopicName from "../../migrations/d1/0020_telegram_topic_name.sql?raw";
 import { splitSqlStatements } from "../helpers/migrations";
 
 /**
@@ -42,6 +43,7 @@ beforeAll(async () => {
 		migrationTelegram,
 		migrationRuntimeConfig,
 		migrationTelegramTopics,
+		migrationTelegramTopicName,
 		migrationExperience,
 	]) {
 		await applyMigration(migration as string);

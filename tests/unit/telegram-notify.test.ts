@@ -7,6 +7,7 @@ import migrationTelegram from "../../migrations/d1/0004_telegram.sql?raw";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationTelegramTopics from "../../migrations/d1/0010_telegram_topics.sql?raw";
 import migrationExperience from "../../migrations/d1/0014_telegram_experience.sql?raw";
+import migrationTelegramTopicName from "../../migrations/d1/0020_telegram_topic_name.sql?raw";
 import { splitSqlStatements } from "../helpers/migrations";
 
 const testEnv = env as unknown as Env;
@@ -48,6 +49,7 @@ beforeAll(async () => {
 		migrationTelegram,
 		migrationRuntimeConfig,
 		migrationTelegramTopics,
+		migrationTelegramTopicName,
 		migrationExperience,
 	]) {
 		await applyMigration(migration as string);
@@ -246,6 +248,47 @@ describe("inbound notification in a forum chat", () => {
 			"SELECT event_type FROM ops_events WHERE event_type = 'telegram.topic_recreated'",
 		).first<{ event_type: string }>();
 		expect(event?.event_type).toBe("telegram.topic_recreated");
+	});
+
+	it("recreates a deleted topic under the name the operator gave it, not the display name", async () => {
+		await testEnv.INDEX_DB.prepare(
+			"INSERT INTO telegram_topics (chat_id, mailbox_id, topic_id, topic_name, created_at) VALUES (?, ?, ?, ?, ?)",
+		)
+			.bind(CHAT_ID, "mbx_hello", 42, "imsanti", new Date().toISOString())
+			.run();
+
+		const calls = stubTelegram((call) =>
+			call.method === "sendMessage" && call.body.message_thread_id === 42
+				? telegramError(400, "Bad Request: message thread not found")
+				: null,
+		);
+
+		const outcome = await deliverInboundNotification(buildEnv(), notification());
+
+		expect(outcome.status).toBe("sent");
+		// display_name is "Hola Santi" -- the From name of the mailbox's replies. The
+		// topic keeps its own name through the self-heal.
+		expect(calls.find((call) => call.method === "createForumTopic")?.body.name).toBe("imsanti");
+		const row = await testEnv.INDEX_DB.prepare(
+			"SELECT topic_id, topic_name FROM telegram_topics WHERE chat_id = ? AND mailbox_id = ?",
+		)
+			.bind(CHAT_ID, "mbx_hello")
+			.first<{ topic_id: number; topic_name: string | null }>();
+		expect(row?.topic_id).not.toBe(42);
+		expect(row?.topic_name).toBe("imsanti");
+	});
+
+	it("leaves an auto-created topic's name NULL so it keeps following the mailbox", async () => {
+		stubTelegram();
+
+		await deliverInboundNotification(buildEnv(), notification());
+
+		const row = await testEnv.INDEX_DB.prepare(
+			"SELECT topic_name FROM telegram_topics WHERE chat_id = ? AND mailbox_id = ?",
+		)
+			.bind(CHAT_ID, "mbx_hello")
+			.first<{ topic_name: string | null }>();
+		expect(row?.topic_name).toBeNull();
 	});
 
 	it("retries only once, so a failure that is not the topic is not looped on", async () => {

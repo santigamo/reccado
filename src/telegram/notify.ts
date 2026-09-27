@@ -2,7 +2,7 @@ import { getMailbox, insertOpsEvent, insertTelegramLink } from "../db/d1";
 import {
 	claimTelegramTopic,
 	forgetTelegramTopic,
-	getTelegramTopicForMailbox,
+	getTelegramTopicMapping,
 } from "../db/telegram-topics";
 import {
 	createForumTopic,
@@ -34,16 +34,56 @@ export type InboundNotificationInput = {
 /**
  * What a mailbox is called in the Telegram sidebar.
  *
- * The operator's own words for his own mailbox -- display_name if he set one,
- * otherwise the address itself. Pointedly NOT the email subject: a topic name is
- * permanent chrome in the operator's client, and deriving it from inbound mail
- * would hand every stranger who can send to this address a pen for the sidebar.
+ * The operator's own words for his own mailbox: the name he gave the topic
+ * itself when he gave one (telegram_topics.topic_name, see migration 0020),
+ * else display_name, else the address. Pointedly NOT the email subject: a topic
+ * name is permanent chrome in the operator's client, and deriving it from
+ * inbound mail would hand every stranger who can send to this address a pen for
+ * the sidebar.
+ *
+ * The stored name comes first because display_name is also the From name of
+ * every reply the mailbox sends: tying the two together meant a topic could not
+ * be renamed without changing how the mailbox signs its mail.
  */
-function topicNameFor(
+export function topicNameFor(
 	mailbox: { display_name: string | null; primary_address: string } | null,
 	fallbackAddress: string,
+	storedName?: string | null,
 ): string {
-	return mailbox?.display_name?.trim() || mailbox?.primary_address || fallbackAddress;
+	return (
+		storedName?.trim() ||
+		mailbox?.display_name?.trim() ||
+		mailbox?.primary_address ||
+		fallbackAddress
+	);
+}
+
+/**
+ * Posts into a mailbox's topic, or into the chat itself when there is none.
+ *
+ * The one send every mailbox-addressed message goes through -- real cards and
+ * the operator's delivery test alike -- so the test exercises the exact
+ * message_thread_id handling a card gets, not a copy of it. A falsy topic id is
+ * dropped rather than sent as 0: Telegram then files the message under General,
+ * which is also what it silently does with a thread id it does not recognise.
+ * That silence is why callers that care compare the returned message_thread_id
+ * with the one they asked for.
+ */
+export async function sendToMailboxTopic(
+	config: TelegramConfig,
+	input: {
+		chatId: string;
+		topicId: number | null;
+		text: string;
+		replyMarkup?: Record<string, unknown>;
+	},
+): Promise<TelegramMessage> {
+	return sendMessage(config, {
+		chatId: input.chatId,
+		text: input.text,
+		messageThreadId: input.topicId,
+		replyMarkup: input.replyMarkup,
+	});
 }
 
 /**
@@ -77,24 +117,32 @@ async function resolveTopicId(
 	env: Env,
 	input: InboundNotificationInput,
 	chatId: string,
+	/**
+	 * The operator-chosen name of a topic that was just found deleted, so the one
+	 * recreated in its place keeps it. Null/absent falls back to the mailbox.
+	 */
+	storedName: string | null = null,
 ): Promise<number | null> {
 	if (!(await chatSupportsTopics(env))) {
 		return null;
 	}
-	const existing = await getTelegramTopicForMailbox(env.INDEX_DB, chatId, input.mailboxId);
+	const existing = await getTelegramTopicMapping(env.INDEX_DB, chatId, input.mailboxId);
 	if (existing !== null) {
-		return existing;
+		return existing.topic_id;
 	}
 	const mailbox = await getMailbox(env.INDEX_DB, input.mailboxId);
 	try {
 		const topic = await createForumTopic(config, {
 			chatId,
-			name: topicNameFor(mailbox, input.mailboxAddress),
+			name: topicNameFor(mailbox, input.mailboxAddress, storedName),
 		});
 		return claimTelegramTopic(env.INDEX_DB, {
 			chatId,
 			mailboxId: input.mailboxId,
 			topicId: topic.message_thread_id,
+			// Carried over, not invented: an auto-created topic stays NULL so it keeps
+			// following the mailbox, a recreated one keeps the name it was given.
+			topicName: storedName,
 		});
 	} catch (error) {
 		if (isRetryable(error)) {
@@ -221,7 +269,7 @@ export async function deliverInboundNotification(
 	let topicId = await resolveTopicId(config, env, input, chatId);
 	let sent: TelegramMessage;
 	try {
-		sent = await sendMessage(config, { chatId, text, messageThreadId: topicId, replyMarkup });
+		sent = await sendToMailboxTopic(config, { chatId, topicId, text, replyMarkup });
 	} catch (error) {
 		// The operator deleted the topic. Nothing here is broken -- deleting a topic
 		// is a normal thing to do -- but the stored id is now a dead address, and
@@ -230,6 +278,10 @@ export async function deliverInboundNotification(
 		if (topicId === null || !isMissingTopicError(error)) {
 			throw error;
 		}
+		// Read before forgetting: a name the operator chose must outlive the topic it
+		// was first given to, or deleting a topic would silently rename the mailbox's
+		// next one back to its display_name.
+		const stale = await getTelegramTopicMapping(env.INDEX_DB, chatId, input.mailboxId);
 		await forgetTelegramTopic(env.INDEX_DB, chatId, input.mailboxId);
 		await insertOpsEvent(env.INDEX_DB, {
 			id: crypto.randomUUID(),
@@ -241,8 +293,8 @@ export async function deliverInboundNotification(
 		// Exactly one retry: a second miss means the failure is not the topic, and
 		// looping on it would burn the chat's rate-limit budget instead of the
 		// queue's backoff.
-		topicId = await resolveTopicId(config, env, input, chatId);
-		sent = await sendMessage(config, { chatId, text, messageThreadId: topicId, replyMarkup });
+		topicId = await resolveTopicId(config, env, input, chatId, stale?.topic_name ?? null);
+		sent = await sendToMailboxTopic(config, { chatId, topicId, text, replyMarkup });
 	}
 	// Inside the retried path on purpose: without this row a reply typed in
 	// Telegram resolves to no thread and is dropped, and a card the operator sees

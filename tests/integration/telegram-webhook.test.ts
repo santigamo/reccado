@@ -2,6 +2,7 @@ import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test"
 import { env } from "cloudflare:workers";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "#/server";
+import { deriveWebhookSecret } from "#/telegram/api";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
@@ -10,7 +11,7 @@ import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?
 import migrationTelegramTopics from "../../migrations/d1/0010_telegram_topics.sql?raw";
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
 import migrationExperience from "../../migrations/d1/0014_telegram_experience.sql?raw";
-import { deriveWebhookSecret } from "#/telegram/api";
+import migrationTelegramTopicName from "../../migrations/d1/0020_telegram_topic_name.sql?raw";
 import { splitSqlStatements } from "../helpers/migrations";
 
 const testEnv = env as unknown as Env;
@@ -34,6 +35,7 @@ beforeAll(async () => {
 		migrationTelegram,
 		migrationRuntimeConfig,
 		migrationTelegramTopics,
+		migrationTelegramTopicName,
 		migrationOwnerRegistry,
 		migrationExperience,
 	]) {

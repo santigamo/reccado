@@ -15,8 +15,76 @@ export type TelegramTopicRow = {
 	chat_id: string;
 	mailbox_id: string;
 	topic_id: number;
+	/**
+	 * The name the operator chose for this topic, or null for "whatever the
+	 * mailbox is called" (display_name, else the address). See
+	 * migrations/d1/0020_telegram_topic_name.sql.
+	 */
+	topic_name: string | null;
 	created_at: string;
 };
+
+/** The whole mapping row, for callers that need the stored name as well as the id. */
+export async function getTelegramTopicMapping(
+	db: D1Database,
+	chatId: string,
+	mailboxId: string,
+): Promise<TelegramTopicRow | null> {
+	return db
+		.prepare(
+			"SELECT chat_id, mailbox_id, topic_id, topic_name, created_at FROM telegram_topics WHERE chat_id = ? AND mailbox_id = ?",
+		)
+		.bind(chatId, mailboxId)
+		.first<TelegramTopicRow>();
+}
+
+/**
+ * Every mapping, in every chat.
+ *
+ * Rows for chats other than the bound one are kept on purpose: a rebind back to
+ * a previous chat finds its topics where it left them (the key includes the
+ * chat, so they never collide with the new chat's).
+ */
+export async function listTelegramTopics(db: D1Database): Promise<TelegramTopicRow[]> {
+	const result = await db
+		.prepare(
+			"SELECT chat_id, mailbox_id, topic_id, topic_name, created_at FROM telegram_topics ORDER BY chat_id, created_at",
+		)
+		.all<TelegramTopicRow>();
+	return result.results ?? [];
+}
+
+/**
+ * Writes a mapping unconditionally -- the operator's explicit override.
+ *
+ * Unlike claimTelegramTopic this is last-write-wins, which is correct only
+ * because it is reachable solely from the authenticated operator route: an
+ * operator replacing a mapping has decided which topic the mailbox belongs in,
+ * and a concurrent notification that auto-created one loses to that decision.
+ */
+export async function upsertTelegramTopic(
+	db: D1Database,
+	input: { chatId: string; mailboxId: string; topicId: number; topicName: string | null },
+): Promise<TelegramTopicRow> {
+	const createdAt = nowIso();
+	await db
+		.prepare(
+			`INSERT INTO telegram_topics (chat_id, mailbox_id, topic_id, topic_name, created_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(chat_id, mailbox_id) DO UPDATE SET
+         topic_id = excluded.topic_id,
+         topic_name = excluded.topic_name,
+         created_at = excluded.created_at`,
+		)
+		.bind(input.chatId, input.mailboxId, input.topicId, input.topicName, createdAt)
+		.run();
+	return {
+		chat_id: input.chatId,
+		mailbox_id: input.mailboxId,
+		topic_id: input.topicId,
+		topic_name: input.topicName,
+		created_at: createdAt,
+	};
+}
 
 export async function getTelegramTopicForMailbox(
 	db: D1Database,
@@ -42,14 +110,14 @@ export async function getTelegramTopicForMailbox(
  */
 export async function claimTelegramTopic(
 	db: D1Database,
-	input: { chatId: string; mailboxId: string; topicId: number },
+	input: { chatId: string; mailboxId: string; topicId: number; topicName?: string | null },
 ): Promise<number> {
 	await db
 		.prepare(
-			`INSERT INTO telegram_topics (chat_id, mailbox_id, topic_id, created_at) VALUES (?, ?, ?, ?)
+			`INSERT INTO telegram_topics (chat_id, mailbox_id, topic_id, topic_name, created_at) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(chat_id, mailbox_id) DO NOTHING`,
 		)
-		.bind(input.chatId, input.mailboxId, input.topicId, nowIso())
+		.bind(input.chatId, input.mailboxId, input.topicId, input.topicName ?? null, nowIso())
 		.run();
 	// Re-read rather than trusting the insert: on conflict the row that survives is
 	// the one the concurrent notification wrote, which is the topic to post into.

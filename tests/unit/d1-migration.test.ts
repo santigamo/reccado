@@ -4,6 +4,8 @@ import { insertMailbox, listMailboxesByOwner } from "#/db/d1";
 import migration1 from "../../migrations/d1/0001_initial.sql?raw";
 import migration2 from "../../migrations/d1/0002_message_index.sql?raw";
 import migration3 from "../../migrations/d1/0003_mailbox_owner.sql?raw";
+import migration10 from "../../migrations/d1/0010_telegram_topics.sql?raw";
+import migration20 from "../../migrations/d1/0020_telegram_topic_name.sql?raw";
 import { applyMigrations } from "../helpers/migrations";
 
 describe("D1 migration 0003_mailbox_owner", () => {
@@ -89,5 +91,34 @@ describe("D1 migration 0003_mailbox_owner", () => {
 
 		const mailboxes = await listMailboxesByOwner(env.INDEX_DB, "mixed.case@example.com");
 		expect(mailboxes.some((m) => m.mailbox_id === mailboxId)).toBe(true);
+	});
+});
+
+describe("D1 migration 0020_telegram_topic_name", () => {
+	it("adds a nullable topic_name and leaves pre-existing mappings on the old naming rule", async () => {
+		await applyMigrations(env.INDEX_DB, migration10);
+		// A mapping written before the migration, exactly as 0010-era code wrote it.
+		await env.INDEX_DB.prepare(
+			"INSERT INTO telegram_topics (chat_id, mailbox_id, topic_id, created_at) VALUES (?, ?, ?, ?)",
+		)
+			.bind("-100", "mbx_legacy_topic", 7, new Date().toISOString())
+			.run();
+
+		await applyMigrations(env.INDEX_DB, migration20);
+
+		const columns = await env.INDEX_DB.prepare("PRAGMA table_info(telegram_topics)").all<{
+			name: string;
+			notnull: number;
+		}>();
+		const topicName = columns.results.find((column) => column.name === "topic_name");
+		expect(topicName).toBeDefined();
+		expect(topicName?.notnull).toBe(0);
+		const legacy = await env.INDEX_DB.prepare(
+			"SELECT topic_id, topic_name FROM telegram_topics WHERE mailbox_id = ?",
+		)
+			.bind("mbx_legacy_topic")
+			.first<{ topic_id: number; topic_name: string | null }>();
+		// NULL means "follow the mailbox's display_name", which is what it meant before.
+		expect(legacy).toEqual({ topic_id: 7, topic_name: null });
 	});
 });
