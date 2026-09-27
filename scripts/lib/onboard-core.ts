@@ -21,8 +21,8 @@ import {
 import { normalizeTxtContent } from "../../src/lib/dns-gate";
 import type { StepOutcome } from "../../src/lib/provision";
 import { validateRecipientPolicy } from "../../src/lib/transactional-send";
-import { canonicalHost, type MxAnswer } from "./dns-lookup";
 import { parseDmarcTags } from "./dmarc";
+import { canonicalHost, type MxAnswer } from "./dns-lookup";
 import { describeFeedbackVerdict, type FeedbackSubscriptionVerdict } from "./event-subscriptions";
 import {
 	literalRoutingRuleArgs,
@@ -38,8 +38,8 @@ import {
 	type ParsedDnsRecord,
 	resolveDmarcPlan,
 	resolveSendingTarget,
-	SPF_VALUE,
 	type SendingTarget,
+	SPF_VALUE,
 	selectProviderRecords,
 } from "./sending-plan";
 
@@ -124,6 +124,19 @@ export const onboardManifestSchema = z
 			.strict()
 			.optional(),
 		keys: z.array(keySchema).optional(),
+		/**
+		 * The mailbox's forum topic in the bound Telegram chat. `topicName` creates
+		 * one under that name (independent of mailbox.displayName, which is the From
+		 * name of its replies); `adoptThreadId` maps an existing topic instead. An
+		 * empty object creates one named after the mailbox.
+		 */
+		telegram: z
+			.object({
+				topicName: z.string().trim().min(1).max(128).optional(),
+				adoptThreadId: z.number().int().positive().optional(),
+			})
+			.strict()
+			.optional(),
 	})
 	.strict();
 
@@ -148,8 +161,11 @@ export type ResolvedManifest = {
 	mailbox: { address: string; displayName?: string; aliases: string[] };
 	templates?: { file: string; archiveMissing: boolean };
 	keys: ManifestKey[];
+	telegram?: TelegramTopicSpec;
 	warnings: string[];
 };
+
+export type TelegramTopicSpec = { topicName?: string; adoptThreadId?: number };
 
 export type Validation<T> = { ok: true; value: T } | { ok: false; errors: string[] };
 
@@ -291,6 +307,7 @@ export function validateManifest(raw: unknown): Validation<ResolvedManifest> {
 					}
 				: {}),
 			keys,
+			...(m.telegram ? { telegram: m.telegram } : {}),
 			warnings,
 		},
 	};
@@ -1334,6 +1351,119 @@ export function parseVersionVars(raw: string): Record<string, string> | null {
 	} catch {
 		return null;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Decisions: Telegram topic
+// ---------------------------------------------------------------------------
+
+/**
+ * What GET /api/telegram/status says about the bridge, reduced to what the
+ * `telegram:topic` step decides from. `isForum` is Telegram's live answer when
+ * getChat succeeded, else the stored flag.
+ */
+export type TelegramTopicObservation = {
+	bridgeOn: boolean;
+	chatId: string | null;
+	isForum: boolean | null;
+	/** Null when the bot's membership could not be read. */
+	canManageTopics: boolean | null;
+	/** The mailbox's mapping in the bound chat; null when none (or the mailbox does not exist yet). */
+	mapping: { topicId: number; topicName: string | null; effectiveName: string } | null;
+};
+
+export type TelegramTopicPlan = { name?: string; adoptThreadId?: number };
+
+function telegramTopicCommand(address: string, spec: TelegramTopicPlan, replace: boolean): string {
+	const how =
+		spec.adoptThreadId !== undefined
+			? `--adopt ${spec.adoptThreadId}${spec.name ? ` --name ${JSON.stringify(spec.name)}` : ""}`
+			: `--name ${JSON.stringify(spec.name ?? "")}`;
+	return `pnpm operator telegram topic ${address} ${how}${replace ? " --replace" : ""} --apply`;
+}
+
+/**
+ * The mailbox's topic in the bound forum: `already` when the mapping the
+ * manifest asks for is in place, `todo` (POST /api/telegram/topics) when there
+ * is none, `blocked` otherwise.
+ *
+ * Never replaces a mapping, the way routing rules are never overwritten: a
+ * mapping decides where the mailbox's mail lands, and the remedy prints the
+ * exact `--replace` command for the operator to choose. With neither a name nor
+ * a thread id, any existing mapping is accepted and a missing one is created
+ * under the mailbox's display name (else its address) -- stored with the
+ * mapping, so later display-name changes do not rename the topic.
+ */
+export function decideTelegramTopic(opts: {
+	spec: TelegramTopicSpec;
+	address: string;
+	displayName?: string;
+	observed: TelegramTopicObservation;
+}): Decision<TelegramTopicPlan> {
+	const { spec, address, observed } = opts;
+	if (!observed.bridgeOn) {
+		return {
+			state: "blocked",
+			reason: "the Telegram bridge is off (TELEGRAM_BOT_TOKEN is not set on the worker).",
+			remedy:
+				"Set it: pnpm wrangler secret put TELEGRAM_BOT_TOKEN --env <env>, bind a forum, then re-run.",
+		};
+	}
+	if (!observed.chatId) {
+		return {
+			state: "blocked",
+			reason: "no Telegram chat is bound.",
+			remedy:
+				"Send /start to the bot from the forum, or: pnpm operator telegram rebind --chat <forum chat id> --apply; then re-run.",
+		};
+	}
+	if (observed.isForum !== true) {
+		return {
+			state: "blocked",
+			reason: `the bound chat ${observed.chatId} is not a forum${observed.isForum === null ? " (never observed)" : ""}.`,
+			remedy: `Turn on Topics in the group (or move the bridge to a forum), then: pnpm operator telegram rebind --chat <forum chat id> --apply; then re-run.`,
+		};
+	}
+	const plan: TelegramTopicPlan =
+		spec.adoptThreadId !== undefined
+			? {
+					adoptThreadId: spec.adoptThreadId,
+					...(spec.topicName ? { name: spec.topicName } : {}),
+				}
+			: { name: spec.topicName ?? opts.displayName ?? address };
+
+	const existing = observed.mapping;
+	if (existing) {
+		const same =
+			spec.adoptThreadId !== undefined
+				? existing.topicId === spec.adoptThreadId &&
+					(spec.topicName === undefined || spec.topicName === existing.topicName)
+				: spec.topicName === undefined || spec.topicName === existing.topicName;
+		if (same) {
+			return {
+				state: "already",
+				detail: `${address} -> topic ${existing.topicId} "${existing.effectiveName}" in ${observed.chatId}.`,
+			};
+		}
+		return {
+			state: "blocked",
+			reason: `${address} is already mapped to topic ${existing.topicId} "${existing.effectiveName}"${existing.topicName ? "" : " (unnamed: follows the mailbox)"} in ${observed.chatId}, not to what the manifest asks.`,
+			remedy: `If it should move: ${telegramTopicCommand(address, plan, true)}. Otherwise align the manifest's telegram block.`,
+		};
+	}
+	if (plan.adoptThreadId === undefined && observed.canManageTopics === false) {
+		return {
+			state: "blocked",
+			reason: `the bot cannot create topics in ${observed.chatId} (no can_manage_topics).`,
+			remedy:
+				"Make the bot an administrator with Manage Topics, or create the topic yourself and set telegram.adoptThreadId; then re-run.",
+		};
+	}
+	return {
+		state: "todo",
+		action: `POST /api/telegram/topics ${JSON.stringify(plan)} for ${address} in ${observed.chatId}${plan.adoptThreadId === undefined ? " (creates the forum topic)" : " (maps the existing thread; unverifiable until pnpm smoke:telegram)"}`,
+		plan,
+	};
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,9 @@
  *   mailbox             POST /api/mailboxes (+ primary alias)                      [domain]
  *   alias:<address>     POST /api/aliases                                          [mailbox]
  *   templates           PUT  /api/mailboxes/:id/transactional/templates           [mailbox]
+ *   telegram:topic      POST /api/telegram/topics: the mailbox's forum topic in the bound
+ *                       chat (manifest `telegram`); `already` when mapped as asked, blocked
+ *                       (never replaced) when mapped otherwise or no forum is bound [mailbox]
  *   key:<name>          POST /api/mailboxes/:id/transactional/api-keys, plaintext
  *                       straight into 1Password; idempotent via the stored key id [mailbox, templates, sending]
  *
@@ -50,6 +53,8 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import type { TelegramOperatorStatus } from "../src/telegram/admin/status";
+import type { TopicMappingResult } from "../src/telegram/admin/topics";
 import { generatedConfigPathFor, readGeneratedConfig, readTrackedConfig } from "./lib/built-config";
 import { deployedVars, effectiveBlock, parseDomainList } from "./lib/deploy-config";
 import { lookupTxt } from "./lib/dmarc";
@@ -66,6 +71,7 @@ import {
 	type AliasRowLike,
 	type ApiKeyEntry,
 	buildOnePasswordItem,
+	type DomainRowLike,
 	decideAlias,
 	decideDeployedDomains,
 	decideDomain,
@@ -75,12 +81,12 @@ import {
 	decideRoutingRule,
 	decideSendingConfig,
 	decideSendingTarget,
+	decideTelegramTopic,
 	decideTemplates,
 	deployCommandFor,
-	type DomainRowLike,
 	diffTemplates,
-	endpointFor,
 	type ExistingTemplate,
+	endpointFor,
 	exitCodeFor,
 	findItemsByTitle,
 	formatResults,
@@ -102,6 +108,7 @@ import {
 	type SendingPlanEntry,
 	type StepSpec,
 	settle,
+	type TelegramTopicObservation,
 	type TemplateInput,
 	type TemplateSyncResult,
 	tally,
@@ -782,6 +789,70 @@ const templatesStep: StepSpec | null =
 			}
 		: null;
 
+// --- Telegram topic -----------------------------------------------------------
+
+/**
+ * GET /api/telegram/status reduced to the step's inputs. The route calls
+ * Telegram read-only (getMe/getChat/getChatMember), so a dry run stays a read.
+ */
+async function observeTelegramTopic(): Promise<TelegramTopicObservation> {
+	const status = await api<TelegramOperatorStatus>("/api/telegram/status");
+	const topic =
+		status.mailboxes.find((m) => m.address.toLowerCase() === manifest.mailbox.address)?.topic ??
+		null;
+	return {
+		bridgeOn: status.bot !== null,
+		chatId: status.binding.chatId,
+		isForum: status.chat?.ok ? status.chat.isForum : status.binding.isForum,
+		canManageTopics: status.membership?.ok ? status.membership.canManageTopics : null,
+		mapping: topic
+			? { topicId: topic.topicId, topicName: topic.topicName, effectiveName: topic.effectiveName }
+			: null,
+	};
+}
+
+const telegramTopicStep: StepSpec | null = manifest.telegram
+	? {
+			id: "telegram:topic",
+			deps: [mailboxStep.id],
+			run: () =>
+				guarded(async () => {
+					const spec = manifest.telegram ?? {};
+					const decide = async () =>
+						decideTelegramTopic({
+							spec,
+							address: manifest.mailbox.address,
+							displayName: manifest.mailbox.displayName,
+							observed: await observeTelegramTopic(),
+						});
+					return settle(await decide(), mode, async (plan) => {
+						const mailboxId = await currentMailboxId();
+						if (!mailboxId) {
+							return {
+								state: "failed",
+								error: "the mailbox id is unknown after the mailbox step.",
+							};
+						}
+						const result = await api<TopicMappingResult>("/api/telegram/topics", {
+							method: "POST",
+							body: { mailboxId, ...plan },
+						});
+						const after = await decide();
+						if (after.state !== "already") {
+							return {
+								state: "failed",
+								error: `POST /api/telegram/topics answered ${result.outcome}, but the mapping still reads as: ${after.state === "todo" ? after.action : after.reason}`,
+							};
+						}
+						return {
+							state: "done",
+							detail: `${result.outcome} ${after.detail}${result.topicVerified ? "" : " Verify with pnpm smoke:telegram."}`,
+						};
+					});
+				}),
+		}
+	: null;
+
 // --- API keys + 1Password ----------------------------------------------------
 
 type OpResult = { ok: true; out: string } | { ok: false; err: string };
@@ -1056,6 +1127,7 @@ const steps: StepSpec[] = [
 	mailboxStep,
 	...manifest.mailbox.aliases.map(aliasStep),
 	...(templatesStep ? [templatesStep] : []),
+	...(telegramTopicStep ? [telegramTopicStep] : []),
 	...manifest.keys.map(keyStep),
 ];
 

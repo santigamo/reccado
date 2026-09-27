@@ -11,6 +11,7 @@
 		"aliases": ["privacy@example.com", "dmarc@example.com"]
 	},
 	"templates": { "file": "./templates.example.json", "archiveMissing": false },
+	"telegram": { "topicName": "example" },
 	"keys": [
 		{
 			"name": "preview",

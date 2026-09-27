@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import exampleManifest from "../../examples/onboard/onboard.example.json";
 import { parseDohMxAnswer } from "../../scripts/lib/dns-lookup";
 import type { FeedbackSubscriptionVerdict } from "../../scripts/lib/event-subscriptions";
 import {
@@ -15,6 +16,7 @@ import {
 	decideRoutingRule,
 	decideSendingConfig,
 	decideSendingTarget,
+	decideTelegramTopic,
 	decideTemplates,
 	dependencyMet,
 	diffKey,
@@ -39,6 +41,7 @@ import {
 	type StepSpec,
 	settle,
 	setupSendingArgs,
+	type TelegramTopicObservation,
 	validateManifest,
 } from "../../scripts/lib/onboard-core";
 import { parseRoutingRulesList, parseRoutingSettings } from "../../scripts/lib/routing";
@@ -1389,5 +1392,109 @@ describe("parseDohMxAnswer", () => {
 		expect(parseDohMxAnswer({ Status: 3 })).toEqual([]);
 		expect(parseDohMxAnswer({ Status: 2 })).toBeNull();
 		expect(parseDohMxAnswer(null)).toBeNull();
+	});
+});
+
+describe("telegram topic", () => {
+	it("the shipped example manifest validates, telegram block included", () => {
+		const result = validateManifest(exampleManifest);
+		if (!result.ok) throw new Error(result.errors.join("\n"));
+		expect(result.value.telegram).toEqual({ topicName: "example" });
+	});
+
+	it("validates the telegram block", () => {
+		const m = validateManifest(withChange((c) => (c.telegram = { adoptThreadId: 42 })));
+		expect(m.ok && m.value.telegram).toEqual({ adoptThreadId: 42 });
+		expect(validateManifest(GOOD).ok && resolved().telegram).toBeUndefined();
+		expect(errorsOf(withChange((c) => (c.telegram = { adoptThreadId: 0 }))).join()).toMatch(
+			/telegram\.adoptThreadId/,
+		);
+		expect(
+			errorsOf(withChange((c) => (c.telegram = { topicName: "x".repeat(129) }))).join(),
+		).toMatch(/telegram\.topicName/);
+		expect(errorsOf(withChange((c) => (c.telegram = { chat: "-100" }))).join()).toMatch(
+			/Unrecognized key/i,
+		);
+	});
+
+	const forum: TelegramTopicObservation = {
+		bridgeOn: true,
+		chatId: "-100",
+		isForum: true,
+		canManageTopics: true,
+		mapping: null,
+	};
+	const decide = (
+		spec: { topicName?: string; adoptThreadId?: number },
+		observed: Partial<TelegramTopicObservation> = {},
+	) =>
+		decideTelegramTopic({
+			spec,
+			address: "support@example.com",
+			displayName: "Example",
+			observed: { ...forum, ...observed },
+		});
+
+	it("creates a named topic, or adopts a thread, when nothing is mapped", () => {
+		const create = decide({ topicName: "example" });
+		expect(create.state).toBe("todo");
+		expect(create.state === "todo" && create.plan).toEqual({ name: "example" });
+		const adopt = decide({ adoptThreadId: 42, topicName: "example" });
+		expect(adopt.state === "todo" && adopt.plan).toEqual({ adoptThreadId: 42, name: "example" });
+		// An empty block names the topic after the mailbox, and stores that name.
+		const plain = decide({});
+		expect(plain.state === "todo" && plain.plan).toEqual({ name: "Example" });
+	});
+
+	it("is `already` when the mapping the manifest asks for is in place", () => {
+		const mapping = { topicId: 7, topicName: "example", effectiveName: "example" };
+		expect(decide({ topicName: "example" }, { mapping }).state).toBe("already");
+		expect(decide({ adoptThreadId: 7 }, { mapping }).state).toBe("already");
+		expect(decide({}, { mapping: { ...mapping, topicName: null } }).state).toBe("already");
+	});
+
+	it("never replaces a different mapping: blocked, with the exact --replace command", () => {
+		const outcome = decide(
+			{ topicName: "example" },
+			{ mapping: { topicId: 7, topicName: null, effectiveName: "Example" } },
+		);
+		expect(outcome.state).toBe("blocked");
+		expect(outcome.state === "blocked" && outcome.remedy).toContain(
+			'pnpm operator telegram topic support@example.com --name "example" --replace --apply',
+		);
+		expect(
+			decide({ adoptThreadId: 8 }, { mapping: { topicId: 7, topicName: null, effectiveName: "x" } })
+				.state,
+		).toBe("blocked");
+	});
+
+	it("is blocked, with a remedy, when there is no forum to put the topic in", () => {
+		const off = decide({ topicName: "example" }, { bridgeOn: false });
+		expect(off.state === "blocked" && off.reason).toMatch(/bridge is off/);
+		const unbound = decide({ topicName: "example" }, { chatId: null });
+		expect(unbound.state === "blocked" && unbound.remedy).toMatch(/rebind --chat/);
+		const flat = decide({ topicName: "example" }, { isForum: false });
+		expect(flat.state === "blocked" && flat.reason).toMatch(/not a forum/);
+		expect(decide({ topicName: "example" }, { isForum: null }).state).toBe("blocked");
+	});
+
+	it("is blocked from creating a topic the bot may not create, but may still adopt one", () => {
+		expect(decide({ topicName: "example" }, { canManageTopics: false }).state).toBe("blocked");
+		expect(decide({ adoptThreadId: 42 }, { canManageTopics: false }).state).toBe("todo");
+	});
+
+	it("depends on the mailbox step, like every other control-plane step", async () => {
+		const results = await runSteps(
+			[
+				{ id: "mailbox", deps: [], run: async () => ({ state: "failed", error: "boom" }) },
+				{
+					id: "telegram:topic",
+					deps: ["mailbox"],
+					run: async () => ({ state: "done", detail: "should not run" }),
+				},
+			],
+			"apply",
+		);
+		expect(results[1]?.outcome).toEqual({ state: "skipped", reason: "needs mailbox (failed)" });
 	});
 });
