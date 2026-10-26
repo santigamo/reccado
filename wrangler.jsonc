@@ -159,7 +159,11 @@
 			// deliberately not set here.
 			"vars": {
 				"MAIL_FROM_ADDRESS": "noreply@send.imsanti.dev",
-				"MAIL_SENDING_DOMAINS": "send.transcribo.es,transcribo.es",
+				// imsanti.dev is the zone apex, so hello@imsanti.dev sends as itself. Ship
+				// this only after `wrangler email sending list` shows imsanti.dev enabled:
+				// a domain listed here that Cloudflare has not accepted makes every send from
+				// that mailbox fail instead of falling back to MAIL_FROM_ADDRESS.
+				"MAIL_SENDING_DOMAINS": "imsanti.dev,send.transcribo.es,transcribo.es",
 				"MAILBOX_JURISDICTION": "eu"
 			},
 			"triggers": {
