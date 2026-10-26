@@ -69,6 +69,16 @@ read/search/draft endpoint.
 
 ### Fixed
 
+- **Sent messages no longer show "(no text content)".** The send path stored the sent copy
+  without its body, so the viewer had nothing to render even though the mail went out intact.
+  Confirming a draft now stores the draft's text on the copy, and its HTML body in R2 under the
+  same key shape an inbound message uses, so the existing sandboxed `/html` route serves it. If the
+  R2 write fails the copy keeps its text and the send still counts as sent. Mailbox schema v7
+  fills in the text of sent copies that already exist, once per mailbox, by following the
+  `sent/<draftId>` key back to the draft. It only touches outbound rows with no body, skips a draft
+  that was edited after it was sent, and leaves inbound mail alone. The HTML body of older sent
+  copies is not backfilled, because that needs an R2 write the Durable Object constructor cannot
+  await.
 - **Delivery events for mailbox sends no longer end in the DLQ.** The email-events consumer only
   correlated against `transactional_request_log`, so every lifecycle event for mail confirmed
   from a mailbox (request-send → confirm-send) was logged four times as

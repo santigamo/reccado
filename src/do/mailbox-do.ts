@@ -6,6 +6,7 @@ import { buildReferences, messageIdHeader, referencesHeader } from "../lib/email
 import { normalizeMessageId } from "../lib/email-metadata";
 import { AmbiguousSendError } from "../lib/errors";
 import { normalizeSubject } from "../lib/mime";
+import { bodyHtmlR2Key } from "../lib/r2-keys";
 import {
 	resolveDeliveredAlias,
 	resolveSenderIdentity,
@@ -26,7 +27,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 6;
+const MAILBOX_SCHEMA_VERSION = 7;
 
 // Minimal runtime validation for the /ingest payload. Defined locally (rather than
 // imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
@@ -401,6 +402,14 @@ type ConfirmSendDraftContext = {
 	fromName?: string | null;
 	fromAddress: string;
 	replyToAddress: string | null;
+	/**
+	 * Where the sent copy's HTML body is stored, and under which mailbox. Both are
+	 * needed to write it, and both are optional so a caller that only cares about
+	 * the send itself (most tests) can leave them out: the sent copy then keeps its
+	 * text body and skips the HTML rendering.
+	 */
+	r2?: Pick<R2Bucket, "put">;
+	mailboxId?: string;
 };
 
 type ParentMessageRow = {
@@ -702,6 +711,26 @@ export async function confirmSendDraft(
 
 	const messageLocalId = crypto.randomUUID();
 	const rawR2Key = `sent/${draftId}`;
+	// The viewer renders body_html_r2_key first and body_text second, so the sent
+	// copy has to carry the same bodies the recipient got. HTML goes to R2 under
+	// the key an inbound message would use (it is served by the same sandboxed
+	// /html route). The mail has already left by now, so a failed R2 write must not
+	// turn a delivered send into an error: the copy keeps its text body instead.
+	let bodyHtmlR2KeyValue: string | null = null;
+	if (draft.body_html && ctx.r2 && ctx.mailboxId) {
+		const htmlKey = bodyHtmlR2Key({ mailboxId: ctx.mailboxId, messageLocalId });
+		try {
+			await ctx.r2.put(htmlKey, draft.body_html, {
+				httpMetadata: { contentType: "text/html; charset=utf-8" },
+			});
+			bodyHtmlR2KeyValue = htmlKey;
+		} catch (error) {
+			console.error("mailbox.sent_html_store_failed", {
+				draftId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
 	const rawSha256 = await sha256Hex(
 		new TextEncoder().encode(
 			JSON.stringify({
@@ -750,8 +779,9 @@ export async function confirmSendDraft(
 			`INSERT INTO messages
          (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
           from_addr, to_json, cc_json, bcc_json, subject, snippet,
-          received_at, raw_r2_key, raw_sha256, raw_size, parse_status, has_attachments, is_read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'parsed', 0, 1, ?, ?)`,
+          received_at, raw_r2_key, raw_sha256, raw_size, body_text, body_html_r2_key,
+          parse_status, has_attachments, is_read, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'parsed', 0, 1, ?, ?)`,
 			messageLocalId,
 			sentKey,
 			threadId,
@@ -767,6 +797,8 @@ export async function confirmSendDraft(
 			now,
 			rawR2Key,
 			rawSha256,
+			draft.body_text,
+			bodyHtmlR2KeyValue,
 			now,
 			now,
 		);
@@ -884,6 +916,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			this.migrateApiKeySenderName();
 			this.migrateApiKeyEventTypes();
 		}
+		// v7: sent copies were written without body_text, so the viewer showed
+		// "(no text content)" for every message the mailbox ever sent. New sends store
+		// the body; this fills in the ones already there, from the draft each came from.
+		if (currentVersion < 7) {
+			this.backfillSentBodyText();
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -969,6 +1007,36 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 		this.ctx.storage.sql.exec("DROP TABLE api_key_events_old");
 		this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id)");
+	}
+
+	/**
+	 * Gives every sent copy that has no body the text of the draft it was sent from.
+	 *
+	 * The link is `raw_r2_key`: a sent copy has no raw MIME in R2, so the send path
+	 * stores the pseudo key `sent/<draftId>` there. Only outbound rows with a NULL
+	 * body are touched, which is what makes a second run a no-op and keeps inbound
+	 * mail out of reach. A draft edited after it was sent (its `updated_at` moves
+	 * past the moment the copy was created) is skipped, because its text is no
+	 * longer what went out. Text only: the HTML body would need an R2 write, which
+	 * a constructor cannot await, and the text is what the viewer falls back to.
+	 */
+	private backfillSentBodyText(): void {
+		this.ctx.storage.sql.exec(
+			`UPDATE messages
+       SET body_text = (
+         SELECT d.body_text FROM outbound_drafts d
+         WHERE d.id = substr(messages.raw_r2_key, 6)
+       )
+       WHERE direction = 'outbound'
+         AND body_text IS NULL
+         AND substr(raw_r2_key, 1, 5) = 'sent/'
+         AND EXISTS (
+           SELECT 1 FROM outbound_drafts d
+           WHERE d.id = substr(messages.raw_r2_key, 6)
+             AND d.body_text IS NOT NULL
+             AND d.updated_at <= messages.created_at
+         )`,
+		);
 	}
 
 	private migrateResolvedViaColumn(): void {
@@ -1953,6 +2021,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				fromAddress: identity.from,
 				fromName: identity.fromName,
 				replyToAddress: identity.replyTo,
+				r2: this.env.MAIL_OBJECTS,
+				mailboxId: this.ctx.id.name,
 			},
 			draftId,
 			idempotencyKey,
