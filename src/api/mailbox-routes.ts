@@ -9,6 +9,7 @@ import {
 	upsertApiKeyProjection,
 	upsertMessageIndex,
 } from "../db/d1";
+import { isPreviewableImage } from "../lib/attachment-preview";
 import { AppError } from "../lib/errors";
 import type { TransactionalApiKeyProjection } from "../lib/transactional-keys";
 import { confirmDraftSend } from "../lib/outbound-send";
@@ -179,10 +180,14 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			return c.json({ error: "attachment_missing" }, 404);
 		}
 		const safeFilename = sanitizeAttachmentFilename(attachment.filename, attachmentId);
+		const disposition =
+			c.req.query("inline") === "1" && isPreviewableImage(attachment.content_type)
+				? "inline"
+				: "attachment";
 		return new Response(object.body, {
 			headers: {
 				"content-type": attachment.content_type ?? "application/octet-stream",
-				"content-disposition": `attachment; filename="${safeFilename}"`,
+				"content-disposition": `${disposition}; filename="${safeFilename}"`,
 				"x-content-type-options": "nosniff",
 				"content-security-policy": "default-src 'none'; sandbox",
 			},

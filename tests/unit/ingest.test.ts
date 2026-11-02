@@ -395,6 +395,26 @@ describe("mailbox DO ingest", () => {
 		expect(detail.thread).toBeTruthy();
 	});
 
+	it("thread detail carries each message's attachments, so the reading pane can list them", async () => {
+		const mailboxId = "mbx_thread_detail_attachments";
+		const { result } = await ingestFixture(
+			mailboxId,
+			attachmentSmallEml as string,
+			"thread-detail-attachments@example.com",
+			"Thread detail attachments",
+		);
+		const message = await getDoMessage(mailboxId, result.messageLocalId as string);
+
+		const detailResp = await mailboxStub(mailboxId).fetch(
+			`https://mailbox-do/threads/${message.thread_id as string}`,
+		);
+		const detail = (await detailResp.json()) as {
+			messages: Array<{ attachments: Array<{ filename: string }> }>;
+		};
+
+		expect(detail.messages[0]?.attachments.map((a) => a.filename)).toEqual(["note.txt"]);
+	});
+
 	it("thread list carries the fields a Gmail-style row needs (sender/snippet/state)", async () => {
 		const mailboxId = "mbx_thread_list_enriched";
 

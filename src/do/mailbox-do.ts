@@ -228,7 +228,19 @@ function getThread(sql: SqlStorage, threadId: string | undefined) {
 	const messages = sql
 		.exec("SELECT * FROM messages WHERE thread_id = ? ORDER BY received_at ASC", threadId)
 		.toArray();
-	return { thread, messages };
+	const attachments = sql
+		.exec(
+			"SELECT a.* FROM attachments a JOIN messages m ON m.id = a.message_id WHERE m.thread_id = ?",
+			threadId,
+		)
+		.toArray();
+	return {
+		thread,
+		messages: messages.map((message) => ({
+			...message,
+			attachments: attachments.filter((a) => a.message_id === message.id),
+		})),
+	};
 }
 
 function getMessage(sql: SqlStorage, messageId: string | undefined) {

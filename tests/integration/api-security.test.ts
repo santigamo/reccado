@@ -6,6 +6,7 @@ import { sha256Hex } from "#/lib/crypto";
 import { inboundIdempotencyKey } from "#/lib/idempotency";
 import { rawEmailR2Key } from "#/lib/r2-keys";
 import worker from "#/server";
+import attachmentImageEml from "../../fixtures/mime/attachment-image.eml?raw";
 import attachmentSmallEml from "../../fixtures/mime/attachment-small.eml?raw";
 import multipartHtmlOnlyContentEml from "../../fixtures/mime/multipart-html-only-content.eml?raw";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
@@ -243,6 +244,75 @@ describe("attachment download route", () => {
 		expect(csp).toContain("default-src 'none'");
 		const text = await attachmentResponse.text();
 		expect(text).toContain("Hello attachment content.");
+	});
+
+	it("serves only raster images inline, and only when ?inline=1 asks for it", async () => {
+		const mailboxId = "mbx_security_attachment_inline";
+		await testEnv.INDEX_DB.prepare(
+			"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		)
+			.bind(
+				mailboxId,
+				"attachment-inline@example.com",
+				null,
+				"active",
+				"dev@local",
+				new Date().toISOString(),
+				new Date().toISOString(),
+			)
+			.run();
+
+		const rawBytes = new TextEncoder().encode(attachmentImageEml as string);
+		const rawSha256 = await sha256Hex(rawBytes);
+		const rawR2Key = rawEmailR2Key({ mailboxId, receivedAt: new Date(), rawSha256 });
+		await testEnv.MAIL_OBJECTS.put(rawR2Key, rawBytes);
+		const messageId = "attachment-image-fixture@example.com";
+		const queueMessage: InboundEmailQueueMessage = {
+			schemaVersion: 1,
+			eventType: "email.received.v1",
+			traceId: crypto.randomUUID(),
+			enqueuedAt: new Date().toISOString(),
+			receivedAt: new Date().toISOString(),
+			mailboxId,
+			domain: "example.com",
+			recipient: "test@example.com",
+			sender: "sender@example.com",
+			rawR2Key,
+			rawSha256,
+			rawSize: rawBytes.byteLength,
+			messageId,
+			headers: { subject: "Attachment image", date: null, inReplyTo: null, references: [] },
+			routing: { ruleId: null, action: "store", matchedAlias: "test@example.com" },
+			idempotencyKey: inboundIdempotencyKey({ mailboxId, messageId, rawSha256 }),
+		};
+		const stub = testEnv.MAILBOX_DO.getByName(mailboxId);
+		const ingestResponse = await stub.fetch("https://mailbox-do/ingest", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(queueMessage),
+		});
+		const { messageLocalId } = (await ingestResponse.json()) as { messageLocalId: string };
+		const messagePayload = (await (
+			await stub.fetch(`https://mailbox-do/messages/${messageLocalId}`)
+		).json()) as { message: { attachments: Array<{ id: string; filename: string }> } };
+		const idOf = (filename: string) =>
+			messagePayload.message.attachments.find((a) => a.filename === filename)?.id;
+
+		const disposition = async (attachmentId: string | undefined, query: string) => {
+			const response = await fetchWorker(
+				new Request(
+					`http://localhost/api/mailboxes/${mailboxId}/messages/${messageLocalId}/attachments/${attachmentId}${query}`,
+				),
+			);
+			expect(response.status).toBe(200);
+			return response.headers.get("content-disposition");
+		};
+
+		expect(await disposition(idOf("pixel.png"), "?inline=1")).toBe('inline; filename="pixel.png"');
+		expect(await disposition(idOf("pixel.png"), "")).toBe('attachment; filename="pixel.png"');
+		expect(await disposition(idOf("note.txt"), "?inline=1")).toBe(
+			'attachment; filename="note.txt"',
+		);
 	});
 
 	it("returns 404 attachment_not_found for an unknown attachment id on a real message", async () => {

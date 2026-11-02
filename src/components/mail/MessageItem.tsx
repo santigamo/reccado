@@ -3,6 +3,7 @@ import type { ReactElement } from "react";
 import { useEffect, useRef, useState } from "react";
 import { Avatar } from "#/components/ui/Avatar";
 import { Button } from "#/components/ui/Button";
+import { isPreviewableImage } from "#/lib/attachment-preview";
 import { cn } from "#/lib/cn";
 import {
 	type Attachment,
@@ -136,6 +137,7 @@ export function MessageItem({
 	}
 
 	const toList = parseAddressList(message.to_json);
+	const images = (message.attachments ?? []).filter((att) => isPreviewableImage(att.content_type));
 
 	return (
 		<div className={cn("mb-3 rounded-2xl border bg-[var(--app-surface)]", cardBorder)}>
@@ -179,6 +181,24 @@ export function MessageItem({
 					<p className="text-[var(--app-text-faint)] italic">(no text content)</p>
 				)}
 			</div>
+
+			{images.length ? (
+				<div className="flex flex-wrap gap-2 px-4 pb-3">
+					{images.map((att) => {
+						const src = `${attachmentUrl(mailboxId, message.id, att.id)}?inline=1`;
+						return (
+							<a key={att.id} href={src} target="_blank" rel="noreferrer">
+								<img
+									src={src}
+									alt={att.filename ?? "image attachment"}
+									loading="lazy"
+									className="max-h-60 max-w-full rounded-lg border border-[var(--app-border)] object-contain"
+								/>
+							</a>
+						);
+					})}
+				</div>
+			) : null}
 
 			{message.attachments?.length ? (
 				<div className="flex flex-wrap gap-2 px-4 pb-4">
