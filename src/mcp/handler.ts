@@ -5,6 +5,7 @@ import { createAuth, AuthConfigError, resolveMcpResource } from "../api/better-a
 import { recordDeploymentOrigin } from "../db/runtime-config";
 import { requireMcpOwner, resolveOwnerEmails } from "./auth-import";
 import { registerTools } from "./tools";
+import { registerResources } from "./resources";
 import { scopesFromClaims } from "../lib/mcp-scopes";
 import type { McpAuthContext } from "./scopes";
 
@@ -38,7 +39,8 @@ async function runMcpServer(
 	const handler = createMcpHandler(
 		() => {
 			const server = new McpServer({ name: "reccado", version: "1.0.0" });
-			registerTools(server, env, auth);
+			registerTools(server, env, auth, new URL(request.url).origin);
+			registerResources(server, env, auth);
 			return server;
 		},
 		{ legacy: "stateless", allowedHostnames, allowedOriginHostnames: allowedHostnames },
