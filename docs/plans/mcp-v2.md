@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-In flight: T6b `mcp-approve-2` (P4b completion, Cursor `grok-4.7-xhigh-fast`). From 2026-11-11 new workers use Cursor CLI with `grok-4.7-xhigh-fast` (max effort, fast mode; Codex quota). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
+In flight: T11 `mcp-revoke`, T12 `mcp-send` (P4c), T13a `mcp-cp-intents` (P5 server side). Next: T13b `manage_*` tools, then P6 docs, then single deploy. From 2026-11-11 new workers use Cursor CLI with `grok-4.7-xhigh-fast` (max effort, fast mode; Codex quota). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -294,14 +294,20 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       `0024_passkey.sql`, `0025_outbound_audit.sql` (approval_channel, intent_id, payload_hash,
       oauth_client_id, token_sub, token_jti), mcp approvals retained 30 d after expiry/consumption,
       Telegram URL-button helper; Telegram callbacks cannot approve mcp intents.
-- [ ] `@better-auth/passkey` on Workers incl. **assertion verification** (only option generation
+- [x] `@better-auth/passkey` on Workers incl. **assertion verification** (only option generation
       proven so far); registration step-up: TOTP (or fresh email OTP) proof bound to session,
       single use, 5 min, both registration endpoints; passkey add/remove → ops_events + Telegram.
-      (T6b `mcp-approve-2`, Cursor `grok-4.7-xhigh-fast`)
-- [ ] `/approve/:id` page per §2.5, passkey challenge bound to the intent.
+      (T6b, merged 31eeb7d; Grok.) Proven with a software authenticator + @simplewebauthn/server
+      13.3.3. Step-up proof in better-auth `verification` table, header `x-passkey-stepup`, via
+      `POST /api/auth/passkey/step-up`. Migration `0026_approval_metadata.sql`.
+- [x] `/approve/:id` page per §2.5 + Passkeys section on `/security`; challenge
+      `base64url(sha256(id + payloadHash))`; approve/deny `POST /api/approvals/:id/*` (Origin must
+      equal request origin, cookie cache off). DO sends an `mcp` draft only with an HMAC approval
+      proof (`mcp-approval.v1`, 60 s) signed with `BETTER_AUTH_SECRET`.
 - [ ] `send` tool with MRTR URL elicitation + legacy pending path; Telegram notify-with-link
-      for `mcp` intents.
-- [ ] Audit fields per §2.8.
+      for `mcp` intents; shared `src/mcp/intent-flow.ts`. (T12 `mcp-send`, in flight)
+- [x] Audit fields per §2.8 (approval_channel=mcp_approval, intent_id, payload_hash,
+      oauth_client_id, token_sub, token_jti).
 - [ ] Tests: single use under concurrent retries; draft edited after intent → refused;
       tampered `requestState` → refused; no passkey → refused; Telegram cannot approve an
       `mcp` intent.
