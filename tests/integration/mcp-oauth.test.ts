@@ -2,7 +2,9 @@ import { env } from "cloudflare:test";
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../../src/server";
+import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
+import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
 import migrationBetterAuth from "../../migrations/d1/0016_better_auth.sql?raw";
@@ -30,7 +32,7 @@ const testEnv = env as unknown as TestEnv;
 const TEST_SECRET = "test-secret-0123456789-0123456789-0123";
 const OWNER = "owner@example.com";
 const STRANGER = "stranger@example.com";
-const ORIGIN = "https://example.com";
+const ORIGIN = "https://inbox.imsanti.dev";
 const RESOURCE = `${ORIGIN}/mcp`;
 
 const authEnv = () =>
@@ -39,7 +41,9 @@ const authEnv = () =>
 beforeAll(async () => {
 	await applyMigrations(
 		testEnv.INDEX_DB,
+		migrationInitial as string,
 		migrationMessageIndex as string,
+		migrationMailboxOwner as string,
 		migrationRuntimeConfig as string,
 		migrationOwnerRegistry as string,
 		migrationBetterAuth as string,
@@ -67,6 +71,9 @@ beforeAll(async () => {
 });
 
 async function run(request: Request): Promise<Response> {
+	if (new URL(request.url).pathname === "/mcp" && !request.headers.has("host")) {
+		request.headers.set("host", new URL(request.url).host);
+	}
 	const ctx = createExecutionContext();
 	const response = await worker.fetch(request, authEnv(), ctx);
 	await waitOnExecutionContext(ctx);
@@ -445,7 +452,7 @@ describe("the /mcp bearer-token perimeter", () => {
 				body: JSON.stringify(INITIALIZE),
 			}),
 		);
-		expect(ownerResponse.status).toBe(200);
+		expect(ownerResponse.status, await ownerResponse.clone().text()).toBe(200);
 		const text = await ownerResponse.text();
 		expect(text).toContain("reccado");
 		// The initialize RESULT echoes protocolVersion and serverInfo (the method
@@ -494,6 +501,101 @@ describe("the /mcp bearer-token perimeter", () => {
 			true,
 		);
 		expect(revoked.status).toBe(500);
+	});
+
+	it("serves ordered, annotated tools and structured results in both protocol eras", async () => {
+		const { cookie, clientId, clientSecret } = await ownerSessionAndClient("OAUTHV2TEST01");
+		const token = await authorizeAndMintToken(clientId, clientSecret, cookie);
+		const call = async (method: string, params: Record<string, unknown>, modern: boolean) => {
+			const response = await run(
+				new Request(`${ORIGIN}/mcp`, {
+					method: "POST",
+					headers: {
+						authorization: `Bearer ${token}`,
+						"content-type": "application/json",
+						accept: "application/json, text/event-stream",
+						"mcp-protocol-version": modern ? "2026-07-28" : "2025-06-18",
+						...(modern ? { "mcp-method": method } : {}),
+						...(modern && typeof params.name === "string" ? { "mcp-name": params.name } : {}),
+					},
+					body: JSON.stringify({
+						jsonrpc: "2.0",
+						id: 1,
+						method,
+						params: {
+							...params,
+							...(modern
+								? {
+										_meta: {
+											"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+											"io.modelcontextprotocol/clientCapabilities": {},
+										},
+									}
+								: {}),
+						},
+					}),
+				}),
+			);
+			expect(response.status, await response.clone().text()).toBe(200);
+			const text = await response.text();
+			const data = text.startsWith("event:") ? text.match(/^data: (.+)$/m)?.[1] : text;
+			return JSON.parse(data ?? "") as {
+				result: {
+					tools?: Array<{
+						name: string;
+						annotations: Record<string, boolean>;
+						outputSchema: unknown;
+					}>;
+					structuredContent?: unknown;
+					content?: unknown;
+				};
+			};
+		};
+		const discovery = await call("server/discover", {}, true);
+		expect(discovery.result).toBeTruthy();
+		await call("initialize", INITIALIZE.params, false);
+		for (const modern of [true, false]) {
+			const list = await call("tools/list", {}, modern);
+			const tools = list.result.tools ?? [];
+			expect(tools.map((tool) => tool.name)).toEqual([
+				"list_mailboxes",
+				"list_threads",
+				"search_messages",
+				"read_message",
+				"draft_reply",
+			]);
+			for (const tool of tools.slice(0, 4)) expect(tool.annotations.readOnlyHint).toBe(true);
+			expect(tools[4]?.annotations).toMatchObject({
+				readOnlyHint: false,
+				destructiveHint: false,
+				idempotentHint: true,
+			});
+			for (const tool of tools) expect(tool.outputSchema).toBeTruthy();
+			const result = await call("tools/call", { name: "list_mailboxes", arguments: {} }, modern);
+			expect(result.result.structuredContent, JSON.stringify(result)).toEqual({ mailboxes: [] });
+			expect(result.result.content).toEqual([
+				{ type: "text", text: JSON.stringify({ mailboxes: [] }, null, 2) },
+			]);
+		}
+	});
+
+	it("enforces host and origin checks for preflight requests", async () => {
+		for (const host of ["inbox.imsanti.dev", "test.workers.dev", "localhost"]) {
+			const response = await run(
+				new Request(`https://${host}/mcp`, {
+					method: "OPTIONS",
+					headers: { host, origin: `https://${host}` },
+				}),
+			);
+			expect(response.status).toBe(200);
+		}
+		for (const headers of [
+			{ host: "evil.example", origin: ORIGIN },
+			{ host: "inbox.imsanti.dev", origin: "https://evil.example" },
+		]) {
+			const response = await run(new Request(`${ORIGIN}/mcp`, { method: "OPTIONS", headers }));
+			expect(response.status).toBe(403);
+		}
 	});
 
 	// The deny path the consent page's Deny button exercises: the provider does

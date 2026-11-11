@@ -1,5 +1,6 @@
 import { requireMcpAuth } from "@better-auth/mcp";
-import { createMcpHandler } from "agents/mcp";
+import { McpServer, type McpRequestContext } from "@modelcontextprotocol/server";
+import { createMcpHandler } from "agents/mcp/server";
 import { createAuth, AuthConfigError, resolveMcpResource } from "../api/better-auth";
 import { recordDeploymentOrigin } from "../db/runtime-config";
 import { requireMcpOwner, resolveOwnerEmails, type AuthContext } from "./auth-import";
@@ -16,21 +17,29 @@ type McpAccessTokenClaims = {
 	[key: string]: unknown;
 };
 
-/**
- * Builds the per-request McpServer (no module-level singleton — per Cloudflare's
- * createMcpHandler docs for SDK 1.26.0+) with the authenticated identity bound
- * into tool closures.
- */
+/** The SDK's validated serving era, available inside its per-request factory. */
+export function isLegacyMcpRequest(context: McpRequestContext): boolean {
+	return context.era === "legacy";
+}
+
+/** Bind a fresh server and its tool closures to this authenticated request. */
 async function runMcpServer(
 	request: Request,
 	env: Env,
 	ctx: ExecutionContext,
 	auth: AuthContext,
 ): Promise<Response> {
-	const McpServer = (await import("@modelcontextprotocol/sdk/server/mcp.js")).McpServer;
-	const server = new McpServer({ name: "reccado", version: "1.0.0" });
-	registerTools(server, env, auth);
-	const handler = createMcpHandler(server);
+	const hostname = new URL(request.url).hostname;
+	const allowedHostnames = ["inbox.imsanti.dev", "localhost", "127.0.0.1", "[::1]"];
+	if (hostname.endsWith(".workers.dev")) allowedHostnames.push(hostname);
+	const handler = createMcpHandler(
+		() => {
+			const server = new McpServer({ name: "reccado", version: "1.0.0" });
+			registerTools(server, env, auth);
+			return server;
+		},
+		{ legacy: "stateless", allowedHostnames, allowedOriginHostnames: allowedHostnames },
+	);
 	return handler(request, env, ctx);
 }
 

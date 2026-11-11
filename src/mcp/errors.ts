@@ -16,8 +16,9 @@ export function mcpToolResult(text: string) {
 	};
 }
 
-export function mcpToolResultJson(data: unknown) {
+export function mcpToolResultJson(data: Record<string, unknown>) {
 	return {
 		content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+		structuredContent: data,
 	};
 }
