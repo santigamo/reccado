@@ -23,17 +23,20 @@ const fetchClientName = createServerFn({ method: "GET" })
 				cookie ? { headers: { cookie } } : undefined,
 			);
 			if (!response.ok) return { clientName: null };
-			const client = (await response.json()) as { name?: string };
-			return { clientName: client.name ?? null };
+			const client = (await response.json()) as { client_name?: string };
+			return { clientName: client.client_name ?? null };
 		} catch {
 			return { clientName: null };
 		}
 	});
 
 export const Route = createFileRoute("/consent")({
-	validateSearch: (search: Record<string, unknown>): { client_id?: string; scope?: string } => ({
+	validateSearch: (
+		search: Record<string, unknown>,
+	): { client_id?: string; scope?: string; redirect_uri?: string } => ({
 		...(typeof search.client_id === "string" ? { client_id: search.client_id } : {}),
 		...(typeof search.scope === "string" ? { scope: search.scope } : {}),
+		...(typeof search.redirect_uri === "string" ? { redirect_uri: search.redirect_uri } : {}),
 	}),
 	loaderDeps: ({ search }) => ({ clientId: search.client_id }),
 	loader: async ({ deps }): Promise<{ clientName: string | null }> => {
@@ -56,12 +59,33 @@ export const Route = createFileRoute("/consent")({
  */
 function ConsentPage(): ReactElement {
 	const { clientName } = Route.useLoaderData();
-	const { client_id: clientId, scope } = Route.useSearch();
+	const { client_id: clientId, scope, redirect_uri: redirectUri } = Route.useSearch();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 
 	const clientLabel = clientName ?? clientId ?? "the requesting client";
 	const scopes = (scope ?? "").split(" ").filter(Boolean);
+	const hostOf = (value?: string) => {
+		try {
+			return value ? new URL(value).host : null;
+		} catch {
+			return null;
+		}
+	};
+	const clientHost = hostOf(clientId);
+	const redirectHost = hostOf(redirectUri);
+	const known =
+		clientHost &&
+		["claude.ai", "anthropic.com", "localhost"].some(
+			(host) => clientHost.split(":")[0] === host || clientHost.split(":")[0]?.endsWith(`.${host}`),
+		);
+	const descriptions: Record<string, string> = {
+		"mail:read": "Leer mensajes y buscar en el buzón.",
+		"mail:draft": "Crear y editar borradores.",
+		"mail:send": "Solicitar el envío de mensajes, sujeto a confirmación humana.",
+		"mail:read:sensitive": "Leer el contenido sensible y los archivos adjuntos.",
+		admin: "Administrar la configuración y los recursos de Reccado.",
+	};
 
 	async function respond(accept: boolean): Promise<void> {
 		setBusy(true);
@@ -94,6 +118,19 @@ function ConsentPage(): ReactElement {
 		<main className="page-wrap px-4 pb-8 pt-14">
 			<section className="island-shell rise-in mx-auto max-w-md rounded-[2rem] px-6 py-10">
 				<p className="island-kicker mb-3">Reccado</p>
+				<p className="mb-2 break-all text-lg font-semibold">
+					{clientHost ?? clientId ?? "Cliente desconocido"}
+				</p>
+				<p className="mb-3 text-sm">
+					Cliente: {clientName ?? "Nombre no disponible"} · Destino:{" "}
+					{redirectHost ?? "No disponible"}
+				</p>
+				{!known && (
+					<p role="alert" className="mb-4 rounded-xl bg-amber-100 p-3 text-sm text-amber-900">
+						Este cliente no está en la lista de dominios conocidos. Comprueba su identidad antes de
+						continuar.
+					</p>
+				)}
 				<h1 className="mb-2 text-2xl font-bold tracking-tight text-[var(--sea-ink)]">
 					Authorize {clientLabel} to access Reccado MCP
 				</h1>
@@ -111,7 +148,7 @@ function ConsentPage(): ReactElement {
 									key={s}
 									className="rounded-full border border-[rgba(50,143,151,0.3)] bg-[rgba(79,184,178,0.14)] px-3 py-1 font-mono text-xs text-[var(--lagoon-deep)]"
 								>
-									{s}
+									{s}: {descriptions[s] ?? "Permiso desconocido; revisa antes de aprobar."}
 								</li>
 							))}
 						</ul>
