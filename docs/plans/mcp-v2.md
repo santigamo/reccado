@@ -214,8 +214,12 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       **Must be applied remotely BEFORE deploying 1.7.20**, or login breaks.
 - [x] Confirm a session JWT is now rejected at `/mcp` (regression test).
 - [x] `pnpm operator mcp register` + `pnpm operator mcp clients` (uses operator session; prints
-      `claude mcp add …`; default redirect `http://localhost:33418/callback`). Revoke: pending
-      worker report.
+      `claude mcp add …`; default redirect `http://localhost:33418/callback`).
+      **Revoke omitted:** better-auth 1.7.20's schema has no `ON DELETE CASCADE` on
+      `oauthConsent/oauthAccessToken/oauthRefreshToken.clientId`, so deleting an authorized
+      client 500s, and there is no owner endpoint to enumerate refresh tokens. Issued access
+      JWTs live 3600 s. Follow-up: an owner-gated revoke that deletes refresh tokens + consent +
+      client in order (our own route, not a schema divergence).
 - [ ] Apply 0021 remotely + `pnpm run deploy:dev` (needs owner approval — live inbox).
 - [ ] Connect Claude Code end-to-end; call the existing 5 tools.
 - [ ] Check whether Codex supports pre-registered clients and which protocol it negotiates.
@@ -253,9 +257,16 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 - [ ] `get_health`, `list_ops`, `list_config` (control plane is **read-only** until P4).
 
 ### P4 — Approvals, passkey, send
-- [ ] Migration: `telegram_actions` → `approvals` (+ `kind`, `payload_hash`, `consumed_at`,
-      `origin`); Telegram code updated; existing Telegram flows unchanged.
-- [ ] Frozen snapshot + `payload_hash` in the mailbox DO `request-send`; hash check at send.
+- [x] Migration `0022_approvals.sql`: `telegram_actions` → `approvals` (+ `kind`,
+      `payload_hash`, `consumed_at`, `origin`); Telegram flows unchanged. (T5, merged)
+      Deploy note: Telegram Send buttons / pending sends created before 0022 have no hash and
+      **fail closed** — the owner must re-draft those replies.
+- [x] Frozen snapshot + `payload_hash` in the mailbox DO `request-send` (identity resolved
+      server-side from D1 and frozen); confirm sends the snapshot; edit after request →
+      `intent_stale`; at-most-once under concurrent/repeated confirms (tested).
+      Telegram corrections mint a new token bound to the new hash and supersede the old button.
+      `confirmDraftSend(expectedPayloadHash)` is optional for web for now; **mandatory for every
+      approvals-table path (incl. MCP)**.
 - [ ] `@better-auth/passkey` 1.7.20 on Workers; registration gated by OTP + TOTP.
 - [ ] `/approve/:id` page per §2.5, passkey challenge bound to the intent.
 - [ ] `send` tool with MRTR URL elicitation + legacy pending path; Telegram notify-with-link
@@ -322,4 +333,5 @@ Accepted residual risk:
 | 2026-11-11 | One `approvals` table (renamed `telegram_actions`); send authority stays in DO | Fewest concepts while respecting the DO-is-authoritative invariant |
 | 2026-11-11 | Human-authored Telegram/web sends keep current flow | Passkey guards against the agent, not the owner |
 | 2026-11-11 | Owner registry never exposed over MCP | Privilege-escalation target with no agent use case |
+| 2026-11-11 | CIMD on a Workers-native fetch transport (https only, no IP literals / local names / own zone, no redirects, size+timeout limits), **no** `global_fetch_strictly_public`, gated by `MCP_CIMD_ENABLED` (default false) until verified live | `@better-auth/cimd` demands exact-once DNS + address pinning, which Workers fetch cannot provide; Workers egress has no private network behind it and refuses raw-IP fetches. Deliberate, documented deviation; pre-registration remains the default path |
 | 2026-11-11 | Supersedes transactional-api.md "keys never exposed via MCP" (from P5) | Owner requested key admin over MCP; secret never reaches the agent |
