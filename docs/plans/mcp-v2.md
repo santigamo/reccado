@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-In flight: T7 `mcp-cimd` (P1), T8 `mcp-tools` (P3 tools), T6 `mcp-approve` (P4b passkey + approval page). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
+In flight: T8 `mcp-tools` (P3 tools, Codex), T6b `mcp-approve-2` (P4b completion, Cursor/Grok 4.7). From 2026-11-11 new workers use Cursor CLI with `grok-4.7-medium` (Codex quota). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -279,7 +279,15 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       Telegram corrections mint a new token bound to the new hash and supersede the old button.
       `confirmDraftSend(expectedPayloadHash)` is optional for web for now; **mandatory for every
       approvals-table path (incl. MCP)**.
-- [ ] `@better-auth/passkey` 1.7.20 on Workers; registration gated by OTP + TOTP.
+- [x] Foundation (T6a, merged 9946194): sticky draft `origin` in the DO (`mcp` is permanent;
+      `mcp` drafts → `approval_required` on web/Telegram confirm, fail closed), passkey plugin +
+      `0024_passkey.sql`, `0025_outbound_audit.sql` (approval_channel, intent_id, payload_hash,
+      oauth_client_id, token_sub, token_jti), mcp approvals retained 30 d after expiry/consumption,
+      Telegram URL-button helper; Telegram callbacks cannot approve mcp intents.
+- [ ] `@better-auth/passkey` on Workers incl. **assertion verification** (only option generation
+      proven so far); registration step-up: TOTP (or fresh email OTP) proof bound to session,
+      single use, 5 min, both registration endpoints; passkey add/remove → ops_events + Telegram.
+      (T6b `mcp-approve-2`, Cursor/Grok 4.7)
 - [ ] `/approve/:id` page per §2.5, passkey challenge bound to the intent.
 - [ ] `send` tool with MRTR URL elicitation + legacy pending path; Telegram notify-with-link
       for `mcp` intents.
