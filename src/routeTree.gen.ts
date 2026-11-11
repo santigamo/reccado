@@ -17,6 +17,7 @@ import { Route as AboutRouteImport } from './routes/about'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as MailboxesIndexRouteImport } from './routes/mailboxes/index'
 import { Route as MailboxesMailboxIdRouteImport } from './routes/mailboxes/$mailboxId'
+import { Route as ApproveIdRouteImport } from './routes/approve/$id'
 import { Route as MailboxesMailboxIdIndexRouteImport } from './routes/mailboxes/$mailboxId/index'
 import { Route as MailboxesMailboxIdKeysRouteImport } from './routes/mailboxes/$mailboxId/keys'
 import { Route as MailboxesMailboxIdComposeRouteImport } from './routes/mailboxes/$mailboxId/compose'
@@ -62,6 +63,11 @@ const MailboxesMailboxIdRoute = MailboxesMailboxIdRouteImport.update({
   path: '/mailboxes/$mailboxId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApproveIdRoute = ApproveIdRouteImport.update({
+  id: '/approve/$id',
+  path: '/approve/$id',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const MailboxesMailboxIdIndexRoute = MailboxesMailboxIdIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -92,6 +98,7 @@ export interface FileRoutesByFullPath {
   '/domains': typeof DomainsRoute
   '/login': typeof LoginRoute
   '/security': typeof SecurityRoute
+  '/approve/$id': typeof ApproveIdRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdRouteWithChildren
   '/mailboxes/': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
@@ -106,6 +113,7 @@ export interface FileRoutesByTo {
   '/domains': typeof DomainsRoute
   '/login': typeof LoginRoute
   '/security': typeof SecurityRoute
+  '/approve/$id': typeof ApproveIdRoute
   '/mailboxes': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
@@ -120,6 +128,7 @@ export interface FileRoutesById {
   '/domains': typeof DomainsRoute
   '/login': typeof LoginRoute
   '/security': typeof SecurityRoute
+  '/approve/$id': typeof ApproveIdRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdRouteWithChildren
   '/mailboxes/': typeof MailboxesIndexRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
@@ -136,6 +145,7 @@ export interface FileRouteTypes {
     | '/domains'
     | '/login'
     | '/security'
+    | '/approve/$id'
     | '/mailboxes/$mailboxId'
     | '/mailboxes/'
     | '/mailboxes/$mailboxId/$threadId'
@@ -150,6 +160,7 @@ export interface FileRouteTypes {
     | '/domains'
     | '/login'
     | '/security'
+    | '/approve/$id'
     | '/mailboxes'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
@@ -163,6 +174,7 @@ export interface FileRouteTypes {
     | '/domains'
     | '/login'
     | '/security'
+    | '/approve/$id'
     | '/mailboxes/$mailboxId'
     | '/mailboxes/'
     | '/mailboxes/$mailboxId/$threadId'
@@ -178,6 +190,7 @@ export interface RootRouteChildren {
   DomainsRoute: typeof DomainsRoute
   LoginRoute: typeof LoginRoute
   SecurityRoute: typeof SecurityRoute
+  ApproveIdRoute: typeof ApproveIdRoute
   MailboxesMailboxIdRoute: typeof MailboxesMailboxIdRouteWithChildren
   MailboxesIndexRoute: typeof MailboxesIndexRoute
 }
@@ -240,6 +253,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof MailboxesMailboxIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/approve/$id': {
+      id: '/approve/$id'
+      path: '/approve/$id'
+      fullPath: '/approve/$id'
+      preLoaderRoute: typeof ApproveIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/mailboxes/$mailboxId/': {
       id: '/mailboxes/$mailboxId/'
       path: '/'
@@ -295,6 +315,7 @@ const rootRouteChildren: RootRouteChildren = {
   DomainsRoute: DomainsRoute,
   LoginRoute: LoginRoute,
   SecurityRoute: SecurityRoute,
+  ApproveIdRoute: ApproveIdRoute,
   MailboxesMailboxIdRoute: MailboxesMailboxIdRouteWithChildren,
   MailboxesIndexRoute: MailboxesIndexRoute,
 }

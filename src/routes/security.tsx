@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import type { ReactElement } from "react";
 import { useState } from "react";
 import { renderSVG } from "uqr";
+import { PasskeysSection } from "../components/PasskeysSection";
 
 export const Route = createFileRoute("/security")({ component: SecurityPage });
 
@@ -287,6 +288,7 @@ function SecurityPage(): ReactElement {
 				)}
 				{enrolError && <p className="mt-3 text-sm text-red-500">{enrolError}</p>}
 			</section>
+			<PasskeysSection />
 		</main>
 	);
 }

@@ -23,6 +23,13 @@ async function postJson(url: string, body: Record<string, unknown>): Promise<Res
 
 const NETWORK_ERROR = "The request never reached the server. Check your connection and retry.";
 
+/** Same-origin path only. A protocol-relative or backslash next is ignored. */
+function destination(): string {
+	const next = new URLSearchParams(window.location.search).get("next");
+	if (next && next.startsWith("/") && !next.startsWith("//") && !next.includes("\\")) return next;
+	return "/mailboxes";
+}
+
 /**
  * The login page: the front door of the web perimeter since Better Auth replaced
  * Cloudflare Access (docs/plans/sending-streams-and-auth.md, Phase 2).
@@ -65,7 +72,7 @@ function LoginPage(): ReactElement {
 	// call, and the deployment learns its own canonical origin from one. Signing
 	// in and stopping at / therefore left the origin pointing at whatever
 	// hostname was used last -- which is what MCP tokens get bound to.
-	const enter = () => window.location.assign("/mailboxes");
+	const enter = () => window.location.assign(destination());
 
 	async function signInWithPassword(event: React.FormEvent): Promise<void> {
 		event.preventDefault();
