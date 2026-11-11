@@ -207,10 +207,16 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 `pnpm run build`. Deploy only via `pnpm run deploy:dev`.
 
 ### P0a — Usable today
-- [ ] Bump `better-auth` + `@better-auth/mcp` to 1.7.20; regression-test login (OTP, TOTP),
-      session, `/mcp` 401 + discovery.
-- [ ] Confirm a session JWT is now rejected at `/mcp` (regression test).
-- [ ] `pnpm operator mcp register` (uses operator session; prints `claude mcp add …`).
+- [x] Bump `better-auth` + `@better-auth/mcp` to 1.7.20; regression-test login (OTP, TOTP),
+      session, `/mcp` 401 + discovery. (T1, merged e61fb89)
+- [x] D1 migration `0021_better_auth_1_7_20.sql` (account table rebuild: `issuer` nullable).
+      Live schema checked read-only: column order matches, no extra indexes.
+      **Must be applied remotely BEFORE deploying 1.7.20**, or login breaks.
+- [x] Confirm a session JWT is now rejected at `/mcp` (regression test).
+- [x] `pnpm operator mcp register` + `pnpm operator mcp clients` (uses operator session; prints
+      `claude mcp add …`; default redirect `http://localhost:33418/callback`). Revoke: pending
+      worker report.
+- [ ] Apply 0021 remotely + `pnpm run deploy:dev` (needs owner approval — live inbox).
 - [ ] Connect Claude Code end-to-end; call the existing 5 tools.
 - [ ] Check whether Codex supports pre-registered clients and which protocol it negotiates.
 
