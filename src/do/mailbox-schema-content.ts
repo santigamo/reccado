@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS messages (
   raw_size INTEGER NOT NULL,
   body_text TEXT,
   body_html_r2_key TEXT,
+  sensitive_kind TEXT,
+  sensitive_classified INTEGER NOT NULL DEFAULT 0,
   parse_status TEXT NOT NULL CHECK (parse_status IN ('pending', 'parsed', 'failed')),
   has_attachments INTEGER NOT NULL DEFAULT 0,
   is_read INTEGER NOT NULL DEFAULT 0,

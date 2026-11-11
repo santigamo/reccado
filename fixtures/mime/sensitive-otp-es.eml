@@ -1,0 +1,7 @@
+From: security@example.com
+To: test@example.com
+Subject: Tu código de verificación
+Message-ID: <sensitive-otp-es@example.com>
+Content-Type: text/plain; charset=utf-8
+
+Tu código de verificación es 482631.

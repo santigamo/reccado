@@ -1,0 +1,7 @@
+From: noreply@example.com
+To: test@example.com
+Subject: Security newsletter
+Message-ID: <sensitive-negative-newsletter@example.com>
+Content-Type: text/plain; charset=utf-8
+
+Use a password manager to protect your accounts.

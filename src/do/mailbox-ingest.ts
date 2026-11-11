@@ -4,6 +4,7 @@ import { domainFromAddress } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
 import { normalizeSubject, parseMimeBytes, snippetFromText } from "../lib/mime";
 import { attachmentR2Key, bodyHtmlR2Key, sanitizeFilename } from "../lib/r2-keys";
+import { classifySensitive, type SensitiveKind } from "../lib/sensitive-mail";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
@@ -420,6 +421,21 @@ export async function ingestInboundEmail(
 			receivedAt: message.receivedAt,
 		});
 		const snippet = snippetFromText(bodyText, parsed.html);
+		let sensitiveKind: SensitiveKind | null = null;
+		let sensitiveClassified = 0;
+		try {
+			sensitiveKind = classifySensitive({
+				from: fromAddr,
+				subject,
+				text: bodyText,
+				html: parsed.html,
+			}).kind;
+			sensitiveClassified = 1;
+		} catch (error) {
+			console.error("mailbox.sensitive_classification_failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 
 		ctx.transactionSync(() => {
 			ctx.sql.exec(
@@ -441,8 +457,8 @@ export async function ingestInboundEmail(
 				`INSERT INTO messages
          (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
           from_addr, to_json, cc_json, bcc_json, subject, snippet, date_header, received_at, raw_r2_key,
-          raw_sha256, raw_size, body_text, body_html_r2_key, parse_status, has_attachments, is_read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'parsed', ?, 0, ?, ?)`,
+          raw_sha256, raw_size, body_text, body_html_r2_key, sensitive_kind, sensitive_classified, parse_status, has_attachments, is_read, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'parsed', ?, 0, ?, ?)`,
 				messageLocalId,
 				message.idempotencyKey,
 				threadId,
@@ -461,6 +477,8 @@ export async function ingestInboundEmail(
 				message.rawSize,
 				bodyText,
 				bodyHtmlR2KeyValue,
+				sensitiveKind,
+				sensitiveClassified,
 				attachments.length > 0 ? 1 : 0,
 				now,
 				now,

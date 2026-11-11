@@ -27,7 +27,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 7;
+const MAILBOX_SCHEMA_VERSION = 8;
 
 // Minimal runtime validation for the /ingest payload. Defined locally (rather than
 // imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
@@ -933,6 +933,16 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		// the body; this fills in the ones already there, from the draft each came from.
 		if (currentVersion < 7) {
 			this.backfillSentBodyText();
+		}
+		if (currentVersion < 8) {
+			const columns = this.columnNames("messages");
+			this.addColumnIfMissing("messages", columns, "sensitive_kind", "TEXT");
+			this.addColumnIfMissing(
+				"messages",
+				columns,
+				"sensitive_classified",
+				"INTEGER NOT NULL DEFAULT 0",
+			);
 		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",

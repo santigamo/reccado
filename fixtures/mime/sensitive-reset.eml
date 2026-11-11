@@ -1,0 +1,7 @@
+From: accounts@example.com
+To: test@example.com
+Subject: Password reset
+Message-ID: <sensitive-reset@example.com>
+Content-Type: text/plain; charset=utf-8
+
+Reset your password: https://example.com/reset?token=supersecret
