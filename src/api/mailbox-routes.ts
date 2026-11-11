@@ -1,31 +1,21 @@
 import type { Hono } from "hono";
-import {
-	deleteMessageIndexForMailbox,
-	getMailbox,
-	getMailboxForOwner,
-	insertOpsEvent,
-	listIngestFailures,
-	listOpsEvents,
-	upsertApiKeyProjection,
-	upsertMessageIndex,
-} from "../db/d1";
+import { getMailbox } from "../db/d1";
 import { isPreviewableImage } from "../lib/attachment-preview";
+import * as templates from "../lib/admin/templates";
+import * as keys from "../lib/admin/api-keys";
+import * as suppressions from "../lib/admin/suppressions";
+import * as ops from "../lib/admin/ops";
+import { adminResponse } from "../lib/admin/errors";
 import { AppError } from "../lib/errors";
-import type { TransactionalApiKeyProjection } from "../lib/transactional-keys";
 import { confirmDraftSend } from "../lib/outbound-send";
-import { backupManifestR2Key } from "../lib/r2-keys";
 import { CARD_STATUS_FOR_ACTION, enqueueTelegramCardRefresh } from "../telegram/cards";
 import { assertMailboxAccess } from "./auth";
 import type { ApiBindings } from "./hono";
 import {
-	adminMailboxActionSchema,
 	confirmSendSchema,
 	createDraftSchema,
-	createTransactionalApiKeySchema,
-	updateTransactionalApiKeySchema,
 	messageActionSchema,
 	searchQuerySchema,
-	syncTransactionalTemplatesSchema,
 	threadListQuerySchema,
 	updateDraftSchema,
 } from "./schemas";
@@ -321,388 +311,95 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		});
 	});
 
-	// --- Transactional API key management (Access-protected, owner-gated) ---
-
-	/**
-	 * Best-effort D1 projection write. Catches and logs failures — D1 is a
-	 * rebuildable index, never the source of truth for API key state.
-	 *
-	 * Takes the key in the camelCase shape the Durable Object returns it in. This
-	 * used to take a snake_case row while every caller handed it the DO's
-	 * camelCase projection, so every column arrived as `undefined` and D1 refused
-	 * the write — the projection had silently never been written by these routes.
-	 */
-	async function projectApiKey(
-		env: Env,
-		key: Omit<TransactionalApiKeyProjection, "quotaUsed" | "senderName">,
-	): Promise<void> {
-		try {
-			await upsertApiKeyProjection(env.INDEX_DB, {
-				key_id: key.keyId,
-				mailbox_id: key.mailboxId,
-				sender: key.sender,
-				display_suffix: key.displaySuffix,
-				environment: key.environment,
-				scopes_json: JSON.stringify(key.scopes),
-				template_allowlist_json: key.templateAllowlist
-					? JSON.stringify(key.templateAllowlist)
-					: null,
-				recipient_policy: key.recipientPolicy ?? null,
-				quota_max: key.quotaMax ?? null,
-				quota_used: 0,
-				expires_at: key.expiresAt ?? null,
-				status: key.status as "active" | "revoked",
-				created_at: key.createdAt,
-				updated_at: key.updatedAt,
-				revoked_at: key.revokedAt ?? null,
-			});
-		} catch (error) {
-			console.error("api_key_projection_failed", {
-				keyId: key.keyId,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-	}
-
-	/**
-	 * Reads a Durable Object JSON response once and hands back both the parsed
-	 * body and a fresh Response carrying the same bytes.
-	 *
-	 * The key routes need to look inside the DO's answer (to project it into D1)
-	 * and then return it. Returning the original Response after `.json()` throws
-	 * "ReadableStream is disturbed" — which turned every successful key creation
-	 * into a 500 AFTER the key was stored, losing the one-time plaintext secret.
-	 */
-	async function readDoJson<T>(
-		doResponse: Response,
-	): Promise<{ data: T | null; response: Response }> {
-		const body = await doResponse.text();
-		let data: T | null = null;
-		if (doResponse.ok) {
-			try {
-				data = JSON.parse(body) as T;
-			} catch {
-				data = null;
-			}
-		}
-		return {
-			data,
-			response: new Response(body, { status: doResponse.status, headers: doResponse.headers }),
-		};
-	}
-
-	async function enforceMailboxOwnership(
-		env: Env,
-		mailboxId: string,
-		email: string,
-	): Promise<Response | null> {
-		const mailbox = await getMailboxForOwner(env.INDEX_DB, mailboxId, email);
-		if (!mailbox) {
-			return Response.json(
-				{ error: "forbidden" },
-				{ status: 403, headers: { "content-type": "application/json" } },
-			);
-		}
-		return null;
-	}
-
-	api.post("/api/mailboxes/:mailboxId/transactional/api-keys", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
-		if (ownershipError) return ownershipError;
-		const body = createTransactionalApiKeySchema.parse(await c.req.json());
-		const stub = await requireMailboxStub(c.env, mailboxId);
-		const doResponse = await stub.fetch("https://mailbox-do/transactional/api-keys", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
-		});
-		const { data, response } = await readDoJson<{
-			key?: TransactionalApiKeyProjection;
-			projection?: TransactionalApiKeyProjection;
-		}>(doResponse);
-		const projection = data?.projection ?? data?.key;
-		if (projection) {
-			await projectApiKey(c.env, projection);
-		}
-		return response;
-	});
-
-	api.get("/api/mailboxes/:mailboxId/transactional/api-keys", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
-		if (ownershipError) return ownershipError;
-		const stub = await requireMailboxStub(c.env, mailboxId);
-		return stub.fetch("https://mailbox-do/transactional/api-keys", {
-			method: "GET",
-		});
-	});
-
-	api.post("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId/revoke", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
-		if (ownershipError) return ownershipError;
-		const keyId = c.req.param("keyId");
-		const stub = await requireMailboxStub(c.env, mailboxId);
-		const doResponse = await stub.fetch(
-			`https://mailbox-do/transactional/api-keys/${keyId}/revoke`,
-			{
-				method: "POST",
-			},
-		);
-		const { data, response } = await readDoJson<{
-			key?: { projection?: TransactionalApiKeyProjection };
-		}>(doResponse);
-		if (data?.key?.projection) {
-			await projectApiKey(c.env, data.key.projection);
-		}
-		return response;
-	});
-
-	/**
-	 * Change (or clear) a key's From display name.
-	 *
-	 * A PATCH rather than a reissue, deliberately: renaming a brand should not
-	 * force every integrator into a coordinated secret swap, and a secret rotated
-	 * for cosmetic reasons is a secret people learn to rotate carelessly. The
-	 * secret, its hash and the sender address are untouched.
-	 */
-	api.patch("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
-		if (ownershipError) return ownershipError;
-		const body = updateTransactionalApiKeySchema.parse(await c.req.json());
-		const keyId = c.req.param("keyId");
-		const stub = await requireMailboxStub(c.env, mailboxId);
-		const doResponse = await stub.fetch(
-			`https://mailbox-do/transactional/api-keys/${encodeURIComponent(keyId)}`,
-			{
-				method: "PATCH",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ senderName: body.senderName }),
-			},
-		);
-		const { data, response } = await readDoJson<{
-			key?: { projection?: TransactionalApiKeyProjection };
-		}>(doResponse);
-		if (data?.key?.projection) {
-			// Keep the D1 projection in step; the list view reads from there.
-			await projectApiKey(c.env, data.key.projection);
-		}
-		return response;
-	});
-
-	api.post("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId/rotate", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
-		if (ownershipError) return ownershipError;
-		const keyId = c.req.param("keyId");
-		const stub = await requireMailboxStub(c.env, mailboxId);
-		const doResponse = await stub.fetch(
-			`https://mailbox-do/transactional/api-keys/${keyId}/rotate`,
-			{
-				method: "POST",
-			},
-		);
-		const { data, response } = await readDoJson<{
-			key?: TransactionalApiKeyProjection;
-			previousKeyProjection?: TransactionalApiKeyProjection;
-		}>(doResponse);
-		// Project old (revoked) key, then the new (active) one.
-		if (data?.previousKeyProjection) {
-			await projectApiKey(c.env, data.previousKeyProjection);
-		}
-		if (data?.key) {
-			await projectApiKey(c.env, data.key);
-		}
-		return response;
-	});
-
-	// Idempotent template sync: a product that owns its templates in a file sends
-	// the whole list and re-runs it on every deploy. Lives beside the key routes
-	// (not with the per-id template routes in server.ts) because it takes the same
-	// stronger gate they do — D1 owner check on top of the session — and it can
-	// create, rewrite and archive many templates in one call.
-	api.put("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
-		if (ownershipError) return ownershipError;
-		const body = syncTransactionalTemplatesSchema.parse(await c.req.json());
-		const stub = await requireMailboxStub(c.env, mailboxId);
-		return stub.fetch("https://mailbox-do/transactional/templates", {
-			method: "PUT",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
-		});
-	});
-
-	api.post("/api/mailboxes/:mailboxId/transactional/reconcile-stale", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const ownershipError = await enforceMailboxOwnership(c.env, mailboxId, auth.email);
-		if (ownershipError) return ownershipError;
-		const stub = await requireMailboxStub(c.env, mailboxId);
-		const doResponse = await stub.fetch("https://mailbox-do/transactional/reconcile-stale", {
-			method: "POST",
-		});
-		if (!doResponse.ok) {
-			return c.json({ error: "reconcile_failed" }, 500);
-		}
-		const result = (await doResponse.json()) as {
-			mailboxId: string;
-			reconciled: number;
-			stillSending: number;
-		};
-		await insertOpsEvent(c.env.INDEX_DB, {
-			id: crypto.randomUUID(),
-			event_type: "transactional.reconcile_stale",
-			severity: "info",
-			subject: mailboxId,
-			payload_json: JSON.stringify({
-				reconciled: result.reconciled,
-				stillSending: result.stillSending,
+	api.post("/api/mailboxes/:mailboxId/transactional/api-keys", async (c) =>
+		adminResponse(
+			await keys.createKey(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
+				get body() {
+					return c.req.json();
+				},
 			}),
+		),
+	);
+	api.get("/api/mailboxes/:mailboxId/transactional/api-keys", async (c) =>
+		adminResponse(
+			await keys.listKeys(c.env, c.get("auth")!, { mailboxId: c.req.param("mailboxId") }),
+		),
+	);
+	api.post("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId/revoke", async (c) =>
+		adminResponse(
+			await keys.revokeKey(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
+				keyId: c.req.param("keyId"),
+			}),
+		),
+	);
+	api.patch("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId", async (c) =>
+		adminResponse(
+			await keys.patchKey(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
+				keyId: c.req.param("keyId"),
+				get body() {
+					return c.req.json();
+				},
+			}),
+		),
+	);
+	api.post("/api/mailboxes/:mailboxId/transactional/api-keys/:keyId/rotate", async (c) =>
+		adminResponse(
+			await keys.rotateKey(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
+				keyId: c.req.param("keyId"),
+			}),
+		),
+	);
+	api.put("/api/mailboxes/:mailboxId/transactional/templates", async (c) =>
+		adminResponse(
+			await templates.syncTemplates(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
+				get body() {
+					return c.req.json();
+				},
+			}),
+		),
+	);
+	api.post("/api/mailboxes/:mailboxId/transactional/reconcile-stale", async (c) => {
+		const result = await ops.reconcile(c.env, c.get("auth")!, {
+			mailboxId: c.req.param("mailboxId"),
 		});
-		return c.json(result);
+		return result ? c.json(result) : c.json({ error: "reconcile_failed" }, 500);
 	});
 }
 
 export function registerMailboxSuppressionRoutes(api: Hono<ApiBindings>): void {
-	// Suppression list — owner-gated via mailboxId path param
-	api.get("/api/mailboxes/:mailboxId/suppressions", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const mailbox = await getMailboxForOwner(c.env.INDEX_DB, mailboxId, auth.email);
-		if (!mailbox) return c.json({ error: "forbidden" }, 403);
-		const stub = mailboxStub(c.env, mailboxId);
-		return stub.fetch("https://mailbox-do/transactional/suppressions");
-	});
-
-	api.post("/api/mailboxes/:mailboxId/suppressions/remove", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const mailbox = await getMailboxForOwner(c.env.INDEX_DB, mailboxId, auth.email);
-		if (!mailbox) return c.json({ error: "forbidden" }, 403);
-		const body = (await c.req.json()) as {
-			email: string;
-			allowProviderRemoval?: boolean;
-		};
-		if (!body.email) {
-			return c.json({ error: "email_required" }, 400);
-		}
-		const stub = mailboxStub(c.env, mailboxId);
-		return stub.fetch("https://mailbox-do/transactional/suppressions", {
-			method: "DELETE",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				email: body.email,
-				allowProviderRemoval: body.allowProviderRemoval ?? false,
+	api.get("/api/mailboxes/:mailboxId/suppressions", async (c) =>
+		adminResponse(
+			await suppressions.listSuppressions(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
 			}),
-		});
-	});
+		),
+	);
+	api.post("/api/mailboxes/:mailboxId/suppressions/remove", async (c) =>
+		adminResponse(
+			await suppressions.removeSuppression(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
+				get body() {
+					return c.req.json() as Promise<{ email: string; allowProviderRemoval?: boolean }>;
+				},
+			}),
+		),
+	);
 }
 
 export function registerAdminRoutes(api: Hono<ApiBindings>): void {
-	api.get("/api/admin/ops-events", async (c) => {
-		return c.json({ events: await listOpsEvents(c.env.INDEX_DB) });
-	});
-
-	api.get("/api/admin/dlq", async (c) => {
-		const failures = await listIngestFailures(c.env.INDEX_DB);
-		return c.json({
-			note: "Cloudflare DLQ messages are inspected via dashboard or wrangler; ingest failures listed here.",
-			ingestFailures: failures,
-		});
-	});
-
+	api.get("/api/admin/ops-events", async (c) => c.json(await ops.opsEvents(c.env, c.get("auth")!)));
+	api.get("/api/admin/dlq", async (c) => c.json(await ops.dlq(c.env, c.get("auth")!)));
 	api.post("/api/admin/reindex", async (c) => {
-		const body = adminMailboxActionSchema.parse(await c.req.json());
-		const stub = mailboxStub(c.env, body.mailboxId);
-		const exportResponse = await stub.fetch("https://mailbox-do/export-index");
-		if (!exportResponse.ok) {
-			return c.json({ error: "export_failed" }, 500);
-		}
-		const exported = (await exportResponse.json()) as {
-			messages: Array<{
-				message_local_id: string;
-				thread_id: string;
-				rfc_message_id: string | null;
-				subject: string | null;
-				from_addr: string;
-				to_json: string;
-				snippet: string | null;
-				received_at: string;
-				has_attachments: number;
-				state: string;
-				raw_r2_key: string;
-				raw_sha256: string;
-			}>;
-		};
-		await deleteMessageIndexForMailbox(c.env.INDEX_DB, body.mailboxId);
-		for (const row of exported.messages) {
-			await upsertMessageIndex(c.env.INDEX_DB, {
-				mailbox_id: body.mailboxId,
-				message_local_id: row.message_local_id,
-				thread_id: row.thread_id,
-				rfc_message_id: row.rfc_message_id,
-				subject: row.subject,
-				from_addr: row.from_addr,
-				to_json: row.to_json,
-				snippet: row.snippet,
-				received_at: row.received_at,
-				has_attachments: row.has_attachments,
-				labels_json: "[]",
-				state: row.state as "inbox" | "archive" | "trash" | "sent" | "draft",
-				raw_r2_key: row.raw_r2_key,
-				raw_sha256: row.raw_sha256,
-				updated_at: new Date().toISOString(),
-			});
-		}
-		await insertOpsEvent(c.env.INDEX_DB, {
-			id: crypto.randomUUID(),
-			event_type: "admin.reindex",
-			severity: "info",
-			subject: body.mailboxId,
-			payload_json: JSON.stringify({ count: exported.messages.length }),
-		});
-		return c.json({ ok: true, count: exported.messages.length });
+		const result = await ops.reindex(c.env, c.get("auth")!, await c.req.json());
+		return result ? c.json(result) : c.json({ error: "export_failed" }, 500);
 	});
-
 	api.post("/api/admin/backups/run", async (c) => {
-		const body = adminMailboxActionSchema.parse(await c.req.json());
-		const date = new Date().toISOString().slice(0, 10);
-		const stub = mailboxStub(c.env, body.mailboxId);
-		const exportResponse = await stub.fetch("https://mailbox-do/export-index");
-		if (!exportResponse.ok) {
-			return c.json({ error: "export_failed" }, 500);
-		}
-		const exported = await exportResponse.json();
-		const key = backupManifestR2Key({ date, mailboxId: body.mailboxId });
-		await c.env.MAIL_OBJECTS.put(key, JSON.stringify(exported, null, 2), {
-			httpMetadata: { contentType: "application/json" },
-		});
-		await insertOpsEvent(c.env.INDEX_DB, {
-			id: crypto.randomUUID(),
-			event_type: "backup.completed",
-			severity: "info",
-			subject: body.mailboxId,
-			payload_json: JSON.stringify({ key }),
-		});
-		return c.json({ ok: true, key });
+		const result = await ops.backup(c.env, c.get("auth")!, await c.req.json());
+		return result ? c.json(result) : c.json({ error: "export_failed" }, 500);
 	});
 }

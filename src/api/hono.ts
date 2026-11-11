@@ -1,57 +1,19 @@
 import { Hono } from "hono";
 import { ZodError } from "zod";
-import {
-	type AliasRow,
-	deleteAlias,
-	deleteRoutingRule,
-	type DomainRow,
-	getAlias,
-	getDomainById,
-	getDomainByName,
-	getMailbox,
-	getRoutingRule,
-	getSetupStatus,
-	insertAlias,
-	insertAliasIfMissing,
-	insertDomain,
-	insertMailbox,
-	insertRoutingRule,
-	listAliases,
-	listDomains,
-	listMailboxes,
-	listRoutingRules,
-	updateAlias,
-	updateDomain,
-	updateMailbox,
-	updateRoutingRule,
-} from "../db/d1";
+import { getSetupStatus } from "../db/d1";
 import { AppError } from "../lib/errors";
-import { provisionSendingDomain } from "../lib/provision";
-import { mailboxIdFromPrimaryAddress } from "../lib/mailbox-id";
-import {
-	fetchWithTimeout,
-	getAuthConfigStatus,
-	isAbortTimeoutError,
-	isLocalRequest,
-} from "../lib/runtime-config";
+import * as mailboxAdmin from "../lib/admin/mailboxes";
+import * as domainAdmin from "../lib/admin/domains";
+import * as routingAdmin from "../lib/admin/routing";
+import { AdminError, AdminRemoteError, AdminValidationError } from "../lib/admin/errors";
+import { getAuthConfigStatus, isLocalRequest } from "../lib/runtime-config";
 import { handleAuthRequest, handleSetPasswordRequest } from "./better-auth";
-import { assertMailboxAccess, type getAuthContext, requireAuth } from "./auth";
+import { type getAuthContext, requireAuth } from "./auth";
 import {
 	registerAdminRoutes,
 	registerMailboxRoutes,
 	registerMailboxSuppressionRoutes,
 } from "./mailbox-routes";
-import {
-	createAliasSchema,
-	createDomainSchema,
-	createMailboxSchema,
-	createRoutingRuleSchema,
-	provisionDomainSchema,
-	updateAliasSchema,
-	updateDomainSchema,
-	updateMailboxSchema,
-	updateRoutingRuleSchema,
-} from "./schemas";
 import { registerTelegramRoutes } from "./telegram-routes";
 
 export type ApiBindings = {
@@ -97,86 +59,6 @@ async function checkIndexDbHealth(indexDb: D1Database): Promise<IndexDbHealth> {
 					: "D1 query against INDEX_DB failed with an unknown error.",
 		};
 	}
-}
-
-type PrimaryAliasOutcome = {
-	alias: AliasRow | null;
-	aliasCreated: boolean;
-	/** Human-readable explanation of why no alias exists, or null when one does. */
-	aliasReason: string | null;
-};
-
-/**
- * Mail only reaches a mailbox through an alias: `resolveRoutingForRecipient` matches the exact
- * alias first and only then falls back to the domain's routing rules (src/db/d1.ts). A mailbox
- * created without one therefore receives nothing — or, worse, its mail lands in whatever mailbox
- * the domain's catch-all rule points at, which looks like it half-works. `pnpm setup:mailbox`
- * always seeds the alias; POST /api/mailboxes used not to, so this closes that gap.
- *
- * Deliberately non-fatal: the endpoint already accepts addresses on domains that are not
- * registered yet and the UI calls it that way, so a 400 here would break existing callers. The
- * mailbox is created regardless and `aliasReason` says why mail will not arrive yet.
- */
-async function ensurePrimaryAlias(
-	db: D1Database,
-	mailboxId: string,
-	primaryAddress: string,
-): Promise<PrimaryAliasOutcome> {
-	const domainName = primaryAddress.split("@")[1];
-	if (!domainName) {
-		return { alias: null, aliasCreated: false, aliasReason: "Address has no domain part." };
-	}
-	const existing = await getAlias(db, primaryAddress);
-	if (existing) {
-		if (existing.mailbox_id !== mailboxId) {
-			// Re-pointing it would silently divert another mailbox's mail. Report, don't steal.
-			return {
-				alias: existing,
-				aliasCreated: false,
-				aliasReason: `Alias ${primaryAddress} already routes to mailbox ${existing.mailbox_id}; it was left untouched.`,
-			};
-		}
-		if (existing.status !== "active") {
-			// Converge on the state a first-time create would have produced: a re-POST of an
-			// address is a provisioning request, so it re-enables its own alias.
-			await updateAlias(db, primaryAddress, { status: "active" });
-			return { alias: { ...existing, status: "active" }, aliasCreated: false, aliasReason: null };
-		}
-		return { alias: existing, aliasCreated: false, aliasReason: null };
-	}
-	const domain = await getDomainByName(db, domainName);
-	if (!domain) {
-		return {
-			alias: null,
-			aliasCreated: false,
-			aliasReason: `Domain ${domainName} is not registered. Register it with POST /api/domains, then repeat this request to create the alias.`,
-		};
-	}
-	if (domain.status !== "active") {
-		return {
-			alias: null,
-			aliasCreated: false,
-			aliasReason: `Domain ${domainName} is registered but ${domain.status}. Activate it, then repeat this request to create the alias.`,
-		};
-	}
-	const inserted = await insertAliasIfMissing(db, {
-		alias_address: primaryAddress,
-		mailbox_id: mailboxId,
-		domain_id: domain.id,
-		status: "active",
-	});
-	return { alias: inserted.alias, aliasCreated: inserted.created, aliasReason: null };
-}
-
-/**
- * Resolves the `:domain` path segment by name first — matching the older
- * GET /api/domains/:domain/status route — and then by id, so a caller holding a row from
- * GET /api/domains does not have to re-derive the name. A registered domain name always contains
- * a dot and ids are opaque UUIDs, so the two key spaces cannot collide.
- */
-async function findDomainByParam(db: D1Database, param: string): Promise<DomainRow | null> {
-	const trimmed = param.trim();
-	return (await getDomainByName(db, trimmed.toLowerCase())) ?? (await getDomainById(db, trimmed));
 }
 
 export function createApiApp(): Hono<ApiBindings> {
@@ -421,49 +303,18 @@ export function createApiApp(): Hono<ApiBindings> {
 	});
 
 	api.get("/api/mailboxes", async (c) => {
-		const mailboxes = await listMailboxes(c.env.INDEX_DB);
-		return c.json({ mailboxes });
+		return c.json(await mailboxAdmin.listMailboxes(c.env, c.get("auth")!));
 	});
 
 	api.post("/api/mailboxes", async (c) => {
-		const auth = c.get("auth")!;
-		const body = createMailboxSchema.parse(await c.req.json());
-		const mailboxId = await mailboxIdFromPrimaryAddress(c.env, body.primaryAddress);
-		const existing = await getMailbox(c.env.INDEX_DB, mailboxId);
-		if (existing) {
-			// Converge rather than no-op: the domain may have been registered since the first call,
-			// in which case this repeat is the request that finally makes the mailbox reachable.
-			const aliasState = await ensurePrimaryAlias(
-				c.env.INDEX_DB,
-				existing.mailbox_id,
-				existing.primary_address,
-			);
-			return c.json({ mailbox: existing, created: false, ...aliasState });
-		}
-		const primaryAddress = body.primaryAddress.trim().toLowerCase();
-		// insertMailbox is ON CONFLICT(primary_address) DO NOTHING and returns the *stored* id, so a
-		// concurrent create for the same address lands on one row instead of forking.
-		const storedMailboxId = await insertMailbox(c.env.INDEX_DB, {
-			mailbox_id: mailboxId,
-			primary_address: primaryAddress,
-			display_name: body.displayName ?? null,
-			status: "active",
-			owner_email: auth.email,
-		});
-		const mailbox = await getMailbox(c.env.INDEX_DB, storedMailboxId);
-		const aliasState = await ensurePrimaryAlias(
-			c.env.INDEX_DB,
-			storedMailboxId,
-			mailbox?.primary_address ?? primaryAddress,
-		);
-		return c.json({ mailbox, created: true, ...aliasState }, 201);
+		const result = await mailboxAdmin.createMailbox(c.env, c.get("auth")!, await c.req.json());
+		return c.json(result, result.created ? 201 : 200);
 	});
 
 	api.get("/api/mailboxes/:mailboxId", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const mailbox = await getMailbox(c.env.INDEX_DB, mailboxId);
+		const { mailbox } = await mailboxAdmin.readMailbox(c.env, c.get("auth")!, {
+			mailboxId: c.req.param("mailboxId"),
+		});
 		if (!mailbox) {
 			return c.json({ error: "mailbox_not_found" }, 404);
 		}
@@ -471,18 +322,14 @@ export function createApiApp(): Hono<ApiBindings> {
 	});
 
 	api.patch("/api/mailboxes/:mailboxId", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const body = updateMailboxSchema.parse(await c.req.json());
-		const updated = await updateMailbox(c.env.INDEX_DB, mailboxId, {
-			display_name: body.displayName,
-			status: body.status,
-		});
-		if (!updated) {
-			throw new AppError("Mailbox not found", "mailbox_not_found", 404);
-		}
-		return c.json({ mailbox: await getMailbox(c.env.INDEX_DB, mailboxId) });
+		return c.json(
+			await mailboxAdmin.patchMailbox(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
+				get body() {
+					return c.req.json();
+				},
+			}),
+		);
 	});
 
 	// Soft delete, and the only kind offered. A mailbox's messages live in its Durable Object and
@@ -491,306 +338,87 @@ export function createApiApp(): Hono<ApiBindings> {
 	// reversible equivalent: it takes the mailbox out of listMailboxesByOwner/getMailboxForOwner,
 	// so MCP and the UI stop serving it, while the archive stays reachable if it is re-enabled.
 	api.delete("/api/mailboxes/:mailboxId", async (c) => {
-		const auth = c.get("auth")!;
-		const mailboxId = c.req.param("mailboxId");
-		assertMailboxAccess(auth, mailboxId, c.env);
-		const updated = await updateMailbox(c.env.INDEX_DB, mailboxId, { status: "disabled" });
-		if (!updated) {
-			throw new AppError("Mailbox not found", "mailbox_not_found", 404);
-		}
-		return c.json({ mailbox: await getMailbox(c.env.INDEX_DB, mailboxId), deleted: "soft" });
+		return c.json(
+			await mailboxAdmin.deleteMailbox(c.env, c.get("auth")!, {
+				mailboxId: c.req.param("mailboxId"),
+			}),
+		);
 	});
 
-	api.get("/api/domains", async (c) => {
-		return c.json({ domains: await listDomains(c.env.INDEX_DB) });
-	});
-
+	api.get("/api/domains", async (c) =>
+		c.json(await domainAdmin.listDomains(c.env, c.get("auth")!)),
+	);
 	api.post("/api/domains", async (c) => {
-		const body = createDomainSchema.parse(await c.req.json());
-		const domain = body.domain.trim().toLowerCase();
-		const existing = await getDomainByName(c.env.INDEX_DB, domain);
-		if (existing) {
-			return c.json({ domain: existing, created: false });
-		}
-		const id = crypto.randomUUID();
-		await insertDomain(c.env.INDEX_DB, {
-			id,
-			domain,
-			zone_id: body.zoneId,
-			status: "active",
-		});
-		return c.json({ domain: await getDomainByName(c.env.INDEX_DB, domain), created: true }, 201);
+		const result = await domainAdmin.createDomain(c.env, c.get("auth")!, await c.req.json());
+		return c.json(result, result.created ? 201 : 200);
 	});
-
-	api.patch("/api/domains/:domain", async (c) => {
-		const body = updateDomainSchema.parse(await c.req.json());
-		const domain = await findDomainByParam(c.env.INDEX_DB, c.req.param("domain"));
-		if (!domain) {
-			throw new AppError("Domain not found", "domain_not_found", 404);
-		}
-		await updateDomain(c.env.INDEX_DB, domain.id, { status: body.status });
-		return c.json({ domain: await getDomainById(c.env.INDEX_DB, domain.id) });
-	});
-
-	// Soft delete. aliases.domain_id and routing_rules.domain_id are foreign keys into this row, so
-	// a hard delete would break or orphan every alias and rule on the domain. It is also
-	// unnecessary: resolveRoutingForRecipient rejects any recipient whose domain is not 'active'
-	// with `unknown_domain`, so flipping the status already produces the intended effect — the
-	// domain stops accepting mail — while keeping its configuration intact for a later re-enable.
-	api.delete("/api/domains/:domain", async (c) => {
-		const domain = await findDomainByParam(c.env.INDEX_DB, c.req.param("domain"));
-		if (!domain) {
-			throw new AppError("Domain not found", "domain_not_found", 404);
-		}
-		await updateDomain(c.env.INDEX_DB, domain.id, { status: "disabled" });
-		return c.json({ domain: await getDomainById(c.env.INDEX_DB, domain.id), deleted: "soft" });
-	});
-
+	api.patch("/api/domains/:domain", async (c) =>
+		c.json(
+			await domainAdmin.patchDomain(c.env, c.get("auth")!, {
+				domain: c.req.param("domain"),
+				body: await c.req.json(),
+			}),
+		),
+	);
+	api.delete("/api/domains/:domain", async (c) =>
+		c.json(
+			await domainAdmin.deleteDomain(c.env, c.get("auth")!, { domain: c.req.param("domain") }),
+		),
+	);
 	api.get("/api/domains/:domain/status", async (c) => {
-		const domainName = c.req.param("domain").trim().toLowerCase();
-		const domain = await getDomainByName(c.env.INDEX_DB, domainName);
-		if (!domain) {
-			return c.json({ error: "domain_not_found" }, 404);
-		}
-		const token = c.env.CLOUDFLARE_API_TOKEN;
-		if (!token) {
-			return c.json({
-				domain,
-				cloudflare: { configured: false, reason: "CLOUDFLARE_API_TOKEN not set" },
-			});
-		}
-		let payload:
-			| {
-					success?: boolean;
-					result?: { status?: string; name?: string };
-			  }
-			| undefined;
-		try {
-			const response = await fetchWithTimeout(
-				`https://api.cloudflare.com/client/v4/zones/${domain.zone_id}`,
-				{
-					headers: { Authorization: `Bearer ${token}` },
-					timeoutMs: 5_000,
-				},
-			);
-			payload = (await response.json()) as {
-				success?: boolean;
-				result?: { status?: string; name?: string };
-			};
-		} catch (error) {
-			return c.json({
-				domain,
-				cloudflare: {
-					configured: true,
-					ok: false,
-					reason: isAbortTimeoutError(error)
-						? "Cloudflare API request timed out."
-						: "Cloudflare API request failed.",
-					status: null,
-					name: null,
-				},
-			});
-		}
-		return c.json({
-			domain,
-			cloudflare: {
-				configured: true,
-				ok: payload.success === true,
-				reason:
-					payload.success === true ? null : "Cloudflare API returned an unsuccessful response.",
-				status: payload.result?.status ?? null,
-				name: payload.result?.name ?? null,
-			},
+		const result = await domainAdmin.domainStatus(c.env, c.get("auth")!, {
+			domain: c.req.param("domain"),
 		});
+		return result ? c.json(result) : c.json({ error: "domain_not_found" }, 404);
 	});
-
-	/**
-	 * Provision a sending domain end to end.
-	 *
-	 * Answers 200 with the per-step outcomes even when steps did not succeed, and
-	 * that is deliberate: the request itself was handled, and the interesting
-	 * information is WHICH step is blocked and what the remedy is. Collapsing that
-	 * into a 5xx would throw away the four steps that did work and leave the
-	 * caller re-running the whole thing blind. A non-2xx is reserved for a request
-	 * that could not be attempted at all.
-	 *
-	 * Idempotent by construction — every step asks what is already true — so the
-	 * normal way to finish a partially provisioned domain is to send this again.
-	 */
-	api.post("/api/domains/:domain/provision", async (c) => {
-		const body = provisionDomainSchema.parse(await c.req.json());
-		const zone = c.req.param("domain").trim().toLowerCase();
-		const sendingDomain = `${body.subdomain.toLowerCase()}.${zone}`;
-
-		if (body.mailbox && !body.mailbox.address.toLowerCase().endsWith(`@${zone}`)) {
-			// A mailbox on another domain would be created but unreachable: inbound
-			// routing is enabled on THIS zone, so nothing would ever deliver to it.
-			throw new AppError(
-				`Mailbox ${body.mailbox.address} is not on ${zone}.`,
-				"mailbox_outside_zone",
-				400,
-			);
-		}
-
-		const result = await provisionSendingDomain(c.env, c.env.INDEX_DB, {
-			zone,
-			sendingDomain,
-			dmarc: body.dmarc,
-			inbound: body.inbound,
-			// Account-scoped, so it needs its own configuration rather than riding on
-			// the zone token. Unset simply omits the step instead of failing the run.
-			feedbackQueueId: c.env.FEEDBACK_QUEUE_ID?.trim() || undefined,
-			mailbox: body.mailbox,
-		});
-
-		return c.json(result);
-	});
-
-	api.get("/api/aliases", async (c) => {
-		return c.json({ aliases: await listAliases(c.env.INDEX_DB) });
-	});
-
-	api.post("/api/aliases", async (c) => {
-		const body = createAliasSchema.parse(await c.req.json());
-		const aliasAddress = body.aliasAddress.trim().toLowerCase();
-		const mailbox = await getMailbox(c.env.INDEX_DB, body.mailboxId);
-		if (!mailbox) {
-			throw new AppError("Mailbox not found", "mailbox_not_found", 404);
-		}
-		const domainName = aliasAddress.split("@")[1];
-		if (!domainName) {
-			throw new AppError("Invalid alias address", "invalid_alias", 400);
-		}
-		const domain = await getDomainByName(c.env.INDEX_DB, domainName);
-		if (!domain) {
-			throw new AppError("Domain not registered", "domain_not_found", 400);
-		}
-		await insertAlias(c.env.INDEX_DB, {
-			alias_address: aliasAddress,
-			mailbox_id: body.mailboxId,
-			domain_id: domain.id,
-			status: "active",
-		});
-		return c.json({ alias: { alias_address: aliasAddress, mailbox_id: body.mailboxId } }, 201);
-	});
-
-	api.patch("/api/aliases/:aliasAddress", async (c) => {
-		const body = updateAliasSchema.parse(await c.req.json());
-		const aliasAddress = c.req.param("aliasAddress").trim().toLowerCase();
-		const updated = await updateAlias(c.env.INDEX_DB, aliasAddress, { status: body.status });
-		if (!updated) {
-			throw new AppError("Alias not found", "alias_not_found", 404);
-		}
-		return c.json({ alias: await getAlias(c.env.INDEX_DB, aliasAddress) });
-	});
-
-	// Hard delete, unlike mailboxes and domains. alias_address is the primary key, so a disabled
-	// row would keep the address claimed forever and block re-pointing it at another mailbox —
-	// which is the usual reason for removing an alias in the first place. Nothing references the
-	// row, and the mail it used to route falls back to the domain's routing rules.
-	api.delete("/api/aliases/:aliasAddress", async (c) => {
-		const aliasAddress = c.req.param("aliasAddress").trim().toLowerCase();
-		const deleted = await deleteAlias(c.env.INDEX_DB, aliasAddress);
-		if (!deleted) {
-			throw new AppError("Alias not found", "alias_not_found", 404);
-		}
-		return c.json({ aliasAddress, deleted: "hard" });
-	});
-
-	api.get("/api/routing-rules", async (c) => {
-		const domainId = c.req.query("domainId") ?? undefined;
-		return c.json({ rules: await listRoutingRules(c.env.INDEX_DB, domainId) });
-	});
-
-	api.post("/api/routing-rules", async (c) => {
-		const body = createRoutingRuleSchema.parse(await c.req.json());
-		const domain = await getDomainById(c.env.INDEX_DB, body.domainId);
-		if (!domain) {
-			throw new AppError("Domain not found", "domain_not_found", 400);
-		}
-		if (body.action === "store") {
-			if (!body.mailboxId) {
-				throw new AppError("Store routing rules require mailboxId", "mailbox_id_required", 400);
-			}
-			const mailbox = await getMailbox(c.env.INDEX_DB, body.mailboxId);
-			if (!mailbox) {
-				throw new AppError("Mailbox not found", "mailbox_not_found", 400);
-			}
-		}
-		if (body.action === "forward" && !body.forwardTo?.length) {
-			throw new AppError(
-				"Forward routing rules require at least one destination",
-				"forward_to_required",
-				400,
-			);
-		}
-		const id = crypto.randomUUID();
-		await insertRoutingRule(c.env.INDEX_DB, {
-			id,
-			domain_id: body.domainId,
-			pattern: body.pattern,
-			priority: body.priority,
-			action: body.action,
-			mailbox_id: body.mailboxId ?? null,
-			forward_to_json: JSON.stringify(body.forwardTo ?? []),
-			reject_reason: body.rejectReason ?? null,
-			enabled: body.enabled ? 1 : 0,
-		});
-		return c.json({ id }, 201);
-	});
-
-	api.patch("/api/routing-rules/:ruleId", async (c) => {
-		const body = updateRoutingRuleSchema.parse(await c.req.json());
-		const ruleId = c.req.param("ruleId");
-		const existing = await getRoutingRule(c.env.INDEX_DB, ruleId);
-		if (!existing) {
-			throw new AppError("Routing rule not found", "routing_rule_not_found", 404);
-		}
-		// Validate the rule as it will be *after* the patch, not the fields the patch carries: a
-		// PATCH that only flips `action` to "store" can strand a rule with no mailbox just as easily
-		// as a bad POST can, and such a rule silently never routes.
-		const action = body.action ?? existing.action;
-		const mailboxId = body.mailboxId !== undefined ? body.mailboxId : existing.mailbox_id;
-		const forwardTo = body.forwardTo ?? (JSON.parse(existing.forward_to_json) as string[]);
-		if (action === "store") {
-			if (!mailboxId) {
-				throw new AppError("Store routing rules require mailboxId", "mailbox_id_required", 400);
-			}
-			if (!(await getMailbox(c.env.INDEX_DB, mailboxId))) {
-				throw new AppError("Mailbox not found", "mailbox_not_found", 400);
-			}
-		}
-		if (action === "forward" && forwardTo.length === 0) {
-			throw new AppError(
-				"Forward routing rules require at least one destination",
-				"forward_to_required",
-				400,
-			);
-		}
-		await updateRoutingRule(c.env.INDEX_DB, ruleId, {
-			pattern: body.pattern,
-			priority: body.priority,
-			action: body.action,
-			mailbox_id: body.mailboxId,
-			forward_to_json: body.forwardTo === undefined ? undefined : JSON.stringify(body.forwardTo),
-			reject_reason: body.rejectReason,
-			enabled: body.enabled === undefined ? undefined : body.enabled ? 1 : 0,
-		});
-		return c.json({ rule: await getRoutingRule(c.env.INDEX_DB, ruleId) });
-	});
-
-	// Hard delete: a routing rule is pure configuration. No row references it and no stored data is
-	// keyed by it, so there is nothing to orphan — and leaving disabled rules behind would just
-	// accumulate dead precedence entries in resolveRoutingForRecipient's priority scan.
-	api.delete("/api/routing-rules/:ruleId", async (c) => {
-		const ruleId = c.req.param("ruleId");
-		const deleted = await deleteRoutingRule(c.env.INDEX_DB, ruleId);
-		if (!deleted) {
-			throw new AppError("Routing rule not found", "routing_rule_not_found", 404);
-		}
-		return c.json({ id: ruleId, deleted: "hard" });
-	});
-
+	api.post("/api/domains/:domain/provision", async (c) =>
+		c.json(
+			await domainAdmin.provisionDomain(c.env, c.get("auth")!, {
+				domain: c.req.param("domain"),
+				body: await c.req.json(),
+			}),
+		),
+	);
+	api.get("/api/aliases", async (c) =>
+		c.json(await routingAdmin.listAliases(c.env, c.get("auth")!)),
+	);
+	api.post("/api/aliases", async (c) =>
+		c.json(await routingAdmin.createAlias(c.env, c.get("auth")!, await c.req.json()), 201),
+	);
+	api.patch("/api/aliases/:aliasAddress", async (c) =>
+		c.json(
+			await routingAdmin.patchAlias(c.env, c.get("auth")!, {
+				aliasAddress: c.req.param("aliasAddress"),
+				body: await c.req.json(),
+			}),
+		),
+	);
+	api.delete("/api/aliases/:aliasAddress", async (c) =>
+		c.json(
+			await routingAdmin.deleteAlias(c.env, c.get("auth")!, {
+				aliasAddress: c.req.param("aliasAddress"),
+			}),
+		),
+	);
+	api.get("/api/routing-rules", async (c) =>
+		c.json(
+			await routingAdmin.listRules(c.env, c.get("auth")!, { domainId: c.req.query("domainId") }),
+		),
+	);
+	api.post("/api/routing-rules", async (c) =>
+		c.json(await routingAdmin.createRule(c.env, c.get("auth")!, await c.req.json()), 201),
+	);
+	api.patch("/api/routing-rules/:ruleId", async (c) =>
+		c.json(
+			await routingAdmin.patchRule(c.env, c.get("auth")!, {
+				ruleId: c.req.param("ruleId"),
+				body: await c.req.json(),
+			}),
+		),
+	);
+	api.delete("/api/routing-rules/:ruleId", async (c) =>
+		c.json(await routingAdmin.deleteRule(c.env, c.get("auth")!, { ruleId: c.req.param("ruleId") })),
+	);
 	registerMailboxRoutes(api);
 	registerMailboxSuppressionRoutes(api);
 	registerAdminRoutes(api);
@@ -810,6 +438,18 @@ export function createApiApp(): Hono<ApiBindings> {
 		// client error rather than a generic 500.
 		if (error instanceof SyntaxError) {
 			return c.json({ error: "invalid_json" }, 400);
+		}
+		if (error instanceof AdminRemoteError) {
+			return new Response(error.status === 304 ? null : error.body, {
+				status: error.status,
+				headers: error.headers,
+			});
+		}
+		if (error instanceof AdminValidationError) {
+			return c.json({ error: error.code, issues: error.issues }, 400);
+		}
+		if (error instanceof AdminError && !error.includeMessage) {
+			return c.json({ error: error.code }, error.status as 400);
 		}
 		if (error instanceof AppError) {
 			return c.json({ error: error.code, message: error.message }, error.status as 400);
