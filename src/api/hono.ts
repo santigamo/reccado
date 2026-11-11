@@ -14,6 +14,7 @@ import {
 	registerMailboxRoutes,
 	registerMailboxSuppressionRoutes,
 } from "./mailbox-routes";
+import { registerApprovalRoutes } from "./approval-routes";
 import { registerTelegramRoutes } from "./telegram-routes";
 
 export type ApiBindings = {
@@ -423,6 +424,7 @@ export function createApiApp(): Hono<ApiBindings> {
 	registerMailboxSuppressionRoutes(api);
 	registerAdminRoutes(api);
 	registerTelegramRoutes(api);
+	registerApprovalRoutes(api);
 
 	// MCP endpoint: forward all methods (GET/POST/OPTIONS) to the MCP handler.
 	api.all("/mcp", async (c) => {

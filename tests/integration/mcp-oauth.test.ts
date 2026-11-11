@@ -10,6 +10,7 @@ import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?
 import migrationBetterAuth from "../../migrations/d1/0016_better_auth.sql?raw";
 import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
 import migrationAuthUpgrade from "../../migrations/d1/0021_better_auth_1_7_20.sql?raw";
+import migrationPasskey from "../../migrations/d1/0024_passkey.sql?raw";
 import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql?raw";
 import migrationBetterAuthMcpFkFix from "../../migrations/d1/0018_better_auth_mcp_fk_fix.sql?raw";
 import { applyMigrations } from "../helpers/migrations";
@@ -61,6 +62,7 @@ beforeAll(async () => {
 		migrationBetterAuthMcpFkFix as string,
 		migrationTwoFactor as string,
 		migrationAuthUpgrade as string,
+		migrationPasskey as string,
 	);
 
 	// Token verification at /mcp fetches the signing keys from our own /jwks.

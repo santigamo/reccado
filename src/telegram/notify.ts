@@ -1,4 +1,5 @@
 import { getMailbox, insertOpsEvent, insertTelegramLink } from "../db/d1";
+import { buildApprovalUrl } from "../lib/approvals";
 import { getRuntimeConfig, RUNTIME_CONFIG_KEYS } from "../db/runtime-config";
 import {
 	claimTelegramTopic,
@@ -32,12 +33,26 @@ export async function notifyIntentCreated(env: Env, intentId: string): Promise<v
 	const chatId = await resolveTelegramChatId(env);
 	const origin = await getRuntimeConfig(env.INDEX_DB, RUNTIME_CONFIG_KEYS.deploymentOrigin);
 	if (!config || !chatId || !origin) return;
-	const url = new URL(`/approve/${encodeURIComponent(intentId)}`, origin);
-	if (url.origin !== origin || (url.protocol !== "https:" && url.hostname !== "localhost")) return;
+	const url = buildApprovalUrl(origin, intentId);
+	if (!url) return;
 	await sendMessage(config, {
 		chatId,
 		text: "Hay una solicitud pendiente de aprobación.",
-		replyMarkup: intentNotificationKeyboard(url.toString()),
+		replyMarkup: intentNotificationKeyboard(url),
+	});
+}
+
+/** Best-effort notice that a passkey was added or removed. Never blocks the auth response. */
+export async function notifyPasskeyChange(env: Env, action: "added" | "removed"): Promise<void> {
+	const config = readTelegramConfig(env);
+	const chatId = await resolveTelegramChatId(env);
+	if (!config || !chatId) return;
+	await sendMessage(config, {
+		chatId,
+		text:
+			action === "added"
+				? "Se ha registrado una passkey en tu cuenta de Reccado."
+				: "Se ha eliminado una passkey de tu cuenta de Reccado.",
 	});
 }
 
