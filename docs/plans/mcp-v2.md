@@ -1,6 +1,11 @@
 # MCP v2 — a full-capability, spec-native MCP server
 
-Status: **planned** · Owner: Santi · Created: 2026-11-11 · Last updated: 2026-11-11
+Status: **in progress** (integration branch `feat/mcp-v2`) · Owner: Santi · Created: 2026-11-11 · Last updated: 2026-11-11
+
+Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test values:
+`PHASE0_DEBUG_TOKEN`, `MAILBOX_JURISDICTION=none`, a fake `TRANSACTIONAL_API_KEY_PEPPER`, and
+`BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
+Baseline on fc22f6a: 66 files / 1132 tests green.
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -233,7 +238,11 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 
 ### P3 — Read, draft, tier 1, admin reads
 - [ ] Read tools incl. `read_thread`, cross-mailbox search, `resource_link` attachments.
-- [ ] Sensitive-mail flag at ingest + redaction + `mail:read:sensitive`.
+- [x] Sensitive-mail flag at ingest + redaction helper (T4, merged 43c630c): `src/lib/sensitive-mail.ts`,
+      DO schema v8 `messages.sensitive_kind` + `sensitive_classified` (0 = legacy/unclassified,
+      1 = classified), legacy fallback `sensitiveKindForRead` (pass fetched HTML for HTML-only rows).
+- [ ] Wire redaction + `mail:read:sensitive` into MCP read tools (also cover raw MIME / attachment
+      `resource_link`s — separate exposure paths).
 - [ ] `update_messages`, `save_draft`, `cancel_draft`.
 - [ ] `get_health`, `list_ops`, `list_config` (control plane is **read-only** until P4).
 
