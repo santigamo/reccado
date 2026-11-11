@@ -18,8 +18,11 @@
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { mcp } from "@better-auth/mcp";
 import { cimd } from "@better-auth/cimd";
+import { passkey } from "@better-auth/passkey";
 import { emailOTP, jwt, twoFactor } from "better-auth/plugins";
 import { insertOpsEvent } from "../db/d1";
+import { sha256Hex } from "../lib/crypto";
+import { notifyPasskeyChange } from "../telegram/notify";
 import { consumePairingCode, type PairingClaim } from "../db/owners";
 import { RUNTIME_CONFIG_KEYS, getRuntimeConfig } from "../db/runtime-config";
 import {
@@ -47,6 +50,14 @@ export const PAIRING_PATH = `${AUTH_BASE_PATH}/pairing`;
 
 /** The email-otp send endpoint whose request the owner gate intercepts. */
 const SEND_OTP_PATH = `${AUTH_BASE_PATH}/email-otp/send-verification-otp`;
+
+/** Fresh proof required before either passkey registration endpoint. */
+const PASSKEY_STEPUP_PATH = `${AUTH_BASE_PATH}/passkey/step-up`;
+const PASSKEY_REGISTER_OPTIONS_PATH = `${AUTH_BASE_PATH}/passkey/generate-register-options`;
+const PASSKEY_REGISTER_VERIFY_PATH = `${AUTH_BASE_PATH}/passkey/verify-registration`;
+const PASSKEY_DELETE_PATH = `${AUTH_BASE_PATH}/passkey/delete-passkey`;
+const STEPUP_TTL_MS = 5 * 60 * 1000;
+export const PASSKEY_STEPUP_HEADER = "x-passkey-stepup";
 
 /**
  * The canonical MCP protected-resource identifier (RFC 8707 / RFC 9728) this
@@ -226,6 +237,15 @@ export async function createAuth(
 			twoFactor({
 				issuer: "Reccado",
 			}),
+			// Registration is additionally gated in handleAuthRequest: a session,
+			// including one opened by a pairing code or a trusted device, is not
+			// enough. Both registration endpoints require a single-use step-up proof.
+			passkey({
+				rpID: new URL(baseURL).hostname,
+				rpName: "Reccado",
+				origin: baseURL,
+				authenticatorSelection: { userVerification: "required", residentKey: "preferred" },
+			}),
 			// Stable signing keys + /jwks, shared by the session-JWT endpoint and the
 			// OAuth provider's access tokens. Payload kept minimal: identity only.
 			jwt({
@@ -382,6 +402,214 @@ function serializeSessionCookie(
 	return parts.join("; ");
 }
 
+function stepUpIdentifier(sessionId: string): string {
+	return `passkey-stepup:${sessionId}`;
+}
+
+function stepUpOtpIdentifier(sessionId: string): string {
+	return `passkey-stepup-otp:${sessionId}`;
+}
+
+async function sha256Text(value: string): Promise<string> {
+	return sha256Hex(new TextEncoder().encode(value));
+}
+
+function randomDigits(length: number): string {
+	const bytes = crypto.getRandomValues(new Uint8Array(length));
+	return [...bytes].map((byte) => String(byte % 10)).join("");
+}
+
+function randomProof(): string {
+	const bytes = crypto.getRandomValues(new Uint8Array(32));
+	let binary = "";
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+type AuthSession = {
+	session: { id: string };
+	user: { id: string; email: string };
+};
+
+async function authoritativeSession(
+	auth: Awaited<ReturnType<typeof createAuth>>,
+	request: Request,
+): Promise<AuthSession | null> {
+	const session = await auth.api.getSession({
+		headers: request.headers,
+		query: { disableCookieCache: true },
+	});
+	if (!session?.session?.id || !session.user?.id || !session.user.email) return null;
+	return { session: { id: session.session.id }, user: { id: session.user.id, email: session.user.email } };
+}
+
+async function twoFactorEnabled(env: AuthEnv, userId: string): Promise<boolean> {
+	const row = await env.INDEX_DB.prepare('SELECT twoFactorEnabled FROM "user" WHERE id = ?')
+		.bind(userId)
+		.first<{ twoFactorEnabled: number | null }>();
+	return row?.twoFactorEnabled === 1;
+}
+
+async function ownerSession(
+	auth: Awaited<ReturnType<typeof createAuth>>,
+	request: Request,
+	env: AuthEnv,
+): Promise<AuthSession | null> {
+	const session = await authoritativeSession(auth, request);
+	if (!session) return null;
+	const owners = await resolveOwnerEmails(env as Env);
+	if (!owners.includes(session.user.email.trim().toLowerCase())) return null;
+	return session;
+}
+
+/**
+ * A registration proof bound to this session. Trusted-device cookies, pairing
+ * codes and earlier sign-in OTPs are not this row: it is written only after a
+ * TOTP (when two-factor is on) or a freshly mailed OTP.
+ */
+async function issueStepUpProof(env: AuthEnv, sessionId: string): Promise<{ proof: string; expiresAt: string }> {
+	const proof = randomProof();
+	const expiresAtMs = Date.now() + STEPUP_TTL_MS;
+	const identifier = stepUpIdentifier(sessionId);
+	await env.INDEX_DB.prepare('DELETE FROM "verification" WHERE identifier = ?').bind(identifier).run();
+	await env.INDEX_DB.prepare(
+		'INSERT INTO "verification" (id, identifier, value, expiresAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+	)
+		.bind(crypto.randomUUID(), identifier, proof, expiresAtMs, Date.now(), Date.now())
+		.run();
+	return { proof, expiresAt: new Date(expiresAtMs).toISOString() };
+}
+
+async function handlePasskeyStepUp(
+	request: Request,
+	env: AuthEnv,
+	auth: Awaited<ReturnType<typeof createAuth>>,
+	mail: AuthMailSender,
+): Promise<Response> {
+	const session = await ownerSession(auth, request, env);
+	if (!session) return Response.json({ error: "unauthorized" }, { status: 401 });
+	let code: string | null = null;
+	try {
+		const body = (await request.clone().json()) as { code?: unknown };
+		if (typeof body.code === "string" && body.code.trim()) code = body.code.trim();
+	} catch {
+		return Response.json({ error: "invalid_body" }, { status: 400 });
+	}
+	const totp = await twoFactorEnabled(env, session.user.id);
+	if (!code) {
+		if (totp) return Response.json({ method: "totp" });
+		const otp = randomDigits(6);
+		const identifier = stepUpOtpIdentifier(session.session.id);
+		const expiresAtMs = Date.now() + STEPUP_TTL_MS;
+		await env.INDEX_DB.prepare('DELETE FROM "verification" WHERE identifier = ?').bind(identifier).run();
+		await env.INDEX_DB.prepare(
+			'INSERT INTO "verification" (id, identifier, value, expiresAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+		)
+			.bind(
+				crypto.randomUUID(),
+				identifier,
+				await sha256Text(`${session.session.id}:${otp}`),
+				expiresAtMs,
+				Date.now(),
+				Date.now(),
+			)
+			.run();
+		await mail.sendMail({
+			to: session.user.email,
+			subject: "Código para registrar una passkey",
+			text: `Tu código para registrar una passkey es ${otp}. Caduca en 5 minutos.`,
+		});
+		return Response.json({ method: "email" });
+	}
+	if (totp) {
+		try {
+			// The plugin endpoint is present at runtime; Better Auth's inferred API
+			// type does not carry plugin methods through this options object.
+			const api = auth.api as unknown as {
+				verifyTOTP: (input: {
+					body: { code: string; trustDevice: false };
+					headers: Headers;
+				}) => Promise<unknown>;
+			};
+			await api.verifyTOTP({
+				body: { code, trustDevice: false },
+				headers: request.headers,
+			});
+		} catch {
+			return Response.json({ error: "invalid_code" }, { status: 401 });
+		}
+		return Response.json(await issueStepUpProof(env, session.session.id));
+	}
+	const identifier = stepUpOtpIdentifier(session.session.id);
+	const hashed = await sha256Text(`${session.session.id}:${code}`);
+	const spent = await env.INDEX_DB.prepare(
+		'DELETE FROM "verification" WHERE identifier = ? AND value = ? AND expiresAt > ?',
+	)
+		.bind(identifier, hashed, Date.now())
+		.run();
+	if ((spent.meta?.changes ?? 0) !== 1) {
+		return Response.json({ error: "invalid_code" }, { status: 401 });
+	}
+	return Response.json(await issueStepUpProof(env, session.session.id));
+}
+
+/**
+ * Both registration endpoints require the step-up proof. Generate checks it;
+ * verify consumes it, so a second registration needs a new code.
+ */
+async function gatePasskeyRegistration(
+	request: Request,
+	env: AuthEnv,
+	auth: Awaited<ReturnType<typeof createAuth>>,
+): Promise<Response | null> {
+	const url = new URL(request.url);
+	const verifying = url.pathname === PASSKEY_REGISTER_VERIFY_PATH;
+	const registering =
+		url.pathname === PASSKEY_REGISTER_OPTIONS_PATH || verifying;
+	if (!registering) return null;
+	const session = await ownerSession(auth, request, env);
+	if (!session) return Response.json({ error: "unauthorized" }, { status: 401 });
+	const proof = request.headers.get(PASSKEY_STEPUP_HEADER)?.trim() ?? "";
+	if (!proof) return Response.json({ error: "passkey_stepup_required" }, { status: 403 });
+	const identifier = stepUpIdentifier(session.session.id);
+	if (!verifying) {
+		const row = await env.INDEX_DB.prepare(
+			'SELECT id FROM "verification" WHERE identifier = ? AND value = ? AND expiresAt > ?',
+		)
+			.bind(identifier, proof, Date.now())
+			.first();
+		if (!row) return Response.json({ error: "passkey_stepup_required" }, { status: 403 });
+		return null;
+	}
+	const spent = await env.INDEX_DB.prepare(
+		'DELETE FROM "verification" WHERE identifier = ? AND value = ? AND expiresAt > ?',
+	)
+		.bind(identifier, proof, Date.now())
+		.run();
+	if ((spent.meta?.changes ?? 0) !== 1) {
+		return Response.json({ error: "passkey_stepup_required" }, { status: 403 });
+	}
+	return null;
+}
+
+async function recordPasskeyChange(
+	request: Request,
+	env: AuthEnv,
+	auth: Awaited<ReturnType<typeof createAuth>>,
+	action: "added" | "removed",
+): Promise<void> {
+	const session = await authoritativeSession(auth, request);
+	const email = session?.user.email ?? "unknown";
+	await insertOpsEvent(env.INDEX_DB, {
+		id: crypto.randomUUID(),
+		event_type: action === "added" ? "passkey.added" : "passkey.removed",
+		severity: "info",
+		subject: email,
+		payload_json: JSON.stringify({ userId: session?.user.id ?? null, action }),
+	}).catch(() => undefined);
+	await notifyPasskeyChange(env as Env, action).catch(() => undefined);
+}
+
 /**
  * The fetch-handler mounted at /api/auth/*.
  *
@@ -424,7 +652,19 @@ export async function handleAuthRequest(
 			authRequest = new Request(url, request);
 		}
 		const auth = await createAuth(env, { request: authRequest, mailSender: opts.mailSender });
+		if (url.pathname === PASSKEY_STEPUP_PATH && request.method === "POST") {
+			const mail = opts.mailSender ?? createAuthMailSender(env);
+			return await handlePasskeyStepUp(request, env, auth, mail);
+		}
+		const registrationGate = await gatePasskeyRegistration(request, env, auth);
+		if (registrationGate) return registrationGate;
 		const response = await auth.handler(authRequest);
+		if (response.ok && url.pathname === PASSKEY_REGISTER_VERIFY_PATH && request.method === "POST") {
+			await recordPasskeyChange(request, env, auth, "added");
+		}
+		if (response.ok && url.pathname === PASSKEY_DELETE_PATH && request.method === "POST") {
+			await recordPasskeyChange(request, env, auth, "removed");
+		}
 		const clientId = url.searchParams.get("client_id");
 		if (
 			clientId &&

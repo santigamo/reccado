@@ -82,6 +82,12 @@ export type OutboundSendRow = {
 	approval_mode: "human_confirmed" | "telegram_confirmed" | "preauthorized_transactional";
 	created_at: string;
 	updated_at: string;
+	approval_channel?: "web" | "telegram" | "mcp_approval" | null;
+	intent_id?: string | null;
+	payload_hash?: string | null;
+	oauth_client_id?: string | null;
+	token_sub?: string | null;
+	token_jti?: string | null;
 };
 
 /**
@@ -779,6 +785,10 @@ export type ApprovalRow = {
 	payload_hash: string | null;
 	consumed_at: string | null;
 	origin: "telegram" | "web" | "mcp";
+	oauth_client_id?: string | null;
+	token_sub?: string | null;
+	token_jti?: string | null;
+	decision?: "approved" | "denied" | null;
 };
 
 export async function insertTelegramLink(
@@ -843,6 +853,106 @@ export async function insertApproval(
 
 export async function getApproval(db: D1Database, token: string): Promise<ApprovalRow | null> {
 	return db.prepare("SELECT * FROM approvals WHERE token = ?").bind(token).first<ApprovalRow>();
+}
+
+/** MCP (and later control-plane) intents. Telegram keeps insertApproval. */
+export async function insertApprovalIntent(
+	db: D1Database,
+	row: {
+		token: string;
+		kind: string;
+		origin: ApprovalRow["origin"];
+		mailboxId: string | null;
+		draftId: string | null;
+		payloadHash: string;
+		expiresAt: string;
+		oauthClientId?: string | null;
+		tokenSub?: string | null;
+		tokenJti?: string | null;
+	},
+): Promise<void> {
+	await db
+		.prepare(
+			`INSERT INTO approvals
+       (token, kind, mailbox_id, draft_id, telegram_user_id, created_at, expires_at, payload_hash, consumed_at, origin, oauth_client_id, token_sub, token_jti, decision)
+       VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, ?, ?, ?, NULL)`,
+		)
+		.bind(
+			row.token,
+			row.kind,
+			row.mailboxId,
+			row.draftId,
+			nowIso(),
+			row.expiresAt,
+			row.payloadHash,
+			row.origin,
+			row.oauthClientId ?? null,
+			row.tokenSub ?? null,
+			row.tokenJti ?? null,
+		)
+		.run();
+}
+
+/**
+ * Single-winner consume. A concurrent caller sees zero changes and must not send.
+ * Expired rows are left untouched so status can still report them as expired.
+ */
+export async function consumeApproval(
+	db: D1Database,
+	token: string,
+	decision: "approved" | "denied",
+	now = nowIso(),
+): Promise<boolean> {
+	const result = await db
+		.prepare(
+			`UPDATE approvals
+       SET consumed_at = ?, decision = ?
+       WHERE token = ? AND consumed_at IS NULL AND decision IS NULL AND expires_at > ?`,
+		)
+		.bind(now, decision, token, now)
+		.run();
+	return (result.meta?.changes ?? 0) > 0;
+}
+
+export async function getOutboundSendByIntentId(
+	db: D1Database,
+	intentId: string,
+): Promise<OutboundSendRow | null> {
+	return db
+		.prepare("SELECT * FROM outbound_sends WHERE intent_id = ?")
+		.bind(intentId)
+		.first<OutboundSendRow>();
+}
+
+export async function updateOutboundSendAudit(
+	db: D1Database,
+	input: {
+		idempotencyKey: string;
+		approvalChannel: "web" | "telegram" | "mcp_approval";
+		intentId: string;
+		payloadHash: string;
+		oauthClientId?: string | null;
+		tokenSub?: string | null;
+		tokenJti?: string | null;
+	},
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE outbound_sends
+       SET approval_channel = ?, intent_id = ?, payload_hash = ?, oauth_client_id = ?, token_sub = ?, token_jti = ?, updated_at = ?
+       WHERE idempotency_key = ?`,
+		)
+		.bind(
+			input.approvalChannel,
+			input.intentId,
+			input.payloadHash,
+			input.oauthClientId ?? null,
+			input.tokenSub ?? null,
+			input.tokenJti ?? null,
+			nowIso(),
+			input.idempotencyKey,
+		)
+		.run();
 }
 
 export async function deleteApproval(db: D1Database, token: string): Promise<void> {

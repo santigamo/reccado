@@ -1,12 +1,15 @@
 import {
 	createOutboundSendIfMissing,
+	getApproval,
 	getMailbox,
 	getOutboundSendByIdempotency,
 	insertOpsEvent,
+	updateOutboundSendAudit,
 	updateOutboundSendStatus,
 	upsertMessageIndex,
 } from "../db/d1";
 import { enqueueTelegramCardRefresh } from "../telegram/cards";
+import { approvalProofSecret, signMcpApprovalProof, type McpApprovalProof } from "./approvals";
 import { AppError } from "./errors";
 import { outboundSendIdempotencyKey } from "./idempotency";
 import { mailboxStub } from "./mailbox-stub";
@@ -53,9 +56,47 @@ export async function confirmDraftSend(
 		attemptKey: string;
 		approvalMode?: "human_confirmed" | "telegram_confirmed" | "preauthorized_transactional";
 		expectedPayloadHash?: string;
+		/**
+		 * Set only by the approval service after it has consumed the intent with a
+		 * passkey. The web and Telegram callers leave this unset; an `mcp` draft
+		 * then cannot send.
+		 */
+		approval?: {
+			intentId: string;
+			payloadHash: string;
+			oauthClientId?: string | null;
+			tokenSub?: string | null;
+			tokenJti?: string | null;
+		};
 	},
 ): Promise<ConfirmDraftSendResult> {
 	const { mailboxId, draftId, attemptKey, approvalMode } = input;
+	let approvalProof: McpApprovalProof | null = null;
+	if (input.approval) {
+		if (!input.expectedPayloadHash || input.expectedPayloadHash !== input.approval.payloadHash) {
+			return { status: 409, body: { id: draftId, sent: false, error: "approval_required" } };
+		}
+		const intent = await getApproval(env.INDEX_DB, input.approval.intentId);
+		const secret = approvalProofSecret(env);
+		if (
+			!secret ||
+			!intent ||
+			intent.decision !== "approved" ||
+			!intent.consumed_at ||
+			intent.payload_hash !== input.approval.payloadHash ||
+			intent.mailbox_id !== mailboxId ||
+			intent.draft_id !== draftId
+		) {
+			return { status: 409, body: { id: draftId, sent: false, error: "approval_required" } };
+		}
+		approvalProof = await signMcpApprovalProof(secret, {
+			intentId: input.approval.intentId,
+			mailboxId,
+			draftId,
+			payloadHash: input.approval.payloadHash,
+			exp: Date.now() + 60_000,
+		});
+	}
 	const mailbox = await getMailbox(env.INDEX_DB, mailboxId);
 	if (!mailbox) {
 		throw new AppError("Mailbox not found", "mailbox_not_found", 404);
@@ -87,6 +128,18 @@ export async function confirmDraftSend(
 		status: "sending",
 		approval_mode: approvalMode ?? "human_confirmed",
 	});
+
+	if (input.approval && approvalProof) {
+		await updateOutboundSendAudit(env.INDEX_DB, {
+			idempotencyKey,
+			approvalChannel: "mcp_approval",
+			intentId: input.approval.intentId,
+			payloadHash: input.approval.payloadHash,
+			oauthClientId: input.approval.oauthClientId,
+			tokenSub: input.approval.tokenSub,
+			tokenJti: input.approval.tokenJti,
+		});
+	}
 
 	if (!created) {
 		// Another caller already holds this idempotency key. Re-fetch to see current status.
@@ -149,6 +202,7 @@ export async function confirmDraftSend(
 				mailboxAddress: mailbox.primary_address,
 				displayName: mailbox.display_name,
 				expectedPayloadHash: input.expectedPayloadHash,
+				approvalProof,
 			}),
 		});
 	} catch (error) {

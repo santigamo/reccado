@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflare/types";
+import { approvalProofSecret, verifyMcpApprovalProof, type McpApprovalProof } from "../lib/approvals";
 import { sha256Hex } from "../lib/crypto";
 import { buildReferences, messageIdHeader, referencesHeader } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
@@ -506,6 +507,8 @@ type ConfirmSendDraftContext = {
 	 */
 	r2?: Pick<R2Bucket, "put">;
 	mailboxId?: string;
+	/** Present only when the worker has verified a consumed passkey approval. */
+	approvalProofSecret?: string | null;
 };
 
 type ParentMessageRow = {
@@ -613,6 +616,23 @@ function parseAddressList(json: string | null | undefined): string[] {
 	}
 }
 
+/** Addresses this mailbox has already exchanged mail with, for the approval warning. */
+function seenAddresses(sql: SqlStorage): string[] {
+	const rows = sql
+		.exec<{ from_addr: string; to_json: string; cc_json: string }>(
+			"SELECT from_addr, to_json, cc_json FROM messages",
+		)
+		.toArray();
+	const seen = new Set<string>();
+	for (const row of rows) {
+		if (row.from_addr) seen.add(row.from_addr.trim().toLowerCase());
+		for (const address of [...parseAddressList(row.to_json), ...parseAddressList(row.cc_json)]) {
+			seen.add(address.trim().toLowerCase());
+		}
+	}
+	return [...seen];
+}
+
 /**
  * From/Reply-To for a draft. Exported for tests: with a catch-all route this is
  * the difference between answering as shop@ and quietly outing the mailbox's
@@ -666,6 +686,7 @@ export async function confirmSendDraft(
 	draftId: string | undefined,
 	idempotencyKey: string,
 	expectedPayloadHash?: string,
+	approvalProof?: McpApprovalProof | null,
 ): Promise<Record<string, unknown>> {
 	if (!draftId) throw new Error("draftId required");
 	let draft = ctx.sql
@@ -676,7 +697,24 @@ export async function confirmSendDraft(
 		.exec<{ origin: string }>("SELECT origin FROM outbound_drafts WHERE id = ?", draftId)
 		.toArray()[0]?.origin;
 	if (origin === "mcp") {
-		return { id: draftId, status: draft.status, sent: false, error: "approval_required" };
+		const secret = ctx.approvalProofSecret;
+		const proofOk =
+			Boolean(secret) &&
+			Boolean(approvalProof) &&
+			Boolean(ctx.mailboxId) &&
+			expectedPayloadHash !== undefined &&
+			approvalProof?.payloadHash === expectedPayloadHash &&
+			(await verifyMcpApprovalProof(secret as string, {
+				intentId: approvalProof?.intentId ?? "",
+				payloadHash: approvalProof?.payloadHash ?? "",
+				exp: approvalProof?.exp ?? 0,
+				sig: approvalProof?.sig ?? "",
+				mailboxId: ctx.mailboxId ?? "",
+				draftId,
+			}));
+		if (!proofOk) {
+			return { id: draftId, status: draft.status, sent: false, error: "approval_required" };
+		}
 	}
 
 	const sentMarker = ctx.sql
@@ -1375,7 +1413,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const stale = this.ctx.storage.sql.exec<{ value: string }>(
 				"SELECT value FROM mailbox_meta WHERE key = ?", `intent_stale:${draftId}`,
 			).toArray()[0];
-			return Response.json({ ...JSON.parse(row.value) as object, stale: stale?.value === "stale" });
+			return Response.json({
+				...(JSON.parse(row.value) as object),
+				stale: stale?.value === "stale",
+				seenAddresses: seenAddresses(this.ctx.storage.sql),
+			});
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/confirm-send$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
@@ -1384,6 +1426,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				mailboxAddress?: string | null;
 				displayName?: string | null;
 				expectedPayloadHash?: string;
+				approvalProof?: McpApprovalProof | null;
 			};
 			const result = await this.confirmSendDraft(
 				draftId,
@@ -1391,6 +1434,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				body.mailboxAddress,
 				body.displayName,
 				body.expectedPayloadHash,
+				body.approvalProof,
 			);
 			// Ambiguous provider outcomes are business-level, not transport-level errors.
 			// Return 200 so the caller's confirmDraftSend reaches the "ambiguous" branch
@@ -2248,6 +2292,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		mailboxAddress?: string | null,
 		displayName?: string | null,
 		expectedPayloadHash?: string,
+		approvalProof?: McpApprovalProof | null,
 	): Promise<Record<string, unknown>> {
 		const identity = resolveReplyIdentity(
 			this.env,
@@ -2266,10 +2311,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				replyToAddress: identity.replyTo,
 				r2: this.env.MAIL_OBJECTS,
 				mailboxId: this.ctx.id.name,
+				approvalProofSecret: approvalProofSecret(this.env),
 			},
 			draftId,
 			idempotencyKey,
 			expectedPayloadHash,
+			approvalProof,
 		);
 	}
 
