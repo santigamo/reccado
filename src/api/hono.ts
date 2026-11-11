@@ -1,19 +1,20 @@
 import { Hono } from "hono";
 import { ZodError } from "zod";
 import { getSetupStatus } from "../db/d1";
-import { AppError } from "../lib/errors";
-import * as mailboxAdmin from "../lib/admin/mailboxes";
 import * as domainAdmin from "../lib/admin/domains";
-import * as routingAdmin from "../lib/admin/routing";
 import { AdminError, AdminRemoteError, AdminValidationError } from "../lib/admin/errors";
+import * as mailboxAdmin from "../lib/admin/mailboxes";
+import * as routingAdmin from "../lib/admin/routing";
+import { AppError } from "../lib/errors";
 import { getAuthConfigStatus, isLocalRequest } from "../lib/runtime-config";
-import { handleAuthRequest, handleSetPasswordRequest } from "./better-auth";
 import { type getAuthContext, requireAuth } from "./auth";
+import { handleAuthRequest, handleSetPasswordRequest } from "./better-auth";
 import {
 	registerAdminRoutes,
 	registerMailboxRoutes,
 	registerMailboxSuppressionRoutes,
 } from "./mailbox-routes";
+import { registerOAuthClientRoutes } from "./oauth-client-routes";
 import { registerTelegramRoutes } from "./telegram-routes";
 
 export type ApiBindings = {
@@ -422,6 +423,7 @@ export function createApiApp(): Hono<ApiBindings> {
 	registerMailboxRoutes(api);
 	registerMailboxSuppressionRoutes(api);
 	registerAdminRoutes(api);
+	registerOAuthClientRoutes(api);
 	registerTelegramRoutes(api);
 
 	// MCP endpoint: forward all methods (GET/POST/OPTIONS) to the MCP handler.

@@ -15,6 +15,9 @@
  *   pnpm operator telegram rebind --chat <id> [--apply]
  *   pnpm operator telegram topic <mailboxId|address> (--name "..." | --adopt <threadId>) [--replace] [--apply]
  *   pnpm operator telegram topics
+ *   pnpm operator mcp register [--name <name>] [--callback-port <port>]
+ *   pnpm operator mcp clients
+ *   pnpm operator mcp revoke <client_id>
  *
  * The telegram subcommands call /api/telegram/* with the stored session; the
  * worker makes every Bot API call with its own (write-only) token. Mutating
@@ -26,6 +29,7 @@
  *
  * Never prints the pairing code or the session cookie.
  */
+import { type OAuthClientRevokeResult, parseMcpRevokeArgs } from "../src/api/oauth-client-routes";
 import type { RebindResult } from "../src/telegram/admin/rebind";
 import type { TelegramOperatorStatus } from "../src/telegram/admin/status";
 import type { TopicListing, TopicMappingResult } from "../src/telegram/admin/topics";
@@ -107,7 +111,10 @@ const USAGE = `Usage: pnpm operator <login|whoami|logout|telegram|mcp> [--env <e
           list every topic mapping, marking the ones in the bound chat
   mcp register [--name <name>] [--callback-port <port>] [--redirect-uri <uri> ...]
           register a public PKCE client (default: Claude Code, port 33418)
-  mcp clients    list clients registered by this session's owner`;
+  mcp clients    list clients registered by this session's owner
+  mcp revoke <client_id>
+          delete that client's refresh tokens, access tokens, consent and
+          registration. Already-issued access JWTs stay valid for 3600 s`;
 
 type Flags = Record<string, string>;
 
@@ -118,13 +125,44 @@ type OAuthClient = {
 	client_id_issued_at?: number;
 };
 
+function printRevokeResult(result: OAuthClientRevokeResult): void {
+	const name = result.name ? ` (${result.name})` : "";
+	console.log(`Revoked ${result.client_id}${name}.`);
+	console.log(
+		`Deleted access tokens: ${result.deleted.access_tokens}, refresh tokens: ${result.deleted.refresh_tokens}, consents: ${result.deleted.consents}.`,
+	);
+	console.log(result.notice);
+	console.log(`Access tokens remain valid until ${result.access_tokens_valid_until}.`);
+}
+
 async function runMcp(
 	sub: string | undefined,
+	args: string[],
 	flags: Flags,
 	redirects: string[],
 	host: string,
 	env?: string,
 ): Promise<number> {
+	if (sub === "revoke") {
+		const clientId = parseMcpRevokeArgs(args);
+		const session = requireSession(host, env);
+		try {
+			const result = await operatorJson<OAuthClientRevokeResult>(
+				session,
+				`/api/oauth-clients/${encodeURIComponent(clientId)}/revoke`,
+				{ method: "POST" },
+				{ env },
+			);
+			printRevokeResult(result);
+			return 0;
+		} catch (error) {
+			if (error instanceof OperatorHttpError && error.status === 404) {
+				console.error("No client with that id is registered by or consented to by this owner.");
+				return 1;
+			}
+			throw error;
+		}
+	}
 	const session = requireSession(host, env);
 	if (sub === "register") {
 		const port = Number(flags["callback-port"] ?? "33418");
@@ -181,7 +219,7 @@ async function runMcp(
 		if (!clients.length) console.log("No clients registered by this owner.");
 		return 0;
 	}
-	throw new Error("Unknown mcp subcommand; use register or clients.");
+	throw new Error("Unknown mcp subcommand; use register, clients, or revoke.");
 }
 
 /** `pnpm operator telegram <sub>`: thin IO around /api/telegram/*; formatting is in the core. */
@@ -277,7 +315,7 @@ async function main(): Promise<number> {
 
 	switch (command) {
 		case "mcp":
-			return runMcp(positional[1], flags, redirects, host, env);
+			return runMcp(positional[1], positional.slice(2), flags, redirects, host, env);
 		case "login": {
 			const email = resolveOwnerEmail(flags.email);
 			const ttlMinutes = flags.ttl ? Number(flags.ttl) : undefined;
