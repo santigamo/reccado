@@ -294,6 +294,8 @@ export const CARD_STATUS_FOR_ACTION = {
 	mark_unread: "unread",
 } as const satisfies Record<string, TelegramCardStatus>;
 
+export type TelegramCardAction = keyof typeof CARD_STATUS_FOR_ACTION;
+
 export type CardRefreshOutcome =
 	| { status: "edited" | "unchanged" }
 	| {
@@ -377,6 +379,25 @@ export async function enqueueTelegramCardRefresh(
 			error: error instanceof Error ? error.message : String(error),
 		});
 	}
+}
+
+/**
+ * Queues the card edit a triage verb implies.
+ *
+ * One mapping for every surface that mutates a message: the HTTP actions route
+ * and MCP `update_messages` both call this, so a card never learns a status
+ * from one of them that the other would not have sent.
+ */
+export async function enqueueTelegramCardRefreshForAction(
+	env: Env,
+	input: { mailboxId: string; messageLocalId: string; action: TelegramCardAction },
+): Promise<void> {
+	await enqueueTelegramCardRefresh(env, {
+		mailboxId: input.mailboxId,
+		messageLocalId: input.messageLocalId,
+		threadId: null,
+		status: CARD_STATUS_FOR_ACTION[input.action],
+	});
 }
 
 // --- cards for mail nobody just received -----------------------------------

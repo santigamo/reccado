@@ -2,6 +2,7 @@ import { getMailboxForOwner, listMailboxesByOwner } from "../db/d1";
 import type { McpDraftResult, McpMessageDto, McpSearchResult, McpThread } from "./types";
 import { mailboxStub } from "../lib/mailbox-stub";
 import { redactSensitive, sensitiveKindForRead, type SensitiveKind } from "../lib/sensitive-mail";
+import { enqueueTelegramCardRefreshForAction, type TelegramCardAction } from "../telegram/cards";
 import { assertScope, type McpAuthContext } from "./scopes";
 
 const MCP_MAX_BODY_CHARS = 10_000;
@@ -26,7 +27,17 @@ type RawThread = {
 
 type RawSearchHit = { message_id: string };
 
-const MESSAGE_ACTIONS = new Set(["mark_read", "mark_unread", "archive", "restore_inbox", "trash"]);
+const MESSAGE_ACTIONS = new Set<TelegramCardAction>([
+	"mark_read",
+	"mark_unread",
+	"archive",
+	"restore_inbox",
+	"trash",
+]);
+
+function isMessageAction(action: string): action is TelegramCardAction {
+	return MESSAGE_ACTIONS.has(action as TelegramCardAction);
+}
 
 async function draftMutationError(response: Response): Promise<Error> {
 	const body = (await response.json().catch(() => null)) as { currentStatus?: string | null } | null;
@@ -386,7 +397,7 @@ export class McpMailboxFacade {
 	}
 
 	async updateMessages(mailboxId: string, messageIds: string[], action: string) {
-		if (!MESSAGE_ACTIONS.has(action)) throw new Error("validation_error");
+		if (!isMessageAction(action)) throw new Error("validation_error");
 		const stub = await this.resolveMailbox(mailboxId);
 		for (const id of messageIds) await this.messageRow(mailboxId, id);
 		for (const id of messageIds) {
@@ -399,6 +410,13 @@ export class McpMailboxFacade {
 				},
 			);
 			if (!response.ok) throw new Error("internal_error");
+			// Same best-effort card edit as the HTTP actions route. A queue miss
+			// must not undo a mutation the mailbox already accepted.
+			await enqueueTelegramCardRefreshForAction(this.env, {
+				mailboxId,
+				messageLocalId: id,
+				action,
+			});
 		}
 		return { message_ids: messageIds, action };
 	}

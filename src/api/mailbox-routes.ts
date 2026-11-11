@@ -8,7 +8,7 @@ import * as ops from "../lib/admin/ops";
 import { adminResponse } from "../lib/admin/errors";
 import { AppError } from "../lib/errors";
 import { confirmDraftSend } from "../lib/outbound-send";
-import { CARD_STATUS_FOR_ACTION, enqueueTelegramCardRefresh } from "../telegram/cards";
+import { enqueueTelegramCardRefreshForAction } from "../telegram/cards";
 import { assertMailboxAccess } from "./auth";
 import type { ApiBindings } from "./hono";
 import {
@@ -202,11 +202,10 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		// inbox. Queued, so the edit waits behind Telegram's per-chat rate limit
 		// instead of this request doing so.
 		if (response.ok) {
-			await enqueueTelegramCardRefresh(c.env, {
+			await enqueueTelegramCardRefreshForAction(c.env, {
 				mailboxId,
 				messageLocalId: messageId,
-				threadId: null,
-				status: CARD_STATUS_FOR_ACTION[body.action],
+				action: body.action,
 			});
 		}
 		return response;
