@@ -3,8 +3,10 @@ import { McpServer, type McpRequestContext } from "@modelcontextprotocol/server"
 import { createMcpHandler } from "agents/mcp/server";
 import { createAuth, AuthConfigError, resolveMcpResource } from "../api/better-auth";
 import { recordDeploymentOrigin } from "../db/runtime-config";
-import { requireMcpOwner, resolveOwnerEmails, type AuthContext } from "./auth-import";
+import { requireMcpOwner, resolveOwnerEmails } from "./auth-import";
 import { registerTools } from "./tools";
+import { scopesFromClaims } from "../lib/mcp-scopes";
+import type { McpAuthContext } from "./scopes";
 
 /**
  * The claims the owner gate consumes. Structural on purpose: `jose` is not a
@@ -14,6 +16,7 @@ import { registerTools } from "./tools";
 type McpAccessTokenClaims = {
 	sub?: string;
 	email?: string;
+	scope?: unknown;
 	[key: string]: unknown;
 };
 
@@ -27,7 +30,7 @@ async function runMcpServer(
 	request: Request,
 	env: Env,
 	ctx: ExecutionContext,
-	auth: AuthContext,
+	auth: McpAuthContext,
 ): Promise<Response> {
 	const hostname = new URL(request.url).hostname;
 	const allowedHostnames = ["inbox.imsanti.dev", "localhost", "127.0.0.1", "[::1]"];
@@ -81,7 +84,7 @@ export async function mcpHandler(
 	// bearer header on preflights, and the MCP transport answers it (same
 	// exemption the old session middleware granted).
 	if (request.method === "OPTIONS") {
-		return runMcpServer(request, env, ctx, { userId: "", email: "" });
+		return runMcpServer(request, env, ctx, { userId: "", email: "", scopes: new Set() });
 	}
 
 	let auth: Awaited<ReturnType<typeof createAuth>>;
@@ -101,10 +104,11 @@ export async function mcpHandler(
 			// Token identity → AuthContext. The email claim is stamped at mint by
 			// the mcp plugin's customAccessTokenClaims; a token without it cannot
 			// match an owner and fails closed below.
-			const ownerAuth: AuthContext = {
+			const ownerAuth: McpAuthContext = {
 				userId: typeof claims.sub === "string" ? claims.sub : "",
 				email: typeof claims.email === "string" ? claims.email : "",
 				owners: await resolveOwnerEmails(env),
+				scopes: scopesFromClaims(claims),
 			};
 			try {
 				requireMcpOwner(ownerAuth, env);

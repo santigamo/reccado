@@ -4,6 +4,7 @@ import type { AuthContext } from "../api/auth";
 import { insertOpsEvent } from "../db/d1";
 import { McpMailboxFacade } from "./mailbox-facade";
 import { mcpToolError, mcpToolResultJson } from "./errors";
+import { assertScope, McpScopeError, type McpAuthContext } from "./scopes";
 
 type RateLimitMap = Map<string, number>;
 
@@ -48,6 +49,7 @@ async function auditMcpCall(
 			subject: auth.email,
 			payload_json: JSON.stringify({
 				tool: toolName,
+				scope: toolName === "draft_reply" ? "mail:draft" : "mail:read",
 				mailbox_id: mailboxId,
 				result_count: details.result_count ?? null,
 				latency_ms: details.latency_ms ?? null,
@@ -60,8 +62,22 @@ async function auditMcpCall(
 	}
 }
 
-export function registerTools(server: McpServer, env: Env, auth: AuthContext): void {
+export function registerTools(server: McpServer, env: Env, auth: McpAuthContext): void {
 	const facade = new McpMailboxFacade(env, auth);
+	async function denied(tool: string, mailboxId: string | null, scope: string, start: number) {
+		try {
+			assertScope(auth, scope);
+			return null;
+		} catch (error) {
+			if (!(error instanceof McpScopeError)) throw error;
+			await auditMcpCall(env, auth, tool, mailboxId, {
+				denied: true,
+				reason: "insufficient_scope",
+				latency_ms: Date.now() - start,
+			});
+			return mcpToolError(error.message);
+		}
+	}
 
 	server.registerTool(
 		"list_mailboxes",
@@ -82,6 +98,8 @@ export function registerTools(server: McpServer, env: Env, auth: AuthContext): v
 		},
 		async () => {
 			const start = Date.now();
+			const scopeError = await denied("list_mailboxes", null, "mail:read", start);
+			if (scopeError) return scopeError;
 			if (!checkRateLimit(auth, "list_mailboxes")) {
 				await auditMcpCall(env, auth, "list_mailboxes", null, {
 					denied: true,
@@ -153,6 +171,8 @@ export function registerTools(server: McpServer, env: Env, auth: AuthContext): v
 		},
 		async (params) => {
 			const start = Date.now();
+			const scopeError = await denied("list_threads", params.mailboxId, "mail:read", start);
+			if (scopeError) return scopeError;
 			if (!checkRateLimit(auth, "list_threads")) {
 				await auditMcpCall(env, auth, "list_threads", params.mailboxId, {
 					denied: true,
@@ -208,8 +228,15 @@ export function registerTools(server: McpServer, env: Env, auth: AuthContext): v
 		},
 		async (params) => {
 			const start = Date.now();
+			const scopeError = await denied(
+				"search_messages",
+				params.mailboxId ?? null,
+				"mail:read",
+				start,
+			);
+			if (scopeError) return scopeError;
 			if (!checkRateLimit(auth, "search_messages")) {
-				await auditMcpCall(env, auth, "search_messages", params.mailboxId, {
+				await auditMcpCall(env, auth, "search_messages", params.mailboxId ?? null, {
 					denied: true,
 					reason: "rate_limited",
 					latency_ms: Date.now() - start,
@@ -218,14 +245,14 @@ export function registerTools(server: McpServer, env: Env, auth: AuthContext): v
 			}
 			try {
 				const results = await facade.searchMessages(params.mailboxId, params.q, params.limit);
-				await auditMcpCall(env, auth, "search_messages", params.mailboxId, {
+				await auditMcpCall(env, auth, "search_messages", params.mailboxId ?? null, {
 					result_count: results.length,
 					latency_ms: Date.now() - start,
 				});
 				return mcpToolResultJson({ results });
 			} catch (error) {
 				const msg = error instanceof Error ? error.message : "internal_error";
-				await auditMcpCall(env, auth, "search_messages", params.mailboxId, {
+				await auditMcpCall(env, auth, "search_messages", params.mailboxId ?? null, {
 					denied: true,
 					reason: msg,
 					latency_ms: Date.now() - start,
@@ -276,6 +303,8 @@ export function registerTools(server: McpServer, env: Env, auth: AuthContext): v
 		},
 		async (params) => {
 			const start = Date.now();
+			const scopeError = await denied("read_message", params.mailboxId, "mail:read", start);
+			if (scopeError) return scopeError;
 			if (!checkRateLimit(auth, "read_message")) {
 				await auditMcpCall(env, auth, "read_message", params.mailboxId, {
 					denied: true,
@@ -338,6 +367,8 @@ export function registerTools(server: McpServer, env: Env, auth: AuthContext): v
 		},
 		async (params) => {
 			const start = Date.now();
+			const scopeError = await denied("draft_reply", params.mailboxId, "mail:draft", start);
+			if (scopeError) return scopeError;
 			if (!checkRateLimit(auth, "draft_reply")) {
 				await auditMcpCall(env, auth, "draft_reply", params.mailboxId, {
 					denied: true,
