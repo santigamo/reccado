@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-In flight: T8 `mcp-tools` (P3 tools, Codex), T6b `mcp-approve-2` (P4b completion, Cursor `grok-4.7-xhigh-fast`). From 2026-11-11 new workers use Cursor CLI with `grok-4.7-xhigh-fast` (max effort, fast mode; Codex quota). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
+In flight: T6b `mcp-approve-2` (P4b completion, Cursor `grok-4.7-xhigh-fast`). From 2026-11-11 new workers use Cursor CLI with `grok-4.7-xhigh-fast` (max effort, fast mode; Codex quota). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -259,14 +259,24 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 - [x] REST routes switch to services with existing tests unchanged and green.
 
 ### P3 — Read, draft, tier 1, admin reads
-- [ ] Read tools incl. `read_thread`, cross-mailbox search, `resource_link` attachments.
+- [x] Read tools incl. `read_thread`, cross-mailbox search (active owned mailboxes only). (T8, merged
+      0745986; finished by Grok after Codex quota ran out.) Attachments and raw MIME are **MCP
+      resources** (`reccado://mailboxes/{id}/messages/{id}/attachments/{id}`, `…/raw`) served by
+      `resources/read` with the same OAuth token — ownership + scope re-checked per read, 5 MB cap
+      (`too_large`), every read audited. Not session-authenticated HTTP links.
+- [x] Scopes enforced in every tool (`scopesFromClaims`; empty set grants nothing; missing →
+      `insufficient_scope: <scope>`).
 - [x] Sensitive-mail flag at ingest + redaction helper (T4, merged 43c630c): `src/lib/sensitive-mail.ts`,
       DO schema v8 `messages.sensitive_kind` + `sensitive_classified` (0 = legacy/unclassified,
       1 = classified), legacy fallback `sensitiveKindForRead` (pass fetched HTML for HTML-only rows).
-- [ ] Wire redaction + `mail:read:sensitive` into MCP read tools (also cover raw MIME / attachment
-      `resource_link`s — separate exposure paths).
-- [ ] `update_messages`, `save_draft`, `cancel_draft`.
-- [ ] `get_health`, `list_ops`, `list_config` (control plane is **read-only** until P4).
+- [x] Redaction + `mail:read:sensitive` in read tools; raw MIME / attachments of sensitive mail need
+      the scope.
+- [x] `update_messages`, `save_draft`, `cancel_draft`. Drafts saved via MCP always `origin='mcp'`
+      (web confirm → `approval_required`, tested). Atomic DO preconditions (`allowedStatuses`):
+      update only `draft`; cancel `draft|pending_confirmation`; else 409 `draft_not_editable`.
+- [x] `get_health`, `list_ops`, `list_config` (control plane is **read-only** until P4).
+- [ ] Follow-up: `update_messages` via MCP does not refresh Telegram cards like the HTTP actions
+      route does; labels are not a message action today (dropped from the tool).
 
 ### P4 — Approvals, passkey, send
 - [x] Migration `0022_approvals.sql`: `telegram_actions` → `approvals` (+ `kind`,
