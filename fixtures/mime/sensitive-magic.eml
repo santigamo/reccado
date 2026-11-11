@@ -1,0 +1,7 @@
+From: no-reply@example.com
+To: test@example.com
+Subject: Your magic link
+Message-ID: <sensitive-magic@example.com>
+Content-Type: text/plain; charset=utf-8
+
+Sign in using this magic link: https://example.com/login?code=secretvalue

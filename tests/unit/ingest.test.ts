@@ -10,6 +10,7 @@ import duplicateBEml from "../../fixtures/mime/duplicate-message-id-b.eml?raw";
 import missingMessageIdEml from "../../fixtures/mime/missing-message-id.eml?raw";
 import multipartAlternativeEml from "../../fixtures/mime/multipart-alternative.eml?raw";
 import multipartHtmlOnlyContentEml from "../../fixtures/mime/multipart-html-only-content.eml?raw";
+import sensitiveOtpEml from "../../fixtures/mime/sensitive-otp-es.eml?raw";
 
 type TestEnv = Env & { MAIL_OBJECTS: R2Bucket; MAILBOX_DO: DurableObjectNamespace };
 
@@ -120,6 +121,35 @@ function buildDeeplyNestedMimeBytes(depth: number, messageId: string): Uint8Arra
 }
 
 describe("mailbox DO ingest", () => {
+	it("stores sensitivity and preserves it on duplicate ingest and thread reads", {
+		timeout: 20_000,
+	}, async () => {
+		const mailboxId = "mbx_sensitive_ingest";
+		const first = await ingestFixture(
+			mailboxId,
+			sensitiveOtpEml,
+			"sensitive-otp-es@example.com",
+			"Tu código de verificación",
+		);
+		const second = await ingestFixture(
+			mailboxId,
+			sensitiveOtpEml,
+			"sensitive-otp-es@example.com",
+			"Tu código de verificación",
+		);
+		expect(first.result.status).toBe("inserted");
+		expect(second.result.status).toBe("duplicate");
+		expect(second.result.messageLocalId).toBe(first.result.messageLocalId);
+		const message = await getDoMessage(mailboxId, first.result.messageLocalId as string);
+		expect(message.sensitive_kind).toBe("otp");
+		expect(message.sensitive_classified).toBe(1);
+		const response = await mailboxStub(mailboxId).fetch(
+			`https://mailbox-do/threads/${first.result.threadId}`,
+		);
+		const thread = (await response.json()) as { messages: Array<Record<string, unknown>> };
+		expect(thread.messages).toHaveLength(1);
+		expect(thread.messages[0]?.sensitive_kind).toBe("otp");
+	});
 	// timeout: the worker bundle now carries the better-auth issuer, which widens
 	// the per-test import/first-call margin just enough that this DO round-trip can
 	// brush the 5s default when the whole suite shares one workerd process.
