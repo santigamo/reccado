@@ -55,16 +55,21 @@ const drafter = actor("drafter@local", ["mail:read", "mail:draft"]);
 const admin = actor("admin@local", ["mail:read", "mail:draft", "admin"]);
 const sensitive = actor("reader@local", ["mail:read", "mail:draft", "mail:read:sensitive"]);
 
-function serverFor(auth: McpAuthContext) {
+function serverFor(auth: McpAuthContext, toolEnv: Env = testEnv) {
 	const server = new McpServer({ name: "reccado", version: "1.0.0" });
-	registerTools(server, testEnv, auth, "http://localhost");
+	registerTools(server, toolEnv, auth, "http://localhost");
 	return server as unknown as {
 		_registeredTools: Record<string, { handler: (args: Record<string, unknown>) => Promise<ToolBody> }>;
 	};
 }
 
-async function callTool(auth: McpAuthContext, name: string, args: Record<string, unknown> = {}) {
-	const tool = serverFor(auth)._registeredTools[name];
+async function callTool(
+	auth: McpAuthContext,
+	name: string,
+	args: Record<string, unknown> = {},
+	toolEnv: Env = testEnv,
+) {
+	const tool = serverFor(auth, toolEnv)._registeredTools[name];
 	if (!tool) throw new Error(`missing tool ${name}`);
 	return tool.handler(args);
 }
@@ -675,6 +680,70 @@ describe("MCP P3 tools", () => {
 				}),
 			),
 		).toContain("not_found");
+	});
+
+	it("enqueues the same Telegram card refresh the HTTP actions route does", async () => {
+		const id = await mailbox(drafter.email);
+		const message = await seedMessage(id, { body: "archive me", fts: false });
+		const queued: unknown[] = [];
+		const toolEnv = {
+			...testEnv,
+			TELEGRAM_BOT_TOKEN: "123:fake-token",
+			NOTIFY_QUEUE: {
+				send: async (body: unknown) => {
+					queued.push(body);
+				},
+			},
+		} as unknown as Env;
+
+		const result = await callTool(
+			drafter,
+			"update_messages",
+			{ mailboxId: id, messageIds: [message.messageId], action: "archive" },
+			toolEnv,
+		);
+
+		expect(result.isError, textOf(result)).toBeFalsy();
+		expect(queued).toEqual([
+			{
+				schemaVersion: 1,
+				eventType: "telegram.card_refresh.v1",
+				refresh: {
+					mailboxId: id,
+					messageLocalId: message.messageId,
+					threadId: null,
+					status: "archived",
+				},
+			},
+		]);
+	});
+
+	it("still succeeds when the Telegram card refresh cannot be enqueued", async () => {
+		const id = await mailbox(drafter.email);
+		const message = await seedMessage(id, { body: "archive me", fts: false });
+		const toolEnv = {
+			...testEnv,
+			TELEGRAM_BOT_TOKEN: "123:fake-token",
+			NOTIFY_QUEUE: {
+				send: async () => {
+					throw new Error("queue down");
+				},
+			},
+		} as unknown as Env;
+
+		const result = await callTool(
+			drafter,
+			"update_messages",
+			{ mailboxId: id, messageIds: [message.messageId], action: "archive" },
+			toolEnv,
+		);
+
+		expect(result.isError, textOf(result)).toBeFalsy();
+		expect(result.structuredContent).toMatchObject({
+			action: "archive",
+			message_ids: [message.messageId],
+		});
+		expect((await messageRow(id, message.messageId)).state).toBe("archive");
 	});
 
 	it("reads health, ops and config without secrets", async () => {
