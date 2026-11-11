@@ -284,9 +284,16 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
-		const stub = await requireMailboxStub(c.env, mailboxId);
+		const mailbox = await getMailbox(c.env.INDEX_DB, mailboxId);
+		if (!mailbox) throw new AppError("Mailbox not found", "mailbox_not_found", 404);
+		const stub = mailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}/request-send`, {
 			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				mailboxAddress: mailbox.primary_address,
+				displayName: mailbox.display_name,
+			}),
 		});
 	});
 

@@ -6,12 +6,15 @@ import {
 import { env } from "cloudflare:workers";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import worker from "#/server";
+import { confirmSendDraft } from "#/do/mailbox-do";
 import { deriveWebhookSecret } from "#/telegram/api";
 import { deliverInboundNotification } from "#/telegram/notify";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
 import migrationTelegram from "../../migrations/d1/0004_telegram.sql?raw";
+import migrationApprovals from "../../migrations/d1/0022_approvals.sql?raw";
+import migrationOutbound from "../../migrations/d1/0005_outbound_status_approval.sql?raw";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationTelegramTopics from "../../migrations/d1/0010_telegram_topics.sql?raw";
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
@@ -139,6 +142,8 @@ beforeAll(async () => {
 		migrationMessageIndex,
 		migrationMailboxOwner,
 		migrationTelegram,
+		migrationApprovals,
+		migrationOutbound,
 		migrationRuntimeConfig,
 		migrationTelegramTopics,
 		migrationTelegramTopicName,
@@ -234,7 +239,7 @@ function telegramEnv(): Env {
 	} as Env;
 }
 
-async function post(body: unknown): Promise<Response> {
+async function post(body: unknown, environment = telegramEnv()): Promise<Response> {
 	const request = new Request("https://reccado.test/telegram/webhook", {
 		method: "POST",
 		headers: {
@@ -244,7 +249,7 @@ async function post(body: unknown): Promise<Response> {
 		body: JSON.stringify(body),
 	});
 	const ctx = createExecutionContext();
-	const response = await worker.fetch(request, telegramEnv(), ctx);
+	const response = await worker.fetch(request, environment, ctx);
 	await waitOnExecutionContext(ctx);
 	return response;
 }
@@ -321,6 +326,125 @@ async function composeReply(sourceMessageId: number, text: string): Promise<Comp
 }
 
 describe("editable draft", () => {
+	it("supersedes the old button, reuses the token on retry, and sends the corrected snapshot once", async () => {
+		const composed = await composeReply(8901, "Original.");
+		const old = await testEnv.INDEX_DB.prepare(
+			"SELECT token, payload_hash FROM approvals WHERE draft_id = ? AND consumed_at IS NULL",
+		)
+			.bind(composed.draftId)
+			.first<{ token: string; payload_hash: string }>();
+		expect(old).not.toBeNull();
+		const correction = messageUpdate({
+			message_id: 8902,
+			text: "Corregido.",
+			reply_to_message: {
+				message_id: composed.previewMessageId,
+				chat: { id: Number(CHAT_ID), type: "private" },
+			},
+		});
+		await post(correction);
+		const replacement = await testEnv.INDEX_DB.prepare(
+			"SELECT token, payload_hash FROM approvals WHERE draft_id = ? AND consumed_at IS NULL",
+		)
+			.bind(composed.draftId)
+			.first<{ token: string; payload_hash: string }>();
+		expect(replacement?.token).not.toBe(old?.token);
+		await post(correction);
+		const retried = await testEnv.INDEX_DB.prepare(
+			"SELECT token FROM approvals WHERE draft_id = ? AND consumed_at IS NULL",
+		)
+			.bind(composed.draftId)
+			.first<{ token: string }>();
+		expect(retried?.token).toBe(replacement?.token);
+		const calls = stubTelegramApi();
+		await post({
+			update_id: ++updateId,
+			callback_query: {
+				id: "old-button",
+				from: { id: Number(ALLOWED_USER) },
+				data: `s:${old!.token}`,
+				message: {
+					message_id: composed.previewMessageId,
+					chat: { id: Number(CHAT_ID), type: "private" },
+				},
+			},
+		});
+		expect(calls.find((c) => c.method === "answerCallbackQuery")?.body.text).toContain(
+			"Sustituido",
+		);
+		const sent: Array<{ text?: string }> = [];
+		const stub = testEnv.MAILBOX_DO.getByName(MAILBOX_ID);
+		const rejected = await runInDurableObject(stub, async (_instance, state) => {
+			const ctx = {
+				sql: state.storage.sql,
+				transactionSync: (fn: () => void) => state.storage.transactionSync(fn),
+				email: {
+					send: async (mail: { text?: string }) => {
+						sent.push(mail);
+						return {};
+					},
+				} as unknown as Env["EMAIL"],
+				fromAddress: "different@example.com",
+				replyToAddress: null,
+			};
+			return confirmSendDraft(ctx, composed.draftId, "old-key", old!.payload_hash);
+		});
+		expect(rejected.error).toBe("intent_stale");
+		// Exercise the real Telegram callback and D1 saga while replacing only the
+		// external provider with a fake inside the real mailbox's SQLite context.
+		const fakeNamespace = {
+			getByName: () => ({
+				fetch: async (_url: string, init: RequestInit) => {
+					const body = JSON.parse(String(init.body)) as {
+						idempotencyKey: string;
+						expectedPayloadHash: string;
+					};
+					return runInDurableObject(stub, async (_instance, state) =>
+						Response.json(
+							await confirmSendDraft(
+								{
+									sql: state.storage.sql,
+									transactionSync: (fn) => state.storage.transactionSync(fn),
+									email: {
+										send: async (mail: { text?: string }) => {
+											sent.push(mail);
+											return {};
+										},
+									} as unknown as Env["EMAIL"],
+									fromAddress: "different@example.com",
+									replyToAddress: null,
+								},
+								composed.draftId,
+								body.idempotencyKey,
+								body.expectedPayloadHash,
+							),
+						),
+					);
+				},
+			}),
+		};
+		const fakeEnv = {
+			...telegramEnv(),
+			MAILBOX_DO: fakeNamespace,
+			MAILBOX_JURISDICTION: "none",
+		} as unknown as Env;
+		const newButton = {
+			update_id: ++updateId,
+			callback_query: {
+				id: "new-button",
+				from: { id: Number(ALLOWED_USER) },
+				data: `s:${replacement!.token}`,
+				message: {
+					message_id: composed.previewMessageId,
+					chat: { id: Number(CHAT_ID), type: "private" },
+				},
+			},
+		};
+		await post(newButton, fakeEnv);
+		await post(newButton, fakeEnv);
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.text).toContain("Corregido.");
+	});
 	it("applies a correction quoted at the preview to the same draft", async () => {
 		const composed = await composeReply(9001, "Te la mando mñana.");
 		expect(

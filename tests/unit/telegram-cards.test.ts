@@ -5,6 +5,7 @@ import { handleCardCallback, refreshTelegramCard } from "#/telegram/cards";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationTelegram from "../../migrations/d1/0004_telegram.sql?raw";
+import migrationApprovals from "../../migrations/d1/0022_approvals.sql?raw";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationTelegramTopics from "../../migrations/d1/0010_telegram_topics.sql?raw";
 import migrationLinkIndex from "../../migrations/d1/0013_telegram_links_message_index.sql?raw";
@@ -30,6 +31,7 @@ beforeAll(async () => {
 		migrationInitial,
 		migrationMessageIndex,
 		migrationTelegram,
+		migrationApprovals,
 		migrationRuntimeConfig,
 		migrationTelegramTopics,
 		migrationTelegramTopicName,
@@ -223,9 +225,9 @@ describe("card triage buttons", () => {
 		expect(String(calls.find((call) => call.method === "editMessageText")?.body.text)).toContain(
 			"Factura pendiente",
 		);
-		const actions = await testEnv.INDEX_DB.prepare(
-			"SELECT COUNT(*) AS n FROM telegram_actions",
-		).first<{ n: number }>();
+		const actions = await testEnv.INDEX_DB.prepare("SELECT COUNT(*) AS n FROM approvals").first<{
+			n: number;
+		}>();
 		expect(actions?.n).toBe(0);
 	});
 

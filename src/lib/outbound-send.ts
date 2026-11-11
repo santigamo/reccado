@@ -52,6 +52,7 @@ export async function confirmDraftSend(
 		draftId: string;
 		attemptKey: string;
 		approvalMode?: "human_confirmed" | "telegram_confirmed" | "preauthorized_transactional";
+		expectedPayloadHash?: string;
 	},
 ): Promise<ConfirmDraftSendResult> {
 	const { mailboxId, draftId, attemptKey, approvalMode } = input;
@@ -147,6 +148,7 @@ export async function confirmDraftSend(
 				idempotencyKey,
 				mailboxAddress: mailbox.primary_address,
 				displayName: mailbox.display_name,
+				expectedPayloadHash: input.expectedPayloadHash,
 			}),
 		});
 	} catch (error) {

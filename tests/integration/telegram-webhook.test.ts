@@ -7,6 +7,7 @@ import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
 import migrationTelegram from "../../migrations/d1/0004_telegram.sql?raw";
+import migrationApprovals from "../../migrations/d1/0022_approvals.sql?raw";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationTelegramTopics from "../../migrations/d1/0010_telegram_topics.sql?raw";
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
@@ -33,6 +34,7 @@ beforeAll(async () => {
 		migrationMessageIndex,
 		migrationMailboxOwner,
 		migrationTelegram,
+		migrationApprovals,
 		migrationRuntimeConfig,
 		migrationTelegramTopics,
 		migrationTelegramTopicName,
@@ -485,7 +487,7 @@ describe("telegram webhook", () => {
 	it("does not act on a token issued to a different user", async () => {
 		const calls = stubTelegramApi();
 		await testEnv.INDEX_DB.prepare(
-			`INSERT INTO telegram_actions (token, kind, mailbox_id, draft_id, telegram_user_id, created_at, expires_at)
+			`INSERT INTO approvals (token, kind, mailbox_id, draft_id, telegram_user_id, created_at, expires_at)
        VALUES (?, 'confirm_send', 'mbx_test', 'draft-1', '777', ?, ?)`,
 		)
 			.bind(

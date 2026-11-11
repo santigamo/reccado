@@ -768,14 +768,17 @@ export type TelegramLinkRow = {
 	created_at: string;
 };
 
-export type TelegramActionRow = {
+export type ApprovalRow = {
 	token: string;
-	kind: "confirm_send";
-	mailbox_id: string;
-	draft_id: string;
-	telegram_user_id: string;
+	kind: string;
+	mailbox_id: string | null;
+	draft_id: string | null;
+	telegram_user_id: string | null;
 	created_at: string;
 	expires_at: string;
+	payload_hash: string | null;
+	consumed_at: string | null;
+	origin: "telegram" | "web" | "mcp";
 };
 
 export async function insertTelegramLink(
@@ -812,15 +815,16 @@ export async function getTelegramLinkByMessage(
 		.first<TelegramLinkRow>();
 }
 
-export async function insertTelegramAction(
+export async function insertApproval(
 	db: D1Database,
-	row: Omit<TelegramActionRow, "created_at">,
+	row: Omit<ApprovalRow, "created_at" | "payload_hash" | "consumed_at" | "origin"> &
+		Partial<Pick<ApprovalRow, "payload_hash" | "consumed_at" | "origin">>,
 ): Promise<void> {
 	await db
 		.prepare(
-			`INSERT INTO telegram_actions
-       (token, kind, mailbox_id, draft_id, telegram_user_id, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO approvals
+       (token, kind, mailbox_id, draft_id, telegram_user_id, created_at, expires_at, payload_hash, consumed_at, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
 		.bind(
 			row.token,
@@ -830,22 +834,54 @@ export async function insertTelegramAction(
 			row.telegram_user_id,
 			nowIso(),
 			row.expires_at,
+			row.payload_hash ?? null,
+			row.consumed_at ?? null,
+			row.origin ?? "telegram",
 		)
 		.run();
 }
 
-export async function getTelegramAction(
-	db: D1Database,
-	token: string,
-): Promise<TelegramActionRow | null> {
-	return db
-		.prepare("SELECT * FROM telegram_actions WHERE token = ?")
-		.bind(token)
-		.first<TelegramActionRow>();
+export async function getApproval(db: D1Database, token: string): Promise<ApprovalRow | null> {
+	return db.prepare("SELECT * FROM approvals WHERE token = ?").bind(token).first<ApprovalRow>();
 }
 
-export async function deleteTelegramAction(db: D1Database, token: string): Promise<void> {
-	await db.prepare("DELETE FROM telegram_actions WHERE token = ?").bind(token).run();
+export async function deleteApproval(db: D1Database, token: string): Promise<void> {
+	await db.prepare("DELETE FROM approvals WHERE token = ?").bind(token).run();
+}
+
+/** Replace the Telegram preview's active token atomically, preserving superseded rows. */
+export async function replaceTelegramApproval(
+	db: D1Database,
+	row: {
+		token: string;
+		mailbox_id: string;
+		draft_id: string;
+		telegram_user_id: string;
+		expires_at: string;
+		payload_hash: string;
+	},
+): Promise<void> {
+	const now = nowIso();
+	await db.batch([
+		db
+			.prepare(
+				"UPDATE approvals SET consumed_at = ? WHERE origin = 'telegram' AND kind = 'confirm_send' AND mailbox_id = ? AND draft_id = ? AND token <> ? AND consumed_at IS NULL",
+			)
+			.bind(now, row.mailbox_id, row.draft_id, row.token),
+		db
+			.prepare(`INSERT INTO approvals (token, kind, mailbox_id, draft_id, telegram_user_id, created_at, expires_at, payload_hash, origin)
+			VALUES (?, 'confirm_send', ?, ?, ?, ?, ?, ?, 'telegram')
+			ON CONFLICT(token) DO UPDATE SET consumed_at = NULL`)
+			.bind(
+				row.token,
+				row.mailbox_id,
+				row.draft_id,
+				row.telegram_user_id,
+				now,
+				row.expires_at,
+				row.payload_hash,
+			),
+	]);
 }
 
 // --- Transactional API key projections (rebuildable from DO, no hash/secret) ---
@@ -932,7 +968,7 @@ export async function deleteApiKeyProjection(db: D1Database, keyId: string): Pro
 /** Housekeeping for the cron sweep: expired buttons are dead weight. */
 export async function deleteExpiredTelegramActions(db: D1Database): Promise<number> {
 	const result = await db
-		.prepare("DELETE FROM telegram_actions WHERE expires_at < ?")
+		.prepare("DELETE FROM approvals WHERE expires_at < ?")
 		.bind(nowIso())
 		.run();
 	return result.meta?.changes ?? 0;

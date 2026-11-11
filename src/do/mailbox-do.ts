@@ -370,6 +370,20 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 	const now = new Date().toISOString();
 	const existing = sql.exec("SELECT * FROM outbound_drafts WHERE id = ?", draftId).toArray()[0];
 	if (!existing) throw new Error("draft not found");
+	const changed =
+		JSON.stringify(body.to ?? JSON.parse(String(existing.to_json))) !== existing.to_json ||
+		JSON.stringify(body.cc ?? JSON.parse(String(existing.cc_json))) !== existing.cc_json ||
+		JSON.stringify(body.bcc ?? JSON.parse(String(existing.bcc_json))) !== existing.bcc_json ||
+		(body.subject ?? existing.subject) !== existing.subject ||
+		(body.bodyText ?? existing.body_text) !== existing.body_text ||
+		(body.bodyHtml ?? existing.body_html) !== existing.body_html;
+	if (changed && existing.status === "pending_confirmation") {
+		sql.exec(
+			"UPDATE mailbox_meta SET value = 'stale', updated_at = ? WHERE key = ?",
+			now,
+			`intent_stale:${draftId}`,
+		);
+	}
 	sql.exec(
 		`UPDATE outbound_drafts SET
          to_json = ?, cc_json = ?, bcc_json = ?, subject = ?, body_text = ?, body_html = ?, updated_at = ?
@@ -386,24 +400,80 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 	return { id: draftId, status: "draft" };
 }
 
-function requestSendDraft(sql: SqlStorage, draftId: string | undefined) {
+export async function requestSendDraft(
+	sql: SqlStorage,
+	draftId: string | undefined,
+	identity: SenderIdentity,
+	replaceStale = false,
+) {
 	if (!draftId) throw new Error("draftId required");
 	const now = new Date().toISOString();
-	// Only a draft can be armed for sending. Guarding on the current status matters
-	// now that a retried Telegram update can re-enter this path: an unguarded UPDATE
-	// would move an already-sent draft back to pending_confirmation and offer a
-	// second Send button for mail that has gone out.
-	sql.exec(
-		`UPDATE outbound_drafts SET status = 'pending_confirmation', updated_at = ?
-     WHERE id = ? AND status IN ('draft', 'pending_confirmation')`,
-		now,
-		draftId,
-	);
 	const row = sql
 		.exec<{ status: string }>("SELECT status FROM outbound_drafts WHERE id = ?", draftId)
 		.toArray()[0];
 	if (!row) throw new Error("draft not found");
-	return { id: draftId, status: row.status };
+	const key = `send_intent:${draftId}`;
+	const existing = sql
+		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", key)
+		.toArray()[0];
+	const staleState = sql
+		.exec<{ value: string }>(
+			"SELECT value FROM mailbox_meta WHERE key = ?",
+			`intent_stale:${draftId}`,
+		)
+		.toArray()[0];
+	const replacing = replaceStale && staleState?.value === "stale";
+	if (row.status === "pending_confirmation" && existing && !replacing) {
+		const intent = JSON.parse(existing.value) as { payload_hash: string };
+		return { id: draftId, status: row.status, payload_hash: intent.payload_hash };
+	}
+	if (row.status !== "draft" && row.status !== "pending_confirmation")
+		return { id: draftId, status: row.status };
+	const snapshot = buildSendSnapshot(sql, draftId, identity);
+	const serialized = JSON.stringify(snapshot);
+	const payload_hash = await sha256Hex(new TextEncoder().encode(serialized));
+	// No await between the recheck and writes: another request or edit cannot slip in.
+	const current = sql
+		.exec<{ status: string }>("SELECT status FROM outbound_drafts WHERE id = ?", draftId)
+		.toArray()[0];
+	if (!current) throw new Error("draft not found");
+	const raced = sql
+		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", key)
+		.toArray()[0];
+	if (raced && (!replacing || raced.value !== existing?.value))
+		return {
+			id: draftId,
+			status: current.status,
+			payload_hash: (JSON.parse(raced.value) as { payload_hash: string }).payload_hash,
+		};
+	if (
+		(current.status !== "draft" && current.status !== "pending_confirmation") ||
+		JSON.stringify(buildSendSnapshot(sql, draftId, identity)) !== serialized
+	) {
+		return { id: draftId, status: current.status, error: "intent_stale" };
+	}
+	if (
+		sql.exec("SELECT key FROM mailbox_meta WHERE key = ?", `draft_sending:${draftId}`).toArray()
+			.length
+	)
+		return { id: draftId, status: current.status, error: "send_in_progress" };
+	sql.exec(
+		"INSERT OR REPLACE INTO mailbox_meta (key, value, updated_at) VALUES (?, ?, ?)",
+		key,
+		JSON.stringify({ snapshot, payload_hash }),
+		now,
+	);
+	sql.exec(
+		"INSERT OR REPLACE INTO mailbox_meta (key, value, updated_at) VALUES (?, 'active', ?)",
+		`intent_stale:${draftId}`,
+		now,
+	);
+	sql.exec(
+		"UPDATE outbound_drafts SET status = 'pending_confirmation', updated_at = ? WHERE id = ?",
+		now,
+		draftId,
+	);
+	return { id: draftId, status: "pending_confirmation", payload_hash };
 }
 
 type ConfirmSendDraftContext = {
@@ -476,6 +546,49 @@ function findThreadParent(
 	);
 }
 
+type SendDraft = {
+	thread_id: string | null;
+	parent_message_id: string | null;
+	to_json: string;
+	cc_json: string;
+	bcc_json: string;
+	subject: string;
+	body_text: string | null;
+	body_html: string | null;
+	status: string;
+};
+
+function buildSendSnapshot(sql: SqlStorage, draftId: string, identity: SenderIdentity) {
+	const draft = sql
+		.exec<SendDraft>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
+		.toArray()[0];
+	if (!draft) throw new Error("draft not found");
+	const parent = findThreadParent(sql, draft.thread_id, draft.parent_message_id ?? null);
+	const inReplyTo = normalizeMessageId(parent?.rfc_message_id ?? null);
+	const references = parent
+		? buildReferences(
+				(JSON.parse(parent.references_json) as string[])
+					.map(normalizeMessageId)
+					.filter((v): v is string => Boolean(v)),
+				inReplyTo,
+			)
+		: [];
+	return {
+		identity: { from: identity.from, fromName: identity.fromName, replyTo: identity.replyTo },
+		threadId: draft.thread_id,
+		parentMessageId: draft.parent_message_id ?? null,
+		to: JSON.parse(draft.to_json) as string[],
+		cc: JSON.parse(draft.cc_json) as string[],
+		bcc: JSON.parse(draft.bcc_json) as string[],
+		subject: draft.subject,
+		text: draft.body_text,
+		html: draft.body_html,
+		inReplyTo,
+		references,
+		attachments: [] as Array<{ r2Key: string; sha256: string }>,
+	};
+}
+
 function parseAddressList(json: string | null | undefined): string[] {
 	if (!json) return [];
 	try {
@@ -538,20 +651,11 @@ export async function confirmSendDraft(
 	ctx: ConfirmSendDraftContext,
 	draftId: string | undefined,
 	idempotencyKey: string,
+	expectedPayloadHash?: string,
 ): Promise<Record<string, unknown>> {
 	if (!draftId) throw new Error("draftId required");
-	const draft = ctx.sql
-		.exec<{
-			thread_id: string | null;
-			to_json: string;
-			cc_json: string;
-			bcc_json: string;
-			subject: string;
-			body_text: string | null;
-			body_html: string | null;
-			status: string;
-			parent_message_id?: string | null;
-		}>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
+	let draft = ctx.sql
+		.exec<SendDraft>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
 		.toArray()[0];
 	if (!draft) throw new Error("draft not found");
 
@@ -592,6 +696,66 @@ export async function confirmSendDraft(
 	if (draft.status !== "pending_confirmation") {
 		return { id: draftId, status: draft.status, sent: false, reason: "not_pending_confirmation" };
 	}
+	const stored = ctx.sql
+		.exec<{ value: string }>(
+			"SELECT value FROM mailbox_meta WHERE key = ?",
+			`send_intent:${draftId}`,
+		)
+		.toArray()[0];
+	const stale = () => ({
+		id: draftId,
+		status: "pending_confirmation",
+		sent: false,
+		error: "intent_stale",
+	});
+	if (!stored) return stale();
+	let intent: { snapshot: ReturnType<typeof buildSendSnapshot>; payload_hash: string };
+	try {
+		intent = JSON.parse(stored.value) as typeof intent;
+	} catch {
+		return stale();
+	}
+	if (expectedPayloadHash !== undefined && expectedPayloadHash !== intent.payload_hash)
+		return stale();
+	const serialized = JSON.stringify(intent.snapshot);
+	if (
+		!serialized ||
+		(await sha256Hex(new TextEncoder().encode(serialized))) !== intent.payload_hash
+	)
+		return stale();
+	const staleMarker = ctx.sql
+		.exec<{ value: string }>(
+			"SELECT value FROM mailbox_meta WHERE key = ?",
+			`intent_stale:${draftId}`,
+		)
+		.toArray()[0];
+	const current = ctx.sql
+		.exec<SendDraft>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
+		.toArray()[0];
+	if (!current || current.status !== "pending_confirmation")
+		return { id: draftId, status: current?.status ?? "missing", sent: false, duplicate: true };
+	try {
+		if (
+			staleMarker?.value !== "active" ||
+			JSON.stringify(buildSendSnapshot(ctx.sql, draftId, intent.snapshot.identity)) !== serialized
+		)
+			return stale();
+	} catch {
+		return stale();
+	}
+	const snapshot = intent.snapshot;
+	// All subsequent wire and sent-copy fields come from the frozen intent.
+	draft = {
+		...draft,
+		thread_id: snapshot.threadId,
+		parent_message_id: snapshot.parentMessageId,
+		to_json: JSON.stringify(snapshot.to),
+		cc_json: JSON.stringify(snapshot.cc),
+		bcc_json: JSON.stringify(snapshot.bcc),
+		subject: snapshot.subject,
+		body_text: snapshot.text,
+		body_html: snapshot.html,
+	};
 
 	const to = JSON.parse(draft.to_json) as string[];
 	const cc = JSON.parse(draft.cc_json) as string[];
@@ -607,7 +771,7 @@ export async function confirmSendDraft(
 		};
 	}
 
-	const fromAddress = ctx.fromAddress;
+	const fromAddress = snapshot.identity.from;
 	const now = new Date().toISOString();
 	const sentKey = idempotencyKey;
 	try {
@@ -627,19 +791,8 @@ export async function confirmSendDraft(
 	// our own would be rejected as a restricted header. So we set the two we may
 	// set and take the sent id back from the provider below.
 	const threadId = draft.thread_id ?? crypto.randomUUID();
-	const parent = findThreadParent(ctx.sql, draft.thread_id, draft.parent_message_id ?? null);
-	// Normalize on read rather than trusting whoever wrote the row: stored ids are
-	// meant to be bare, and a stray "<...>" here would emit In-Reply-To: <<id>>,
-	// which threads nowhere. normalizeMessageId is idempotent, so this is free.
-	const inReplyTo = normalizeMessageId(parent?.rfc_message_id ?? null);
-	const references = parent
-		? buildReferences(
-				(JSON.parse(parent.references_json) as string[])
-					.map((reference) => normalizeMessageId(reference))
-					.filter((reference): reference is string => Boolean(reference)),
-				inReplyTo,
-			)
-		: [];
+	const inReplyTo = snapshot.inReplyTo;
+	const references = snapshot.references;
 	const outboundHeaders: Record<string, string> = {};
 	if (inReplyTo) {
 		outboundHeaders["In-Reply-To"] = messageIdHeader(inReplyTo);
@@ -677,11 +830,13 @@ export async function confirmSendDraft(
 			// Bare address when the mailbox has no display name — identical to the
 			// behaviour before names existed, so no mailbox changes how it renders
 			// unless someone gave it a name.
-			from: ctx.fromName ? { name: ctx.fromName, email: fromAddress } : fromAddress,
+			from: snapshot.identity.fromName
+				? { name: snapshot.identity.fromName, email: fromAddress }
+				: fromAddress,
 			to,
 			cc: cc.length ? cc : undefined,
 			bcc: bcc.length ? bcc : undefined,
-			replyTo: ctx.replyToAddress ?? undefined,
+			replyTo: snapshot.identity.replyTo ?? undefined,
 			subject: draft.subject,
 			text: draft.body_text ?? undefined,
 			html: draft.body_html ?? undefined,
@@ -1171,7 +1326,21 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/request-send$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
-			return Response.json(this.requestSendDraft(draftId));
+			const body = request.headers.get("content-type")?.includes("application/json")
+				? ((await request.json()) as {
+						mailboxAddress?: string | null;
+						displayName?: string | null;
+						replaceStale?: boolean;
+					})
+				: {};
+			return Response.json(
+				await this.requestSendDraft(
+					draftId,
+					body.mailboxAddress,
+					body.displayName,
+					body.replaceStale,
+				),
+			);
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/confirm-send$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
@@ -1179,12 +1348,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				idempotencyKey: string;
 				mailboxAddress?: string | null;
 				displayName?: string | null;
+				expectedPayloadHash?: string;
 			};
 			const result = await this.confirmSendDraft(
 				draftId,
 				body.idempotencyKey,
 				body.mailboxAddress,
 				body.displayName,
+				body.expectedPayloadHash,
 			);
 			// Ambiguous provider outcomes are business-level, not transport-level errors.
 			// Return 200 so the caller's confirmDraftSend reaches the "ambiguous" branch
@@ -1193,9 +1364,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const isAmbiguous = result.error === "ambiguous";
 			const status =
 				"error" in result && !isAmbiguous
-					? result.error === "too_many_recipients"
-						? 400
-						: 500
+					? result.error === "intent_stale"
+						? 409
+						: result.error === "too_many_recipients"
+							? 400
+							: 500
 					: 200;
 			return Response.json(result, { status });
 		}
@@ -1970,8 +2143,20 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		return updateDraft(this.ctx.storage.sql, draftId, body);
 	}
 
-	private requestSendDraft(draftId: string | undefined) {
-		return requestSendDraft(this.ctx.storage.sql, draftId);
+	private requestSendDraft(
+		draftId: string | undefined,
+		mailboxAddress?: string | null,
+		displayName?: string | null,
+		replaceStale?: boolean,
+	) {
+		const identity = resolveReplyIdentity(
+			this.env,
+			this.ctx.storage.sql,
+			draftId,
+			this.resolveMailboxAddress(mailboxAddress),
+			this.resolveMailboxDisplayName(displayName),
+		);
+		return requestSendDraft(this.ctx.storage.sql, draftId, identity, replaceStale);
 	}
 
 	/**
@@ -2027,6 +2212,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		idempotencyKey: string,
 		mailboxAddress?: string | null,
 		displayName?: string | null,
+		expectedPayloadHash?: string,
 	): Promise<Record<string, unknown>> {
 		const identity = resolveReplyIdentity(
 			this.env,
@@ -2048,6 +2234,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			},
 			draftId,
 			idempotencyKey,
+			expectedPayloadHash,
 		);
 	}
 

@@ -3,7 +3,7 @@ import { env as testEnv } from "cloudflare:workers";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { handleDeadLetterQueue } from "#/cloudflare/dlq-consumer";
 import { handleEmailEventsQueue } from "#/cloudflare/email-events-consumer";
-import { confirmSendDraft } from "#/do/mailbox-do";
+import { confirmSendDraft } from "../helpers/armed-confirm";
 import { splitSqlStatements } from "../helpers/migrations";
 
 /**
