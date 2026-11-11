@@ -7,6 +7,7 @@ import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
 import migrationBetterAuth from "../../migrations/d1/0016_better_auth.sql?raw";
 import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
+import migrationAuthUpgrade from "../../migrations/d1/0021_better_auth_1_7_20.sql?raw";
 import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql?raw";
 import migrationBetterAuthMcpFkFix from "../../migrations/d1/0018_better_auth_mcp_fk_fix.sql?raw";
 import { applyMigrations } from "../helpers/migrations";
@@ -45,6 +46,7 @@ beforeAll(async () => {
 		migrationBetterAuthMcp as string,
 		migrationBetterAuthMcpFkFix as string,
 		migrationTwoFactor as string,
+		migrationAuthUpgrade as string,
 	);
 
 	// Token verification at /mcp fetches the signing keys from our own /jwks.
@@ -198,6 +200,7 @@ async function authorizeAndMintToken(clientId: string, clientSecret: string, coo
 
 beforeEach(async () => {
 	await testEnv.INDEX_DB.prepare("DELETE FROM owner_identities").run();
+	await testEnv.INDEX_DB.prepare('DELETE FROM "rateLimit"').run();
 });
 
 /**
@@ -267,6 +270,46 @@ async function sessionCookieFor(email: string): Promise<string> {
 }
 
 describe("the /mcp bearer-token perimeter", () => {
+	it("rejects a jwt plugin session token even with the MCP issuer and audience", async () => {
+		const { cookie } = await ownerSessionAndClient("OAUTHJWTSESSION01");
+		const tokenResponse = await run(
+			new Request(`${ORIGIN}/api/auth/token`, { headers: { cookie } }),
+		);
+		expect(tokenResponse.status).toBe(200);
+		const { token } = (await tokenResponse.json()) as { token: string };
+		const payload = JSON.parse(
+			atob(token.split(".")[1]!.replace(/-/g, "+").replace(/_/g, "/")),
+		) as Record<string, unknown>;
+		const { createAuth } = await import("#/api/better-auth");
+		const auth = await createAuth(authEnv(), { request: new Request(`${ORIGIN}/`) });
+		const signJWT = (
+			auth.api as unknown as {
+				signJWT(args: {
+					body: {
+						payload: Record<string, unknown>;
+						overrideOptions: { jwt: { issuer: string; audience: string } };
+					};
+				}): Promise<{ token: string }>;
+			}
+		).signJWT;
+		const sameAudience = await signJWT({
+			body: {
+				payload: { ...payload, aud: RESOURCE, iss: `${ORIGIN}/api/auth` },
+				overrideOptions: { jwt: { issuer: `${ORIGIN}/api/auth`, audience: RESOURCE } },
+			},
+		});
+		const response = await run(
+			new Request(`${ORIGIN}/mcp`, {
+				method: "POST",
+				headers: {
+					authorization: `Bearer ${sameAudience.token}`,
+					"content-type": "application/json",
+				},
+				body: JSON.stringify(INITIALIZE),
+			}),
+		);
+		expect(response.status).toBe(401);
+	});
 	it("answers a tokenless request with 401 + RFC 9728 WWW-Authenticate, without running the MCP handler", async () => {
 		const response = await run(
 			new Request(`${ORIGIN}/mcp`, {
@@ -331,6 +374,56 @@ describe("the /mcp bearer-token perimeter", () => {
 		expect(response.status).toBe(401);
 	});
 
+	it("registers, lists and revokes an owner public PKCE client", async () => {
+		const { cookie } = await ownerSessionAndClient("OAUTHREGPUBLIC01");
+		const response = await postJson(
+			"/api/auth/oauth2/register",
+			{
+				client_name: "Claude Code",
+				redirect_uris: ["http://localhost:33418/callback"],
+				application_type: "native",
+				token_endpoint_auth_method: "none",
+				grant_types: ["authorization_code", "refresh_token"],
+				response_types: ["code"],
+			},
+			cookie,
+			true,
+		);
+		expect(response.status).toBe(201);
+		const client = (await response.json()) as {
+			client_id: string;
+			client_secret?: string;
+			token_endpoint_auth_method: string;
+		};
+		expect(client.client_id).toBeTruthy();
+		expect(client.client_secret).toBeFalsy();
+		expect(client.token_endpoint_auth_method).toBe("none");
+		const list = await run(
+			new Request(`${ORIGIN}/api/auth/oauth2/get-clients`, { headers: { cookie } }),
+		);
+		expect(await list.json()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					client_id: client.client_id,
+					redirect_uris: ["http://localhost:33418/callback"],
+				}),
+			]),
+		);
+		const deleted = await postJson(
+			"/api/auth/oauth2/delete-client",
+			{ client_id: client.client_id },
+			cookie,
+			true,
+		);
+		expect(deleted.status).toBe(200);
+		const after = await run(
+			new Request(`${ORIGIN}/api/auth/oauth2/get-clients`, { headers: { cookie } }),
+		);
+		expect(await after.json()).not.toEqual(
+			expect.arrayContaining([expect.objectContaining({ client_id: client.client_id })]),
+		);
+	});
+
 	// Full flow against 0016+0017+0018: the FK fix migration recreates the four
 	// oauth* tables with the canonical reference map the oauth-provider plugin
 	// writes (clientId -> oauthClient(clientId), resourceId ->
@@ -379,6 +472,28 @@ describe("the /mcp bearer-token perimeter", () => {
 		expect(strangerResponse.status).toBe(403);
 		const body = (await strangerResponse.json()) as { error?: string };
 		expect(body.error).toBe("forbidden");
+
+		await testEnv.INDEX_DB.prepare("DELETE FROM owner_identities").run();
+		const ctx = createExecutionContext();
+		const noOwnerResponse = await worker.fetch(
+			new Request(`${ORIGIN}/mcp`, {
+				method: "POST",
+				headers: { authorization: `Bearer ${ownerToken}`, "content-type": "application/json" },
+				body: JSON.stringify(INITIALIZE),
+			}),
+			{ ...authEnv(), OWNER_BOOTSTRAP_EMAILS: "" },
+			ctx,
+		);
+		await waitOnExecutionContext(ctx);
+		expect(noOwnerResponse.status).toBe(503);
+		// Upstream's client FK has no cascade: deletion of an authorized client fails.
+		const revoked = await postJson(
+			"/api/auth/oauth2/delete-client",
+			{ client_id: clientId },
+			cookie,
+			true,
+		);
+		expect(revoked.status).toBe(500);
 	});
 
 	// The deny path the consent page's Deny button exercises: the provider does

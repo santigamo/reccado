@@ -36,6 +36,7 @@ import {
 	logout,
 	OperatorHttpError,
 	operatorJson,
+	originFor,
 	requireSession,
 	resolveHost,
 	resolveOwnerEmail,
@@ -52,9 +53,14 @@ import {
 	resolveMailboxRef,
 } from "./lib/telegram-operator-core";
 
-function parseArgs(argv: string[]): { positional: string[]; flags: Record<string, string> } {
+function parseArgs(argv: string[]): {
+	positional: string[];
+	flags: Record<string, string>;
+	redirects: string[];
+} {
 	const positional: string[] = [];
 	const flags: Record<string, string> = {};
+	const redirects: string[] = [];
 	for (let i = 0; i < argv.length; i += 1) {
 		const arg = argv[i];
 		if (!arg) continue;
@@ -65,6 +71,7 @@ function parseArgs(argv: string[]): { positional: string[]; flags: Record<string
 		const [rawKey, inlineValue] = arg.slice(2).split("=", 2);
 		if (!rawKey) continue;
 		if (inlineValue !== undefined) {
+			if (rawKey === "redirect-uri") redirects.push(inlineValue);
 			flags[rawKey] = inlineValue;
 			continue;
 		}
@@ -74,12 +81,13 @@ function parseArgs(argv: string[]): { positional: string[]; flags: Record<string
 			continue;
 		}
 		flags[rawKey] = next;
+		if (rawKey === "redirect-uri") redirects.push(next);
 		i += 1;
 	}
-	return { positional, flags };
+	return { positional, flags, redirects };
 }
 
-const USAGE = `Usage: pnpm operator <login|whoami|logout|telegram> [--env <env>] [--host <host>] [--email <owner>]
+const USAGE = `Usage: pnpm operator <login|whoami|logout|telegram|mcp> [--env <env>] [--host <host>] [--email <owner>]
   login   mint a single-use pairing code in D1, exchange it for a session, store it (0600)
           flags: --ttl <minutes, 1-60, default 10> --label <text> --allow-new-owner
   whoami  show the signed-in owner and session expiry, or "not signed in"
@@ -96,9 +104,85 @@ const USAGE = `Usage: pnpm operator <login|whoami|logout|telegram> [--env <env>]
           adopt an existing thread; the name is stored with the mapping, independent of
           the mailbox's display name (dry run by default)
   telegram topics [--json]
-          list every topic mapping, marking the ones in the bound chat`;
+          list every topic mapping, marking the ones in the bound chat
+  mcp register [--name <name>] [--callback-port <port>] [--redirect-uri <uri> ...]
+          register a public PKCE client (default: Claude Code, port 33418)
+  mcp clients    list clients registered by this session's owner`;
 
 type Flags = Record<string, string>;
+
+type OAuthClient = {
+	client_id: string;
+	client_name?: string;
+	redirect_uris?: string[];
+	client_id_issued_at?: number;
+};
+
+async function runMcp(
+	sub: string | undefined,
+	flags: Flags,
+	redirects: string[],
+	host: string,
+	env?: string,
+): Promise<number> {
+	const session = requireSession(host, env);
+	if (sub === "register") {
+		const port = Number(flags["callback-port"] ?? "33418");
+		if (!Number.isInteger(port) || port < 1 || port > 65535)
+			throw new Error("--callback-port must be an integer from 1 to 65535");
+		const name = flags.name ?? "Claude Code";
+		if (!name.trim() || name === "true") throw new Error("--name requires a client name");
+		if (flags["redirect-uri"] === "true" || redirects.some((uri) => !uri.trim()))
+			throw new Error("--redirect-uri requires a URI");
+		const uris = redirects.length ? redirects : [`http://localhost:${port}/callback`];
+		if (!uris.includes(`http://localhost:${port}/callback`)) {
+			console.warn(
+				`Claude Code's callback http://localhost:${port}/callback is not in the supplied redirect URIs.`,
+			);
+		}
+		console.log(
+			`Registering public client ${JSON.stringify(name)} with redirects: ${uris.join(", ")}`,
+		);
+		const client = await operatorJson<OAuthClient>(
+			session,
+			"/api/auth/oauth2/register",
+			{
+				method: "POST",
+				body: {
+					client_name: name,
+					redirect_uris: uris,
+					application_type: "native",
+					token_endpoint_auth_method: "none",
+					grant_types: ["authorization_code", "refresh_token"],
+					response_types: ["code"],
+				},
+			},
+			{ env },
+		);
+		if (!client.client_id || !/^[A-Za-z0-9._~-]+$/.test(client.client_id))
+			throw new Error("Provider returned an invalid client_id");
+		console.log(`client_id: ${client.client_id}`);
+		console.log(
+			`claude mcp add --transport http reccado ${originFor(host)}/mcp --client-id ${client.client_id} --callback-port ${port}`,
+		);
+		return 0;
+	}
+	if (sub === "clients") {
+		const clients = await operatorJson<OAuthClient[]>(
+			session,
+			"/api/auth/oauth2/get-clients",
+			{},
+			{ env },
+		);
+		for (const client of clients)
+			console.log(
+				`${client.client_id}\t${client.client_name ?? ""}\t${(client.redirect_uris ?? []).join(", ")}\t${client.client_id_issued_at ? new Date(client.client_id_issued_at * 1000).toISOString() : "unknown"}`,
+			);
+		if (!clients.length) console.log("No clients registered by this owner.");
+		return 0;
+	}
+	throw new Error("Unknown mcp subcommand; use register or clients.");
+}
 
 /** `pnpm operator telegram <sub>`: thin IO around /api/telegram/*; formatting is in the core. */
 async function runTelegram(
@@ -180,7 +264,7 @@ async function runTelegram(
 }
 
 async function main(): Promise<number> {
-	const { positional, flags } = parseArgs(process.argv.slice(2));
+	const { positional, flags, redirects } = parseArgs(process.argv.slice(2));
 	const command = positional[0];
 	const env = flags.env && flags.env !== "true" ? flags.env : undefined;
 
@@ -192,6 +276,8 @@ async function main(): Promise<number> {
 	const host = resolveHost(flags.host, env);
 
 	switch (command) {
+		case "mcp":
+			return runMcp(positional[1], flags, redirects, host, env);
 		case "login": {
 			const email = resolveOwnerEmail(flags.email);
 			const ttlMinutes = flags.ttl ? Number(flags.ttl) : undefined;

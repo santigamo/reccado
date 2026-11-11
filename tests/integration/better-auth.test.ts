@@ -8,6 +8,7 @@ import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?
 import migrationBetterAuth from "../../migrations/d1/0016_better_auth.sql?raw";
 import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql?raw";
 import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
+import migrationAuthUpgrade from "../../migrations/d1/0021_better_auth_1_7_20.sql?raw";
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import { applyMigrations } from "../helpers/migrations";
@@ -27,6 +28,7 @@ beforeAll(async () => {
 		migrationBetterAuth as string,
 		migrationBetterAuthMcp as string,
 		migrationTwoFactor as string,
+		migrationAuthUpgrade as string,
 	);
 });
 
