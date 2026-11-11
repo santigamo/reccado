@@ -965,14 +965,20 @@ export async function deleteApiKeyProjection(db: D1Database, keyId: string): Pro
 	await db.prepare("DELETE FROM transactional_api_keys WHERE key_id = ?").bind(keyId).run();
 }
 
-/** Housekeeping for the cron sweep: expired buttons are dead weight. */
-export async function deleteExpiredTelegramActions(db: D1Database): Promise<number> {
+/** Keep MCP statuses available for 30 days after their last terminal timestamp. */
+export async function deleteExpiredApprovals(db: D1Database): Promise<number> {
+	const now = new Date();
+	const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
 	const result = await db
-		.prepare("DELETE FROM approvals WHERE expires_at < ?")
-		.bind(nowIso())
+		.prepare(`DELETE FROM approvals WHERE
+			(origin <> 'mcp' AND expires_at < ?)
+			OR (origin = 'mcp' AND expires_at < ? AND (consumed_at IS NULL OR consumed_at < ?))`)
+		.bind(now.toISOString(), cutoff, cutoff)
 		.run();
 	return result.meta?.changes ?? 0;
 }
+
+export const deleteExpiredTelegramActions = deleteExpiredApprovals;
 
 // --- Transactional request projections (rebuildable from DO, no body/secret) ---
 

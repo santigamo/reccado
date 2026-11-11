@@ -35,6 +35,9 @@ const STRANGER = "stranger@example.com";
 const ORIGIN = "https://inbox.imsanti.dev";
 const RESOURCE = `${ORIGIN}/mcp`;
 let cimdEnabled = false;
+let forbiddenFetches: string[] | null = null;
+let observedFetches: string[] = [];
+let blockUnmockedFetch = false;
 const metadataResponses = new Map<string, Response>();
 
 const authEnv = () =>
@@ -70,11 +73,17 @@ beforeAll(async () => {
 	const realFetch = globalThis.fetch;
 	vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+		observedFetches.push(url);
+		if (forbiddenFetches) {
+			forbiddenFetches.push(url);
+			throw new Error(`Unexpected outbound fetch: ${url}`);
+		}
 		if (url === `${ORIGIN}/api/auth/jwks`) {
 			return new Response(jwks, { headers: { "content-type": "application/json" } });
 		}
 		const metadata = metadataResponses.get(url);
 		if (metadata) return metadata.clone();
+		if (blockUnmockedFetch) throw new Error(`Unexpected outbound fetch: ${url}`);
 		return realFetch(input, init);
 	});
 });
@@ -217,6 +226,9 @@ async function authorizeAndMintToken(clientId: string, clientSecret: string, coo
 
 beforeEach(async () => {
 	cimdEnabled = false;
+	forbiddenFetches = null;
+	observedFetches = [];
+	blockUnmockedFetch = false;
 	metadataResponses.clear();
 	await testEnv.INDEX_DB.prepare("DELETE FROM owner_identities").run();
 	await testEnv.INDEX_DB.prepare('DELETE FROM "rateLimit"').run();
@@ -360,7 +372,12 @@ describe("CIMD opt-in", () => {
 			"https://0x7f000001/metadata",
 			"https://[::1]/metadata",
 			"https://service.internal/metadata",
-			"https://sibling.example.com/metadata",
+			`https://sibling.${new URL(ORIGIN).hostname.split(".").slice(-2).join(".")}/metadata`,
+			"https://2130706433/metadata",
+			"https://0177.0.0.1/metadata",
+			"https://[::ffff:127.0.0.1]/metadata",
+			"https://localhost./metadata",
+			"https://foo.localhost/metadata",
 		]) {
 			const url = new URL(`${ORIGIN}/api/auth/oauth2/authorize`);
 			for (const [key, value] of Object.entries({
@@ -372,9 +389,32 @@ describe("CIMD opt-in", () => {
 				resource: RESOURCE,
 			}))
 				url.searchParams.set(key, value);
+			forbiddenFetches = [];
 			const result = await run(new Request(url, { headers: { cookie }, redirect: "manual" }));
+			expect(forbiddenFetches, `outbound fetch while rejecting ${clientId}`).toEqual([]);
 			expect(result.headers.get("location") ?? "").not.toMatch(/^\/consent\?/);
 		}
+		forbiddenFetches = null;
+	});
+
+	it("allows an unrelated public client and fetches only its mocked metadata", async () => {
+		const { cookie } = await ownerSessionAndClient("cimd-public-host-owner");
+		cimdEnabled = true;
+		const clientId = "https://sibling.example.com/metadata";
+		metadataResponses.set(
+			clientId,
+			Response.json({
+				client_id: clientId,
+				client_name: "Public",
+				redirect_uris: ["https://client.example/cb"],
+				token_endpoint_auth_method: "none",
+			}),
+		);
+		observedFetches = [];
+		blockUnmockedFetch = true;
+		await runAuthorize(clientId, cookie);
+		expect(observedFetches).toEqual([clientId]);
+		blockUnmockedFetch = false;
 	});
 });
 

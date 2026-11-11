@@ -27,7 +27,15 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 8;
+const MAILBOX_SCHEMA_VERSION = 9;
+
+export type DraftOrigin = "web" | "telegram" | "mcp";
+
+function requestedDraftOrigin(value: unknown): DraftOrigin {
+	if (value === undefined) return "web";
+	if (value === "web" || value === "telegram" || value === "mcp") return value;
+	throw new Error("invalid_draft_origin");
+}
 
 // Minimal runtime validation for the /ingest payload. Defined locally (rather than
 // imported from src/api/schemas.ts) so this DO doesn't take a dependency on the API
@@ -301,6 +309,7 @@ function getDraft(sql: SqlStorage, draftId: string | undefined) {
 
 function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 	const idempotencyKey = (body.idempotencyKey as string | undefined) ?? null;
+	const origin = requestedDraftOrigin(body.origin);
 	const now = new Date().toISOString();
 
 	// Idempotent insert: if an idempotencyKey is provided and a draft with that
@@ -336,11 +345,13 @@ function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 				)
 				.toArray()[0];
 			if (existing) {
+				if (origin === "mcp") sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", existing.id);
 				return { id: existing.id, status: "draft", duplicate: true };
 			}
 			// Unexpected: zero rows written but no existing draft. Treat as internal error.
 			throw new Error("draft_idempotency_conflict_unresolved");
 		}
+		sql.exec("UPDATE outbound_drafts SET origin = ? WHERE id = ?", origin, id);
 		return { id, status: "draft", duplicate: false };
 	}
 
@@ -362,11 +373,13 @@ function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 		now,
 		now,
 	);
+	sql.exec("UPDATE outbound_drafts SET origin = ? WHERE id = ?", origin, id);
 	return { id, status: "draft" };
 }
 
 function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<string, unknown>) {
 	if (!draftId) throw new Error("draftId required");
+	const origin = requestedDraftOrigin(body.origin);
 	const now = new Date().toISOString();
 	const allowed =
 		Array.isArray(body.allowedStatuses) && body.allowedStatuses.every((s) => typeof s === "string")
@@ -376,6 +389,7 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 	if (allowed && (!existing || !allowed.includes(String(existing.status))))
 		return { error: "draft_not_editable", currentStatus: existing?.status ?? null };
 	if (!existing) throw new Error("draft not found");
+	if (origin === "mcp") sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", draftId);
 	const changed =
 		JSON.stringify(body.to ?? JSON.parse(String(existing.to_json))) !== existing.to_json ||
 		JSON.stringify(body.cc ?? JSON.parse(String(existing.cc_json))) !== existing.cc_json ||
@@ -667,6 +681,12 @@ export async function confirmSendDraft(
 		.exec<SendDraft>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
 		.toArray()[0];
 	if (!draft) throw new Error("draft not found");
+	const origin = ctx.sql
+		.exec<{ origin: string }>("SELECT origin FROM outbound_drafts WHERE id = ?", draftId)
+		.toArray()[0]?.origin;
+	if (origin === "mcp") {
+		return { id: draftId, status: draft.status, sent: false, error: "approval_required" };
+	}
 
 	const sentMarker = ctx.sql
 		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", idempotencyKey)
@@ -1115,6 +1135,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				"INTEGER NOT NULL DEFAULT 0",
 			);
 		}
+		if (currentVersion < 9) {
+			const columns = this.columnNames("outbound_drafts");
+			this.addColumnIfMissing("outbound_drafts", columns, "origin", "TEXT NOT NULL DEFAULT 'web'");
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -1359,6 +1383,17 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				),
 			);
 		}
+		if (url.pathname.match(/^\/drafts\/[^/]+\/send-intent$/) && request.method === "GET") {
+			const draftId = url.pathname.split("/")[2];
+			const row = this.ctx.storage.sql.exec<{ value: string }>(
+				"SELECT value FROM mailbox_meta WHERE key = ?", `send_intent:${draftId}`,
+			).toArray()[0];
+			if (!row) return Response.json({ error: "intent_not_found" }, { status: 404 });
+			const stale = this.ctx.storage.sql.exec<{ value: string }>(
+				"SELECT value FROM mailbox_meta WHERE key = ?", `intent_stale:${draftId}`,
+			).toArray()[0];
+			return Response.json({ ...JSON.parse(row.value) as object, stale: stale?.value === "stale" });
+		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/confirm-send$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
 			const body = (await request.json()) as {
@@ -1381,7 +1416,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const isAmbiguous = result.error === "ambiguous";
 			const status =
 				"error" in result && !isAmbiguous
-					? result.error === "intent_stale"
+					? result.error === "intent_stale" || result.error === "approval_required"
 						? 409
 						: result.error === "too_many_recipients"
 							? 400

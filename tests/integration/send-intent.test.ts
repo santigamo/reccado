@@ -29,6 +29,29 @@ async function draft() {
 }
 
 describe("frozen send intent", () => {
+	it("keeps MCP origin sticky and refuses unapproved sends", async () => {
+		const { stub, id, arm } = await draft();
+		await stub.fetch(`https://mailbox-do/drafts/${id}`, {
+			method: "PATCH", headers: { "content-type": "application/json" },
+			body: JSON.stringify({ origin: "mcp", bodyText: "Agent draft" }),
+		});
+		await stub.fetch(`https://mailbox-do/drafts/${id}`, {
+			method: "PATCH", headers: { "content-type": "application/json" },
+			body: JSON.stringify({ origin: "web", bodyText: "Human edit" }),
+		});
+		await arm();
+		const sent: unknown[] = [];
+		const result = await runInDurableObject(stub, async (_instance, state) =>
+			confirmSendDraft({
+				sql: state.storage.sql,
+				transactionSync: (fn) => state.storage.transactionSync(fn),
+				email: { send: async (mail: unknown) => { sent.push(mail); return {}; } } as unknown as Env["EMAIL"],
+				fromAddress: "owner@example.com", replyToAddress: null,
+			}, id, "attempt"),
+		);
+		expect(result.error).toBe("approval_required");
+		expect(sent).toHaveLength(0);
+	});
 	it("hashes identical snapshots deterministically and keeps repeated requests stable", async () => {
 		const a = await draft();
 		const b = await draft();

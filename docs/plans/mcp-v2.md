@@ -242,8 +242,9 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 - [x] `@better-auth/cimd` 1.7.20 with a Workers-native guarded transport, **opt-in** via
       `MCP_CIMD_ENABLED` (default false); `global_fetch_strictly_public` NOT enabled (see decision
       log). (T7, merged 83350bd)
-- [ ] **Bug found on merge:** host-rejection test hangs → at least one private/numeric host may
-      pass the guard. Sent back to T7; CIMD must stay disabled until fixed + verified live.
+- [x] Host-rejection test hang investigated: stale test hostname, not a guard bug. Now deterministic
+      with a fetch spy: 10 private/numeric/local variants rejected with zero fetches. CIMD stays
+      disabled until verified live.
 - [ ] Record which `client_id` URLs Claude Code and claude.ai present.
 - [x] Consent page: client host, `client_name`, redirect host, scopes (Spanish copy);
       warn-only known hosts; first-seen client → `ops_events`.
