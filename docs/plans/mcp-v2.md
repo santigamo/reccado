@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-In flight: T11 `mcp-revoke`, T12 `mcp-send` (P4c), T13a `mcp-cp-intents` (P5 server side). Next: T13b `manage_*` tools, then P6 docs, then single deploy. From 2026-11-11 new workers use Cursor CLI with `grok-4.7-xhigh-fast` (max effort, fast mode; Codex quota). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
+In flight: T12 `mcp-send` (P4c), T13a `mcp-cp-intents` (P5 server side). Next: T13b `manage_*` tools, then P6 docs, then single deploy. From 2026-11-11 new workers use Cursor CLI with `grok-4.7-xhigh-fast` (max effort, fast mode; Codex quota). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -220,8 +220,12 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       **Revoke omitted:** better-auth 1.7.20's schema has no `ON DELETE CASCADE` on
       `oauthConsent/oauthAccessToken/oauthRefreshToken.clientId`, so deleting an authorized
       client 500s, and there is no owner endpoint to enumerate refresh tokens. Issued access
-      JWTs live 3600 s. Follow-up: an owner-gated revoke that deletes refresh tokens + consent +
-      client in order (our own route, not a schema divergence).
+      JWTs live 3600 s.
+- [x] Revoke implemented (T11, merged 19a5e43): `POST /api/oauth-clients/:clientId/revoke` (owner,
+      Origin-checked) deletes access tokens → refresh tokens → consent → client in one D1 batch;
+      `pnpm operator mcp revoke <client_id>`; unknown/foreign → 404 `client_not_found`. Issued
+      access JWTs stay valid ≤ 3600 s. Gap: CIMD URL client ids don't fit one path segment —
+      accept the id in the body when CIMD is enabled.
 - [ ] Deploy: **owner decided 2026-11-11 to deploy once, after everything is done** (not per phase).
       Order: remote D1 migrations 0021 → 0022 → (0024 passkey) → `pnpm run deploy:dev` → re-register
       MCP client (old tokens lack the new scopes and need re-consent) → re-draft any pre-0022
