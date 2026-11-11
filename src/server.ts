@@ -1,4 +1,7 @@
 import { createApiApp } from "./api/hono";
+import { requireAuth } from "./api/auth";
+import * as templates from "./lib/admin/templates";
+import { adminResponse } from "./lib/admin/errors";
 import type { InboundEmailQueueMessage } from "./cloudflare/types";
 import { deriveDevTestMailboxId } from "./db/seed-dev";
 import { mailboxStub } from "./lib/mailbox-stub";
@@ -112,71 +115,44 @@ api.get("/api/mailboxes/:mailboxId/ws", async (c) => {
 
 // --- Transactional API: template management (session-protected, under /api/*) ---
 
-/**
- * Session + per-mailbox owner gate for the template routes.
- *
- * These routes used to stop at "is an owner of this deployment", while the key
- * routes (and the docs, for both) also require the mailbox's D1 `owner_email` to be
- * the caller. Templates decide what a live key sends, so they get the same gate.
- * Returns a Response to send back, or null when the caller may proceed.
- */
-async function templateRouteGate(
-	request: Request,
-	env: Env,
-	mailboxId: string,
-): Promise<Response | null> {
-	const { requireAuth, assertMailboxAccess } = await import("./api/auth");
-	const auth = await requireAuth(request, env);
-	assertMailboxAccess(auth, mailboxId, env);
-	const { getMailboxForOwner } = await import("./db/d1");
-	const mailbox = await getMailboxForOwner(env.INDEX_DB, mailboxId, auth.email);
-	return mailbox ? null : Response.json({ error: "forbidden" }, { status: 403 });
-}
-
 api.post("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
-	const denied = await templateRouteGate(c.req.raw, c.env, c.req.param("mailboxId"));
-	if (denied) return denied;
-	const mailboxId = c.req.param("mailboxId");
-	const stub = mailboxStub(c.env, mailboxId);
-	return stub.fetch("https://mailbox-do/transactional/templates", {
-		method: "POST",
-		body: JSON.stringify(await c.req.json()),
-		headers: { "content-type": "application/json" },
-	});
+	const actor = await requireAuth(c.req.raw, c.env);
+	return adminResponse(
+		await templates.createTemplate(c.env, actor, {
+			mailboxId: c.req.param("mailboxId"),
+			get body() {
+				return c.req.json();
+			},
+		}),
+	);
 });
-
 api.get("/api/mailboxes/:mailboxId/transactional/templates", async (c) => {
-	const denied = await templateRouteGate(c.req.raw, c.env, c.req.param("mailboxId"));
-	if (denied) return denied;
-	const mailboxId = c.req.param("mailboxId");
-	const stub = mailboxStub(c.env, mailboxId);
-	return stub.fetch("https://mailbox-do/transactional/templates");
+	const actor = await requireAuth(c.req.raw, c.env);
+	return adminResponse(
+		await templates.listTemplates(c.env, actor, { mailboxId: c.req.param("mailboxId") }),
+	);
 });
-
 api.put("/api/mailboxes/:mailboxId/transactional/templates/:templateId", async (c) => {
-	const denied = await templateRouteGate(c.req.raw, c.env, c.req.param("mailboxId"));
-	if (denied) return denied;
-	const mailboxId = c.req.param("mailboxId");
-	const templateId = c.req.param("templateId");
-	const stub = mailboxStub(c.env, mailboxId);
-	return stub.fetch(`https://mailbox-do/transactional/templates/${templateId}`, {
-		method: "PUT",
-		body: JSON.stringify(await c.req.json()),
-		headers: { "content-type": "application/json" },
-	});
+	const actor = await requireAuth(c.req.raw, c.env);
+	return adminResponse(
+		await templates.updateTemplate(c.env, actor, {
+			mailboxId: c.req.param("mailboxId"),
+			templateId: c.req.param("templateId"),
+			get body() {
+				return c.req.json();
+			},
+		}),
+	);
 });
-
 api.post("/api/mailboxes/:mailboxId/transactional/templates/:templateId/archive", async (c) => {
-	const denied = await templateRouteGate(c.req.raw, c.env, c.req.param("mailboxId"));
-	if (denied) return denied;
-	const mailboxId = c.req.param("mailboxId");
-	const templateId = c.req.param("templateId");
-	const stub = mailboxStub(c.env, mailboxId);
-	return stub.fetch(`https://mailbox-do/transactional/templates/${templateId}/archive`, {
-		method: "POST",
-	});
+	const actor = await requireAuth(c.req.raw, c.env);
+	return adminResponse(
+		await templates.archiveTemplate(c.env, actor, {
+			mailboxId: c.req.param("mailboxId"),
+			templateId: c.req.param("templateId"),
+		}),
+	);
 });
-
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
