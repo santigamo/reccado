@@ -222,7 +222,10 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       client 500s, and there is no owner endpoint to enumerate refresh tokens. Issued access
       JWTs live 3600 s. Follow-up: an owner-gated revoke that deletes refresh tokens + consent +
       client in order (our own route, not a schema divergence).
-- [ ] Apply 0021 remotely + `pnpm run deploy:dev` (needs owner approval — live inbox).
+- [ ] Deploy: **owner decided 2026-11-11 to deploy once, after everything is done** (not per phase).
+      Order: remote D1 migrations 0021 → 0022 → (0024 passkey) → `pnpm run deploy:dev` → re-register
+      MCP client (old tokens lack the new scopes and need re-consent) → re-draft any pre-0022
+      Telegram pending sends.
 - [ ] Connect Claude Code end-to-end; call the existing 5 tools.
 - [ ] Check whether Codex supports pre-registered clients and which protocol it negotiates.
 
@@ -236,12 +239,18 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 - [x] Both protocol eras verified in the Workers test pool (2026-07-28 `server/discover`; 2025-06-18 `initialize`). Live client check pending deploy.
 
 ### P1 — CIMD
-- [ ] Add `@better-auth/cimd` with the Workers fetch transport and `global_fetch_strictly_public`.
+- [x] `@better-auth/cimd` 1.7.20 with a Workers-native guarded transport, **opt-in** via
+      `MCP_CIMD_ENABLED` (default false); `global_fetch_strictly_public` NOT enabled (see decision
+      log). (T7, merged 83350bd)
+- [ ] **Bug found on merge:** host-rejection test hangs → at least one private/numeric host may
+      pass the guard. Sent back to T7; CIMD must stay disabled until fixed + verified live.
 - [ ] Record which `client_id` URLs Claude Code and claude.ai present.
-- [ ] Consent page: client host, `client_name`, redirect host, scopes; warn-only known hosts;
-      first-seen client → `ops_events`.
-- [ ] Default consent = `mail:read mail:draft`; step-up via `insufficient_scope` works.
-- [ ] Close DCR; document `operator mcp register` as plan B.
+- [x] Consent page: client host, `client_name`, redirect host, scopes (Spanish copy);
+      warn-only known hosts; first-seen client → `ops_events`.
+- [x] Default consent = `mail:read mail:draft`; scopes defined; `src/lib/mcp-scopes.ts`
+      (`scopesFromClaims`, `requireScope`, `insufficientScope`). Wiring into tools: T8.
+- [x] Unauthenticated DCR refused (tested); session-backed registration kept as the
+      pre-registration path (`operator mcp register`).
 
 ### P2 — Service layer
 - [x] Extract mailbox/domain/alias/routing/template/key/suppression/ops logic into
