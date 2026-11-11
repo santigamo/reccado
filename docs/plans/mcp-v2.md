@@ -275,7 +275,7 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       (web confirm → `approval_required`, tested). Atomic DO preconditions (`allowedStatuses`):
       update only `draft`; cancel `draft|pending_confirmation`; else 409 `draft_not_editable`.
 - [x] `get_health`, `list_ops`, `list_config` (control plane is **read-only** until P4).
-- [ ] Follow-up: `update_messages` via MCP does not refresh Telegram cards like the HTTP actions
+- [x] Follow-up done (T10): `update_messages` via MCP now refreshes Telegram cards like the HTTP actions
       route does; labels are not a message action today (dropped from the tool).
 
 ### P4 — Approvals, passkey, send
