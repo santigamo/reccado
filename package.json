@@ -77,6 +77,7 @@
 		"cf-typegen": "wrangler types"
 	},
 	"dependencies": {
+		"@better-auth/cimd": "1.7.20",
 		"@better-auth/mcp": "1.7.20",
 		"@modelcontextprotocol/server": "2.4.0",
 		"@tailwindcss/vite": "^4.3.2",

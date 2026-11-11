@@ -17,6 +17,7 @@
 
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { mcp } from "@better-auth/mcp";
+import { cimd } from "@better-auth/cimd";
 import { emailOTP, jwt, twoFactor } from "better-auth/plugins";
 import { insertOpsEvent } from "../db/d1";
 import { consumePairingCode, type PairingClaim } from "../db/owners";
@@ -28,6 +29,7 @@ import {
 	type AuthMailSender,
 } from "../lib/better-auth";
 import { resolveOwnerEmails } from "./auth";
+import { DEFAULT_MCP_SCOPES, MCP_SCOPES } from "../lib/mcp-scopes";
 
 /** The path better-auth mounts under in the worker (server.ts proxies /api/* to the Hono app). */
 export const AUTH_BASE_PATH = "/api/auth";
@@ -63,7 +65,43 @@ export type AuthEnv = {
 	EMAIL?: SendEmail;
 	MAIL_FROM_ADDRESS?: string;
 	BETTER_AUTH_SECRET?: string;
+	MCP_CIMD_ENABLED?: string;
 };
+
+function metadataHostAllowed(value: string, deploymentOrigin: string): boolean {
+	try {
+		const url = new URL(value);
+		const host = url.hostname.toLowerCase().replace(/\.$/, "");
+		const own = new URL(deploymentOrigin).hostname.toLowerCase().replace(/\.$/, "");
+		// Conservatively deny the deployment's last two labels and all descendants.
+		// This may deny unrelated hosts on shared suffixes, but never widens access.
+		const zone = own.split(".").slice(-2).join(".");
+		return (
+			url.protocol === "https:" &&
+			!url.username &&
+			!url.password &&
+			!host.startsWith("[") &&
+			!/^\d+(?:\.\d+)*$/.test(host) &&
+			!host.split(".").some((part) => /^(?:0x[0-9a-f]+|\d+)$/.test(part)) &&
+			!host.split(".").some((part) => ["localhost", "local", "internal", "arpa"].includes(part)) &&
+			host !== zone &&
+			!host.endsWith(`.${zone}`)
+		);
+	} catch {
+		return false;
+	}
+}
+
+async function recordMcpClient(db: D1Database, clientId: string): Promise<void> {
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(clientId));
+	const id = `mcp-client-${Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+	await db
+		.prepare(
+			"INSERT OR IGNORE INTO ops_events (id, event_type, severity, subject, payload_json, created_at) VALUES (?, 'mcp.client_first_seen', 'info', ?, '{}', ?)",
+		)
+		.bind(id, clientId, new Date().toISOString())
+		.run();
+}
 
 /** Thrown by createAuth when the issuer cannot run at all; handleAuthRequest maps it to 503. */
 export class AuthConfigError extends Error {}
@@ -200,11 +238,12 @@ export async function createAuth(
 			// audience-bound to the canonical /mcp resource; verification happens in
 			// mcp/handler.ts via @better-auth/mcp's requireMcpAuth. Tables: 0017.
 			mcp({
+				scopes: [...MCP_SCOPES],
+				clientRegistrationDefaultScopes: [...DEFAULT_MCP_SCOPES],
+				clientRegistrationAllowedScopes: [...MCP_SCOPES],
 				resource: await resolveMcpResource(env, opts.request ?? new Request(baseURL)),
 				loginPage: "/login",
-				// No consent UI page exists yet; a dynamically registered client's
-				// authorize redirect lands here after the owner logs in (the operator
-				// path is documented in mcp/handler.ts).
+				// The owner reviews client identity and requested permissions here.
 				consentPage: "/consent",
 				// Session-backed dynamic client registration (RFC 7591): a request with
 				// no owner session is rejected (allowUnauthenticatedClientRegistration
@@ -215,6 +254,40 @@ export async function createAuth(
 				// access-token claims carry only sub/aud/scope, so add the identity here.
 				customAccessTokenClaims: async ({ user }) => (user ? { email: user.email } : {}),
 			}),
+			...(env.MCP_CIMD_ENABLED === "true"
+				? [
+						cimd({
+							metadataProfile: "mcp-2026-07-28",
+							isMetadataDocumentUrlAllowed: (url) => metadataHostAllowed(url, baseURL),
+							// Deliberate opt-in deviation: Workers fetch does not expose resolve-once
+							// DNS or connection pinning required by the plugin's Node-oriented contract.
+							// Workers uses Cloudflare egress; host restrictions and manual redirects
+							// reduce exposure, but do not prove equivalent DNS rebinding protection.
+							fetchClientMetadataResource: async (input, init) => {
+								const url =
+									typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+								if (!metadataHostAllowed(url, baseURL)) throw new Error("metadata host refused");
+								const headers = new Headers();
+								const supplied = new Headers(init?.headers);
+								for (const name of ["accept", "if-none-match", "if-modified-since"]) {
+									const value = supplied.get(name);
+									if (value) headers.set(name, value);
+								}
+								const response = await fetch(url, {
+									headers,
+									signal: init?.signal,
+									redirect: "manual",
+								});
+								if (response.status >= 300 && response.status < 400 && response.status !== 304)
+									throw new Error("metadata redirect refused");
+								return response;
+							},
+							onClientCreated: async ({ client }) => {
+								await recordMcpClient(env.INDEX_DB, client.clientId);
+							},
+						}),
+					]
+				: []),
 		],
 		advanced: {
 			defaultCookieAttributes: {
@@ -331,8 +404,36 @@ export async function handleAuthRequest(
 			const gated = await gateSendOtp(request, env);
 			if (gated) return gated;
 		}
-		const auth = await createAuth(env, { request, mailSender: opts.mailSender });
-		return await auth.handler(request);
+		let authRequest = request;
+		if (
+			env.MCP_CIMD_ENABLED !== "true" &&
+			url.pathname === `${AUTH_BASE_PATH}/oauth2/authorize` &&
+			/^https?:/i.test(url.searchParams.get("client_id") ?? "")
+		) {
+			return Response.json(
+				{ error: "invalid_client", error_description: "Client metadata discovery is disabled" },
+				{ status: 400 },
+			);
+		}
+		if (
+			url.pathname === `${AUTH_BASE_PATH}/oauth2/authorize` &&
+			request.method === "GET" &&
+			!url.searchParams.has("scope")
+		) {
+			url.searchParams.set("scope", DEFAULT_MCP_SCOPES.join(" "));
+			authRequest = new Request(url, request);
+		}
+		const auth = await createAuth(env, { request: authRequest, mailSender: opts.mailSender });
+		const response = await auth.handler(authRequest);
+		const clientId = url.searchParams.get("client_id");
+		if (
+			clientId &&
+			url.pathname === `${AUTH_BASE_PATH}/oauth2/authorize` &&
+			response.headers.get("location")?.startsWith("/consent?")
+		) {
+			await recordMcpClient(env.INDEX_DB, clientId);
+		}
+		return response;
 	} catch (error) {
 		if (error instanceof AuthConfigError) {
 			return Response.json({ error: "auth_unavailable", reason: error.message }, { status: 503 });

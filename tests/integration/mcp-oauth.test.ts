@@ -34,9 +34,16 @@ const OWNER = "owner@example.com";
 const STRANGER = "stranger@example.com";
 const ORIGIN = "https://inbox.imsanti.dev";
 const RESOURCE = `${ORIGIN}/mcp`;
+let cimdEnabled = false;
+const metadataResponses = new Map<string, Response>();
 
 const authEnv = () =>
-	({ ...env, BETTER_AUTH_SECRET: TEST_SECRET, OWNER_BOOTSTRAP_EMAILS: OWNER }) as Env;
+	({
+		...env,
+		BETTER_AUTH_SECRET: TEST_SECRET,
+		OWNER_BOOTSTRAP_EMAILS: OWNER,
+		MCP_CIMD_ENABLED: String(cimdEnabled),
+	}) as Env;
 
 beforeAll(async () => {
 	await applyMigrations(
@@ -66,6 +73,8 @@ beforeAll(async () => {
 		if (url === `${ORIGIN}/api/auth/jwks`) {
 			return new Response(jwks, { headers: { "content-type": "application/json" } });
 		}
+		const metadata = metadataResponses.get(url);
+		if (metadata) return metadata.clone();
 		return realFetch(input, init);
 	});
 });
@@ -132,6 +141,7 @@ const INITIALIZE = {
 async function runAuthorize(
 	clientId: string,
 	cookie: string,
+	scope: string | null = "mail:read mail:draft",
 ): Promise<{ oauthQuery: string; verifier: string }> {
 	const verifierBytes = crypto.getRandomValues(new Uint8Array(32));
 	const verifier = btoa(String.fromCharCode(...verifierBytes))
@@ -148,7 +158,7 @@ async function runAuthorize(
 	authorizeUrl.searchParams.set("response_type", "code");
 	authorizeUrl.searchParams.set("client_id", clientId);
 	authorizeUrl.searchParams.set("redirect_uri", "https://client.example/cb");
-	authorizeUrl.searchParams.set("scope", "openid email");
+	if (scope !== null) authorizeUrl.searchParams.set("scope", scope);
 	authorizeUrl.searchParams.set("code_challenge", challenge);
 	authorizeUrl.searchParams.set("code_challenge_method", "S256");
 	authorizeUrl.searchParams.set("resource", RESOURCE);
@@ -206,8 +216,166 @@ async function authorizeAndMintToken(clientId: string, clientSecret: string, coo
 }
 
 beforeEach(async () => {
+	cimdEnabled = false;
+	metadataResponses.clear();
 	await testEnv.INDEX_DB.prepare("DELETE FROM owner_identities").run();
 	await testEnv.INDEX_DB.prepare('DELETE FROM "rateLimit"').run();
+});
+
+describe("CIMD opt-in", () => {
+	it("discovers a client, displays the requested scopes and mints only approved scopes", async () => {
+		const { cookie } = await ownerSessionAndClient("cimd-owner");
+		cimdEnabled = true;
+		const clientId = "https://client.test/metadata";
+		metadataResponses.set(
+			clientId,
+			Response.json({
+				client_id: clientId,
+				client_name: "Example client",
+				redirect_uris: ["https://client.example/cb"],
+				token_endpoint_auth_method: "none",
+			}),
+		);
+		for (const requested of [null, "mail:read mail:draft admin"]) {
+			const { oauthQuery, verifier } = await runAuthorize(clientId, cookie, requested);
+			expect(new URLSearchParams(oauthQuery).get("scope")).toBe(
+				requested ?? "mail:read mail:draft",
+			);
+			expect(new URLSearchParams(oauthQuery).get("redirect_uri")).toBe("https://client.example/cb");
+			const client = await run(
+				new Request(
+					`${ORIGIN}/api/auth/oauth2/public-client?client_id=${encodeURIComponent(clientId)}`,
+					{ headers: { cookie } },
+				),
+			);
+			expect(((await client.json()) as { client_name: string }).client_name).toBe("Example client");
+			const consent = await postJson(
+				"/api/auth/oauth2/consent",
+				{ accept: true, oauth_query: oauthQuery },
+				cookie,
+				true,
+			);
+			expect(consent.status).toBe(200);
+			const result = (await consent.json()) as { redirect_uri?: string; url?: string };
+			const code = new URL(result.redirect_uri ?? result.url ?? "").searchParams.get("code");
+			const token = await run(
+				new Request(`${ORIGIN}/api/auth/oauth2/token`, {
+					method: "POST",
+					headers: { "content-type": "application/x-www-form-urlencoded" },
+					body: new URLSearchParams({
+						grant_type: "authorization_code",
+						code: code ?? "",
+						client_id: clientId,
+						redirect_uri: "https://client.example/cb",
+						code_verifier: verifier,
+					}),
+				}),
+			);
+			expect(token.status).toBe(200);
+			const body = (await token.json()) as { scope: string };
+			expect(body.scope).toBe(requested ?? "mail:read mail:draft");
+		}
+		const rows = await testEnv.INDEX_DB.prepare(
+			"SELECT id FROM ops_events WHERE event_type = 'mcp.client_first_seen' AND subject = ?",
+		)
+			.bind(clientId)
+			.all();
+		expect(rows.results).toHaveLength(1);
+	});
+
+	it("refuses a mismatched redirect and metadata redirects", async () => {
+		const { cookie } = await ownerSessionAndClient("cimd-rejection-owner");
+		cimdEnabled = true;
+		for (const [clientId, response] of [
+			[
+				"https://other-client.test/metadata",
+				Response.json({
+					client_id: "https://other-client.test/metadata",
+					client_name: "Other",
+					redirect_uris: ["https://elsewhere.test/callback"],
+					token_endpoint_auth_method: "none",
+				}),
+			],
+			[
+				"https://redirect-client.test/metadata",
+				new Response(null, {
+					status: 302,
+					headers: { location: "https://elsewhere.test/metadata" },
+				}),
+			],
+		] as const) {
+			metadataResponses.set(clientId, response);
+			const url = new URL(`${ORIGIN}/api/auth/oauth2/authorize`);
+			for (const [key, value] of Object.entries({
+				client_id: clientId,
+				response_type: "code",
+				redirect_uri: "https://client.example/cb",
+				code_challenge: "a".repeat(43),
+				code_challenge_method: "S256",
+				resource: RESOURCE,
+			}))
+				url.searchParams.set(key, value);
+			const result = await run(new Request(url, { headers: { cookie }, redirect: "manual" }));
+			expect(result.headers.get("location") ?? "").not.toMatch(/^\/consent\?/);
+		}
+	});
+
+	it("denies admin and disables URL clients by default", async () => {
+		const { cookie } = await ownerSessionAndClient("cimd-deny-owner");
+		const clientId = "https://deny-client.test/metadata";
+		const disabled = await run(
+			new Request(`${ORIGIN}/api/auth/oauth2/authorize?client_id=${encodeURIComponent(clientId)}`, {
+				headers: { cookie },
+			}),
+		);
+		expect(disabled.status).toBe(400);
+		cimdEnabled = true;
+		metadataResponses.set(
+			clientId,
+			Response.json({
+				client_id: clientId,
+				client_name: "Deny client",
+				redirect_uris: ["https://client.example/cb"],
+				token_endpoint_auth_method: "none",
+			}),
+		);
+		const { oauthQuery } = await runAuthorize(clientId, cookie, "admin");
+		const consent = await postJson(
+			"/api/auth/oauth2/consent",
+			{ accept: false, oauth_query: oauthQuery },
+			cookie,
+			true,
+		);
+		const result = (await consent.json()) as { redirect_uri?: string; url?: string };
+		const target = new URL(result.redirect_uri ?? result.url ?? "");
+		expect(target.searchParams.get("error")).toBe("access_denied");
+		expect(target.searchParams.has("code")).toBe(false);
+	});
+
+	it("rejects private names, numeric addresses and the deployment zone", async () => {
+		const { cookie } = await ownerSessionAndClient("cimd-host-owner");
+		cimdEnabled = true;
+		for (const clientId of [
+			"https://127.0.0.1/metadata",
+			"https://0x7f000001/metadata",
+			"https://[::1]/metadata",
+			"https://service.internal/metadata",
+			"https://sibling.example.com/metadata",
+		]) {
+			const url = new URL(`${ORIGIN}/api/auth/oauth2/authorize`);
+			for (const [key, value] of Object.entries({
+				client_id: clientId,
+				response_type: "code",
+				redirect_uri: "https://client.example/cb",
+				code_challenge: "a".repeat(43),
+				code_challenge_method: "S256",
+				resource: RESOURCE,
+			}))
+				url.searchParams.set(key, value);
+			const result = await run(new Request(url, { headers: { cookie }, redirect: "manual" }));
+			expect(result.headers.get("location") ?? "").not.toMatch(/^\/consent\?/);
+		}
+	});
 });
 
 /**
@@ -628,7 +796,7 @@ describe("the /mcp bearer-token perimeter", () => {
 		const { cookie, clientId } = await ownerSessionAndClient("OAUTHTAMPER01");
 		const { oauthQuery } = await runAuthorize(clientId, cookie);
 		const tampered = new URLSearchParams(oauthQuery);
-		tampered.set("scope", "openid email admin");
+		tampered.set("scope", "mail:read mail:draft admin");
 		const response = await postJson(
 			"/api/auth/oauth2/consent",
 			{ accept: true, oauth_query: tampered.toString() },
