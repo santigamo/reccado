@@ -26,6 +26,53 @@ export async function dlq(env: Env, actor: AuthContext) {
 		ingestFailures: await listIngestFailures(env.INDEX_DB),
 	};
 }
+export async function listOpsPage(
+	env: Env,
+	actor: AuthContext,
+	input: {
+		kind: "events" | "dlq";
+		limit: number;
+		offset: number;
+		eventType?: string;
+		mailboxId?: string;
+	},
+) {
+	assertAdminAccess(env, actor, "");
+	if (input.kind === "events") {
+		const filters: string[] = [];
+		const binds: Array<string | number> = [];
+		if (input.eventType) {
+			filters.push("event_type = ?");
+			binds.push(input.eventType);
+		}
+		if (input.mailboxId) {
+			filters.push("(subject = ? OR instr(payload_json, ?) > 0)");
+			binds.push(input.mailboxId, `"mailbox_id":"${input.mailboxId}"`);
+		}
+		const where = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+		return {
+			events:
+				(
+					await env.INDEX_DB.prepare(
+						`SELECT * FROM ops_events ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+					)
+						.bind(...binds, input.limit, input.offset)
+						.all()
+				).results ?? [],
+		};
+	}
+	const mailboxFilter = input.mailboxId ? "AND mailbox_id = ?" : "";
+	const statement = env.INDEX_DB.prepare(
+		`SELECT * FROM ingest_events WHERE status = 'failed' ${mailboxFilter} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+	);
+	const bound = input.mailboxId
+		? statement.bind(input.mailboxId, input.limit, input.offset)
+		: statement.bind(input.limit, input.offset);
+	return {
+		ingestFailures: (await bound.all()).results ?? [],
+		note: "Cloudflare DLQ messages are inspected via dashboard or wrangler; ingest failures listed here.",
+	};
+}
 export async function reconcile(env: Env, actor: AuthContext, input: { mailboxId: string }) {
 	await requireMailboxOwner(env, actor, input.mailboxId);
 	if (!(await getMailbox(env.INDEX_DB, input.mailboxId)))

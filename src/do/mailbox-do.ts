@@ -194,7 +194,9 @@ const THREAD_LIST_COLUMNS = `
   lm.direction AS latest_direction,
   lm.state AS latest_state`;
 
-function listThreads(sql: SqlStorage, limit: number, state?: ThreadListState) {
+function listThreads(sql: SqlStorage, limit: number, state?: ThreadListState, unread?: boolean) {
+	const unreadClause =
+		unread === undefined ? "" : unread ? "WHERE t.unread_count > 0" : "WHERE t.unread_count = 0";
 	if (state) {
 		// The JOIN's correlated subquery only resolves for threads that actually
 		// have a message in this state, so it doubles as the folder filter — a
@@ -209,7 +211,7 @@ function listThreads(sql: SqlStorage, limit: number, state?: ThreadListState) {
             WHERE m.thread_id = t.id AND m.state = ?
             ORDER BY m.received_at DESC LIMIT 1
           )
-          ORDER BY lm.received_at DESC
+          ${unreadClause} ORDER BY lm.received_at DESC
           LIMIT ?`,
 				state,
 				limit,
@@ -223,7 +225,7 @@ function listThreads(sql: SqlStorage, limit: number, state?: ThreadListState) {
         JOIN messages lm ON lm.id = (
           SELECT m.id FROM messages m WHERE m.thread_id = t.id ORDER BY m.received_at DESC LIMIT 1
         )
-        ORDER BY t.last_message_at DESC
+        ${unreadClause} ORDER BY t.last_message_at DESC
         LIMIT ?`,
 			limit,
 		)
@@ -345,7 +347,8 @@ function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 				)
 				.toArray()[0];
 			if (existing) {
-				if (origin === "mcp") sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", existing.id);
+				if (origin === "mcp")
+					sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", existing.id);
 				return { id: existing.id, status: "draft", duplicate: true };
 			}
 			// Unexpected: zero rows written but no existing draft. Treat as internal error.
@@ -381,7 +384,13 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 	if (!draftId) throw new Error("draftId required");
 	const origin = requestedDraftOrigin(body.origin);
 	const now = new Date().toISOString();
+	const allowed =
+		Array.isArray(body.allowedStatuses) && body.allowedStatuses.every((s) => typeof s === "string")
+			? (body.allowedStatuses as string[])
+			: undefined;
 	const existing = sql.exec("SELECT * FROM outbound_drafts WHERE id = ?", draftId).toArray()[0];
+	if (allowed && (!existing || !allowed.includes(String(existing.status))))
+		return { error: "draft_not_editable", currentStatus: existing?.status ?? null };
 	if (!existing) throw new Error("draft not found");
 	if (origin === "mcp") sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", draftId);
 	const changed =
@@ -398,10 +407,10 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 			`intent_stale:${draftId}`,
 		);
 	}
-	sql.exec(
+	const updated = sql.exec(
 		`UPDATE outbound_drafts SET
          to_json = ?, cc_json = ?, bcc_json = ?, subject = ?, body_text = ?, body_html = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ?${allowed ? ` AND status IN (${allowed.map(() => "?").join(",") || "NULL"})` : ""}`,
 		JSON.stringify(body.to ?? JSON.parse(String(existing.to_json))),
 		JSON.stringify(body.cc ?? JSON.parse(String(existing.cc_json))),
 		JSON.stringify(body.bcc ?? JSON.parse(String(existing.bcc_json))),
@@ -410,7 +419,10 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 		body.bodyHtml ?? existing.body_html,
 		now,
 		draftId,
+		...(allowed ?? []),
 	);
+	if (allowed && !updated.rowsWritten)
+		return { error: "draft_not_editable", currentStatus: existing.status };
 	return { id: draftId, status: "draft" };
 }
 
@@ -1016,14 +1028,21 @@ export async function confirmSendDraft(
 	};
 }
 
-function cancelDraft(sql: SqlStorage, draftId: string | undefined) {
+function cancelDraft(sql: SqlStorage, draftId: string | undefined, allowed?: string[]) {
 	if (!draftId) throw new Error("draftId required");
 	const now = new Date().toISOString();
-	sql.exec(
-		"UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?",
+	const updated = sql.exec(
+		`UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?${allowed ? ` AND status IN (${allowed.map(() => "?").join(",") || "NULL"})` : ""}`,
 		now,
 		draftId,
+		...(allowed ?? []),
 	);
+	if (allowed && !updated.rowsWritten) {
+		const current = sql
+			.exec<{ status: string }>("SELECT status FROM outbound_drafts WHERE id = ?", draftId)
+			.toArray()[0];
+		return { error: "draft_not_editable", currentStatus: current?.status ?? null };
+	}
 	return { id: draftId, status: "cancelled" };
 }
 
@@ -1304,7 +1323,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const stateParam = url.searchParams.get("state");
 			const state = isThreadListState(stateParam) ? stateParam : undefined;
 			return Response.json({
-				threads: this.listThreads(Number(url.searchParams.get("limit") ?? "25"), state),
+				threads: this.listThreads(
+					Number(url.searchParams.get("limit") ?? "25"),
+					state,
+					url.searchParams.has("unread") ? url.searchParams.get("unread") === "true" : undefined,
+				),
 			});
 		}
 		if (url.pathname.startsWith("/threads/") && request.method === "GET") {
@@ -1346,7 +1369,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (url.pathname.match(/^\/drafts\/[^/]+$/) && request.method === "PATCH") {
 			const draftId = url.pathname.split("/")[2];
 			const body = await request.json();
-			return Response.json(this.updateDraft(draftId, body as Record<string, unknown>));
+			const result = this.updateDraft(draftId, body as Record<string, unknown>);
+			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/request-send$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
@@ -1368,14 +1392,23 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/send-intent$/) && request.method === "GET") {
 			const draftId = url.pathname.split("/")[2];
-			const row = this.ctx.storage.sql.exec<{ value: string }>(
-				"SELECT value FROM mailbox_meta WHERE key = ?", `send_intent:${draftId}`,
-			).toArray()[0];
+			const row = this.ctx.storage.sql
+				.exec<{ value: string }>(
+					"SELECT value FROM mailbox_meta WHERE key = ?",
+					`send_intent:${draftId}`,
+				)
+				.toArray()[0];
 			if (!row) return Response.json({ error: "intent_not_found" }, { status: 404 });
-			const stale = this.ctx.storage.sql.exec<{ value: string }>(
-				"SELECT value FROM mailbox_meta WHERE key = ?", `intent_stale:${draftId}`,
-			).toArray()[0];
-			return Response.json({ ...JSON.parse(row.value) as object, stale: stale?.value === "stale" });
+			const stale = this.ctx.storage.sql
+				.exec<{ value: string }>(
+					"SELECT value FROM mailbox_meta WHERE key = ?",
+					`intent_stale:${draftId}`,
+				)
+				.toArray()[0];
+			return Response.json({
+				...(JSON.parse(row.value) as object),
+				stale: stale?.value === "stale",
+			});
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/confirm-send$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
@@ -1409,7 +1442,16 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/cancel$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
-			return Response.json(this.cancelDraft(draftId));
+			const body = request.headers.get("content-type")?.includes("application/json")
+				? ((await request.json()) as { allowedStatuses?: unknown })
+				: {};
+			const allowed =
+				Array.isArray(body.allowedStatuses) &&
+				body.allowedStatuses.every((s) => typeof s === "string")
+					? (body.allowedStatuses as string[])
+					: undefined;
+			const result = this.cancelDraft(draftId, allowed);
+			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname === "/export-index" && request.method === "GET") {
 			return Response.json({ messages: this.exportMessageIndex() });
@@ -2124,8 +2166,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		return result;
 	}
 
-	private listThreads(limit: number, state?: ThreadListState) {
-		return listThreads(this.ctx.storage.sql, limit, state);
+	private listThreads(limit: number, state?: ThreadListState, unread?: boolean) {
+		return listThreads(this.ctx.storage.sql, limit, state, unread);
 	}
 
 	private getThread(threadId: string | undefined) {
@@ -2273,8 +2315,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 	}
 
-	private cancelDraft(draftId: string | undefined) {
-		return cancelDraft(this.ctx.storage.sql, draftId);
+	private cancelDraft(draftId: string | undefined, allowed?: string[]) {
+		return cancelDraft(this.ctx.storage.sql, draftId, allowed);
 	}
 
 	private exportMessageIndex() {

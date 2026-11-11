@@ -22,6 +22,7 @@ export type McpThread = {
 
 export type McpSearchResult = {
 	message_id: string;
+	mailbox_id?: string;
 	subject: string | null;
 	from_addr: string;
 	snippet: string | null;
@@ -50,6 +51,9 @@ export type McpMessageDto = {
 	body_text: string;
 	body_truncated: boolean;
 	body_original_length: number;
+	sensitive_kind: import("../lib/sensitive-mail").SensitiveKind | null;
+	redacted: boolean;
+	resource_links: Array<{ uri: string; name: string; mimeType: string }>;
 };
 
 export type McpDraftResult = {

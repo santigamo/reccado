@@ -770,10 +770,16 @@ describe("the /mcp bearer-token perimeter", () => {
 				"list_threads",
 				"search_messages",
 				"read_message",
-				"draft_reply",
+				"read_thread",
+				"save_draft",
+				"cancel_draft",
+				"update_messages",
+				"get_health",
+				"list_ops",
+				"list_config",
 			]);
-			for (const tool of tools.slice(0, 4)) expect(tool.annotations.readOnlyHint).toBe(true);
-			expect(tools[4]?.annotations).toMatchObject({
+			for (const tool of tools.slice(0, 5)) expect(tool.annotations.readOnlyHint).toBe(true);
+			expect(tools[5]?.annotations).toMatchObject({
 				readOnlyHint: false,
 				destructiveHint: false,
 				idempotentHint: true,
