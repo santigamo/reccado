@@ -5,7 +5,9 @@ Status: **in progress** (integration branch `feat/mcp-v2`) · Owner: Santi · Cr
 Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test values:
 `PHASE0_DEBUG_TOKEN`, `MAILBOX_JURISDICTION=none`, a fake `TRANSACTIONAL_API_KEY_PEPPER`, and
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
-Baseline on fc22f6a: 66 files / 1132 tests green.
+Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
+
+In flight: T7 `mcp-cimd` (P1), T8 `mcp-tools` (P3 tools), T6 `mcp-approve` (P4b passkey + approval page). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -227,11 +229,11 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 **Done when:** Claude Code lists and calls the 5 tools against the live deployment.
 
 ### P0b — SDK v2 port
-- [ ] `agents` → 0.33, add `@modelcontextprotocol/server` 2.4.0 (optional peer dep since 0.31).
-- [ ] Port the 5 tools to a v2 factory on `agents/mcp/server` `createMcpHandler`;
-      `legacy: "stateless"`; set `allowedHostnames` for the custom domain.
-- [ ] Add annotations, `outputSchema`, `structuredContent`, deterministic order.
-- [ ] Verify both a 2026-07-28 client (Claude Code) and a legacy client work.
+- [x] `agents` → 0.33, add `@modelcontextprotocol/server` 2.4.0; SDK v1 no longer a direct dep. (T3, merged)
+- [x] Port the 5 tools to a v2 factory on `agents/mcp/server` `createMcpHandler`;
+      `legacy: "stateless"`; Host/Origin protection for the custom domain.
+- [x] Add annotations, `outputSchema`, `structuredContent`, deterministic order.
+- [x] Both protocol eras verified in the Workers test pool (2026-07-28 `server/discover`; 2025-06-18 `initialize`). Live client check pending deploy.
 
 ### P1 — CIMD
 - [ ] Add `@better-auth/cimd` with the Workers fetch transport and `global_fetch_strictly_public`.
@@ -242,9 +244,9 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 - [ ] Close DCR; document `operator mcp register` as plan B.
 
 ### P2 — Service layer
-- [ ] Extract mailbox/domain/alias/routing/template/key/suppression/ops logic into
-      `src/lib/admin/*`.
-- [ ] REST routes switch to services with existing tests unchanged and green.
+- [x] Extract mailbox/domain/alias/routing/template/key/suppression/ops logic into
+      `src/lib/admin/*` (services take the trusted `AuthContext`; `AdminError` → same HTTP). (T2, merged)
+- [x] REST routes switch to services with existing tests unchanged and green.
 
 ### P3 — Read, draft, tier 1, admin reads
 - [ ] Read tools incl. `read_thread`, cross-mailbox search, `resource_link` attachments.
