@@ -1,4 +1,5 @@
 import { getMailbox, insertOpsEvent, insertTelegramLink } from "../db/d1";
+import { getRuntimeConfig, RUNTIME_CONFIG_KEYS } from "../db/runtime-config";
 import {
 	claimTelegramTopic,
 	forgetTelegramTopic,
@@ -6,6 +7,7 @@ import {
 } from "../db/telegram-topics";
 import {
 	createForumTopic,
+	inlineKeyboard,
 	isMissingTopicError,
 	readTelegramConfig,
 	sendMessage,
@@ -19,6 +21,25 @@ import { renderInboundNotification } from "./format";
 import { isFirstContact } from "./index-rows";
 import { fetchMailboxAttachments } from "./messages";
 import { flushTelegramDigest, isQuietNow, isSenderMuted, retainNotification } from "./noise";
+
+export function intentNotificationKeyboard(url: string): Record<string, unknown> {
+	return inlineKeyboard([[{ text: "Revisar solicitud", url }]]);
+}
+
+/** Notify the owner without exposing an action that can approve over Telegram. */
+export async function notifyIntentCreated(env: Env, intentId: string): Promise<void> {
+	const config = readTelegramConfig(env);
+	const chatId = await resolveTelegramChatId(env);
+	const origin = await getRuntimeConfig(env.INDEX_DB, RUNTIME_CONFIG_KEYS.deploymentOrigin);
+	if (!config || !chatId || !origin) return;
+	const url = new URL(`/approve/${encodeURIComponent(intentId)}`, origin);
+	if (url.origin !== origin || (url.protocol !== "https:" && url.hostname !== "localhost")) return;
+	await sendMessage(config, {
+		chatId,
+		text: "Hay una solicitud pendiente de aprobación.",
+		replyMarkup: intentNotificationKeyboard(url.toString()),
+	});
+}
 
 export type InboundNotificationInput = {
 	mailboxId: string;
