@@ -368,7 +368,13 @@ function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<string, unknown>) {
 	if (!draftId) throw new Error("draftId required");
 	const now = new Date().toISOString();
+	const allowed =
+		Array.isArray(body.allowedStatuses) && body.allowedStatuses.every((s) => typeof s === "string")
+			? (body.allowedStatuses as string[])
+			: undefined;
 	const existing = sql.exec("SELECT * FROM outbound_drafts WHERE id = ?", draftId).toArray()[0];
+	if (allowed && (!existing || !allowed.includes(String(existing.status))))
+		return { error: "draft_not_editable", currentStatus: existing?.status ?? null };
 	if (!existing) throw new Error("draft not found");
 	const changed =
 		JSON.stringify(body.to ?? JSON.parse(String(existing.to_json))) !== existing.to_json ||
@@ -384,10 +390,10 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 			`intent_stale:${draftId}`,
 		);
 	}
-	sql.exec(
+	const updated = sql.exec(
 		`UPDATE outbound_drafts SET
          to_json = ?, cc_json = ?, bcc_json = ?, subject = ?, body_text = ?, body_html = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ?${allowed ? ` AND status IN (${allowed.map(() => "?").join(",") || "NULL"})` : ""}`,
 		JSON.stringify(body.to ?? JSON.parse(String(existing.to_json))),
 		JSON.stringify(body.cc ?? JSON.parse(String(existing.cc_json))),
 		JSON.stringify(body.bcc ?? JSON.parse(String(existing.bcc_json))),
@@ -396,7 +402,10 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 		body.bodyHtml ?? existing.body_html,
 		now,
 		draftId,
+		...(allowed ?? []),
 	);
+	if (allowed && !updated.rowsWritten)
+		return { error: "draft_not_editable", currentStatus: existing.status };
 	return { id: draftId, status: "draft" };
 }
 
@@ -996,14 +1005,21 @@ export async function confirmSendDraft(
 	};
 }
 
-function cancelDraft(sql: SqlStorage, draftId: string | undefined) {
+function cancelDraft(sql: SqlStorage, draftId: string | undefined, allowed?: string[]) {
 	if (!draftId) throw new Error("draftId required");
 	const now = new Date().toISOString();
-	sql.exec(
-		"UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?",
+	const updated = sql.exec(
+		`UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?${allowed ? ` AND status IN (${allowed.map(() => "?").join(",") || "NULL"})` : ""}`,
 		now,
 		draftId,
+		...(allowed ?? []),
 	);
+	if (allowed && !updated.rowsWritten) {
+		const current = sql
+			.exec<{ status: string }>("SELECT status FROM outbound_drafts WHERE id = ?", draftId)
+			.toArray()[0];
+		return { error: "draft_not_editable", currentStatus: current?.status ?? null };
+	}
 	return { id: draftId, status: "cancelled" };
 }
 
@@ -1322,7 +1338,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (url.pathname.match(/^\/drafts\/[^/]+$/) && request.method === "PATCH") {
 			const draftId = url.pathname.split("/")[2];
 			const body = await request.json();
-			return Response.json(this.updateDraft(draftId, body as Record<string, unknown>));
+			const result = this.updateDraft(draftId, body as Record<string, unknown>);
+			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/request-send$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
@@ -1374,7 +1391,16 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+\/cancel$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
-			return Response.json(this.cancelDraft(draftId));
+			const body = request.headers.get("content-type")?.includes("application/json")
+				? ((await request.json()) as { allowedStatuses?: unknown })
+				: {};
+			const allowed =
+				Array.isArray(body.allowedStatuses) &&
+				body.allowedStatuses.every((s) => typeof s === "string")
+					? (body.allowedStatuses as string[])
+					: undefined;
+			const result = this.cancelDraft(draftId, allowed);
+			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname === "/export-index" && request.method === "GET") {
 			return Response.json({ messages: this.exportMessageIndex() });
@@ -2238,8 +2264,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 	}
 
-	private cancelDraft(draftId: string | undefined) {
-		return cancelDraft(this.ctx.storage.sql, draftId);
+	private cancelDraft(draftId: string | undefined, allowed?: string[]) {
+		return cancelDraft(this.ctx.storage.sql, draftId, allowed);
 	}
 
 	private exportMessageIndex() {
