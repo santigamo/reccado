@@ -32,14 +32,20 @@ export const DRAFT_PREVIEW_TTL_MS = 24 * 60 * 60 * 1000;
 /**
  * Deterministic action token derived from the Telegram message that produced the
  * draft. Telegram retries updates it thinks failed; a random token would mint a
- * second button (and a second send attempt key) for the same reply.
+ * second button (and a second send attempt key) for the same reply and content.
  *
  * It lives here rather than in webhook.ts because the edit path has to rebuild
  * the very same Send button when it restates a preview, and two derivations of
  * one token is one derivation too many.
  */
-export async function actionToken(chatId: string, messageId: number): Promise<string> {
-	const digest = await sha256Hex(new TextEncoder().encode(`tg:${chatId}:${messageId}`));
+export async function actionToken(
+	chatId: string,
+	messageId: number,
+	payloadHash: string,
+): Promise<string> {
+	const digest = await sha256Hex(
+		new TextEncoder().encode(`tg:${chatId}:${messageId}:${payloadHash}`),
+	);
 	return digest.slice(0, 24);
 }
 
@@ -183,9 +189,7 @@ type StoredDraft = {
  * mapping row is dropped in that case, so the second correction is refused by
  * lookup rather than by luck.
  *
- * Nothing is re-armed: a draft already in pending_confirmation stays there, and
- * its Send token is derived from the source message rather than stored per
- * version, so the button under the preview keeps pointing at the same draft.
+ * The caller re-arms the corrected draft and replaces its approval button.
  */
 export async function applyDraftEdit(
 	env: Env,

@@ -1,7 +1,8 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { confirmSendDraft, resolveReplyIdentity } from "#/do/mailbox-do";
+import { requestSendDraft, resolveReplyIdentity } from "#/do/mailbox-do";
+import { confirmSendDraft } from "../helpers/armed-confirm";
 
 /**
  * What a reply has to get right to read as a reply: it joins the thread it was
@@ -315,6 +316,11 @@ describe("atomic per-draft send gate", () => {
 		const sent: SentEmail[] = [];
 		const result = await withMailbox("mbx-gate-1", async (state) => {
 			const seed = await seedThreadWithDraft(state, { parentRfcId: "parent@example.com" });
+			await requestSendDraft(state.storage.sql, seed.draftId, {
+				from: "hello@imsanti.dev",
+				fromName: null,
+				replyTo: null,
+			});
 
 			// Simulate an in-flight send from a different attempt key: the per-draft
 			// gate is already held. A real concurrent request would insert this via

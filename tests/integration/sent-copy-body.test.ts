@@ -1,7 +1,7 @@
 import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { confirmSendDraft } from "#/do/mailbox-do";
+import { confirmSendDraft } from "../helpers/armed-confirm";
 
 /**
  * The copy of a sent message has to show what was sent. The viewer renders the

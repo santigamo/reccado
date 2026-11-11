@@ -1,9 +1,10 @@
 import {
-	deleteTelegramAction,
-	getTelegramAction,
+	deleteApproval,
+	getApproval,
+	getMailbox,
 	getTelegramLinkByMessage,
 	insertOpsEvent,
-	insertTelegramAction,
+	replaceTelegramApproval,
 	type TelegramLinkRow,
 } from "../db/d1";
 import {
@@ -218,13 +219,11 @@ async function handleIdentityCommand(
 /**
  * The two buttons under a preview.
  *
- * Rebuilt from the source message rather than stored, because the send token is
- * derived from it: a corrected draft keeps the same token, so the button that was
- * already under the preview keeps pointing at the same draft and a redelivered
- * press still resolves to one send.
+ * The token incorporates the frozen payload hash, so an older button cannot
+ * approve the contents of a corrected draft.
  */
-async function previewKeyboard(chatId: string, sourceMessageId: number) {
-	const token = await actionToken(chatId, sourceMessageId);
+async function previewKeyboard(chatId: string, sourceMessageId: number, payloadHash: string) {
+	const token = await actionToken(chatId, sourceMessageId, payloadHash);
 	return inlineKeyboard([
 		[
 			{ text: "✅ Enviar", callback_data: `s:${token}` },
@@ -239,8 +238,8 @@ async function previewKeyboard(chatId: string, sourceMessageId: number) {
  *
  * Editing in place rather than posting a second preview is the whole point. Two
  * previews under one reply is exactly the ambiguity the operator was trying to
- * resolve — which of these is going to be sent? — and it would also mint a second
- * Send button for a draft that has one.
+ * resolve — which of these is going to be sent? — while replacing the button
+ * keeps approval bound to the corrected contents.
  */
 async function applyPreviewCorrection(
 	env: Env,
@@ -283,6 +282,46 @@ async function applyPreviewCorrection(
 		await say("No encuentro el mensaje original en el buzón.");
 		return;
 	}
+	const mailbox = await getMailbox(env.INDEX_DB, input.row.mailbox_id);
+	if (!mailbox) {
+		await say("No encuentro el buzón.");
+		return;
+	}
+	const stub = mailboxStub(env, input.row.mailbox_id);
+	const armedResponse = await stub.fetch(
+		`https://mailbox-do/drafts/${input.row.draft_id}/request-send`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				mailboxAddress: mailbox.primary_address,
+				displayName: mailbox.display_name,
+				replaceStale: true,
+			}),
+		},
+	);
+	const armed = (await armedResponse.json()) as {
+		status?: string;
+		payload_hash?: string;
+		error?: string;
+	};
+	if (armed.status !== "pending_confirmation" || !armed.payload_hash || armed.error) {
+		await say("No he podido preparar el borrador para enviar.");
+		return;
+	}
+	const token = await actionToken(
+		input.row.chat_id,
+		input.row.source_message_id,
+		armed.payload_hash,
+	);
+	await replaceTelegramApproval(env.INDEX_DB, {
+		token,
+		mailbox_id: input.row.mailbox_id,
+		draft_id: input.row.draft_id,
+		telegram_user_id: input.row.telegram_user_id,
+		expires_at: input.row.expires_at,
+		payload_hash: armed.payload_hash,
+	});
 
 	try {
 		await editMessageText(config, {
@@ -294,7 +333,11 @@ async function applyPreviewCorrection(
 				bodyText: input.text,
 				version: outcome.version,
 			}),
-			replyMarkup: await previewKeyboard(input.row.chat_id, input.row.source_message_id),
+			replyMarkup: await previewKeyboard(
+				input.row.chat_id,
+				input.row.source_message_id,
+				armed.payload_hash,
+			),
 		});
 	} catch (error) {
 		// The draft is already patched, so a failed edit is a display problem, not a
@@ -436,6 +479,9 @@ async function handleMessage(
 			return;
 		}
 	}
+	// A redelivery of the original reply must not recreate a preview containing
+	// its old text after a correction has already changed the frozen intent.
+	if (await getDraftBySource(env.INDEX_DB, chatId, message.message_id)) return;
 
 	const link = await resolveLink(env, chatId, message);
 	if (!link) {
@@ -506,11 +552,22 @@ async function handleMessage(
 	}
 	const draft = (await draftResponse.json()) as { id: string };
 
+	const mailbox = await getMailbox(env.INDEX_DB, link.mailbox_id);
+	if (!mailbox) throw new Error("mailbox_not_found");
 	const armResponse = await stub.fetch(`https://mailbox-do/drafts/${draft.id}/request-send`, {
 		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			mailboxAddress: mailbox.primary_address,
+			displayName: mailbox.display_name,
+		}),
 	});
-	const armed = (await armResponse.json()) as { status?: string };
-	if (armed.status !== "pending_confirmation") {
+	const armed = (await armResponse.json()) as {
+		status?: string;
+		payload_hash?: string;
+		error?: string;
+	};
+	if (armed.status !== "pending_confirmation" || !armed.payload_hash || armed.error) {
 		// The draft is already sent or cancelled — which is what a retried Telegram
 		// update looks like. Say so instead of offering a Send button that would do
 		// nothing.
@@ -526,14 +583,14 @@ async function handleMessage(
 		return;
 	}
 
-	const token = await actionToken(chatId, message.message_id);
-	await insertTelegramAction(env.INDEX_DB, {
+	const token = await actionToken(chatId, message.message_id, armed.payload_hash);
+	await replaceTelegramApproval(env.INDEX_DB, {
 		token,
-		kind: "confirm_send",
 		mailbox_id: link.mailbox_id,
 		draft_id: draft.id,
 		telegram_user_id: String(message.from?.id ?? ""),
 		expires_at: new Date(Date.now() + ACTION_TTL_MS).toISOString(),
+		payload_hash: armed.payload_hash,
 	});
 
 	const preview = await sendMessage(config, {
@@ -541,7 +598,7 @@ async function handleMessage(
 		text: renderDraftPreview({ to: [parentMessage.from_addr], subject, bodyText: text }),
 		replyToMessageId: message.message_id,
 		messageThreadId: message.message_thread_id ?? null,
-		replyMarkup: await previewKeyboard(chatId, message.message_id),
+		replyMarkup: await previewKeyboard(chatId, message.message_id, armed.payload_hash),
 	});
 	// After the send, because the preview's own message id is the key a correction
 	// arrives with. A failure here costs the ability to edit this one draft; doing
@@ -604,14 +661,32 @@ async function handleCallbackQuery(
 		return;
 	}
 
-	const action = await getTelegramAction(env.INDEX_DB, token);
-	if (!action || new Date(action.expires_at).getTime() < Date.now()) {
+	const action = await getApproval(env.INDEX_DB, token);
+	if (
+		!action ||
+		action.origin !== "telegram" ||
+		action.kind !== "confirm_send" ||
+		!action.mailbox_id ||
+		!action.draft_id ||
+		new Date(action.expires_at).getTime() < Date.now()
+	) {
 		await answerCallbackQuery(config, { callbackQueryId: query.id, text: "Caducado" });
 		return;
 	}
 	// The button is bound to the person it was shown to, not just to the allowlist.
 	if (action.telegram_user_id !== String(query.from.id)) {
 		await answerCallbackQuery(config, { callbackQueryId: query.id, text: "No autorizado" });
+		return;
+	}
+	if (action.consumed_at) {
+		await answerCallbackQuery(config, {
+			callbackQueryId: query.id,
+			text: "Sustituido por una versión nueva",
+		});
+		return;
+	}
+	if (!action.payload_hash) {
+		await answerCallbackQuery(config, { callbackQueryId: query.id, text: "Caducado" });
 		return;
 	}
 
@@ -623,7 +698,7 @@ async function handleCallbackQuery(
 	if (kind === "x") {
 		const stub = mailboxStub(env, action.mailbox_id);
 		await stub.fetch(`https://mailbox-do/drafts/${action.draft_id}/cancel`, { method: "POST" });
-		await deleteTelegramAction(env.INDEX_DB, token);
+		await deleteApproval(env.INDEX_DB, token);
 		if (chatId && messageId) {
 			await editMessageText(config, { chatId, messageId, text: "✖️ Borrador descartado." });
 		}
@@ -638,8 +713,9 @@ async function handleCallbackQuery(
 		draftId: action.draft_id,
 		attemptKey: token,
 		approvalMode: "telegram_confirmed",
+		expectedPayloadHash: action.payload_hash,
 	});
-	await deleteTelegramAction(env.INDEX_DB, token);
+	await deleteApproval(env.INDEX_DB, token);
 
 	const sent = body.sent === true || body.status === "sent";
 	if (chatId && messageId) {
