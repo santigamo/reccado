@@ -6,6 +6,35 @@ import type { InboundEmailQueueMessage } from "./cloudflare/types";
 import { deriveDevTestMailboxId } from "./db/seed-dev";
 import { mailboxStub } from "./lib/mailbox-stub";
 
+/**
+ * Anti-framing headers for every server-rendered HTML response (/approve/:id,
+ * /security, /consent, /login, ...), so no other origin — including same-site
+ * siblings — can frame a page that asks for a passkey. The approval page also
+ * sends no Referer (its URL carries the intent id).
+ */
+export function withHtmlSecurityHeaders(response: Response, pathname: string): Response {
+	if (!response.headers.get("content-type")?.toLowerCase().includes("text/html")) return response;
+	const headers = new Headers(response.headers);
+	headers.set("Content-Security-Policy", mergeFrameAncestors(headers.get("Content-Security-Policy")));
+	headers.set("X-Frame-Options", "DENY");
+	if (pathname.startsWith("/approve/")) headers.set("Referrer-Policy", "no-referrer");
+	return new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers,
+		webSocket: (response as Response & { webSocket?: WebSocket | null }).webSocket ?? null,
+	} as ResponseInit);
+}
+
+function mergeFrameAncestors(existing: string | null): string {
+	const directives = (existing ?? "")
+		.split(";")
+		.map((directive) => directive.trim())
+		.filter((directive) => directive && !/^frame-ancestors\b/i.test(directive));
+	directives.push("frame-ancestors 'none'");
+	return directives.join("; ");
+}
+
 export { MailboxDurableObject } from "./do/mailbox-do";
 
 const api = createApiApp();
@@ -258,7 +287,7 @@ export default {
 		}
 
 		const startHandler = (await import("@tanstack/react-start/server-entry")).default;
-		return startHandler.fetch(request);
+		return withHtmlSecurityHeaders(await startHandler.fetch(request), url.pathname);
 	},
 	async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
 		const { handleEmail } = await import("./cloudflare/email-handler");
