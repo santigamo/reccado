@@ -335,3 +335,92 @@ describe("passkey registration step-up", () => {
 		expect(removedEvent.results.length).toBeGreaterThan(0);
 	});
 });
+
+describe("passkey step-up attempt limits", () => {
+	async function stepUp(jar: Jar, body: unknown, mail?: AuthMailSender, overrides: Partial<Env> = {}) {
+		return authFetch(jar, "/api/auth/passkey/step-up", jsonInit(body), mail, overrides);
+	}
+
+	it("locks the e-mail OTP after 5 bad codes, invalidates the pending code and notifies", async () => {
+		const email = "lock-email@example.com";
+		const jar = await pair(email);
+		const mail = stubMail();
+		await stepUp(jar, {}, mail);
+		const goodCode = mail.calls[0]?.text.match(/\b(\d{6})\b/)?.[1] ?? "";
+		const bad = goodCode === "000000" ? "111111" : "000000";
+
+		const calls: string[] = [];
+		vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (!url.startsWith("https://api.telegram.org/")) throw new Error(`unexpected fetch ${url}`);
+			calls.push(url.split("/").pop() ?? "");
+			return Response.json({ ok: true, result: { message_id: 1, chat: { id: 4242, type: "private" } } });
+		});
+		await db
+			.prepare(
+				"INSERT INTO runtime_config (key, value, updated_at) VALUES ('telegram.chat_id', '4242', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			)
+			.bind(new Date().toISOString())
+			.run();
+		const telegram = { TELEGRAM_BOT_TOKEN: "123:fake-token" } as Partial<Env>;
+
+		for (let i = 0; i < 5; i++) {
+			const failed = await stepUp(jar, { code: bad }, mail, telegram);
+			expect(failed.status).toBe(401);
+		}
+		expect(calls).toContain("sendMessage");
+		const event = await db
+			.prepare("SELECT event_type FROM ops_events WHERE event_type = 'passkey.stepup_locked' AND subject = ?")
+			.bind(email)
+			.all();
+		expect(event.results).toHaveLength(1);
+
+		// Even the right code is refused now, and the pending OTP is gone.
+		const locked = await stepUp(jar, { code: goodCode }, mail, telegram);
+		expect(locked.status).toBe(429);
+		expect(await locked.json()).toMatchObject({ error: "stepup_locked" });
+		const refreshed = await stepUp(jar, {}, mail, telegram);
+		expect(refreshed.status).toBe(429);
+		expect(mail.calls).toHaveLength(1);
+	});
+
+	it("locks TOTP step-up after 5 bad codes", async () => {
+		const jar = await pair("lock-totp@example.com");
+		await handleSetPasswordRequest(
+			new Request(`${ORIGIN}/api/account/password`, jsonInit({ newPassword: "correct-horse-battery" }, { cookie: jar.header(), origin: ORIGIN })),
+			authEnv(),
+		);
+		const enabled = await authFetch(jar, "/api/auth/two-factor/enable", jsonInit({ password: "correct-horse-battery" }));
+		const { totpURI } = (await enabled.json()) as { totpURI: string };
+		const secret = base32Decode(new URL(totpURI).searchParams.get("secret") ?? "");
+		await authFetch(jar, "/api/auth/two-factor/verify-totp", jsonInit({ code: await totp(secret), trustDevice: false }));
+
+		const good = await totp(secret);
+		const bad = good === "000000" ? "111111" : "000000";
+		for (let i = 0; i < 5; i++) {
+			expect((await stepUp(jar, { code: bad })).status).toBe(401);
+		}
+		const locked = await stepUp(jar, { code: good });
+		expect(locked.status).toBe(429);
+	});
+
+	it("allows 3 OTP e-mail requests per session per window, then rate limits", async () => {
+		const jar = await pair("rate-otp@example.com");
+		const mail = stubMail();
+		for (let i = 0; i < 3; i++) expect((await stepUp(jar, {}, mail)).status).toBe(200);
+		const limited = await stepUp(jar, {}, mail);
+		expect(limited.status).toBe(429);
+		expect(await limited.json()).toMatchObject({ error: "stepup_rate_limited" });
+		expect(mail.calls).toHaveLength(3);
+	});
+
+	it("a correct code resets the failure counter", async () => {
+		const jar = await pair("reset-count@example.com");
+		const mail = stubMail();
+		await stepUp(jar, {}, mail);
+		const code = mail.calls[0]?.text.match(/\b(\d{6})\b/)?.[1] ?? "";
+		const bad = code === "000000" ? "111111" : "000000";
+		for (let i = 0; i < 4; i++) expect((await stepUp(jar, { code: bad }, mail)).status).toBe(401);
+		expect((await stepUp(jar, { code }, mail)).status).toBe(200);
+	});
+});

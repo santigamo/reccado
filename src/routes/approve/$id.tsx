@@ -7,7 +7,7 @@ type ApprovalView = {
 	id: string;
 	status: string;
 	title: string;
-	fields: Array<{ label: string; value: string }>;
+	fields: Array<{ label: string; value: string; format?: "text" | "pre" | "list" }>;
 	warnings: Array<{ code: string; message: string }>;
 	challenge: string | null;
 	hasPasskey: boolean;
@@ -148,9 +148,27 @@ function ApprovePage(): ReactElement {
 							<dt className="text-xs font-semibold uppercase tracking-wide text-[var(--sea-ink-soft)]">
 								{field.label}
 							</dt>
-							<dd className="mt-1 whitespace-pre-wrap text-sm text-[var(--sea-ink)]">
-								{field.value}
-							</dd>
+							{field.format === "pre" ? (
+								<dd className="mt-1">
+									<pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded bg-black/10 p-2 text-xs text-[var(--sea-ink)]">
+										{field.value}
+									</pre>
+								</dd>
+							) : field.format === "list" ? (
+								<dd className="mt-1">
+									<ul className="list-disc space-y-1 pl-5 text-sm text-[var(--sea-ink)]">
+										{field.value.split("\n").map((item, i) => (
+											<li key={`${i}:${item}`} className="break-all">
+												{item}
+											</li>
+										))}
+									</ul>
+								</dd>
+							) : (
+								<dd className="mt-1 whitespace-pre-wrap text-sm text-[var(--sea-ink)]">
+									{field.value}
+								</dd>
+							)}
 						</div>
 					))}
 				</dl>

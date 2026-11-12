@@ -180,6 +180,7 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 }
 
 registerControlPlaneKind("restore", {
+	covers: ["opsEventId"],
 	validate: (value) => strict(restoreSchema, value),
 	render: async (env, auth, payload) => {
 		const p = await plan(env, auth, payload);

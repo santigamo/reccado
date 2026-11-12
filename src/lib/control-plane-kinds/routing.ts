@@ -114,6 +114,7 @@ async function renderRule(env: Env, auth: AuthContext, payload: Operation) {
 }
 
 registerControlPlaneKind("alias_add", {
+	covers: ["aliasAddress", "mailboxId"],
 	validate: (value) => strict(aliasAddSchema, value),
 	render: async (env, auth, payload) => {
 		const mailbox = await ownedMailbox(env, auth, String(payload.mailboxId));
@@ -145,6 +146,7 @@ async function ownedAlias(env: Env, auth: AuthContext, aliasAddress: string) {
 	return { alias, mailbox };
 }
 registerControlPlaneKind("alias_remove", {
+	covers: ["aliasAddress"],
 	validate: (value) => strict(aliasRemoveSchema, value),
 	render: async (env, auth, payload) => {
 		const { alias, mailbox } = await ownedAlias(env, auth, String(payload.aliasAddress));
@@ -168,6 +170,7 @@ registerControlPlaneKind("alias_remove", {
 });
 
 registerControlPlaneKind("routing_rule_upsert", {
+	covers: ["ruleId", "domainId", "pattern", "priority", "action", "mailboxId", "forwardTo", "rejectReason", "enabled"],
 	validate: (value) => strict(ruleUpsertSchema, value),
 	render: renderRule,
 	execute: async (env, auth, payload) => {
@@ -188,6 +191,7 @@ async function ownedRule(env: Env, auth: AuthContext, ruleId: string) {
 	return rule;
 }
 registerControlPlaneKind("routing_rule_remove", {
+	covers: ["ruleId"],
 	validate: (value) => strict(ruleRemoveSchema, value),
 	render: async (env, auth, payload) => {
 		const rule = await ownedRule(env, auth, String(payload.ruleId));
