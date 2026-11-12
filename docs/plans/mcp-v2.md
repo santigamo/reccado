@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-P0a–P5 merged (2026-11-12): 90 files / 1250 tests green, tsc + build OK. Remaining: P6 docs, pre-deploy review, single deploy (remote migrations 0021, 0022, 0024–0028), live e2e (§5). Workers since 2026-11-12: Claude Sonnet 5.5 effort medium (Codex weekly limit, Cursor exhausted).
+P0a–P5 merged (2026-11-12): 90 files / 1250 tests green, tsc + build OK. P6 docs merged. Remaining: pre-deploy review (T15 in flight), single deploy (remote migrations 0021, 0022, 0024–0028), live e2e (§5). Workers since 2026-11-12: Claude Sonnet 5.5 effort medium (Codex weekly limit, Cursor exhausted).
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -337,8 +337,8 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       no auto-retry → operator reconciliation.
 
 ### P6 — Docs and invariant
-- [ ] Update AGENTS.md invariant, SECURITY.md, README, OPERATIONS.md (see §6).
-- [ ] Mark `docs/plans/transactional-api.md` decision "API keys are never exposed as MCP
+- [x] Update AGENTS.md invariant, SECURITY.md, README, OPERATIONS.md (see §6). (T14, also SKILL.md, ARCHITECTURE.md, CHANGELOG.md)
+- [x] Mark `docs/plans/transactional-api.md` decision "API keys are never exposed as MCP
       capabilities" as superseded by this plan.
 
 ---
