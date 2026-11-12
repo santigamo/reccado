@@ -4,33 +4,18 @@ import { getMailbox, insertOpsEvent } from "../db/d1";
 import { requireMailboxOwner } from "./admin/access";
 import { AdminError } from "./admin/errors";
 import { createMailbox, deleteMailbox, patchMailbox } from "./admin/mailboxes";
-import type { IntentField, IntentWarning } from "./approvals";
+import {
+	controlPlaneKind,
+	operation,
+	registerControlPlaneKind,
+	show,
+	type ControlPlaneKind,
+	type Operation,
+} from "./control-plane-registry";
+import "./control-plane-kinds";
 
-type Operation = Record<string, unknown>;
-type Rendered = { title: string; fields: IntentField[]; warnings: IntentWarning[] };
-export type ControlPlaneKind = {
-	validate: (payload: unknown) => Operation;
-	render: (env: Env, auth: AuthContext, payload: Operation) => Promise<Rendered>;
-	execute: (env: Env, auth: AuthContext, payload: Operation) => Promise<unknown>;
-};
-const registry = new Map<string, ControlPlaneKind>();
-export function registerControlPlaneKind(kind: string, definition: ControlPlaneKind): void {
-	if (!/^[a-z][a-z0-9_]{0,31}$/.test(kind) || kind === "send" || registry.has(kind))
-		throw new Error("invalid_intent_kind");
-	registry.set(kind, definition);
-}
-export function controlPlaneKind(kind: string): ControlPlaneKind | undefined {
-	return registry.get(kind);
-}
+export { controlPlaneKind, registerControlPlaneKind, type ControlPlaneKind };
 
-function operation(value: unknown, keys: string[]): Operation {
-	if (!value || typeof value !== "object" || Array.isArray(value))
-		throw new AdminError("Invalid payload", "validation_error", 400);
-	const row = value as Operation;
-	if (Object.keys(row).some((key) => !keys.includes(key)))
-		throw new AdminError("Invalid payload", "validation_error", 400);
-	return row;
-}
 function mailboxId(payload: Operation): string {
 	if (typeof payload.mailboxId !== "string" || !payload.mailboxId)
 		throw new AdminError("Invalid mailbox", "validation_error", 400);
@@ -42,9 +27,6 @@ async function owned(env: Env, auth: AuthContext, payload: Operation) {
 	const mailbox = await getMailbox(env.INDEX_DB, id);
 	if (!mailbox) throw new AdminError("Mailbox not found", "mailbox_not_found", 404);
 	return mailbox;
-}
-function show(value: unknown): string {
-	return value == null ? "(vacío)" : String(value);
 }
 async function checkCreateOwner(env: Env, auth: AuthContext, payload: Operation): Promise<void> {
 	if (typeof payload.primaryAddress !== "string") return;
@@ -153,7 +135,7 @@ registerControlPlaneKind("mailbox_disable", {
 			event_type: "admin.before_snapshot",
 			severity: "info",
 			subject: before.mailbox_id,
-			payload_json: JSON.stringify(before),
+			payload_json: JSON.stringify({ entity: "mailbox", by: auth.email, ...before }),
 		});
 		return deleteMailbox(env, auth, { mailboxId: before.mailbox_id });
 	},
@@ -191,7 +173,7 @@ export async function requestControlPlaneChange(
 	payload: unknown | unknown[],
 ): Promise<{ id: string; expiresAt: string; payloadHash: string }> {
 	requireMcpOwner(auth, env);
-	const definition = registry.get(kind);
+	const definition = controlPlaneKind(kind);
 	if (!definition) throw new Error("invalid_intent_kind");
 	const items = Array.isArray(payload) ? payload : [payload];
 	if (!items.length || items.length > 100) throw new Error("invalid_payload");
