@@ -185,6 +185,46 @@ async function registerOwner(
 }
 
 describe("control-plane approvals", () => {
+	it("refuses another owner at render and execution", async () => {
+		const first = await registerOwner("control-first@example.com");
+		const second = await registerOwner("control-second@example.com");
+		await insertMailbox(db, {
+			mailbox_id: "mbx_control_private",
+			primary_address: "private-control@example.com",
+			display_name: "Private",
+			status: "active",
+			owner_email: "control-first@example.com",
+		});
+		const intent = await requestControlPlaneChange(
+			env,
+			{
+				userId: first.userId,
+				email: "control-first@example.com",
+				owners: ["control-first@example.com"],
+			},
+			"mailbox_update",
+			{ mailboxId: "mbx_control_private", body: { displayName: "New" } },
+		);
+		const view = await getIntentView(env, intent.id, { userId: second.userId });
+		expect(view.status).toBe("stale");
+		expect(view.fields).toEqual([]);
+		const result = await approveIntent(env, {
+			id: intent.id,
+			userId: second.userId,
+			origin: ORIGIN,
+			assertion: await second.authenticator.assertion(
+				await approvalChallenge(intent.id, intent.payloadHash),
+				1,
+			),
+		});
+		expect(result.error).toBe("forbidden");
+		expect(
+			await db
+				.prepare("SELECT display_name FROM mailboxes WHERE mailbox_id = ?")
+				.bind("mbx_control_private")
+				.first(),
+		).toEqual({ display_name: "Private" });
+	});
 	it("executes once and rejects payload tampering", async () => {
 		const email = "control-owner@example.com";
 		const owner = await registerOwner(email);
