@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-In flight: T12 `mcp-send` (P4c), T13a `mcp-cp-intents` (P5 server side). Next: T13b `manage_*` tools, then P6 docs, then single deploy. From 2026-11-11 new workers use Cursor CLI with `grok-4.7-xhigh-fast` (max effort, fast mode; Codex quota). Next: T9 MCP `send` + tier-2 admin tools (P4c/P5), then P6 docs.
+After T13a merge (2026-11-12): 88 files / 1220 tests green. In flight: T12 `mcp-send-v2` (P4c, adds migration 0028 pending-intent unique index). Next: T13b `manage_*` tools (on top of T12's `src/mcp/intent-flow.ts`), then P6 docs, then single deploy (remote migrations 0021→0028). Workers back on Codex `gpt-6.1-terra` medium (Cursor quota exhausted 2026-11-12).
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -320,7 +320,13 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
 - [ ] `manage_*`, `remove_suppression`, `restore`, `reconcile_stale` through approvals, with
       batch intents.
 - [ ] API key secret reveal on the approval page only.
-- [ ] Soft delete via `disabled`/`revoked` + `ops_events` snapshot.
+- [x] Soft delete via `disabled` + `ops_events` `admin.before_snapshot` (T13a, mailboxes).
+- [x] Framework (T13a): `src/lib/control-plane-intents.ts` registry (`validate/render/execute`),
+      canonical `payload_json` hashed into the passkey challenge, `result_json` per item, batch
+      stops at first failure (`executed`/`<code>`/`not_run`), mailbox kinds
+      `mailbox_create|update|disable`, `requestControlPlaneChange`. Migration 0027.
+      Known gap: worker interruption mid-batch leaves intent approved without final report;
+      no auto-retry → operator reconciliation.
 
 ### P6 — Docs and invariant
 - [ ] Update AGENTS.md invariant, SECURITY.md, README, OPERATIONS.md (see §6).
