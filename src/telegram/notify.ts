@@ -28,7 +28,25 @@ export function intentNotificationKeyboard(url: string): Record<string, unknown>
 }
 
 /** Notify the owner without exposing an action that can approve over Telegram. */
+export const INTENT_NOTIFY_COALESCE_MS = 60_000;
+
 export async function notifyIntentCreated(env: Env, intentId: string): Promise<void> {
+	// Coalesce: one ping per token subject per minute. Durable (read from D1) so it holds
+	// across isolates; the earlier intent's notification already points the owner at the inbox of requests.
+	const principal = await env.INDEX_DB.prepare("SELECT token_sub, created_at FROM approvals WHERE token = ?")
+		.bind(intentId)
+		.first<{ token_sub: string | null; created_at: string }>()
+		.catch(() => null);
+	if (principal?.token_sub) {
+		const since = new Date(Date.parse(principal.created_at) - INTENT_NOTIFY_COALESCE_MS).toISOString();
+		const earlier = await env.INDEX_DB.prepare(
+			"SELECT 1 AS hit FROM approvals WHERE token_sub = ? AND token <> ? AND created_at > ? AND created_at <= ? LIMIT 1",
+		)
+			.bind(principal.token_sub, intentId, since, principal.created_at)
+			.first()
+			.catch(() => null);
+		if (earlier) return;
+	}
 	const config = readTelegramConfig(env);
 	const chatId = await resolveTelegramChatId(env);
 	const origin = await getRuntimeConfig(env.INDEX_DB, RUNTIME_CONFIG_KEYS.deploymentOrigin);

@@ -544,7 +544,7 @@ describe("mcp send approval", () => {
 			draftId: draft.draftId,
 			payloadHash: draft.payloadHash,
 			oauthClientId: "oauth-client",
-			tokenSub: "token-sub",
+			tokenSub: owner.userId,
 			tokenJti: "token-jti",
 		});
 
@@ -651,7 +651,7 @@ describe("mcp send approval", () => {
 			intent_id: intent.id,
 			payload_hash: draft.payloadHash,
 			oauth_client_id: "oauth-client",
-			token_sub: "token-sub",
+			token_sub: owner.userId,
 			token_jti: "token-jti",
 		});
 

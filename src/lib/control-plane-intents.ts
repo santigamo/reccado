@@ -166,13 +166,39 @@ export async function ownerForUser(env: Env, userId: string): Promise<AuthContex
 	requireMcpOwner(auth, env);
 	return auth;
 }
+export type IntentPrincipal = {
+	oauthClientId?: string | null;
+	tokenSub?: string | null;
+	tokenJti?: string | null;
+};
+export const MAX_PENDING_INTENTS_PER_SUB = 5;
+const bound = (value: string | null | undefined, max: number): string | null =>
+	value ? value.slice(0, max) : null;
+
+/** Live (undecided, unexpired) MCP intents a token subject already holds, send and control plane alike. */
+export async function assertPendingCapacity(
+	env: Env,
+	tokenSub: string | null | undefined,
+	except?: { mailboxId: string; draftId: string },
+): Promise<void> {
+	if (!tokenSub) return;
+	const row = await env.INDEX_DB.prepare(
+		`SELECT COUNT(*) AS n FROM approvals WHERE origin = 'mcp' AND token_sub = ? AND consumed_at IS NULL AND decision IS NULL AND expires_at > ?
+		 AND NOT (kind = 'send' AND mailbox_id IS ? AND draft_id IS ?)`,
+	)
+		.bind(tokenSub, new Date().toISOString(), except?.mailboxId ?? null, except?.draftId ?? null)
+		.first<{ n: number }>();
+	if ((row?.n ?? 0) >= MAX_PENDING_INTENTS_PER_SUB) throw new Error("too_many_pending_approvals");
+}
 export async function requestControlPlaneChange(
 	env: Env,
 	auth: AuthContext,
 	kind: string,
 	payload: unknown | unknown[],
+	principal: IntentPrincipal = {},
 ): Promise<{ id: string; expiresAt: string; payloadHash: string }> {
 	requireMcpOwner(auth, env);
+	await assertPendingCapacity(env, principal.tokenSub);
 	const definition = controlPlaneKind(kind);
 	if (!definition) throw new Error("invalid_intent_kind");
 	const items = Array.isArray(payload) ? payload : [payload];
@@ -189,9 +215,19 @@ export async function requestControlPlaneChange(
 	const now = new Date();
 	const expiresAt = new Date(now.getTime() + 600000).toISOString();
 	await env.INDEX_DB.prepare(
-		"INSERT INTO approvals (token, kind, created_at, expires_at, payload_hash, origin, payload_json) VALUES (?, ?, ?, ?, ?, 'mcp', ?)",
+		"INSERT INTO approvals (token, kind, created_at, expires_at, payload_hash, origin, payload_json, oauth_client_id, token_sub, token_jti) VALUES (?, ?, ?, ?, ?, 'mcp', ?, ?, ?, ?)",
 	)
-		.bind(id, kind, now.toISOString(), expiresAt, payloadHash, json)
+		.bind(
+			id,
+			kind,
+			now.toISOString(),
+			expiresAt,
+			payloadHash,
+			json,
+			bound(principal.oauthClientId, 2048),
+			bound(principal.tokenSub, 512),
+			bound(principal.tokenJti, 512),
+		)
 		.run();
 	return { id, expiresAt, payloadHash };
 }

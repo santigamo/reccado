@@ -30,6 +30,11 @@ declare interface Env {
 	 * falls back to MAIL_FROM_ADDRESS with Reply-To. See lib/sender-identity.ts.
 	 */
 	MAIL_SENDING_DOMAINS?: string;
+	/**
+	 * Extra hostnames `/mcp` accepts, comma-separated (e.g. a custom domain in front of
+	 * the Worker). The observed deployment origin and localhost are always allowed.
+	 */
+	MCP_ALLOWED_HOSTS?: string;
 	/** Telegram bot token from @BotFather. Unset = the Telegram bridge is off. */
 	TELEGRAM_BOT_TOKEN?: string;
 	/**

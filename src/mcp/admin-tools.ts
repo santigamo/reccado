@@ -89,7 +89,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 };
 
 const ANNOTATIONS = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } as const;
-const ERRORS = /^(insufficient_scope: admin|rate_limited|not_found|invalid_request_state|intent_stale|validation_error|tool_unavailable|invalid_origin)/;
+const ERRORS = /^(insufficient_scope: admin|rate_limited|too_many_pending_approvals|not_found|invalid_request_state|intent_stale|validation_error|tool_unavailable|invalid_origin)/;
 
 /** Drop anything that looks like a secret before the agent sees it. */
 export function stripSecrets(value: unknown): unknown {
@@ -100,6 +100,12 @@ export function stripSecrets(value: unknown): unknown {
 }
 
 class ToolFailure extends Error {}
+
+/** Per-minute buckets are keyed by the minute; drop the ones that can no longer be hit. */
+function pruneRates(map: Map<string, number>): void {
+	const current = String(Math.floor(Date.now() / 60000));
+	for (const key of map.keys()) if (!key.endsWith(`:${current}`)) map.delete(key);
+}
 
 type Resolved = { kind: string; payload: unknown };
 
@@ -133,6 +139,7 @@ async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: Inte
 	const count = rates.get(key) ?? 0;
 	if (count >= RATE_LIMIT) throw new Error("rate_limited");
 	rates.set(key, count + 1);
+	pruneRates(rates);
 	const retry = ctx ? resolveIntentRetry(ctx) : undefined;
 	const given = typeof params.intentId === "string" ? params.intentId : undefined;
 	if (retry && given && retry !== given) throw new Error("invalid_request_state");
@@ -143,12 +150,14 @@ async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: Inte
 		audit.intentId = existing;
 		const row = await getApproval(env.INDEX_DB, existing);
 		if (!row || row.origin !== "mcp" || !kinds.includes(row.kind)) throw new Error("not_found");
+		// Only the principal that created an intent may read its status/result.
+		if ((row.token_sub ?? null) !== (auth.tokenSub ?? null)) throw new Error("not_found");
 		return intentResponse(env, retry ? flow : undefined, retry ? ctx : undefined, { intentId: existing, expiresAt: row.expires_at, origin, message, transform });
 	}
 	const { kind, payload } = resolve();
 	let created: { id: string; expiresAt: string };
 	try {
-		created = await requestControlPlaneChange(env, auth, kind, payload);
+		created = await requestControlPlaneChange(env, auth, kind, payload, { oauthClientId: auth.oauthClientId, tokenSub: auth.tokenSub, tokenJti: auth.tokenJti });
 	} catch (error) {
 		if (error instanceof Error && error.message === "invalid_intent_kind") throw new ToolFailure("tool_unavailable");
 		const code = (error as { code?: unknown }).code;
