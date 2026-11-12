@@ -140,8 +140,8 @@ the UI/Telegram/MCP confirmation gate. API-key administration is reachable over 
 Better Auth OAuth tokens; the owner gate still applies after the token. The design and its
 decision log are in `docs/plans/mcp-v2.md`.
 
-- **Scopes**, checked inside each tool handler (missing scope → `403 insufficient_scope` with a
-  `WWW-Authenticate` scope hint, which makes the client re-prompt consent):
+- **Scopes**, checked inside each tool handler (missing scope → an `insufficient_scope: <scope>`
+  tool error; clients do not automatically re-prompt consent, so re-authorize to widen scopes):
 
   | Scope | Grants | Default consent |
   |---|---|---|
@@ -151,7 +151,9 @@ decision log are in `docs/plans/mcp-v2.md`.
   | `mail:read:sensitive` | un-redacted OTP / reset / magic-link content, raw MIME and attachments of such mail | no |
   | `admin` | read the control plane; request tier-2 changes (still need approval) | no |
 
-  Existing tokens issued before this release lack the new scopes and need re-consent.
+  Existing tokens issued before this release lack the new scopes and need re-consent. On the
+  consent page `mail:send`, `mail:read:sensitive` and `admin` start unticked, each with its own
+  risk line, and the server strips any of them that the owner did not explicitly tick.
 - **Tiers.** The line is mailbox content vs control plane. *Tier 1* (no confirmation): mark
   read/unread, archive, trash (recoverable), draft create/update/cancel. *Tier 2* (approval page +
   passkey): every outbound send and every control-plane write — mailboxes, domains, aliases,
@@ -171,7 +173,13 @@ decision log are in `docs/plans/mcp-v2.md`.
   snapshot, never the live draft, and editing the draft afterwards yields `intent_stale`. Intents
   expire after 10 minutes, are single use, and their status rows are retained 30 days after expiry
   or consumption. Telegram only *notifies* for `mcp` intents (a "Revisar solicitud" link) and cannot
-  approve them. Audit fields (`approval_channel`, `intent_id`, `payload_hash`, OAuth `client_id`,
+  approve them. Every field the passkey approves is visible on the page: template bodies in full
+  (HTML as escaped source, the list of linked hosts, warnings for external or unsafe links, a
+  diff against the previous version), API-key recipient policy and template allow-list, DMARC
+  `rua` targets; a registry safety net appends any payload field a kind did not render. Intents
+  record the requesting OAuth client / token `sub` / `jti`; only that principal can read an
+  intent's status and only the same owner can approve it. At most 5 live pending MCP intents per
+  token subject, and Telegram notices are coalesced to one per minute. Audit fields (`approval_channel`, `intent_id`, `payload_hash`, OAuth `client_id`,
   token `sub`/`jti`) land in `outbound_sends` and `ops_events`.
 - **Sticky draft origin.** A draft saved over MCP is permanently `origin='mcp'`; the web and
   Telegram confirm paths refuse it (`approval_required`, fail closed). The mailbox DO sends it only
@@ -181,12 +189,29 @@ decision log are in `docs/plans/mcp-v2.md`.
 - **Passkey registration step-up.** Adding a passkey needs a fresh proof of a second factor — TOTP
   or a fresh e-mail OTP — bound to the session, single use, 5 minutes (`POST
   /api/auth/passkey/step-up`, header `x-passkey-stepup`). Adding or removing a passkey writes an
-  `ops_events` row and a Telegram notice.
+  `ops_events` row and a Telegram notice. Five failed step-up codes lock step-up for that session
+  for 15 minutes (`passkey.stepup_locked` + Telegram notice) and at most 3 step-up e-mail codes
+  can be requested per 15 minutes. The e-mail fallback is kept deliberately (owner decision); its
+  safety depends on the next bullet's isolation of this instance's authentication mail.
+- **Instance authentication mail is never visible to agents.** Sign-in, step-up and other
+  authentication mail sent by this instance carries an `X-Reccado-Auth` HMAC marker; a message
+  with a valid marker **or** from this instance's auth sender is classified `instance_auth` (at
+  ingest, and by sender at read time for older rows) and is omitted from every MCP tool, search
+  match and resource, whatever the scopes, including `mail:read:sensitive`. Without this, an
+  owner address hosted on the instance would let an agent with sensitive scope read login and
+  step-up codes and enrol its own passkey.
 - **Sensitive-mail redaction.** At ingest, OTP / password-reset / magic-link / verification mail is
   flagged (`messages.sensitive_kind`). `read_message` / `read_thread` redact codes and links unless
   the token holds `mail:read:sensitive`. Email bodies are labelled untrusted content in tool
   descriptions and results. Attachments and raw MIME are MCP resources re-checked (owner, scope)
-  per read, capped at 5 MB, and audited.
+  per read, capped at 5 MB, and audited. Codes with spaces or hyphens, alphanumeric codes near
+  keywords and token-bearing links are redacted; search without `mail:read:sensitive` does not
+  match inside sensitive bodies; unclassified or parse-failed messages need
+  `mail:read:sensitive` for raw access (fail closed). Agents can update or cancel only drafts
+  they created (`origin='mcp'`).
+- **Host allow-list and framing.** `/mcp` accepts only localhost, the deployment's own origin and
+  hosts listed in `MCP_ALLOWED_HOSTS`. Every HTML response carries `frame-ancestors 'none'` and
+  `X-Frame-Options: DENY`; `/approve/*` also sends `Referrer-Policy: no-referrer`.
 - **API-key secret reveal.** `manage_api_key` create/rotate shows the secret once, in the owner's
   approve response on the approval page; only the redacted result is stored in `result_json` and
   tool results strip `secret|token|plaintext`. The agent never receives it.

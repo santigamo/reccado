@@ -394,7 +394,12 @@ outbound audit, approval metadata, intent payload, pending-intent uniqueness; th
 - Telegram "Send" buttons and pending sends created before `0022` carry no payload hash and fail
   closed — re-draft those replies.
 - Enrol a passkey at `/security` before the first agent send or admin change (nothing can be
-  approved without one).
+  approved without one). Step-up locks for 15 minutes after 5 wrong codes.
+- `/mcp` only answers on hosts it knows: localhost, the deployment origin, and
+  `MCP_ALLOWED_HOSTS` (comma-separated; `env.dev` sets `inbox.imsanti.dev`). A new custom domain
+  must be added there.
+- Authentication mail of this instance is hidden from MCP entirely, and raw MIME of unclassified
+  or parse-failed messages needs `mail:read:sensitive`.
 
 ### Rollback
 
