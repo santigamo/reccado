@@ -80,6 +80,7 @@ async function disableWarnings(env: Env, name: string) {
 }
 
 registerControlPlaneKind("domain_add", {
+	covers: ["domain", "zoneId"],
 	validate: (value) => strict(addSchema, value),
 	render: async (env, auth, payload) => {
 		assertAdminAccess(env, auth, "");
@@ -98,6 +99,7 @@ registerControlPlaneKind("domain_add", {
 });
 
 registerControlPlaneKind("domain_provision", {
+	covers: ["domain", "body"],
 	validate: (value) => strict(provisionSchema, value),
 	render: async (env, auth, payload) => {
 		assertAdminAccess(env, auth, "");
@@ -117,14 +119,28 @@ registerControlPlaneKind("domain_provision", {
 				code: "dmarc_enforced",
 				message: `DMARC en modo ${body.dmarc.policy}: afecta al correo que ya está circulando.`,
 			});
+		const ruaDomain = body.dmarc.rua?.split("@")[1]?.toLowerCase();
+		if (ruaDomain && ruaDomain !== zone.toLowerCase() && !ruaDomain.endsWith(`.${zone.toLowerCase()}`))
+			warnings.push({
+				code: "dmarc_external_rua",
+				message: `Los informes DMARC agregados se enviarán a una dirección externa: ${body.dmarc.rua}`,
+			});
 		return {
 			title: "Aprovisionar dominio de envío",
 			fields: [
 				{ label: "Zona", value: zone },
 				{ label: "Dominio de envío", value: sending },
-				{ label: "DMARC", value: body.dmarc.policy },
+				{ label: "DMARC política", value: body.dmarc.policy },
+				{ label: "DMARC alineación", value: show(body.dmarc.alignment) },
+				{ label: "DMARC informes (rua)", value: show(body.dmarc.rua) },
 				{ label: "Correo entrante", value: body.inbound ? "sí" : "no" },
-				...(body.mailbox ? [{ label: "Buzón", value: body.mailbox.address }] : []),
+				...(body.mailbox
+					? [
+							{ label: "Buzón", value: body.mailbox.address },
+							{ label: "Nombre del buzón", value: show(body.mailbox.displayName) },
+							{ label: "Propietario del buzón", value: show(body.mailbox.ownerEmail) },
+						]
+					: []),
 			],
 			warnings,
 		};
@@ -138,6 +154,7 @@ registerControlPlaneKind("domain_provision", {
 });
 
 registerControlPlaneKind("domain_update", {
+	covers: ["domain", "body.status"],
 	validate: (value) => strict(updateSchema, value),
 	render: async (env, auth, payload) => {
 		const before = await existing(env, auth, String(payload.domain));
@@ -161,6 +178,7 @@ registerControlPlaneKind("domain_update", {
 });
 
 registerControlPlaneKind("domain_disable", {
+	covers: ["domain"],
 	validate: (value) => strict(disableSchema, value),
 	render: async (env, auth, payload) => {
 		const before = await existing(env, auth, String(payload.domain));

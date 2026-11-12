@@ -9,7 +9,7 @@
 export type ApprovalPageModel = {
 	title: string;
 	status: string;
-	fields: Array<{ label: string; value: string }>;
+	fields: Array<{ label: string; value: string; format?: "text" | "pre" | "list" }>;
 	warnings: Array<{ message: string }>;
 	hasPasskey: boolean;
 };
@@ -36,7 +36,19 @@ export function escapeHtml(value: string): string {
 
 export function renderApprovalPage(view: ApprovalPageModel): string {
 	const fields = view.fields
-		.map((field) => `<dt>${escapeHtml(field.label)}</dt><dd>${escapeHtml(field.value)}</dd>`)
+		.map((field) => {
+			const value = escapeHtml(field.value);
+			const body =
+				field.format === "pre"
+					? `<pre style="max-height:20rem;overflow:auto;white-space:pre-wrap">${value}</pre>`
+					: field.format === "list"
+						? `<ul>${field.value
+								.split("\n")
+								.map((item) => `<li>${escapeHtml(item)}</li>`)
+								.join("")}</ul>`
+						: value;
+			return `<dt>${escapeHtml(field.label)}</dt><dd>${body}</dd>`;
+		})
 		.join("");
 	const warnings = view.warnings
 		.map((warning) => `<li>${escapeHtml(warning.message)}</li>`)
