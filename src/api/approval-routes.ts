@@ -1,3 +1,4 @@
+import "../lib/reflect-polyfill";
 import type { Hono } from "hono";
 import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
 import { requireAuth } from "./auth";

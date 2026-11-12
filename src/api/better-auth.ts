@@ -1,3 +1,4 @@
+import "../lib/reflect-polyfill";
 /**
  * The web auth issuer: Better Auth 1.7.2 on the INDEX_DB D1 binding
  * (migrations/d1/0016_better_auth.sql), replacing the Cloudflare Access JWT

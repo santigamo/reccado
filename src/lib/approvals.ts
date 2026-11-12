@@ -1,3 +1,4 @@
+import "./reflect-polyfill";
 /**
  * Passkey approval of an agent-originated action.
  *

@@ -1,3 +1,4 @@
+import "./lib/reflect-polyfill";
 import { createApiApp } from "./api/hono";
 import { requireAuth } from "./api/auth";
 import * as templates from "./lib/admin/templates";
