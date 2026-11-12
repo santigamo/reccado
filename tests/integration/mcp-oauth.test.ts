@@ -287,7 +287,8 @@ describe("CIMD opt-in", () => {
 			);
 			expect(token.status).toBe(200);
 			const body = (await token.json()) as { scope: string };
-			expect(body.scope).toBe(requested ?? "mail:read mail:draft");
+			// A bare consent (no explicit tick) never grants the high-risk `admin` scope.
+			expect(body.scope).toBe("mail:read mail:draft");
 		}
 		const rows = await testEnv.INDEX_DB.prepare(
 			"SELECT id FROM ops_events WHERE event_type = 'mcp.client_first_seen' AND subject = ?",

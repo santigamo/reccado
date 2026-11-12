@@ -30,6 +30,17 @@ const fetchClientName = createServerFn({ method: "GET" })
 		}
 	});
 
+/** Plain-Spanish risk line shown next to each high-risk scope's checkbox. */
+const HIGH_RISK_LINES: Record<string, string> = {
+	"mail:send":
+		"Permite pedir envíos de correo en tu nombre. Cada envío sigue necesitando tu aprobación con passkey, pero el cliente podrá redactar y proponer mensajes sin límite.",
+	"mail:read:sensitive":
+		"Expone códigos de verificación y enlaces de restablecimiento de contraseña de tus otros servicios que lleguen a tus buzones. Los correos de autenticación de esta instancia nunca se exponen.",
+	admin:
+		"Permite proponer cambios de configuración: dominios, buzones, alias, reglas, plantillas y claves de API. Cada cambio sigue necesitando tu aprobación con passkey.",
+};
+const HIGH_RISK_SCOPES: ReadonlySet<string> = new Set(Object.keys(HIGH_RISK_LINES));
+
 export const Route = createFileRoute("/consent")({
 	validateSearch: (
 		search: Record<string, unknown>,
@@ -62,9 +73,13 @@ function ConsentPage(): ReactElement {
 	const { client_id: clientId, scope, redirect_uri: redirectUri } = Route.useSearch();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	// High-risk scopes start unchecked: each needs its own explicit tick.
+	const [ticked, setTicked] = useState<ReadonlySet<string>>(new Set());
 
 	const clientLabel = clientName ?? clientId ?? "the requesting client";
-	const scopes = (scope ?? "").split(" ").filter(Boolean);
+	const requestedScopes = (scope ?? "").split(" ").filter(Boolean);
+	const scopes = requestedScopes.filter((s) => !HIGH_RISK_SCOPES.has(s));
+	const highScopes = requestedScopes.filter((s) => HIGH_RISK_SCOPES.has(s));
 	const hostOf = (value?: string) => {
 		try {
 			return value ? new URL(value).host : null;
@@ -95,7 +110,12 @@ function ConsentPage(): ReactElement {
 				method: "POST",
 				headers: { "content-type": "application/json" },
 				// The raw signed query, byte-for-byte as the authorize redirect delivered it.
-				body: JSON.stringify({ accept, oauth_query: window.location.search.slice(1) }),
+				body: JSON.stringify({
+					accept,
+					// Only what is read/draft plus the high-risk scopes explicitly ticked.
+					scope: [...scopes, ...highScopes.filter((s) => ticked.has(s))].join(" "),
+					oauth_query: window.location.search.slice(1),
+				}),
 			});
 			const body = (await response.json().catch(() => null)) as {
 				url?: string;
@@ -153,6 +173,36 @@ function ConsentPage(): ReactElement {
 							))}
 						</ul>
 					</div>
+				)}
+
+				{highScopes.length > 0 && (
+					<fieldset className="mb-6 rounded-xl border border-amber-300 p-3">
+						<legend className="px-1 text-sm font-semibold text-amber-900">
+							Permisos de alto riesgo (desactivados por defecto)
+						</legend>
+						{highScopes.map((s) => (
+							<label key={s} className="mb-3 flex items-start gap-2 text-sm last:mb-0">
+								<input
+									type="checkbox"
+									className="mt-1"
+									checked={ticked.has(s)}
+									onChange={(event) =>
+										setTicked((current) => {
+											const next = new Set(current);
+											if (event.target.checked) next.add(s);
+											else next.delete(s);
+											return next;
+										})
+									}
+								/>
+								<span>
+									<span className="font-mono text-xs">{s}</span>
+									<br />
+									{HIGH_RISK_LINES[s]}
+								</span>
+							</label>
+						))}
+					</fieldset>
 				)}
 
 				<div className="flex gap-3">

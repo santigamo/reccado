@@ -23,6 +23,8 @@ import { emailOTP, jwt, twoFactor } from "better-auth/plugins";
 import { insertOpsEvent } from "../db/d1";
 import { sha256Hex } from "../lib/crypto";
 import { notifyPasskeyChange } from "../telegram/notify";
+import { readTelegramConfig, sendMessage } from "../telegram/api";
+import { resolveTelegramChatId } from "../telegram/binding";
 import { consumePairingCode, type PairingClaim } from "../db/owners";
 import { RUNTIME_CONFIG_KEYS, getRuntimeConfig } from "../db/runtime-config";
 import {
@@ -57,6 +59,12 @@ const PASSKEY_REGISTER_OPTIONS_PATH = `${AUTH_BASE_PATH}/passkey/generate-regist
 const PASSKEY_REGISTER_VERIFY_PATH = `${AUTH_BASE_PATH}/passkey/verify-registration`;
 const PASSKEY_DELETE_PATH = `${AUTH_BASE_PATH}/passkey/delete-passkey`;
 const STEPUP_TTL_MS = 5 * 60 * 1000;
+/** Failed step-up codes allowed per session before the step-up locks. */
+const STEPUP_MAX_FAILURES = 5;
+/** New step-up e-mail OTPs that may be requested per session per window. */
+const STEPUP_MAX_OTP_REQUESTS = 3;
+/** Lockout / rate-limit window for step-up attempts. */
+const STEPUP_LOCK_MS = 15 * 60 * 1000;
 export const PASSKEY_STEPUP_HEADER = "x-passkey-stepup";
 
 /**
@@ -480,6 +488,91 @@ async function issueStepUpProof(env: AuthEnv, sessionId: string): Promise<{ proo
 	return { proof, expiresAt: new Date(expiresAtMs).toISOString() };
 }
 
+function stepUpFailIdentifier(sessionId: string): string {
+	return `passkey-stepup-fail:${sessionId}`;
+}
+
+function stepUpRequestIdentifier(sessionId: string): string {
+	return `passkey-stepup-req:${sessionId}`;
+}
+
+/**
+ * Counts one event against `identifier` in the verification table (so the
+ * count survives isolates). The window starts at the first event and the row
+ * expires with it. Returns the count including this event.
+ */
+async function bumpStepUpCounter(env: AuthEnv, identifier: string, windowMs: number): Promise<number> {
+	const now = Date.now();
+	const updated = await env.INDEX_DB.prepare(
+		'UPDATE "verification" SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT), updatedAt = ? WHERE identifier = ? AND expiresAt > ? RETURNING value',
+	)
+		.bind(now, identifier, now)
+		.first<{ value: string }>();
+	if (updated) return Number(updated.value);
+	await env.INDEX_DB.prepare('DELETE FROM "verification" WHERE identifier = ?').bind(identifier).run();
+	await env.INDEX_DB.prepare(
+		'INSERT INTO "verification" (id, identifier, value, expiresAt, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)',
+	)
+		.bind(crypto.randomUUID(), identifier, "1", now + windowMs, now, now)
+		.run();
+	return 1;
+}
+
+async function readStepUpCounter(env: AuthEnv, identifier: string): Promise<number> {
+	const row = await env.INDEX_DB.prepare('SELECT value FROM "verification" WHERE identifier = ? AND expiresAt > ?')
+		.bind(identifier, Date.now())
+		.first<{ value: string }>();
+	return row ? Number(row.value) : 0;
+}
+
+async function clearStepUpCounter(env: AuthEnv, identifier: string): Promise<void> {
+	await env.INDEX_DB.prepare('DELETE FROM "verification" WHERE identifier = ?').bind(identifier).run();
+}
+
+function stepUpLockedResponse(): Response {
+	return Response.json(
+		{ error: "stepup_locked", retryAfterSeconds: STEPUP_LOCK_MS / 1000 },
+		{ status: 429, headers: { "retry-after": String(STEPUP_LOCK_MS / 1000) } },
+	);
+}
+
+/**
+ * Handles one failed step-up code (`count` is the attempt number, already
+ * reserved). The failure that reaches the limit
+ * invalidates the pending OTP, starts the 15-minute lockout, and tells the owner.
+ */
+async function recordStepUpFailure(env: AuthEnv, session: AuthSession, count: number): Promise<Response> {
+	const failIdentifier = stepUpFailIdentifier(session.session.id);
+	if (count >= STEPUP_MAX_FAILURES) {
+		const now = Date.now();
+		await env.INDEX_DB.prepare('UPDATE "verification" SET expiresAt = ? WHERE identifier = ?')
+			.bind(now + STEPUP_LOCK_MS, failIdentifier)
+			.run();
+		await env.INDEX_DB.prepare('DELETE FROM "verification" WHERE identifier = ?')
+			.bind(stepUpOtpIdentifier(session.session.id))
+			.run();
+		await insertOpsEvent(env.INDEX_DB, {
+			id: crypto.randomUUID(),
+			event_type: "passkey.stepup_locked",
+			severity: "warning",
+			subject: session.user.email,
+			payload_json: JSON.stringify({ userId: session.user.id, failures: count }),
+		}).catch(() => undefined);
+		await notifyStepUpLocked(env as Env).catch(() => undefined);
+	}
+	return Response.json({ error: "invalid_code" }, { status: 401 });
+}
+
+async function notifyStepUpLocked(env: Env): Promise<void> {
+	const config = readTelegramConfig(env);
+	const chatId = await resolveTelegramChatId(env);
+	if (!config || !chatId) return;
+	await sendMessage(config, {
+		chatId,
+		text: "Se han bloqueado 15 minutos los intentos de registrar una passkey en Reccado tras 5 códigos incorrectos.",
+	});
+}
+
 async function handlePasskeyStepUp(
 	request: Request,
 	env: AuthEnv,
@@ -496,8 +589,17 @@ async function handlePasskeyStepUp(
 		return Response.json({ error: "invalid_body" }, { status: 400 });
 	}
 	const totp = await twoFactorEnabled(env, session.user.id);
+	const failIdentifier = stepUpFailIdentifier(session.session.id);
 	if (!code) {
 		if (totp) return Response.json({ method: "totp" });
+		if ((await readStepUpCounter(env, failIdentifier)) >= STEPUP_MAX_FAILURES) return stepUpLockedResponse();
+		const requested = await bumpStepUpCounter(env, stepUpRequestIdentifier(session.session.id), STEPUP_LOCK_MS);
+		if (requested > STEPUP_MAX_OTP_REQUESTS) {
+			return Response.json(
+				{ error: "stepup_rate_limited", retryAfterSeconds: STEPUP_LOCK_MS / 1000 },
+				{ status: 429, headers: { "retry-after": String(STEPUP_LOCK_MS / 1000) } },
+			);
+		}
 		const otp = randomDigits(6);
 		const identifier = stepUpOtpIdentifier(session.session.id);
 		const expiresAtMs = Date.now() + STEPUP_TTL_MS;
@@ -521,6 +623,9 @@ async function handlePasskeyStepUp(
 		});
 		return Response.json({ method: "email" });
 	}
+	// Reserve the attempt before checking it so parallel guesses are all counted.
+	const attempt = await bumpStepUpCounter(env, failIdentifier, STEPUP_LOCK_MS);
+	if (attempt > STEPUP_MAX_FAILURES) return stepUpLockedResponse();
 	if (totp) {
 		try {
 			// The plugin endpoint is present at runtime; Better Auth's inferred API
@@ -536,8 +641,9 @@ async function handlePasskeyStepUp(
 				headers: request.headers,
 			});
 		} catch {
-			return Response.json({ error: "invalid_code" }, { status: 401 });
+			return await recordStepUpFailure(env, session, attempt);
 		}
+		await clearStepUpCounter(env, failIdentifier);
 		return Response.json(await issueStepUpProof(env, session.session.id));
 	}
 	const identifier = stepUpOtpIdentifier(session.session.id);
@@ -548,8 +654,9 @@ async function handlePasskeyStepUp(
 		.bind(identifier, hashed, Date.now())
 		.run();
 	if ((spent.meta?.changes ?? 0) !== 1) {
-		return Response.json({ error: "invalid_code" }, { status: 401 });
+		return await recordStepUpFailure(env, session, attempt);
 	}
+	await clearStepUpCounter(env, failIdentifier);
 	return Response.json(await issueStepUpProof(env, session.session.id));
 }
 
@@ -610,6 +717,40 @@ async function recordPasskeyChange(
 	await notifyPasskeyChange(env as Env, action).catch(() => undefined);
 }
 
+const CONSENT_PATH = `${AUTH_BASE_PATH}/oauth2/consent`;
+/** Scopes that are only ever granted when the consent POST lists them explicitly. */
+const HIGH_RISK_CONSENT_SCOPES: ReadonlySet<string> = new Set(["mail:send", "mail:read:sensitive", "admin"]);
+
+/**
+ * Better Auth grants every originally requested scope when the consent body has
+ * no `scope`. Narrow that here: high-risk scopes survive only when the body
+ * names them, so a bare/forged accept can never grant admin, send or sensitive.
+ */
+export async function constrainConsentScopes(request: Request): Promise<Request> {
+	let body: { accept?: unknown; scope?: unknown; oauth_query?: unknown };
+	try {
+		body = (await request.clone().json()) as typeof body;
+	} catch {
+		return request;
+	}
+	if (body.accept !== true) return request;
+	const requested = new URLSearchParams(typeof body.oauth_query === "string" ? body.oauth_query : "")
+		.get("scope")
+		?.split(/\s+/)
+		.filter(Boolean) ?? [];
+	const ticked = new Set(typeof body.scope === "string" ? body.scope.split(/\s+/).filter(Boolean) : []);
+	const granted = requested.filter(
+		(scope) => !HIGH_RISK_CONSENT_SCOPES.has(scope) || ticked.has(scope),
+	);
+	const headers = new Headers(request.headers);
+	headers.delete("content-length");
+	return new Request(request.url, {
+		method: request.method,
+		headers,
+		body: JSON.stringify({ ...body, scope: granted.join(" ") }),
+	});
+}
+
 /**
  * The fetch-handler mounted at /api/auth/*.
  *
@@ -633,6 +774,9 @@ export async function handleAuthRequest(
 			if (gated) return gated;
 		}
 		let authRequest = request;
+		if (url.pathname === CONSENT_PATH && request.method === "POST") {
+			authRequest = await constrainConsentScopes(request);
+		}
 		if (
 			env.MCP_CIMD_ENABLED !== "true" &&
 			url.pathname === `${AUTH_BASE_PATH}/oauth2/authorize` &&
