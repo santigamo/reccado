@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-P0a–P5 merged (2026-11-12): 90 files / 1250 tests green, tsc + build OK. P6 docs merged. Remaining: pre-deploy review (T15 in flight), single deploy (remote migrations 0021, 0022, 0024–0028), live e2e (§5). Workers since 2026-11-12: Claude Sonnet 5.5 effort medium (Codex weekly limit, Cursor exhausted).
+P0a–P5 merged (2026-11-12): 90 files / 1250 tests green, tsc + build OK. P6 docs merged. Pre-deploy review T15 done (`docs/plans/mcp-v2-review-t15.md`: 0 critical, 2 high). Fixes in flight: T16a approval fidelity (H1, M2), T16b auth hardening (H2c, P1, M6; owner kept e-mail OTP fallback for step-up), T16c instance-auth mail isolation + redactor (H2a, M3, P2, L2), T16d intent principal + host allow-list + pending caps (M4, M1, L1, M5-partial). Deferred: M5 owner-scoped admin reads (single owner today), M7, L3, P4. Then: single deploy (remote migrations 0021, 0022, 0024–0028), live e2e (§5). Workers since 2026-11-12: Claude Sonnet 5.5 effort medium (Codex weekly limit, Cursor exhausted).
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
