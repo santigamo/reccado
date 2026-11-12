@@ -1,5 +1,5 @@
 import { createRequestStateCodec, inputRequired, type RequestStateCodec, type ServerContext } from "@modelcontextprotocol/server";
-import { getIntentStatus } from "../lib/approvals";
+import { buildApprovalUrl, getIntentStatus } from "../lib/approvals";
 import { hmacSha256 } from "../lib/crypto";
 import { mcpToolResultJson } from "./errors";
 
@@ -36,4 +36,19 @@ export async function statusForIntent(env: Env, id: string) {
 		...(result.send?.errorCode ? { error: result.send.errorCode } : {}),
 		...(result.result ? { result: result.result } : {}),
 	};
+}
+
+/** Shared tail of every tier-2 tool: report a settled intent, or ask for approval while it is pending. */
+export async function intentResponse(
+	env: Env,
+	flow: IntentFlow | undefined,
+	ctx: ServerContext | undefined,
+	input: { intentId: string; expiresAt: string; origin: string; message: string; transform?: (status: Record<string, unknown>) => Record<string, unknown> },
+) {
+	const status = await statusForIntent(env, input.intentId);
+	if (status.status !== "pending") return mcpToolResultJson(input.transform ? input.transform(status) : status);
+	const approvalUrl = buildApprovalUrl(input.origin, input.intentId);
+	if (!approvalUrl) throw new Error("invalid_origin");
+	if (!flow || !ctx) return mcpToolResultJson({ status: "pending", intentId: input.intentId, approvalUrl, expiresAt: input.expiresAt });
+	return respondWithIntent(flow, ctx, { intentId: input.intentId, expiresAt: input.expiresAt, approvalUrl, message: input.message });
 }
