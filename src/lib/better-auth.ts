@@ -15,7 +15,12 @@ import { DEFAULT_FROM_ADDRESS } from "./sender-identity";
 
 /** The shape createAuth needs. A stub can satisfy it in tests. */
 export interface AuthMailSender {
-	sendMail(message: { to: string; subject: string; text: string }): Promise<void>;
+	sendMail(message: {
+		to: string;
+		subject: string;
+		text: string;
+		headers?: Record<string, string>;
+	}): Promise<void>;
 }
 
 /** Structurally typed so tests can pass any Env-like object (see sender-identity.ts). */
@@ -41,7 +46,15 @@ export function createAuthMailSender(env: AuthMailEnv): AuthMailSender {
 					"auth.mail_unavailable: the EMAIL send_email binding is missing, so the sign-in code cannot be delivered.",
 				);
 			}
-			await binding.send({ from, to: message.to, subject: message.subject, text: message.text });
+			await binding.send({
+				from,
+				to: message.to,
+				subject: message.subject,
+				text: message.text,
+				...(message.headers && Object.keys(message.headers).length
+					? { headers: message.headers }
+					: {}),
+			});
 		},
 	};
 }

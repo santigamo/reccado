@@ -4,7 +4,13 @@ import { domainFromAddress } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
 import { normalizeSubject, parseMimeBytes, snippetFromText } from "../lib/mime";
 import { attachmentR2Key, bodyHtmlR2Key, sanitizeFilename } from "../lib/r2-keys";
-import { classifySensitive, type SensitiveKind } from "../lib/sensitive-mail";
+import {
+	INSTANCE_AUTH_KIND,
+	extractAuthMarker,
+	isInstanceAuthMail,
+	type AuthMailSecretEnv,
+} from "../lib/auth-mail";
+import { classifySensitive, type StoredSensitiveKind } from "../lib/sensitive-mail";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
@@ -13,6 +19,8 @@ export type IngestContext = {
 	r2: R2Bucket;
 	mailboxId: string;
 	transactionSync: (fn: () => void) => void;
+	/** Secret + sender used to recognise this instance's own authentication mail. */
+	authMail?: AuthMailSecretEnv;
 };
 
 function nowIso(): string {
@@ -421,15 +429,27 @@ export async function ingestInboundEmail(
 			receivedAt: message.receivedAt,
 		});
 		const snippet = snippetFromText(bodyText, parsed.html);
-		let sensitiveKind: SensitiveKind | null = null;
+		let sensitiveKind: StoredSensitiveKind | null = null;
 		let sensitiveClassified = 0;
 		try {
-			sensitiveKind = classifySensitive({
-				from: fromAddr,
-				subject,
-				text: bodyText,
-				html: parsed.html,
-			}).kind;
+			if (
+				ctx.authMail &&
+				(await isInstanceAuthMail(ctx.authMail, {
+					from: fromAddr,
+					recipients: [message.recipient, ...toAddresses, ...ccAddresses],
+					marker: extractAuthMarker(rawBytes),
+					receivedAt: message.receivedAt,
+				}))
+			) {
+				sensitiveKind = INSTANCE_AUTH_KIND;
+			} else {
+				sensitiveKind = classifySensitive({
+					from: fromAddr,
+					subject,
+					text: bodyText,
+					html: parsed.html,
+				}).kind;
+			}
 			sensitiveClassified = 1;
 		} catch (error) {
 			console.error("mailbox.sensitive_classification_failed", {
@@ -568,6 +588,17 @@ export async function ingestInboundEmail(
 		const messageLocalId = crypto.randomUUID();
 		const threadId = crypto.randomUUID();
 		const snippet = snippetFromText(null, null);
+		// A body that could not be parsed cannot be classified, but who sent it and the
+		// auth marker still can be: instance authentication mail stays hidden from MCP.
+		const failedAuthMail = Boolean(
+			ctx.authMail &&
+				(await isInstanceAuthMail(ctx.authMail, {
+					from: fromAddr,
+					recipients: [message.recipient, ...toAddresses],
+					marker: extractAuthMarker(rawBytes),
+					receivedAt: message.receivedAt,
+				})),
+		);
 
 		try {
 			ctx.transactionSync(() => {
@@ -583,8 +614,8 @@ export async function ingestInboundEmail(
 					`INSERT INTO messages
          (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
           from_addr, to_json, cc_json, bcc_json, subject, snippet, date_header, received_at, raw_r2_key,
-          raw_sha256, raw_size, body_text, body_html_r2_key, parse_status, has_attachments, is_read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, '[]', '[]', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'failed', 0, 0, ?, ?)`,
+          raw_sha256, raw_size, body_text, body_html_r2_key, sensitive_kind, sensitive_classified, parse_status, has_attachments, is_read, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, '[]', '[]', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 'failed', 0, 0, ?, ?)`,
 					messageLocalId,
 					message.idempotencyKey,
 					threadId,
@@ -600,6 +631,8 @@ export async function ingestInboundEmail(
 					message.rawR2Key,
 					message.rawSha256,
 					message.rawSize,
+					failedAuthMail ? INSTANCE_AUTH_KIND : null,
+					failedAuthMail ? 1 : 0,
 					now,
 					now,
 				);
@@ -655,13 +688,72 @@ export function searchMessages(
 	sql: SqlStorage,
 	query: string,
 	limit: number,
+	opts: { includeSensitive?: boolean } = {},
 ): Array<{ message_id: string }> {
-	const escaped = query.replace(/"/g, '""');
-	return sql
+	const phrase = `"${query.replace(/"/g, '""')}"`;
+	if (opts.includeSensitive) {
+		return sql
+			.exec<{ message_id: string }>(
+				`SELECT message_id FROM message_fts WHERE message_fts MATCH ? ORDER BY rank LIMIT ?`,
+				phrase,
+				limit,
+			)
+			.toArray();
+	}
+	// Without the sensitive scope, bodies of sensitive (or never classified) messages
+	// must not be searchable: otherwise a hit/no-hit tells the caller what is inside a
+	// redacted code mail. Those rows match on subject/sender/recipients only.
+	const hits = sql
 		.exec<{ message_id: string }>(
 			`SELECT message_id FROM message_fts WHERE message_fts MATCH ? ORDER BY rank LIMIT ?`,
-			`"${escaped}"`,
-			limit,
+			phrase,
+			Math.max(limit, 1) * 4,
 		)
 		.toArray();
+	const headHits = new Set(
+		sql
+			.exec<{ message_id: string }>(
+				`SELECT message_id FROM message_fts WHERE message_fts MATCH ? LIMIT ?`,
+				`{subject sender recipients} : ${phrase}`,
+				Math.max(limit, 1) * 4,
+			)
+			.toArray()
+			.map((row) => row.message_id),
+	);
+	const out: Array<{ message_id: string }> = [];
+	for (const hit of hits) {
+		const row = sql
+			.exec<{
+				from_addr: string;
+				subject: string | null;
+				body_text: string | null;
+				body_html_r2_key: string | null;
+				sensitive_kind: string | null;
+				sensitive_classified: number;
+				parse_status: string;
+			}>(
+				`SELECT from_addr, subject, body_text, body_html_r2_key, sensitive_kind, sensitive_classified, parse_status
+         FROM messages WHERE id = ?`,
+				hit.message_id,
+			)
+			.toArray()[0];
+		if (!row) continue;
+		// Rows ingested before classification existed are classified from the stored text;
+		// when there is no text to judge by (HTML-only, failed parse) they stay protected.
+		const protect =
+			row.parse_status === "failed" ||
+			(row.sensitive_classified === 1
+				? row.sensitive_kind !== null
+				: row.body_text === null
+					? row.body_html_r2_key !== null
+					: classifySensitive({
+							from: row.from_addr,
+							subject: row.subject,
+							text: row.body_text,
+						}).kind !== null);
+		if (protect && !headHits.has(hit.message_id)) continue;
+		out.push(hit);
+		if (out.length >= limit) break;
+	}
+	return out;
 }

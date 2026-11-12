@@ -34,6 +34,7 @@ import {
 	type AuthMailSender,
 } from "../lib/better-auth";
 import { resolveOwnerEmails } from "./auth";
+import { authMailHeader } from "../lib/auth-mail";
 import { DEFAULT_MCP_SCOPES, MCP_SCOPES } from "../lib/mcp-scopes";
 
 /** The path better-auth mounts under in the worker (server.ts proxies /api/* to the Hono app). */
@@ -206,7 +207,12 @@ export async function createAuth(
 			minPasswordLength: MIN_PASSWORD_LENGTH,
 			sendResetPassword: async ({ user, url }) => {
 				const content = renderPasswordResetEmail(url);
-				await mail.sendMail({ to: user.email, subject: content.subject, text: content.text });
+				await mail.sendMail({
+					to: user.email,
+					subject: content.subject,
+					text: content.text,
+					headers: await authMailHeader(env, user.email),
+				});
 			},
 			// A reset proves control of the mailbox, which is not the same as proving
 			// the operator asked for it -- so every other session goes with it.
@@ -231,7 +237,12 @@ export async function createAuth(
 					// The owner gate ran before this endpoint was reached (handleAuthRequest),
 					// so every code below is on its way to a vouched-for address only.
 					const content = renderOtpEmail(otp);
-					await mail.sendMail({ to: email, subject: content.subject, text: content.text });
+					await mail.sendMail({
+						to: email,
+						subject: content.subject,
+						text: content.text,
+						headers: await authMailHeader(env, email),
+					});
 				},
 			}),
 			// TOTP as the second factor. `trustDevice` on verification remembers the
@@ -620,6 +631,7 @@ async function handlePasskeyStepUp(
 			to: session.user.email,
 			subject: "Código para registrar una passkey",
 			text: `Tu código para registrar una passkey es ${otp}. Caduca en 5 minutos.`,
+			headers: await authMailHeader(env, session.user.email),
 		});
 		return Response.json({ method: "email" });
 	}

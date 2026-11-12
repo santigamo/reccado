@@ -1355,7 +1355,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (url.pathname === "/search" && request.method === "GET") {
 			const q = url.searchParams.get("q") ?? "";
 			const limit = Number(url.searchParams.get("limit") ?? "25");
-			return Response.json({ results: searchMessages(this.ctx.storage.sql, q, limit) });
+			return Response.json({
+				results: searchMessages(this.ctx.storage.sql, q, limit, {
+					includeSensitive: url.searchParams.get("sensitive") === "1",
+				}),
+			});
 		}
 		if (url.pathname === "/threads" && request.method === "GET") {
 			const stateParam = url.searchParams.get("state");
@@ -2189,6 +2193,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				r2: this.env.MAIL_OBJECTS,
 				mailboxId: message.mailboxId,
 				transactionSync: (fn) => this.ctx.storage.transactionSync(fn),
+				authMail: this.env,
 			},
 			message,
 		);

@@ -476,7 +476,7 @@ describe("MCP P3 tools", () => {
 
 	it("refuses oversized raw resources", async () => {
 		const id = await mailbox(reader.email);
-		const seeded = await seedMessage(id, { body: "small", fts: false });
+		const seeded = await seedMessage(id, { body: "small", fts: false, sensitiveClassified: 1 });
 		const bigKey = `test/big-${seeded.messageId}`;
 		await testEnv.MAIL_OBJECTS.put(bigKey, new Uint8Array(5 * 1024 * 1024 + 1));
 		await runInDurableObject(testEnv.MAILBOX_DO.getByName(id), async (_instance, state) => {
