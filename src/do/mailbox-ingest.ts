@@ -723,13 +723,35 @@ export function searchMessages(
 	const out: Array<{ message_id: string }> = [];
 	for (const hit of hits) {
 		const row = sql
-			.exec<{ protect: number }>(
-				`SELECT (sensitive_classified != 1 OR sensitive_kind IS NOT NULL OR parse_status = 'failed') AS protect
+			.exec<{
+				from_addr: string;
+				subject: string | null;
+				body_text: string | null;
+				body_html_r2_key: string | null;
+				sensitive_kind: string | null;
+				sensitive_classified: number;
+				parse_status: string;
+			}>(
+				`SELECT from_addr, subject, body_text, body_html_r2_key, sensitive_kind, sensitive_classified, parse_status
          FROM messages WHERE id = ?`,
 				hit.message_id,
 			)
 			.toArray()[0];
-		if (!row || (row.protect && !headHits.has(hit.message_id))) continue;
+		if (!row) continue;
+		// Rows ingested before classification existed are classified from the stored text;
+		// when there is no text to judge by (HTML-only, failed parse) they stay protected.
+		const protect =
+			row.parse_status === "failed" ||
+			(row.sensitive_classified === 1
+				? row.sensitive_kind !== null
+				: row.body_text === null
+					? row.body_html_r2_key !== null
+					: classifySensitive({
+							from: row.from_addr,
+							subject: row.subject,
+							text: row.body_text,
+						}).kind !== null);
+		if (protect && !headHits.has(hit.message_id)) continue;
 		out.push(hit);
 		if (out.length >= limit) break;
 	}
