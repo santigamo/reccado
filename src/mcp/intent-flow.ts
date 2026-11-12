@@ -34,5 +34,6 @@ export async function statusForIntent(env: Env, id: string) {
 		...(result.send?.providerMessageId ? { sentMessageId: result.send.providerMessageId } : {}),
 		...(result.deliveryFeedback ? { deliveryFeedback: result.deliveryFeedback } : {}),
 		...(result.send?.errorCode ? { error: result.send.errorCode } : {}),
+		...(result.result ? { result: result.result } : {}),
 	};
 }

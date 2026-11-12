@@ -11,6 +11,7 @@ import {
 	denyIntent,
 	fieldsFromSnapshot,
 	getIntentStatus,
+	getOrCreatePendingIntent,
 	getIntentView,
 	requestControlPlaneChange,
 } from "#/lib/approvals";
@@ -425,6 +426,16 @@ async function sentRows(draftId: string) {
 }
 
 describe("mcp send approval", () => {
+	it("replaces an expired pending intent while retaining its expired status", async () => {
+		const draft = await mcpDraft("expired intent");
+		const input = { kind: "send" as const, origin: "mcp" as const, mailboxId: draft.mailboxId, draftId: draft.draftId, payloadHash: draft.payloadHash };
+		const first = await getOrCreatePendingIntent(env as Env, input);
+		await db.prepare("UPDATE approvals SET expires_at = ? WHERE token = ?").bind(new Date(Date.now() - 1000).toISOString(), first.intent.id).run();
+		const second = await getOrCreatePendingIntent(env as Env, input);
+		expect(second.created).toBe(true);
+		expect(second.intent.id).not.toBe(first.intent.id);
+		expect((await getIntentStatus(env as Env, first.intent.id)).status).toBe("expired");
+	});
 	it("rejects a tampered requestState at the SDK seam", async () => {
 		const codec = await makeIntentCodec(TEST_SECRET, "sdk-owner");
 		const auth = { userId: "sdk-owner", email: "sdk@example.com", scopes: new Set(["mail:send"]) };
