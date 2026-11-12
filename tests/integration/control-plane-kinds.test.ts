@@ -9,8 +9,10 @@ import {
 	approveIntent,
 	getIntentStatus,
 	getIntentView,
+	registerControlPlaneKind,
 	requestControlPlaneChange,
 } from "#/lib/approvals";
+import { renderApprovalPage } from "#/components/approval-page";
 import { mailboxStub } from "#/lib/mailbox-stub";
 import type { AuthMailSender } from "#/lib/better-auth";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
@@ -355,7 +357,8 @@ describe("templates", () => {
 		const rendered = await view(next);
 		const text = JSON.stringify(rendered.fields);
 		expect(text).toContain("Hola → Hola 2");
-		expect(text).toContain("cambia: sí");
+		expect(text).toContain("- uno");
+		expect(text).toContain("+ uno dos");
 		await approve(next);
 		await applied("template_archive", { mailboxId: "mbx_kinds_t", templateId: "welcome" });
 		await expect(
@@ -364,6 +367,94 @@ describe("templates", () => {
 		await expect(
 			request("template_upsert", tpl("bad\nsubject")),
 		).rejects.toMatchObject({ code: "validation_error" });
+	});
+});
+
+describe("approval page fidelity", () => {
+	it("template approval shows body, escaped HTML, links and external-link warnings", async () => {
+		await newMailbox("mbx_kinds_f", "f@kinds-f.example");
+		await applied("domain_add", { domain: "kinds-f.example", zoneId: "zf" });
+		const base = { mailboxId: "mbx_kinds_f", templateId: "promo" };
+		await applied("template_upsert", { ...base, body: { subject: "Hi", body_text: "old line\nkeep" } });
+		const intent = await request("template_upsert", {
+			...base,
+			body: {
+				subject: "Hi 2",
+				body_text: "Pay now at https://evil.example/pay.\nkeep",
+				body_html: '<p onclick="x()">Go <a href="https://kinds-f.example/ok">ok</a> <a href="https://phish.example/x?a=1&b=2">pay</a></p><script>alert(1)</script>',
+			},
+		});
+		const v = await view(intent);
+		const html = renderApprovalPage({ ...v, fields: v.fields, warnings: v.warnings });
+		expect(html).toContain("Pay now at https://evil.example/pay.");
+		expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+		expect(html).not.toContain("<script>");
+		expect(html).toContain("evil.example — https://evil.example/pay");
+		expect(html).toContain("phish.example — https://phish.example/x?a=1&amp;b=2");
+		expect(html).toContain("kinds-f.example — https://kinds-f.example/ok");
+		expect(html).toContain("<pre");
+		expect(html).toContain("- old line");
+		expect(html).toContain("+ Pay now at");
+		const warnings = v.warnings.map((w) => w.message).join("|");
+		expect(warnings).toContain("evil.example");
+		expect(warnings).toContain("phish.example");
+		expect(warnings).not.toContain("dominio que no es uno de tus dominios de envío: kinds-f.example");
+	});
+	it("api key and domain provision pages show every approved field", async () => {
+		await newMailbox("mbx_kinds_g", "g@kinds-g.example");
+		const intent = await request("api_key_create", {
+			mailboxId: "mbx_kinds_g",
+			body: {
+				environment: "live",
+				sender: "g@kinds-g.example",
+				senderName: "Gee Co",
+				scopes: ["transactional:send", "transactional:templates:use"],
+				templateAllowlist: ["welcome", "reset"],
+				recipientPolicy: "*@*",
+			},
+		});
+		const v = await view(intent);
+		const page = renderApprovalPage(v);
+		for (const expected of ["Gee Co", "*@*", "welcome, reset", "transactional:send"])
+			expect(page).toContain(expected);
+		expect(v.warnings.map((w) => w.code)).toContain("permissive_recipient_policy");
+		const prov = await request("domain_provision", {
+			domain: "kinds-g.example",
+			body: {
+				dmarc: { policy: "quarantine", alignment: "strict", rua: "reports@collector.example" },
+				mailbox: { address: "g@kinds-g.example", displayName: "Gee", ownerEmail: EMAIL },
+			},
+		});
+		const pv = await view(prov);
+		const ppage = renderApprovalPage(pv);
+		for (const expected of ["strict", "reports@collector.example", "Gee", EMAIL])
+			expect(ppage).toContain(expected);
+		expect(pv.warnings.map((w) => w.code)).toContain("dmarc_external_rua");
+		expect(pv.fields.some((f) => f.label.startsWith("campo:"))).toBe(false);
+	});
+	it("safety net appends payload keys a kind did not render", async () => {
+		registerControlPlaneKind("synthetic_hidden", {
+			covers: ["shown"],
+			validate: (value) => value as Record<string, unknown>,
+			render: async () => ({
+				title: "Sintético",
+				fields: [{ label: "Visto", value: "x" }],
+				warnings: [],
+			}),
+			execute: async () => ({}),
+		});
+		const intent = await request("synthetic_hidden", {
+			shown: 1,
+			hidden: "secret-target@evil.example",
+			nested: { deep: [1, 2], other: true },
+		});
+		const v = await view(intent);
+		const rows = Object.fromEntries(v.fields.map((f) => [f.label, f.value]));
+		expect(rows["campo: hidden"]).toBe("secret-target@evil.example");
+		expect(rows["campo: nested.deep"]).toBe("[1,2]");
+		expect(rows["campo: nested.other"]).toBe("true");
+		expect(rows["campo: shown"]).toBeUndefined();
+		expect(renderApprovalPage(v)).toContain("campo: hidden");
 	});
 });
 

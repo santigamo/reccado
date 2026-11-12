@@ -40,6 +40,7 @@ import {
 	hashPayload,
 	ownerForUser,
 } from "./control-plane-intents";
+import { renderWithSafetyNet } from "./control-plane-registry";
 import { AdminError } from "./admin/errors";
 export { registerControlPlaneKind, requestControlPlaneChange } from "./control-plane-intents";
 
@@ -56,7 +57,12 @@ export type IntentStatusName =
 	| "executed"
 	| "failed";
 
-export type IntentField = { label: string; value: string };
+/**
+ * `text` (default) is a short line, `pre` is long/verbatim content shown in a scrollable
+ * monospace block (never rendered as HTML), `list` is newline-separated items.
+ */
+export type IntentFieldFormat = "text" | "pre" | "list";
+export type IntentField = { label: string; value: string; format?: IntentFieldFormat };
 export type IntentWarning = { code: string; message: string };
 
 export type IntentStatus = {
@@ -600,7 +606,7 @@ export async function getIntentView(
 			const payload: unknown = JSON.parse(data?.payload_json ?? "null");
 			const items = Array.isArray(payload) ? payload : [payload];
 			const parts = await Promise.all(
-				items.map((item) => definition.render(env, actorAuth, definition.validate(item))),
+				items.map((item) => renderWithSafetyNet(definition, env, actorAuth, definition.validate(item))),
 			);
 			rendered = {
 				title: parts.length === 1 ? parts[0]!.title : `Cambios (${parts.length})`,
