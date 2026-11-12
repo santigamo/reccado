@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-After T13a + T12 merge (2026-11-12): 88 files / 1224 tests green, tsc + build OK. T12 = `send` tool + `src/mcp/intent-flow.ts` + migration 0028 (unique live pending intent per draft). Blocked: T13b-kinds (remaining control-plane kinds; spec in scratchpad) — Codex weekly limit until 2026-11-13 15:37, Cursor exhausted. Next: T13b `manage_*` tools (on top of T12's `src/mcp/intent-flow.ts`), then P6 docs, then single deploy (remote migrations 0021→0028). Workers back on Codex `gpt-6.1-terra` medium (Cursor quota exhausted 2026-11-12).
+P0a–P5 merged (2026-11-12): 90 files / 1250 tests green, tsc + build OK. Remaining: P6 docs, pre-deploy review, single deploy (remote migrations 0021, 0022, 0024–0028), live e2e (§5). Workers since 2026-11-12: Claude Sonnet 5.5 effort medium (Codex weekly limit, Cursor exhausted).
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -317,9 +317,17 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       `mcp` intent.
 
 ### P5 — Tier-2 admin
-- [ ] `manage_*`, `remove_suppression`, `restore`, `reconcile_stale` through approvals, with
-      batch intents.
-- [ ] API key secret reveal on the approval page only.
+- [x] `manage_*`, `remove_suppression`, `restore`, `reconcile_stale` through approvals, with
+      batch intents (≤20). (T13c `src/mcp/admin-tools.ts`; T13b-kinds
+      `src/lib/control-plane-kinds/*`, registry `src/lib/control-plane-registry.ts`.)
+- [x] API key secret reveal on the approval page only: kinds' `redact()` splits the execute
+      result; only the redacted part is stored in `result_json`; the secret is returned once in
+      the owner's approve response; tool results also strip `secret|token|plaintext`.
+- Known limits (T13b): `api_key_scopes` issues a replacement key and revokes the old one (no DO
+  scope-patch route); archived templates are not restorable (`restore_unsupported`); domains and
+  mailbox-less rules gated by owner role only (no per-row owner); `restore` consumption is
+  atomic via an `ops_events` row `restored:<snapshotId>`; reconcile count is the approximate D1
+  projection and never resends.
 - [x] Soft delete via `disabled` + `ops_events` `admin.before_snapshot` (T13a, mailboxes).
 - [x] Framework (T13a): `src/lib/control-plane-intents.ts` registry (`validate/render/execute`),
       canonical `payload_json` hashed into the passkey challenge, `result_json` per item, batch
