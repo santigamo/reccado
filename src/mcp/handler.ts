@@ -1,7 +1,7 @@
 import { requireMcpAuth } from "@better-auth/mcp";
 import { McpServer, type McpRequestContext } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
-import { createAuth, AuthConfigError, resolveMcpResource } from "../api/better-auth";
+import { createAuth, AuthConfigError, getDeploymentOriginForAuth, resolveMcpResource } from "../api/better-auth";
 import { recordDeploymentOrigin } from "../db/runtime-config";
 import { requireMcpOwner, resolveOwnerEmails } from "./auth-import";
 import { registerTools } from "./tools";
@@ -27,6 +27,29 @@ export function isLegacyMcpRequest(context: McpRequestContext): boolean {
 	return context.era === "legacy";
 }
 
+/**
+ * Hosts `/mcp` answers to: localhost, the observed public origin (the one OAuth
+ * tokens are bound to), operator-listed `MCP_ALLOWED_HOSTS`, and the request's own
+ * `*.workers.dev` hostname. Everything else is refused by the SDK's Host check.
+ */
+export async function resolveAllowedHostnames(env: Env, requestHostname: string): Promise<string[]> {
+	const hosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+	const origin = await getDeploymentOriginForAuth(env.INDEX_DB).catch(() => null);
+	if (origin) {
+		try {
+			hosts.add(new URL(origin).hostname.toLowerCase());
+		} catch {
+			// A malformed stored origin contributes nothing.
+		}
+	}
+	for (const entry of (env.MCP_ALLOWED_HOSTS ?? "").split(",")) {
+		const host = entry.trim().toLowerCase();
+		if (host) hosts.add(host);
+	}
+	if (requestHostname.endsWith(".workers.dev")) hosts.add(requestHostname);
+	return [...hosts];
+}
+
 /** Bind a fresh server and its tool closures to this authenticated request. */
 async function runMcpServer(
 	request: Request,
@@ -39,8 +62,7 @@ async function runMcpServer(
 	const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 	if (!secret && !local) return Response.json({ error: "auth_unavailable" }, { status: 503 });
 	const codec = await makeIntentCodec(secret || `local:${env.PHASE0_DEBUG_TOKEN ?? ""}`, `${auth.userId}\0${auth.oauthClientId ?? ""}`);
-	const allowedHostnames = ["inbox.imsanti.dev", "localhost", "127.0.0.1", "[::1]"];
-	if (hostname.endsWith(".workers.dev")) allowedHostnames.push(hostname);
+	const allowedHostnames = await resolveAllowedHostnames(env, hostname);
 	const handler = createMcpHandler(
 		(requestContext) => {
 			const server = new McpServer({ name: "reccado", version: "1.0.0" }, { requestState: { verify: codec.verify } });

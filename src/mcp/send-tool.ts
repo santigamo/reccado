@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { getApproval, getMailboxForOwner, insertOpsEvent } from "../db/d1";
 import { buildApprovalUrl, getOrCreatePendingIntent } from "../lib/approvals";
+import { assertPendingCapacity } from "../lib/control-plane-intents";
 import { mailboxStub } from "../lib/mailbox-stub";
 import { notifyIntentCreated } from "../telegram/notify";
 import { mcpToolError, mcpToolResultJson } from "./errors";
@@ -27,6 +28,8 @@ export function registerSendTool(server: McpServer, env: Env, auth: McpSendAuth,
 			const count = rates.get(key) ?? 0;
 			if (count >= 10) throw new Error("rate_limited");
 			rates.set(key, count + 1);
+			const minute = String(Math.floor(Date.now() / 60000));
+			for (const k of rates.keys()) if (!k.endsWith(`:${minute}`)) rates.delete(k);
 			const mailbox = await getMailboxForOwner(env.INDEX_DB, params.mailboxId, auth.email);
 			if (!mailbox) throw new Error("not_found");
 			const retry = ctx ? resolveIntentRetry(ctx) : undefined;
@@ -35,6 +38,7 @@ export function registerSendTool(server: McpServer, env: Env, auth: McpSendAuth,
 			if (intentId) {
 				const row = await getApproval(env.INDEX_DB, intentId);
 				if (!row || row.kind !== "send" || row.origin !== "mcp" || row.mailbox_id !== params.mailboxId || row.draft_id !== params.draftId) throw new Error("not_found");
+				if ((row.token_sub ?? null) !== (auth.tokenSub ?? null)) throw new Error("not_found");
 				const status = await statusForIntent(env, intentId);
 				if (retry && status.status === "pending" && flow && ctx) {
 					const approvalUrl = buildApprovalUrl(origin, intentId);
@@ -55,6 +59,7 @@ export function registerSendTool(server: McpServer, env: Env, auth: McpSendAuth,
 			if (!requested.ok) throw new Error("request_send_failed");
 			const frozen = await requested.json() as { payload_hash?: string; error?: string };
 			if (!frozen.payload_hash || frozen.error) throw new Error(frozen.error ?? "request_send_failed");
+			await assertPendingCapacity(env, auth.tokenSub, { mailboxId: params.mailboxId, draftId: params.draftId });
 			const { intent, created } = await getOrCreatePendingIntent(env, { kind: "send", origin: "mcp", mailboxId: params.mailboxId, draftId: params.draftId, payloadHash: frozen.payload_hash, oauthClientId: auth.oauthClientId, tokenSub: auth.tokenSub, tokenJti: auth.tokenJti });
 			intentId = intent.id;
 			if (created) await notifyIntentCreated(env, intent.id).catch(() => undefined);
@@ -66,7 +71,7 @@ export function registerSendTool(server: McpServer, env: Env, auth: McpSendAuth,
 			return await respondWithIntent(flow, ctx, { intentId: intent.id, expiresAt: intent.expiresAt, approvalUrl, message: `Revisa y aprueba el envío en ${new URL(origin).host}` });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "internal_error";
-			reason = /^(insufficient_scope: mail:send|rate_limited|not_found|draft_not_agent_owned|draft_not_editable|invalid_request_state|intent_stale)$/.test(message) ? message : "internal_error";
+			reason = /^(insufficient_scope: mail:send|rate_limited|too_many_pending_approvals|not_found|draft_not_agent_owned|draft_not_editable|invalid_request_state|intent_stale)$/.test(message) ? message : "internal_error";
 			return mcpToolError(reason);
 		} finally {
 			await insertOpsEvent(env.INDEX_DB, { id: crypto.randomUUID(), event_type: "mcp.tool_call", severity: reason ? "warning" : "info", subject: auth.email, payload_json: JSON.stringify({ tool: "send", scope: "mail:send", mailbox_id: params.mailboxId, intent_id: intentId ?? null, denied: Boolean(reason), reason: reason ?? null, latency_ms: Date.now() - start }) }).catch(() => undefined);

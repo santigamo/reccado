@@ -368,3 +368,88 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		expect(content.status).toBe("pending");
 	});
 });
+
+describe("mcp intent principal, approver binding and approval-fatigue limits", () => {
+	const emailA = "principal-a@example.com";
+	const emailB = "principal-b@example.com";
+	let a: Awaited<ReturnType<typeof registerOwner>>;
+	let b: Awaited<ReturnType<typeof registerOwner>>;
+	let counter = 500;
+	const authFor = (owner: { userId: string }, email: string, extra: Record<string, unknown> = {}) => ({
+		userId: owner.userId,
+		email,
+		owners: [emailA, emailB, email],
+		scopes: new Set(ADMIN),
+		oauthClientId: "client-1",
+		tokenSub: owner.userId,
+		tokenJti: "jti-1",
+		...extra,
+	});
+	beforeAll(async () => {
+		a = await registerOwner(emailA);
+		b = await registerOwner(emailB);
+	});
+	const pending = async (auth: Record<string, unknown>, address: string) => {
+		const { handler } = await handlerFor("manage_mailbox", auth, "legacy");
+		const result = await handler({ action: "create", primaryAddress: address }, context());
+		return { handler, result, content: result.structuredContent as { intentId: string } };
+	};
+
+	it("persists the principal and records it with the approver at execute time", async () => {
+		const { content } = await pending(authFor(a, emailA), "principal-created@example.com");
+		const row = await db.prepare("SELECT oauth_client_id, token_sub, token_jti FROM approvals WHERE token = ?").bind(content.intentId).first();
+		expect(row).toEqual({ oauth_client_id: "client-1", token_sub: a.userId, token_jti: "jti-1" });
+		const challenge = await db.prepare("SELECT payload_hash FROM approvals WHERE token = ?").bind(content.intentId).first<{ payload_hash: string }>();
+		const assertion = await a.authenticator.assertion(await approvalChallenge(content.intentId, challenge!.payload_hash), counter++);
+		expect((await approveIntent(env, { id: content.intentId, userId: a.userId, origin: ORIGIN, assertion })).status).toBe("executed");
+		const event = await db.prepare("SELECT payload_json FROM ops_events WHERE id = ?").bind(`approval.executed:${content.intentId}`).first<{ payload_json: string }>();
+		expect(JSON.parse(event!.payload_json)).toMatchObject({ oauth_client_id: "client-1", token_sub: a.userId, token_jti: "jti-1", approver_user_id: a.userId, kind: "mailbox_create" });
+	});
+
+	it("hides an intent's status from a different principal", async () => {
+		const { content } = await pending(authFor(a, emailA), "principal-hidden@example.com");
+		const { handler } = await handlerFor("manage_mailbox", authFor(b, emailB), "legacy");
+		const result = await handler({ intentId: content.intentId }, context());
+		expect(result.isError).toBe(true);
+		expect(JSON.stringify(result)).toContain("not_found");
+	});
+
+	it("refuses approval by an owner other than the intent's creator", async () => {
+		const { content } = await pending(authFor(a, emailA), "principal-cross@example.com");
+		const row = await db.prepare("SELECT payload_hash FROM approvals WHERE token = ?").bind(content.intentId).first<{ payload_hash: string }>();
+		const assertion = await b.authenticator.assertion(await approvalChallenge(content.intentId, row!.payload_hash), counter++);
+		const result = await approveIntent(env, { id: content.intentId, userId: b.userId, origin: ORIGIN, assertion });
+		expect(result.error).toBe("forbidden");
+		expect(result.status).toBe("pending");
+	});
+
+	it("refuses the 6th live pending intent for one token subject", async () => {
+		const c = await registerOwner("principal-cap@example.com");
+		const auth = authFor(c, "principal-cap@example.com");
+		for (let i = 0; i < 5; i++) {
+			const { result } = await pending(auth, `cap-${i}@example.com`);
+			expect(result.isError, String(i)).not.toBe(true);
+		}
+		const sixth = await pending(auth, "cap-5@example.com");
+		expect(sixth.result.isError).toBe(true);
+		expect(JSON.stringify(sixth.result)).toContain("too_many_pending_approvals");
+		// A different subject is unaffected.
+		expect((await pending(authFor(a, emailA), "cap-other@example.com")).result.isError).not.toBe(true);
+	});
+
+	it("coalesces Telegram notifications to one per minute per token subject", async () => {
+		await db.prepare("INSERT OR REPLACE INTO runtime_config (key, value, updated_at) VALUES ('telegram.chat_id', '999', ?)").bind(new Date().toISOString()).run();
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ ok: true, result: { message_id: 1 } }));
+		try {
+			const telegramEnv = { ...env, TELEGRAM_BOT_TOKEN: "123:abc" } as Env;
+			const d = await registerOwner("principal-notify@example.com");
+			const auth = authFor(d, "principal-notify@example.com");
+			const ids: string[] = [];
+			for (let i = 0; i < 2; i++) ids.push((await pending(auth, `notify-${i}@example.com`)).content.intentId);
+			fetchSpy.mockClear();
+			for (const id of ids) await notification.notifyIntentCreated(telegramEnv, id);
+			const sent = fetchSpy.mock.calls.filter(([input]) => String(input instanceof Request ? input.url : input).includes("sendMessage"));
+			expect(sent.length).toBe(1);
+		} finally { fetchSpy.mockRestore(); }
+	});
+});

@@ -17,6 +17,7 @@
 	"workers_dev": false,
 	"vars": {
 		"MCP_CIMD_ENABLED": "false",
+		"MCP_ALLOWED_HOSTS": "",
 		"MAIL_FROM_ADDRESS": "noreply@mail.example.com",
 		// Mailbox Durable Objects are pinned to Cloudflare's EU jurisdiction.
 		// Declared rather than assumed because workerd does not implement
@@ -160,6 +161,7 @@
 			// deliberately not set here.
 			"vars": {
 				"MCP_CIMD_ENABLED": "false",
+				"MCP_ALLOWED_HOSTS": "inbox.imsanti.dev",
 				"MAIL_FROM_ADDRESS": "noreply@send.imsanti.dev",
 				// imsanti.dev is the zone apex, so hello@imsanti.dev sends as itself. Ship
 				// this only after `wrangler email sending list` shows imsanti.dev enabled:

@@ -61,6 +61,9 @@ function checkRateLimit(auth: AuthContext, toolName: string): boolean {
 		return false;
 	}
 	rateLimitStore.set(key, current + 1);
+	// Buckets are per minute; anything from an earlier minute can never be read again.
+	const suffix = `:${Math.floor(Date.now() / 60_000)}`;
+	for (const stale of rateLimitStore.keys()) if (!stale.endsWith(suffix)) rateLimitStore.delete(stale);
 	return true;
 }
 

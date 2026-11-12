@@ -701,6 +701,10 @@ export async function approveIntent(
 		await recordEvent(env, row.token, "approval.expired", { kind: row.kind });
 		return { ...(await getIntentStatus(env, input.id)), error: "expired" };
 	}
+	// Multi-owner safety: an MCP intent is approved only by the owner whose token created it.
+	if (row.token_sub && row.token_sub !== input.userId) {
+		return { ...(await getIntentStatus(env, input.id)), error: "forbidden" };
+	}
 	const passkeys = await listPasskeys(env, input.userId).catch(() => []);
 	if (passkeys.length === 0) {
 		return { ...(await getIntentStatus(env, input.id)), error: "no_passkey" };
@@ -745,6 +749,10 @@ export async function approveIntent(
 		kind: row.kind,
 		method: "passkey",
 		payloadHash: row.payload_hash,
+		approverUserId: input.userId,
+		oauthClientId: row.oauth_client_id ?? null,
+		tokenSub: row.token_sub ?? null,
+		tokenJti: row.token_jti ?? null,
 	});
 	if (row.kind === "send") return dispatchSend(env, row);
 	return dispatchControl(env, row, input.userId);
@@ -788,6 +796,14 @@ async function dispatchControl(
 	const parsed: unknown = JSON.parse(stored.payload_json);
 	const items = Array.isArray(parsed) ? parsed : [parsed];
 	const results: NonNullable<IntentStatus["result"]>["items"] = [];
+	const principal = {
+		kind: row.kind,
+		intent_id: row.token,
+		oauth_client_id: row.oauth_client_id ?? null,
+		token_sub: row.token_sub ?? null,
+		token_jti: row.token_jti ?? null,
+		approver_user_id: userId,
+	};
 	let failed = false;
 	const reveal: IntentField[] = [];
 	for (const item of items) {
@@ -813,6 +829,17 @@ async function dispatchControl(
 	await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?")
 		.bind(JSON.stringify({ items: results }), row.token)
 		.run();
+	// Attribution: which client/token asked for this change and which owner approved it.
+	await insertOpsEvent(env.INDEX_DB, {
+		id: `approval.executed:${row.token}`,
+		event_type: "approval.executed",
+		severity: failed ? "warning" : "info",
+		subject: row.token,
+		payload_json: JSON.stringify({
+			...principal,
+			outcomes: results.map((item) => item.status),
+		}),
+	}).catch(() => undefined);
 	const status = await getIntentStatus(env, row.token);
 	return reveal.length ? { ...status, reveal } : status;
 }
