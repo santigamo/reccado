@@ -70,6 +70,8 @@ function ApprovePage(): ReactElement {
 	const view = Route.useLoaderData();
 	const [error, setError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
+	// One-time secrets from the approve response. Held in memory only; a reload loses them.
+	const [reveal, setReveal] = useState<Array<{ label: string; value: string }> | null>(null);
 
 	async function approve(): Promise<void> {
 		if (!view.challenge) return;
@@ -87,6 +89,14 @@ function ApprovePage(): ReactElement {
 			});
 			if (!response.ok) {
 				setError("No se ha aprobado. La solicitud sigue pendiente o ya no vale.");
+				setBusy(false);
+				return;
+			}
+			const result = (await response.json().catch(() => null)) as {
+				reveal?: Array<{ label: string; value: string }>;
+			} | null;
+			if (result?.reveal?.length) {
+				setReveal(result.reveal);
 				setBusy(false);
 				return;
 			}
@@ -144,7 +154,31 @@ function ApprovePage(): ReactElement {
 						</div>
 					))}
 				</dl>
-				{view.status === "pending" && view.hasPasskey && view.challenge && (
+				{reveal && (
+					<section className="mt-6 rounded-xl border border-amber-400/50 bg-amber-500/10 p-4">
+						<p className="text-sm font-semibold text-[var(--sea-ink)]">
+							Cambio aplicado. Copia ahora el secreto: no se volverá a mostrar.
+						</p>
+						{reveal.map((item) => (
+							<div key={item.label} className="mt-3">
+								<p className="text-xs font-semibold uppercase tracking-wide text-[var(--sea-ink-soft)]">
+									{item.label}
+								</p>
+								<code className="mt-1 block break-all rounded bg-black/10 p-2 text-sm">
+									{item.value}
+								</code>
+							</div>
+						))}
+						<button
+							type="button"
+							className={`${QUIET_BUTTON_CLASS} mt-4`}
+							onClick={() => window.location.reload()}
+						>
+							Ya lo he guardado
+						</button>
+					</section>
+				)}
+				{!reveal && view.status === "pending" && view.hasPasskey && view.challenge && (
 					<div className="mt-6 flex flex-wrap gap-3">
 						<button
 							type="button"

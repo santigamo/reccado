@@ -683,7 +683,7 @@ export async function approveIntent(
 		origin: string;
 		assertion: AuthenticationResponseJSON;
 	},
-): Promise<IntentStatus & { error?: string }> {
+): Promise<IntentStatus & { error?: string; reveal?: IntentField[] }> {
 	const row = await getApproval(env.INDEX_DB, input.id);
 	if (!row || !row.payload_hash || (row.kind === "send" && (!row.mailbox_id || !row.draft_id))) {
 		return { ...expiredStatus(), error: "expired" };
@@ -759,7 +759,11 @@ async function payloadMatches(json: string, hash: string): Promise<boolean> {
 		return false;
 	}
 }
-async function dispatchControl(env: Env, row: ApprovalRow, userId: string): Promise<IntentStatus> {
+async function dispatchControl(
+	env: Env,
+	row: ApprovalRow,
+	userId: string,
+): Promise<IntentStatus & { reveal?: IntentField[] }> {
 	const definition = controlPlaneKind(row.kind)!;
 	const stored = await controlData(env, row.token);
 	if (
@@ -779,6 +783,7 @@ async function dispatchControl(env: Env, row: ApprovalRow, userId: string): Prom
 	const items = Array.isArray(parsed) ? parsed : [parsed];
 	const results: NonNullable<IntentStatus["result"]>["items"] = [];
 	let failed = false;
+	const reveal: IntentField[] = [];
 	for (const item of items) {
 		if (failed) {
 			results.push({ status: "not_run" });
@@ -787,7 +792,10 @@ async function dispatchControl(env: Env, row: ApprovalRow, userId: string): Prom
 		try {
 			const actor = await ownerForUser(env, userId);
 			const result = await definition.execute(env, actor, definition.validate(item));
-			results.push({ status: "executed", result });
+			// One-time secrets go only to the approving owner's HTTP response, never into result_json.
+			const split = definition.redact ? definition.redact(result) : { stored: result };
+			reveal.push(...(split.secrets ?? []));
+			results.push({ status: "executed", result: split.stored });
 		} catch (error) {
 			failed = true;
 			results.push({
@@ -799,7 +807,8 @@ async function dispatchControl(env: Env, row: ApprovalRow, userId: string): Prom
 	await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?")
 		.bind(JSON.stringify({ items: results }), row.token)
 		.run();
-	return getIntentStatus(env, row.token);
+	const status = await getIntentStatus(env, row.token);
+	return reveal.length ? { ...status, reveal } : status;
 }
 
 async function dispatchSend(
