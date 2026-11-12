@@ -7,6 +7,8 @@ import { McpMailboxFacade } from "./mailbox-facade";
 import { mcpToolError, mcpToolResultJson } from "./errors";
 import { assertScope, McpScopeError, type McpAuthContext } from "./scopes";
 import * as adminReads from "./admin-reads";
+import { registerSendTool } from "./send-tool";
+import type { IntentFlow } from "./intent-flow";
 
 type RateLimitMap = Map<string, number>;
 
@@ -98,6 +100,7 @@ export function registerTools(
 	env: Env,
 	auth: McpAuthContext,
 	origin: string,
+	flow?: IntentFlow,
 ): void {
 	const facade = new McpMailboxFacade(env, auth);
 	async function denied(tool: string, mailboxId: string | null, scope: string, start: number) {
@@ -621,4 +624,5 @@ export function registerTools(
 		},
 		async () => runTool("list_config", "admin", null, () => adminReads.config(env, auth)),
 	);
+	registerSendTool(server, env, auth, origin, flow);
 }

@@ -25,8 +25,10 @@ const TOOL_NAMES = [
 	"get_health",
 	"list_ops",
 	"list_config",
+	"send",
 ] as const;
 const TOOL_SCOPES: Record<(typeof TOOL_NAMES)[number], string> = {
+	send: "mail:send",
 	list_mailboxes: "mail:read",
 	list_threads: "mail:read",
 	search_messages: "mail:read",
