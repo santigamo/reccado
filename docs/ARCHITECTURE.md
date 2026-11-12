@@ -2,7 +2,7 @@
 
 ## Status
 
-- Status: Tier A architecture plus a minimal MCP endpoint (read/search/draft, no send) and the
+- Status: Tier A architecture plus an MCP endpoint (read/draft/send-request/admin, approval-gated) and the
   transactional API MVP are implemented in this repository; the rest of Tier B (EmailAgent,
   Vectorize/RAG, AI Gateway, long Workflow sagas) remains roadmap-only.
 - Date: 2026-08-19 (updated from 2026-07-01 for the MCP endpoint and transactional API MVP).
@@ -27,8 +27,9 @@ Current repo status:
 - Tier A is the implemented product surface today: inbound Email Routing, mailbox Durable Objects,
   R2 raw storage, Queue ingest, D1 cross-mailbox index, realtime UI, and human-confirmed outbound
   send.
-- A minimal MCP endpoint (`/mcp`, OAuth 2.1 bearer tokens plus the owner registry) ships
-  read/search/draft tools with no send capability; see `src/mcp/*`.
+- An MCP endpoint (`/mcp`, OAuth 2.1 bearer tokens plus the owner registry) ships read, draft,
+  send-request and control-plane tools; every send and control-plane change needs owner approval
+  on `/approve/:id` with a passkey. See `src/mcp/*`, `docs/plans/mcp-v2.md` and `SECURITY.md`.
 - A transactional REST API MVP (`/v1/.../transactional/...`) ships scoped, mailbox-bound API keys
   for operator-authorized programmatic sends; see `docs/plans/transactional-api.md`,
   `src/do/transactional-*`, and `docs/OPERATIONS.md`.
@@ -155,8 +156,8 @@ flowchart LR
 
 ## Outbound Email Flow
 
-1. A user or authorized MCP/agent action creates a draft (the shipped MCP endpoint exposes only
-   `draft_reply` — it has no send/cancel tool).
+1. A user or authorized MCP/agent action creates a draft (an MCP draft is permanently
+   `origin='mcp'`; the `send` tool only creates an approval intent, never sends).
 2. The mailbox Durable Object stores the draft and approval state.
 3. Agent-created drafts require explicit human approval before sending.
 4. On approval, the Durable Object records an outbox attempt with an idempotency key.
@@ -182,7 +183,8 @@ provider returned.
 - Queue payloads contain metadata only, reducing sensitive content exposure in retry systems.
 - Public or OSS multi-user MCP should use OAuth 2.1 style scopes per tool.
 - MCP scopes should separate read, search, draft, label, and send.
-- The agent may draft and summarize, but it may not send without human confirmation.
+- The agent may read, draft and summarize, but it may not send, nor change the control plane,
+  without the owner's passkey approval on a server-rendered page.
 - Prompt-injection defenses wrap every email-to-agent path.
 - Cloudflare API tokens for domain provisioning are narrow and environment-scoped.
 - Secrets live in Cloudflare bindings or deployment secrets, not source files.

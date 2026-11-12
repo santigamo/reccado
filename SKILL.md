@@ -23,11 +23,12 @@ confirmation step.**
 
 In this codebase that confirmation is the `request-send` → `confirm-send` flow
 (`POST /api/mailboxes/{mailboxId}/drafts/{draftId}/request-send` then
-`.../confirm-send`), each gated by its own idempotency key. The shipped MCP endpoint has no
-send/cancel tool at all, so this invariant holds by construction there. The one deliberate
-exception to per-message confirmation is the transactional REST API, where an operator-created,
-mailbox-bound API key is itself the pre-authorization — see `SECURITY.md` and
-`docs/OPERATIONS.md`; that surface is not available to agents via MCP. If you are building or
+`.../confirm-send`), each gated by its own idempotency key. Over MCP the `send` tool only creates an
+approval intent; the owner approves it at `/approve/:id` with a passkey, and the DO sends an
+MCP-origin draft only with that approval's HMAC proof, so an agent cannot reach `confirm-send` by
+itself. The one deliberate exception to per-message confirmation is the transactional REST API,
+where an operator-created, mailbox-bound API key is itself the pre-authorization — see
+`SECURITY.md` and `docs/OPERATIONS.md`. If you are building or
 extending the MCP/agent layer:
 
 - Agent-facing tools may create and edit drafts (`drafts.create`, `drafts.update`) and may call
@@ -244,27 +245,21 @@ If you use the manual path, you own the two sharp edges the scripted flow is des
   the id is random and assigned by the insert, and `UNIQUE(primary_address)` is what makes
   re-seeding the same address a no-op rather than a duplicate.
 
-## Part B — MCP / agent layer (implemented: read/search/draft only)
+## Part B — MCP / agent layer (implemented)
 
-The MCP endpoint (`/mcp`) is implemented and behind the same Cloudflare Access perimeter as
-`/api/*`, plus a fail-closed `ACCESS_ALLOWED_EMAILS` allowlist (`503` if unset). It exposes five
-tools — `list_mailboxes`, `list_threads`, `search_messages`, `read_message`, `draft_reply` — via a
-closed-operation `McpMailboxFacade` (`src/mcp/*`) that deliberately makes send, cancel, raw,
-attachment-download, admin, and debug paths unreachable. A security test
-(`tests/integration/mcp-facade-security.test.ts`) asserts there is no registered send tool and no
-imported send path. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
+The MCP endpoint (`/mcp`) authenticates with Better Auth OAuth tokens plus the owner registry (see
+`SECURITY.md`, "MCP"). Tools: `list_mailboxes`, `list_threads`, `read_thread`, `read_message`,
+`search_messages`, `save_draft`, `cancel_draft`, `update_messages`, `send`, `get_health`, `list_ops`,
+`list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`, `manage_template`,
+`manage_api_key`, `remove_suppression`, `restore`, `reconcile_stale` (`src/mcp/*`). Scopes:
+`mail:read`, `mail:draft` (default consent), `mail:send`, `mail:read:sensitive`, `admin`.
+
+Connect a client with `pnpm operator mcp register` (prints the `claude mcp add` command; see
+`docs/OPERATIONS.md`). `send` and every `manage_*`/`restore`/`reconcile_stale` call only create an
+approval intent: the agent gets a `/approve/:id` URL and the owner approves it with a passkey. An
+agent must never try to approve, replay or bypass that step, and the owner registry is not reachable
+over MCP. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
 `mailboxes.owner_email` for pre-existing mailboxes so the owner-scoped MCP lookups can serve them.
-
-Practical constraints:
-
-- No OAuth flow: MCP identity comes from the Access JWT; the client must present a valid
-  `CF-Access-JWT-Assertion`. For browser-based MCP clients behind Access this is wired through the
-  Access session; non-browser clients need an Access-issued assertion or an Access-gated tunnel.
-- The tool set is intentionally minimal (read/search/draft). Expanding it is future work: tool
-  list and scopes (read/search/draft vs. send), the chosen auth model (Access vs. OAuth 2.1), and
-  connection instructions for MCP clients should all be expanded here when it lands.
-- Keep the draft-only boundary: do not add a send/cancel tool; the human-confirm invariant from
-  the top of this document applies in full — no automated `confirm-send`.
 
 ## Verification checklist
 

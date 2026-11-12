@@ -17,7 +17,8 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
 - Inbound processing must remain idempotent across Email Routing retries, Queue retries, and any
   manual replay.
 - Outbound sending from the UI, Telegram, and the MCP endpoint still requires explicit human
-  confirmation through `request-send` then `confirm-send`; there is no fully automated send path on
+  confirmation through `request-send` then `confirm-send` (for MCP-originated drafts, the owner's
+  passkey approval at `/approve/:id`); there is no fully automated send path on
   those surfaces. The transactional API is the one deliberate exception: an operator-created,
   mailbox-bound API key is an explicit pre-authorization, and sends made with it skip the
   per-message confirm step (see `SECURITY.md`).
@@ -382,6 +383,19 @@ Sending, and Access end-to-end in one call. Readiness is still an operator check
 4. Tail logs and Cloudflare dashboards for the first inbound message and the next cron window if
    the change touched ingest, indexing, or scheduled work.
 
+#### Deploy order for the MCP v2 release
+
+Apply remote D1 migrations **before** `pnpm run deploy:dev`: `0021` (Better Auth 1.7.20 account
+table; login breaks if the new code runs without it), `0022` (approvals), `0024`–`0028` (passkey,
+outbound audit, approval metadata, intent payload, pending-intent uniqueness; there is no `0023`).
+`pnpm run d1:migrate:dev` applies whatever is pending. Then:
+
+- Existing MCP tokens lack the new scopes: re-register/re-consent (`pnpm operator mcp register`).
+- Telegram "Send" buttons and pending sends created before `0022` carry no payload hash and fail
+  closed — re-draft those replies.
+- Enrol a passkey at `/security` before the first agent send or admin change (nothing can be
+  approved without one).
+
 ### Rollback
 
 Use rollback when the newly deployed revision breaks availability, auth, ingest, send, or causes
@@ -672,6 +686,47 @@ Scripts should import `scripts/lib/operator-session.ts`: `requireSession(host)` 
 `loadSession(host)`, then `operatorFetch(session, "/api/...", init)` or `operatorJson(...)`, which
 add the cookie, the `Origin` header the CSRF check requires, and a JSON content-type, and throw
 `OperatorAuthError` (with the login command in its message) on a 401.
+
+## MCP clients, approvals and passkeys
+
+**Clients.** With an operator session (previous section):
+
+```bash
+pnpm operator mcp register [--name <name>] [--callback-port <port>] [--redirect-uri <uri> ...] --host <host>
+pnpm operator mcp clients  --host <host>
+pnpm operator mcp revoke <client_id> --host <host>
+```
+
+`register` creates a public PKCE client (default: Claude Code, callback port `33418`) and prints the
+exact `claude mcp add --transport http reccado https://<host>/mcp --client-id … --callback-port …`
+command. `clients` lists registered clients. `revoke` deletes a client's access tokens, refresh
+tokens, consent and registration in one D1 batch; an access JWT already issued stays valid until it
+expires (≤ 3600 s). CIMD client ids (URLs) are accepted only when `MCP_CIMD_ENABLED=true`
+(default `false` in `wrangler.jsonc`). Default consent is `mail:read mail:draft`; `mail:send`,
+`mail:read:sensitive` and `admin` are granted on the consent screen only when the client asks.
+
+**Passkey enrolment.** Open `/security` (signed in as the owner) → Passkeys. Adding one asks for a
+fresh second factor first (TOTP, or a fresh e-mail OTP). Adding/removing a passkey writes an
+`ops_events` row and a Telegram notice. Without a passkey `/approve/:id` refuses and links back here.
+
+**Approvals page.** `send` and every control-plane tool (`manage_*`, `remove_suppression`,
+`restore`, `reconcile_stale`) create an intent; the agent receives `https://<host>/approve/<id>`.
+The owner reviews the server-rendered payload and approves with the passkey (or denies). Intents
+expire after 10 minutes, are single use, and are kept as status rows for 30 days. For MCP intents
+Telegram only sends a "Revisar solicitud" link to the same page; it cannot approve. An
+`intent_stale` result means the draft changed after the request: ask for a new send. A batch
+(≤ 20 operations) runs in order and stops at the first failure; per-item results are
+`executed`, the failure code, or `not_run`.
+
+**Restore and reconcile.** Deletes over MCP are soft (`disabled`/`revoked`) and record an
+`admin.before_snapshot` in `ops_events`. `restore` (itself approval-gated) takes that ops event id
+and re-enables the mailbox, domain, alias, routing rule or template; each snapshot is restorable
+once (it writes `restored:<snapshotId>`), and archived templates are not restorable (create them
+again). `reconcile_stale` runs the transactional stale-request reconciliation after approval; its
+count is the approximate D1 projection and it never resends. If the worker dies in the middle of an
+approved batch, the intent is left approved without a final report and is not retried: read
+`result_json` / `ops_events`, finish or undo the remaining items by hand. `api_key_scopes` issues a
+replacement key and revokes the old one.
 
 ## Onboarding a product
 
