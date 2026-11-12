@@ -688,13 +688,50 @@ export function searchMessages(
 	sql: SqlStorage,
 	query: string,
 	limit: number,
+	opts: { includeSensitive?: boolean } = {},
 ): Array<{ message_id: string }> {
-	const escaped = query.replace(/"/g, '""');
-	return sql
+	const phrase = `"${query.replace(/"/g, '""')}"`;
+	if (opts.includeSensitive) {
+		return sql
+			.exec<{ message_id: string }>(
+				`SELECT message_id FROM message_fts WHERE message_fts MATCH ? ORDER BY rank LIMIT ?`,
+				phrase,
+				limit,
+			)
+			.toArray();
+	}
+	// Without the sensitive scope, bodies of sensitive (or never classified) messages
+	// must not be searchable: otherwise a hit/no-hit tells the caller what is inside a
+	// redacted code mail. Those rows match on subject/sender/recipients only.
+	const hits = sql
 		.exec<{ message_id: string }>(
 			`SELECT message_id FROM message_fts WHERE message_fts MATCH ? ORDER BY rank LIMIT ?`,
-			`"${escaped}"`,
-			limit,
+			phrase,
+			Math.max(limit, 1) * 4,
 		)
 		.toArray();
+	const headHits = new Set(
+		sql
+			.exec<{ message_id: string }>(
+				`SELECT message_id FROM message_fts WHERE message_fts MATCH ? LIMIT ?`,
+				`{subject sender recipients} : ${phrase}`,
+				Math.max(limit, 1) * 4,
+			)
+			.toArray()
+			.map((row) => row.message_id),
+	);
+	const out: Array<{ message_id: string }> = [];
+	for (const hit of hits) {
+		const row = sql
+			.exec<{ protect: number }>(
+				`SELECT (sensitive_classified != 1 OR sensitive_kind IS NOT NULL OR parse_status = 'failed') AS protect
+         FROM messages WHERE id = ?`,
+				hit.message_id,
+			)
+			.toArray()[0];
+		if (!row || (row.protect && !headHits.has(hit.message_id))) continue;
+		out.push(hit);
+		if (out.length >= limit) break;
+	}
+	return out;
 }

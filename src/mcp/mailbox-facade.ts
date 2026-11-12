@@ -1,7 +1,13 @@
 import { getMailboxForOwner, listMailboxesByOwner } from "../db/d1";
 import type { McpDraftResult, McpMessageDto, McpSearchResult, McpThread } from "./types";
 import { mailboxStub } from "../lib/mailbox-stub";
-import { redactSensitive, sensitiveKindForRead, type SensitiveKind } from "../lib/sensitive-mail";
+import { isInstanceAuthSender } from "../lib/auth-mail";
+import {
+	redactSensitive,
+	sensitiveKindForRead,
+	type SensitiveKind,
+	type StoredSensitiveKind,
+} from "../lib/sensitive-mail";
 import { enqueueTelegramCardRefreshForAction, type TelegramCardAction } from "../telegram/cards";
 import { assertScope, type McpAuthContext } from "./scopes";
 
@@ -64,8 +70,9 @@ type RawMessage = {
 	body_text: string | null;
 	body_html_r2_key: string | null;
 	raw_r2_key: string;
-	sensitive_kind: SensitiveKind | null;
+	sensitive_kind: StoredSensitiveKind | null;
 	sensitive_classified: number;
+	parse_status?: string;
 	attachments: Array<{
 		id: string;
 		filename: string | null;
@@ -122,29 +129,37 @@ export class McpMailboxFacade {
 			data.threads.map(async (t) => {
 				const response = await stub.fetch(`https://mailbox-do/threads/${encodeURIComponent(t.id)}`);
 				if (!response.ok) throw new Error("internal_error");
-				const thread = (await response.json()) as { messages: RawMessage[] };
+				const full = (await response.json()) as { messages: RawMessage[] };
+				const visible = full.messages
+					.filter((message) => !this.isInstanceAuth(message))
+					.sort((a, b) => a.received_at.localeCompare(b.received_at));
+				const latest = visible[visible.length - 1];
+				if (!latest) return null;
+				const thread = { messages: visible };
 				const kinds = this.auth.scopes.has("mail:read:sensitive")
 					? []
 					: await Promise.all(thread.messages.map((message) => this.sensitivity(message)));
 				const kind = kinds.find((value) => value !== null) ?? null;
 				const protect = (s: string | null) => (s && kind ? redactSensitive(s, kind).text : s);
+				// Summary fields come from the latest *visible* message, never from a hidden one.
+				const hiddenLatest = full.messages.length !== visible.length;
 				return {
 					id: t.id,
 					subject_norm: protect(t.subject_norm),
-					last_message_at: t.last_message_at,
-					message_count: t.message_count,
-					unread_count: t.unread_count,
-					latest_subject: protect(t.latest_subject),
-					latest_from: protect(t.latest_from),
-					latest_snippet: protect(t.latest_snippet),
-					latest_received_at: t.latest_received_at,
-					latest_has_attachments: t.latest_has_attachments,
-					latest_is_read: t.latest_is_read,
-					latest_direction: t.latest_direction,
-					latest_state: t.latest_state,
+					last_message_at: hiddenLatest ? latest.received_at : t.last_message_at,
+					message_count: visible.length,
+					unread_count: visible.filter((message) => !message.is_read).length,
+					latest_subject: protect(hiddenLatest ? latest.subject : t.latest_subject),
+					latest_from: protect(hiddenLatest ? latest.from_addr : t.latest_from),
+					latest_snippet: protect(hiddenLatest ? latest.snippet : t.latest_snippet),
+					latest_received_at: hiddenLatest ? latest.received_at : t.latest_received_at,
+					latest_has_attachments: hiddenLatest ? latest.has_attachments : t.latest_has_attachments,
+					latest_is_read: hiddenLatest ? latest.is_read : t.latest_is_read,
+					latest_direction: hiddenLatest ? latest.direction : t.latest_direction,
+					latest_state: hiddenLatest ? latest.state : t.latest_state,
 				};
 			}),
-		);
+		).then((threads) => threads.filter((thread): thread is McpThread => thread !== null));
 	}
 
 	async searchMessages(
@@ -171,6 +186,9 @@ export class McpMailboxFacade {
 		const url = new URL("https://mailbox-do/search");
 		url.searchParams.set("q", query);
 		url.searchParams.set("limit", String(Math.min(limit, 50)));
+		// Without the sensitive scope the DO matches sensitive messages on subject,
+		// sender and recipients only, so a hit is not an oracle for hidden bodies.
+		if (this.auth.scopes.has("mail:read:sensitive")) url.searchParams.set("sensitive", "1");
 		const response = await stub.fetch(url.toString());
 		if (!response.ok) {
 			throw new Error("internal_error");
@@ -178,7 +196,13 @@ export class McpMailboxFacade {
 		const data = (await response.json()) as { results: RawSearchHit[] };
 		const hits: McpSearchResult[] = [];
 		for (const hit of data.results) {
-			const msg = await this.messageRow(mailboxId, hit.message_id);
+			let msg: RawMessage;
+			try {
+				msg = await this.messageRow(mailboxId, hit.message_id);
+			} catch (error) {
+				if (error instanceof Error && error.message === "not_found") continue;
+				throw error;
+			}
 			const kind = await this.sensitivity(msg);
 			const protect = (value: string | null) =>
 				value && kind && !this.auth.scopes.has("mail:read:sensitive")
@@ -200,9 +224,11 @@ export class McpMailboxFacade {
 		const stub = await this.resolveMailbox(mailboxId);
 		const response = await stub.fetch(`https://mailbox-do/threads/${encodeURIComponent(threadId)}`);
 		if (!response.ok) throw new Error("internal_error");
-		const data = (await response.json()) as { thread?: unknown; messages: Array<{ id: string }> };
+		const data = (await response.json()) as { thread?: unknown; messages: Array<RawMessage> };
 		if (!data.thread) throw new Error("not_found");
-		return Promise.all(data.messages.map((message) => this.readMessage(mailboxId, message.id)));
+		const visible = data.messages.filter((message) => !this.isInstanceAuth(message));
+		if (data.messages.length && !visible.length) throw new Error("not_found");
+		return Promise.all(visible.map((message) => this.readMessage(mailboxId, message.id)));
 	}
 
 	private async messageRow(mailboxId: string, messageId: string): Promise<RawMessage> {
@@ -217,7 +243,24 @@ export class McpMailboxFacade {
 		const data = (await response.json()) as { message: RawMessage | null };
 		const msg = data.message;
 		if (!msg?.id) throw new Error("not_found");
+		// This instance's own authentication mail does not exist as far as MCP is
+		// concerned, whatever the scope.
+		if (this.isInstanceAuth(msg)) throw new Error("not_found");
 		return msg;
+	}
+
+	/** Stored classification, or (rows ingested before it existed) the sender. */
+	private isInstanceAuth(msg: Pick<RawMessage, "sensitive_kind" | "from_addr">): boolean {
+		return msg.sensitive_kind === "instance_auth" || isInstanceAuthSender(this.env, msg.from_addr);
+	}
+
+	/** The draft must have been created by an agent (origin 'mcp'); human drafts are off limits. */
+	private async assertAgentDraft(stub: DurableObjectStub, draftId: string): Promise<void> {
+		const response = await stub.fetch(`https://mailbox-do/drafts/${encodeURIComponent(draftId)}`);
+		if (!response.ok) throw new Error("not_found");
+		const data = (await response.json()) as { draft?: { origin?: string } | null };
+		if (!data.draft) throw new Error("not_found");
+		if (data.draft.origin !== "mcp") throw new Error("draft_not_agent_owned");
 	}
 
 	private async sensitivity(msg: RawMessage): Promise<SensitiveKind | null> {
@@ -282,7 +325,15 @@ export class McpMailboxFacade {
 	async readResource(mailboxId: string, messageId: string, attachmentId?: string) {
 		assertScope(this.auth, "mail:read");
 		const msg = await this.messageRow(mailboxId, messageId);
-		if (await this.sensitivity(msg)) assertScope(this.auth, "mail:read:sensitive");
+		// Fail closed: a row that was never classified, or whose body could not be
+		// parsed, cannot be shown to be harmless, and raw MIME/attachments carry the
+		// full content.
+		if (
+			msg.sensitive_classified !== 1 ||
+			msg.parse_status === "failed" ||
+			(await this.sensitivity(msg))
+		)
+			assertScope(this.auth, "mail:read:sensitive");
 		const attachment = attachmentId
 			? msg.attachments?.find((a) => a.id === attachmentId)
 			: undefined;
@@ -368,6 +419,7 @@ export class McpMailboxFacade {
 		params: { to: string[]; subject: string; bodyText: string },
 	): Promise<McpDraftResult> {
 		const stub = await this.resolveMailbox(mailboxId);
+		await this.assertAgentDraft(stub, draftId);
 		const mailbox = await getMailboxForOwner(this.env.INDEX_DB, mailboxId, this.auth.email);
 		const to = params.to.filter(
 			(addr) => addr.toLowerCase() !== mailbox?.primary_address.toLowerCase(),
@@ -384,6 +436,7 @@ export class McpMailboxFacade {
 
 	async cancelDraft(mailboxId: string, draftId: string) {
 		const stub = await this.resolveMailbox(mailboxId);
+		await this.assertAgentDraft(stub, draftId);
 		const response = await stub.fetch(
 			`https://mailbox-do/drafts/${encodeURIComponent(draftId)}/cancel`,
 			{
