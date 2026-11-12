@@ -11,11 +11,13 @@ const STALE_MS = 30 * 60 * 1000; // same threshold as the DO's reconcile-stale r
 const suppressionSchema = z
 	.object({
 		mailboxId: z.string().min(1).max(100),
-		email: z.string().email().max(254),
-		allowProviderRemoval: z.boolean().optional(),
+		body: z
+			.object({ email: z.string().email().max(254), allowProviderRemoval: z.boolean().optional() })
+			.strict(),
 	})
 	.strict();
-const reconcileSchema = z.object({ mailboxId: z.string().min(1).max(100) }).strict();
+// No mailboxId means every active mailbox the owner has.
+const reconcileSchema = z.object({ mailboxId: z.string().min(1).max(100).optional() }).strict();
 
 type Suppression = { email: string; reason?: string };
 async function suppression(env: Env, auth: Parameters<typeof requireMailboxOwner>[1], mailboxId: string, email: string) {
@@ -30,9 +32,10 @@ async function suppression(env: Env, auth: Parameters<typeof requireMailboxOwner
 registerControlPlaneKind("suppression_remove", {
 	validate: (value) => strict(suppressionSchema, value),
 	render: async (env, auth, payload) => {
-		const row = await suppression(env, auth, String(payload.mailboxId), String(payload.email));
+		const body = payload.body as z.infer<typeof suppressionSchema>["body"];
+		const row = await suppression(env, auth, String(payload.mailboxId), body.email);
 		const warnings = [{ code: "suppressed_recipient", message: "Este destinatario rebotó o se quejó: volver a enviarle puede dañar la reputación del dominio." }];
-		if (payload.allowProviderRemoval === true)
+		if (body.allowProviderRemoval === true)
 			warnings.push({ code: "provider_removal", message: "Se elimina incluso la supresión del proveedor (rebote/queja)." });
 		return {
 			title: "Quitar supresión de destinatario",
@@ -44,10 +47,11 @@ registerControlPlaneKind("suppression_remove", {
 		};
 	},
 	execute: async (env, auth, payload) => {
-		await suppression(env, auth, String(payload.mailboxId), String(payload.email));
+		const body = payload.body as z.infer<typeof suppressionSchema>["body"];
+		await suppression(env, auth, String(payload.mailboxId), body.email);
 		const result = await removeSuppression(env, auth, {
 			mailboxId: String(payload.mailboxId),
-			body: { email: String(payload.email), allowProviderRemoval: payload.allowProviderRemoval === true },
+			body: { email: body.email, allowProviderRemoval: body.allowProviderRemoval === true },
 		});
 		return result.value ?? null;
 	},
@@ -63,23 +67,39 @@ async function staleCount(env: Env, mailboxId: string): Promise<number> {
 		.first<{ n: number }>();
 	return row?.n ?? 0;
 }
-async function reconcileTarget(env: Env, auth: Parameters<typeof requireMailboxOwner>[1], id: string) {
-	await requireMailboxOwner(env, auth, id);
-	const mailbox = await getMailbox(env.INDEX_DB, id);
-	if (!mailbox) throw new AdminError("Mailbox not found", "mailbox_not_found", 404);
-	return mailbox;
+async function reconcileTargets(env: Env, auth: Parameters<typeof requireMailboxOwner>[1], id: unknown) {
+	if (typeof id === "string") {
+		await requireMailboxOwner(env, auth, id);
+		const mailbox = await getMailbox(env.INDEX_DB, id);
+		if (!mailbox) throw new AdminError("Mailbox not found", "mailbox_not_found", 404);
+		return [mailbox];
+	}
+	const rows = await env.INDEX_DB.prepare(
+		"SELECT mailbox_id FROM mailboxes WHERE status = 'active' AND owner_email = ? ORDER BY mailbox_id",
+	)
+		.bind(auth.email.trim().toLowerCase())
+		.all<{ mailbox_id: string }>();
+	const out = [];
+	for (const row of rows.results ?? []) {
+		const mailbox = await getMailbox(env.INDEX_DB, row.mailbox_id);
+		if (mailbox) out.push(mailbox);
+	}
+	return out;
 }
 registerControlPlaneKind("transactional_reconcile", {
 	validate: (value) => strict(reconcileSchema, value),
 	render: async (env, auth, payload) => {
-		const mailbox = await reconcileTarget(env, auth, String(payload.mailboxId));
-		const n = await staleCount(env, mailbox.mailbox_id);
+		const mailboxes = await reconcileTargets(env, auth, payload.mailboxId);
+		let total = 0;
+		const fields = [];
+		for (const mailbox of mailboxes) {
+			const n = await staleCount(env, mailbox.mailbox_id);
+			total += n;
+			fields.push({ label: `Buzón ${mailbox.primary_address}`, value: String(n) });
+		}
 		return {
 			title: "Reconciliar solicitudes transaccionales atascadas",
-			fields: [
-				{ label: "Buzón", value: mailbox.primary_address },
-				{ label: "Solicitudes atascadas (aprox.)", value: String(n) },
-			],
+			fields: [{ label: "Solicitudes atascadas (aprox.)", value: String(total) }, ...fields],
 			warnings: [
 				{
 					code: "manual_review",
@@ -89,7 +109,9 @@ registerControlPlaneKind("transactional_reconcile", {
 		};
 	},
 	execute: async (env, auth, payload) => {
-		await reconcileTarget(env, auth, String(payload.mailboxId));
-		return reconcile(env, auth, { mailboxId: String(payload.mailboxId) });
+		const results = [];
+		for (const mailbox of await reconcileTargets(env, auth, payload.mailboxId))
+			results.push(await reconcile(env, auth, { mailboxId: mailbox.mailbox_id }));
+		return { mailboxes: results.length, reconciled: results.reduce((n, r) => n + r.reconciled, 0) };
 	},
 });

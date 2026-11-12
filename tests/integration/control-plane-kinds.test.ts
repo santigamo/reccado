@@ -348,9 +348,10 @@ describe("routing", () => {
 describe("templates", () => {
 	it("upserts with a diff summary, archives, and refuses non-owners", async () => {
 		await newMailbox("mbx_kinds_t", "t@kinds-t.example");
-		const base = { mailboxId: "mbx_kinds_t", templateId: "welcome", subject: "Hola" };
-		await applied("template_upsert", { ...base, bodyText: "uno" });
-		const next = await request("template_upsert", { ...base, subject: "Hola 2", bodyText: "uno dos" });
+		const base = { mailboxId: "mbx_kinds_t", templateId: "welcome" };
+		const tpl = (subject: string, body_text?: string) => ({ ...base, body: { subject, body_text } });
+		await applied("template_upsert", tpl("Hola", "uno"));
+		const next = await request("template_upsert", tpl("Hola 2", "uno dos"));
 		const rendered = await view(next);
 		const text = JSON.stringify(rendered.fields);
 		expect(text).toContain("Hola → Hola 2");
@@ -361,7 +362,7 @@ describe("templates", () => {
 			request("template_archive", { mailboxId: "mbx_kinds_foreign", templateId: "welcome" }),
 		).rejects.toMatchObject({ code: "forbidden" });
 		await expect(
-			request("template_upsert", { ...base, subject: "bad\nsubject" }),
+			request("template_upsert", tpl("bad\nsubject")),
 		).rejects.toMatchObject({ code: "validation_error" });
 	});
 });
@@ -433,7 +434,7 @@ describe("suppressions and reconcile", () => {
 		});
 		const intent = await request("suppression_remove", {
 			mailboxId: "mbx_kinds_s",
-			email: "bounced@example.net",
+			body: { email: "bounced@example.net" },
 		});
 		const rendered = await view(intent);
 		expect(rendered.warnings[0]?.message).toContain("rebotó o se quejó");
@@ -447,10 +448,10 @@ describe("suppressions and reconcile", () => {
 		await approve(intent);
 		expect(await count()).toBe(0);
 		await expect(
-			request("suppression_remove", { mailboxId: "mbx_kinds_s", email: "bounced@example.net" }),
+			request("suppression_remove", { mailboxId: "mbx_kinds_s", body: { email: "bounced@example.net" } }),
 		).rejects.toMatchObject({ code: "suppression_not_found" });
 		await expect(
-			request("suppression_remove", { mailboxId: "mbx_kinds_s", email: "not-an-email" }),
+			request("suppression_remove", { mailboxId: "mbx_kinds_s", body: { email: "not-an-email" } }),
 		).rejects.toBeTruthy();
 	});
 	it("reconcile lists stale requests and never sends", async () => {

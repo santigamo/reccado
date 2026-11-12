@@ -11,6 +11,10 @@ import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?ra
 import migrationOwnerColumn from "../../migrations/d1/0003_mailbox_owner.sql?raw";
 import migrationTelegram from "../../migrations/d1/0004_telegram.sql?raw";
 import migrationOutbound from "../../migrations/d1/0005_outbound_status_approval.sql?raw";
+import migrationKeys from "../../migrations/d1/0006_transactional_api_keys.sql?raw";
+import migrationRequests from "../../migrations/d1/0007_transactional_requests.sql?raw";
+import migrationEvents from "../../migrations/d1/0008_email_events_suppressions.sql?raw";
+import migrationResolved from "../../migrations/d1/0015_transactional_resolved_via.sql?raw";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
 import migrationBetterAuth from "../../migrations/d1/0016_better_auth.sql?raw";
@@ -24,6 +28,8 @@ import migrationApprovalMeta from "../../migrations/d1/0026_approval_metadata.sq
 import migrationIntentPayload from "../../migrations/d1/0027_intent_payload.sql?raw";
 import migrationPendingUnique from "../../migrations/d1/0028_approval_pending_unique.sql?raw";
 import { McpServer, type ServerContext } from "@modelcontextprotocol/server";
+import { insertMailbox } from "#/db/d1";
+import { getIntentView } from "#/lib/approvals";
 import { registerTools } from "../../src/mcp/tools";
 import { makeIntentCodec } from "../../src/mcp/intent-flow";
 import * as notification from "../../src/telegram/notify";
@@ -43,6 +49,10 @@ beforeAll(async () => {
 		migrationOwnerColumn,
 		migrationTelegram,
 		migrationOutbound,
+		migrationKeys,
+		migrationRequests,
+		migrationEvents,
+		migrationResolved,
 		migrationRuntimeConfig,
 		migrationOwnerRegistry,
 		migrationBetterAuth,
@@ -227,15 +237,6 @@ describe("mcp admin tools", () => {
 		expect(await approvals()).toBe(before);
 	});
 
-	it("returns a clean typed error for a kind that is not registered", async () => {
-		const owner = await registerOwner("unregistered-admin@example.com");
-		const auth = { userId: owner.userId, email: "unregistered-admin@example.com", owners: ["unregistered-admin@example.com"], scopes: new Set(ADMIN) };
-		const { handler } = await handlerFor("manage_domain", auth, "legacy");
-		const result = await handler({ action: "add", domain: "unregistered.example.com", zoneId: "z" }, context());
-		expect(result).toMatchObject({ isError: true });
-		expect(JSON.stringify(result)).toContain("tool_unavailable");
-	});
-
 	it("asks legacy clients to approve, then returns the executed result", async () => {
 		const email = "legacy-admin@example.com";
 		const owner = await registerOwner(email);
@@ -285,5 +286,85 @@ describe("mcp admin tools", () => {
 		const done = (await handler({ intentId: pending.intentId }, context())).structuredContent as { result?: unknown };
 		expect(JSON.stringify(done.result)).toContain("batch-a@example.com");
 		expect(JSON.stringify(done.result)).toContain("batch-b@example.com");
+	});
+});
+
+describe("mcp admin tools: control-plane kinds end to end", () => {
+	const email = "kinds-mcp@example.com";
+	let owner: Awaited<ReturnType<typeof registerOwner>>;
+	let auth: Record<string, unknown>;
+	let counter = 100;
+	beforeAll(async () => {
+		owner = await registerOwner(email);
+		auth = { userId: owner.userId, email, owners: [email], scopes: new Set(ADMIN) };
+	});
+	async function call(tool: string, args: object) {
+		const { handler } = await handlerFor(tool, auth, "legacy");
+		const result = await handler(args, context());
+		return { handler, result, content: result.structuredContent as { status: string; intentId: string; result?: unknown } };
+	}
+	async function approveNext(intentId: string) {
+		const row = await db.prepare("SELECT payload_hash FROM approvals WHERE token = ?").bind(intentId).first<{ payload_hash: string }>();
+		const assertion = await owner.authenticator.assertion(await approvalChallenge(intentId, row!.payload_hash), counter++);
+		return approveIntent(env, { id: intentId, userId: owner.userId, origin: ORIGIN, assertion });
+	}
+
+	it("manage_domain add: pending until approved, then registered", async () => {
+		const { content } = await call("manage_domain", { action: "add", domain: "mcp-kinds.example", zoneId: "zone-mcp" });
+		expect(content.status).toBe("pending");
+		const exists = () => db.prepare("SELECT status FROM domains WHERE domain = 'mcp-kinds.example'").first();
+		expect(await exists()).toBeNull();
+		expect((await approveNext(content.intentId)).status).toBe("executed");
+		expect(await exists()).toEqual({ status: "active" });
+	});
+
+	it("manage_routing rule_upsert warns about an external forward", async () => {
+		const domain = await db.prepare("SELECT id FROM domains WHERE domain = 'mcp-kinds.example'").first<{ id: string }>();
+		const { content } = await call("manage_routing", {
+			action: "rule_upsert",
+			domainId: domain!.id,
+			pattern: "fwd@mcp-kinds.example",
+			priority: 1,
+			ruleAction: "forward",
+			forwardTo: ["outside@elsewhere.test"],
+		});
+		expect(content.status).toBe("pending");
+		const view = await getIntentView(env, content.intentId, { userId: owner.userId });
+		expect(view.warnings.map((w) => w.message)).toContain("Reenvío a una dirección externa: outside@elsewhere.test");
+		expect(await db.prepare("SELECT 1 FROM routing_rules WHERE pattern = 'fwd@mcp-kinds.example'").first()).toBeNull();
+	});
+
+	it("manage_api_key create: the secret never reaches the tool result, only the approve response", async () => {
+		await insertMailbox(db, { mailbox_id: "mbx_mcp_keys", primary_address: "keys@mcp-kinds.example", display_name: null, status: "active", owner_email: email });
+		const args = { action: "create", mailboxId: "mbx_mcp_keys", body: { environment: "test", sender: "keys@mcp-kinds.example", scopes: ["transactional:status"] } };
+		const { handler, result, content } = await call("manage_api_key", args);
+		expect(content.status).toBe("pending");
+		expect(JSON.stringify(result)).not.toContain("rck_");
+		const approved = await approveNext(content.intentId);
+		const secret = approved.reveal?.[0]?.value ?? "";
+		expect(secret).toMatch(/^rck_test_/);
+		const done = await handler({ intentId: content.intentId }, context());
+		expect((done.structuredContent as { status: string }).status).toBe("executed");
+		expect(JSON.stringify(done)).not.toContain(secret);
+		expect((await approveNext(content.intentId)).reveal).toBeUndefined();
+	});
+
+	it("restore tool: disable a domain, then restore it through the tools", async () => {
+		const disable = await call("manage_domain", { action: "disable", domain: "mcp-kinds.example" });
+		expect((await approveNext(disable.content.intentId)).status).toBe("executed");
+		const domain = await db.prepare("SELECT id, status FROM domains WHERE domain = 'mcp-kinds.example'").first<{ id: string; status: string }>();
+		expect(domain?.status).toBe("disabled");
+		const snap = await db.prepare("SELECT id FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ?").bind(domain!.id).first<{ id: string }>();
+		const restore = await call("restore", { opsEventId: snap!.id });
+		expect(restore.content.status).toBe("pending");
+		expect((await approveNext(restore.content.intentId)).status).toBe("executed");
+		expect(await db.prepare("SELECT status FROM domains WHERE id = ?").bind(domain!.id).first()).toEqual({ status: "active" });
+		const again = await call("restore", { opsEventId: snap!.id });
+		expect(again.result.isError).toBe(true);
+	});
+
+	it("reconcile_stale accepts an empty payload", async () => {
+		const { content } = await call("reconcile_stale", {});
+		expect(content.status).toBe("pending");
 	});
 });

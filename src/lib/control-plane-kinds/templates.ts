@@ -17,13 +17,17 @@ const upsertSchema = z
 	.object({
 		mailboxId: z.string().min(1).max(100),
 		templateId,
-		subject: z
-			.string()
-			.min(1)
-			.max(300)
-			.refine((s) => !/[\r\n]/.test(s), "subject_contains_newline"),
-		bodyText: z.string().max(100_000).nullable().optional(),
-		bodyHtml: z.string().max(200_000).nullable().optional(),
+		body: z
+			.object({
+				subject: z
+					.string()
+					.min(1)
+					.max(300)
+					.refine((s) => !/[\r\n]/.test(s), "subject_contains_newline"),
+				body_text: z.string().max(100_000).nullable().optional(),
+				body_html: z.string().max(200_000).nullable().optional(),
+			})
+			.strict(),
 	})
 	.strict();
 const archiveSchema = z.object({ mailboxId: z.string().min(1).max(100), templateId }).strict();
@@ -52,11 +56,11 @@ async function renderUpsert(env: Env, auth: AuthContext, payload: Operation) {
 	const fields = [{ label: "Plantilla", value: p.templateId }];
 	fields.push({
 		label: "Asunto",
-		value: before ? `${before.subject} → ${p.subject}` : p.subject,
+		value: before ? `${before.subject} → ${p.body.subject}` : p.body.subject,
 	});
 	for (const f of [
-		bodyChange("Cuerpo texto", before?.body_text, p.bodyText),
-		bodyChange("Cuerpo HTML", before?.body_html, p.bodyHtml),
+		bodyChange("Cuerpo texto", before?.body_text, p.body.body_text),
+		bodyChange("Cuerpo HTML", before?.body_html, p.body.body_html),
 	])
 		if (f) fields.push(f);
 	return {
@@ -76,9 +80,9 @@ registerControlPlaneKind("template_upsert", {
 		const p = payload as z.infer<typeof upsertSchema>;
 		const before = await activeTemplate(env, auth, p.mailboxId, p.templateId);
 		const body = {
-			subject: p.subject,
-			body_text: p.bodyText ?? before?.body_text ?? null,
-			body_html: p.bodyHtml ?? before?.body_html ?? null,
+			subject: p.body.subject,
+			body_text: p.body.body_text ?? before?.body_text ?? null,
+			body_html: p.body.body_html ?? before?.body_html ?? null,
 		};
 		if (before) {
 			await writeBeforeSnapshot(env, auth, "template", `${p.mailboxId}:${p.templateId}`, {
