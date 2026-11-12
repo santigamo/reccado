@@ -39,6 +39,7 @@ async function checkCreateOwner(env: Env, auth: AuthContext, payload: Operation)
 }
 
 registerControlPlaneKind("mailbox_create", {
+	covers: ["primaryAddress", "displayName"],
 	validate: (value) => {
 		const row = operation(value, ["primaryAddress", "displayName"]);
 		if (
@@ -65,6 +66,7 @@ registerControlPlaneKind("mailbox_create", {
 	},
 });
 registerControlPlaneKind("mailbox_update", {
+	covers: ["mailboxId", "body.displayName", "body.status"],
 	validate: (value) => {
 		const row = operation(value, ["mailboxId", "body"]);
 		mailboxId(row);
@@ -110,6 +112,7 @@ registerControlPlaneKind("mailbox_update", {
 	},
 });
 registerControlPlaneKind("mailbox_disable", {
+	covers: ["mailboxId"],
 	validate: (value) => {
 		const row = operation(value, ["mailboxId"]);
 		mailboxId(row);

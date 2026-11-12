@@ -4,7 +4,7 @@ import { createTransactionalApiKeySchema } from "../../api/schemas";
 import { requireMailboxOwner } from "../admin/access";
 import { AdminError } from "../admin/errors";
 import { createKey, listKeys, revokeKey, rotateKey } from "../admin/api-keys";
-import type { IntentField } from "../approvals";
+import type { IntentField, IntentWarning } from "../approvals";
 import { registerControlPlaneKind, show, strict, type Operation } from "../control-plane-registry";
 import { KEY_SCOPES, type TransactionalApiKeyProjection } from "../transactional-keys";
 
@@ -43,9 +43,33 @@ async function activeKey(env: Env, auth: AuthContext, payload: Operation) {
 	if (key.status !== "active") throw new AdminError("Key not active", "key_not_active", 400);
 	return key;
 }
-const keyFields = (k: TransactionalApiKeyProjection) => [
+/** Positive rules (`!` denies) whose domain part is a wildcard match arbitrary recipients. */
+function wildcardDomainRules(policy: string): string[] {
+	return policy
+		.split(",")
+		.map((rule) => rule.trim())
+		.filter((rule) => !rule.startsWith("!") && (rule.split("@")[1] ?? "").includes("*"));
+}
+function policyWarnings(policy: string | null | undefined, sends: boolean): IntentWarning[] {
+	if (!sends) return [];
+	if (!policy?.trim())
+		return [{ code: "no_recipient_policy", message: "Sin política de destinatarios: puede enviar a cualquiera." }];
+	if (wildcardDomainRules(policy).length)
+		return [
+			{
+				code: "permissive_recipient_policy",
+				message: `Política de destinatarios permisiva (comodín en el dominio): ${wildcardDomainRules(policy).join(", ")}`,
+			},
+		];
+	return [];
+}
+const keyFields = (k: TransactionalApiKeyProjection): IntentField[] => [
 	{ label: "Clave", value: `…${k.displaySuffix} (${k.environment})` },
 	{ label: "Remitente", value: k.sender },
+	{ label: "Nombre del remitente", value: show(k.senderName) },
+	{ label: "Permisos", value: k.scopes.join(", ") },
+	{ label: "Plantillas permitidas", value: show(k.templateAllowlist?.join(", ")) },
+	{ label: "Política de destinatarios", value: show(k.recipientPolicy), format: "pre" },
 ];
 
 /** Splits the plaintext key out of a service response; nothing else of it is kept. */
@@ -65,6 +89,7 @@ function redactSecret(result: unknown): { stored: unknown; secrets?: IntentField
 }
 
 registerControlPlaneKind("api_key_create", {
+	covers: ["mailboxId", "body"],
 	validate: (value) => {
 		const row = strict(createSchema, value);
 		strict(createTransactionalApiKeySchema, row.body);
@@ -73,18 +98,19 @@ registerControlPlaneKind("api_key_create", {
 	render: async (env, auth, payload) => {
 		await requireMailboxOwner(env, auth, String(payload.mailboxId));
 		const body = payload.body as z.infer<typeof createSchema>["body"];
-		const warnings = [];
+		const warnings: IntentWarning[] = [];
 		if (body.environment === "live")
 			warnings.push({ code: "live_key", message: "Clave de producción: podrá enviar correo real." });
-		if (body.scopes.includes("transactional:send") && !body.recipientPolicy)
-			warnings.push({ code: "no_recipient_policy", message: "Sin política de destinatarios: puede enviar a cualquiera." });
+		warnings.push(...policyWarnings(body.recipientPolicy, body.scopes.includes("transactional:send")));
 		return {
 			title: "Crear clave API",
 			fields: [
 				{ label: "Entorno", value: body.environment },
 				{ label: "Remitente", value: body.sender },
+				{ label: "Nombre del remitente", value: show(body.senderName) },
 				{ label: "Permisos", value: body.scopes.join(", ") },
-				{ label: "Plantillas", value: show(body.templateAllowlist?.join(", ")) },
+				{ label: "Plantillas permitidas", value: show(body.templateAllowlist?.join(", ")) },
+				{ label: "Política de destinatarios", value: show(body.recipientPolicy), format: "pre" },
 				{ label: "Cuota", value: show(body.quotaMax) },
 				{ label: "Caduca", value: show(body.expiresAt) },
 			],
@@ -97,13 +123,21 @@ registerControlPlaneKind("api_key_create", {
 });
 
 registerControlPlaneKind("api_key_rotate", {
+	covers: ["mailboxId", "keyId"],
 	validate: (value) => strict(keySchema, value),
 	render: async (env, auth, payload) => {
 		const key = await activeKey(env, auth, payload);
 		return {
 			title: "Rotar clave API",
-			fields: keyFields(key),
-			warnings: [{ code: "key_rotated", message: "La clave actual dejará de funcionar al aprobar." }],
+			fields: [
+				...keyFields(key),
+				{ label: "Cuota", value: show(key.quotaMax) },
+				{ label: "Caduca", value: show(key.expiresAt) },
+			],
+			warnings: [
+				{ code: "key_rotated", message: "La clave actual dejará de funcionar al aprobar." },
+				...policyWarnings(key.recipientPolicy, key.scopes.includes("transactional:send")),
+			],
 		};
 	},
 	execute: async (env, auth, payload) => {
@@ -114,6 +148,7 @@ registerControlPlaneKind("api_key_rotate", {
 });
 
 registerControlPlaneKind("api_key_revoke", {
+	covers: ["mailboxId", "keyId"],
 	validate: (value) => strict(keySchema, value),
 	render: async (env, auth, payload) => {
 		const key = await activeKey(env, auth, payload);
@@ -138,17 +173,26 @@ registerControlPlaneKind("api_key_revoke", {
  * same settings and revokes the old one. The new secret is revealed once, like a create.
  */
 registerControlPlaneKind("api_key_scopes", {
+	covers: ["mailboxId", "keyId", "scopes", "templateAllowlist"],
 	validate: (value) => strict(scopesSchema, value),
 	render: async (env, auth, payload) => {
 		const key = await activeKey(env, auth, payload);
 		const next = payload.scopes as string[];
+		const nextList = payload.templateAllowlist as string[] | undefined;
 		return {
 			title: "Cambiar permisos de clave API",
 			fields: [
-				...keyFields(key),
+				...keyFields(key).filter((f) => f.label !== "Permisos" && f.label !== "Plantillas permitidas"),
 				{ label: "Permisos", value: `${key.scopes.join(", ")} → ${next.join(", ")}` },
+				{
+					label: "Plantillas permitidas",
+					value: `${show(key.templateAllowlist?.join(", "))} → ${show((nextList ?? key.templateAllowlist)?.join(", "))}${nextList === undefined ? " (sin cambios)" : ""}`,
+				},
+				{ label: "Cuota", value: show(key.quotaMax) },
+				{ label: "Caduca", value: show(key.expiresAt) },
 			],
 			warnings: [
+				...policyWarnings(key.recipientPolicy, next.includes("transactional:send")),
 				{
 					code: "key_replaced",
 					message: "Se emite una clave nueva con estos permisos y la actual se revoca. Tendrás que actualizar la integración.",
