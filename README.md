@@ -23,8 +23,8 @@
 
 **Reccado is a self-hosted, full-serverless email inbox that runs entirely on your own Cloudflare
 account** — no third-party mail provider, no separate database to operate, no servers to patch.
-It ships a realtime inbox UI, an MCP endpoint for agents (read/search/draft only — sending stays
-human-confirmed), and a scoped transactional REST API for programmatic outbound mail.
+It ships a realtime inbox UI, an MCP endpoint for agents (read, draft and administer; every send and
+control-plane change needs your passkey approval), and a scoped transactional REST API for programmatic outbound mail.
 
 ## Table of contents
 
@@ -36,6 +36,7 @@ human-confirmed), and a scoped transactional REST API for programmatic outbound 
   - [2. Wire your domain](#2-wire-your-domain)
   - [3. Verify](#3-verify)
 - [Telegram bridge (optional)](#telegram-bridge-optional)
+- [MCP for agents](#mcp-for-agents)
 - [Transactional API (optional)](#transactional-api-optional)
 - [Configuration](#configuration)
 - [Compatibility](#compatibility)
@@ -63,8 +64,9 @@ human-confirmed), and a scoped transactional REST API for programmatic outbound 
   properly threaded email (`Re:`, `In-Reply-To`/`References`, quoted original) that still goes
   through the same confirm-send button. See [Telegram bridge](#telegram-bridge-optional).
 - **Agent-ready** — an MCP endpoint (`/mcp`, Better Auth OAuth + owner allowlist) exposes
-  read/search/draft tools for agents; there is deliberately **no send tool** (drafts still go
-  through the human confirm gate). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+  read/draft/admin tools for agents; sends and control-plane changes are only *requested* by the
+  agent and approved by you with a passkey. See [MCP for agents](#mcp-for-agents) and
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - **Transactional API (scoped, pre-authorized)** — external apps can send transactional mail
   through `POST /v1/mailboxes/:id/transactional/messages` with HMAC-hashed, mailbox-bound API keys
   (`rck_<env>_<id>_<secret>`, scopes, template allowlist, recipient policy, quotas, mandatory
@@ -514,6 +516,31 @@ a valid code.
 | Reply-to-sender only | A Telegram reply goes to the original sender; CC recipients are dropped. Reply-all lives in the web UI. |
 | Replies come from the mailbox's primary address | Mail that arrived at an alias (`support@`) is answered from the mailbox's primary address (`hello@`). Alias-accurate `From` is not implemented yet. |
 | Text only | Attachments cannot be sent from Telegram (the bot answers with a note); inbound attachments are flagged in the card but stay in Reccado. |
+
+## MCP for agents
+
+`/mcp` lets an agent work your mailboxes over OAuth. With the default consent (`mail:read`,
+`mail:draft`) it can list, search and read mail (OTP and reset links are redacted), save and cancel
+drafts, and mark/archive/trash messages. With extra scopes it can also request a send (`mail:send`)
+and read or change configuration — mailboxes, domains, aliases, routing rules, templates, API keys,
+suppressions (`admin`). It can never touch the owner registry.
+
+**Connect Claude Code** with a pre-registered client (needs an operator session; see
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md)):
+
+```bash
+pnpm operator login --env dev --host <your-host> --email <owner>
+pnpm operator mcp register --host <your-host>   # prints the exact `claude mcp add ...` command
+```
+
+Run the printed command, then approve the consent screen in the browser.
+
+**Approval flow.** When the agent asks to send an email or change configuration, nothing happens
+yet: the tool returns a link to `https://<your-host>/approve/<id>` (and you get a Telegram
+"Revisar solicitud" button if the bridge is on). You open it signed in as the owner, review what the
+server renders — recipients, subject, body, or the exact change — and approve with your passkey, or
+deny. Approvals expire after 10 minutes and are single use. If you have no passkey yet, enrol one at
+`/security` first. Details and limits: [`SECURITY.md`](SECURITY.md).
 
 ## Transactional API (optional)
 

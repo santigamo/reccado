@@ -35,12 +35,16 @@ informed decision from the user/supervisor.
 
 ### Outbound sending
 
-- **An agent (or any automated caller) may draft and summarize mail, but must never send without
-  explicit human confirmation.** The `request-send` → `confirm-send` flow with an idempotency key
-  is the only sending path; there is no shortcut. This is a security boundary, not a UX
-  preference — see `docs/ARCHITECTURE.md` ("Authentication and Security Model") and `SKILL.md`
-  ("Hard invariant"). Repeated `confirm-send` calls with the same idempotency key must send at
-  most once.
+- **An agent may read, draft and act on mailbox content, but every outbound send and every
+  control-plane change it initiates requires the owner's approval on a server-rendered page
+  (`/approve/:id`), bound to the exact payload by a passkey with user verification.** The
+  `request-send` → `confirm-send` flow with an idempotency key remains the only sending path; there
+  is no shortcut. A draft created over MCP has a sticky `origin='mcp'` and the mailbox DO sends it
+  only with the HMAC approval proof (`mcp-approval.v1`) minted by that approval; web and Telegram
+  confirm refuse it (`approval_required`). Repeated `confirm-send` calls with the same idempotency
+  key must send at most once. This is a security boundary, not a UX preference — see
+  `docs/ARCHITECTURE.md` ("Authentication and Security Model"), `SECURITY.md` ("MCP") and `SKILL.md`
+  ("Hard invariant"). Owner-registry changes are never available over MCP.
 
 ### Legal / provenance
 
@@ -117,8 +121,18 @@ actual repo state, fix this section rather than trusting it blindly.
   `unknown` → no auto-retry, redacted logs, non-authoritative D1 projections) is implemented in
   `src/lib/transactional-*`, `src/do/transactional-*`, D1 migrations `0006`/`0007`, and covered by
   `tests/unit/transactional-*.test.ts` + `tests/integration/transactional-*.test.ts`. The
-  MCP endpoint (`/mcp`, Better Auth OAuth + owner registry, read/search/draft only) is implemented in
-  `src/mcp/*` (no send tool). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
+  MCP endpoint (`/mcp`, Better Auth OAuth + owner registry; plan `docs/plans/mcp-v2.md`) is no longer
+  read/draft-only: `src/mcp/*` registers `list_mailboxes`, `list_threads`, `read_thread`,
+  `read_message`, `search_messages`, `save_draft`, `cancel_draft`, `update_messages`, `send`,
+  `get_health`, `list_ops`, `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`,
+  `manage_template`, `manage_api_key`, `remove_suppression`, `restore` and `reconcile_stale`, gated
+  by scopes (`mail:read`, `mail:draft`, `mail:send`, `mail:read:sensitive`, `admin`). `send` and every
+  control-plane tool only create an *approval* (table `approvals`, frozen payload + `payload_hash`,
+  10 min) that the owner approves at `/approve/:id` with a passkey; control-plane kinds live in
+  `src/lib/control-plane-kinds/*`. Better Auth/`@better-auth/mcp` is 1.7.20, with
+  `@better-auth/passkey` and `@better-auth/cimd`; migrations run through `0028`
+  (`0021` Better Auth 1.7.20, `0022` approvals, `0024` passkey, `0025`–`0028` audit/approval
+  metadata, intent payload, pending uniqueness; `0023` does not exist). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
   Gateway) has not started — do not claim it. Cloudflare Email Sending lifecycle events are
   consumed by the `inbox-mcp-email-events` Queue and hard-bounce/complaint suppressions are
   enforced in the mailbox DO. The per-domain Email Sending event subscription is now created and
@@ -141,10 +155,10 @@ actual repo state, fix this section rather than trusting it blindly.
   explicit opt-in, an optional `OWNER_BOOTSTRAP_EMAILS` owner bootstrap exists, inbound size is
   capped, and mutating `/api/*` routes get an Origin-check CSRF defense. See `SECURITY.md` for the
   current posture and `CHANGELOG.md` for what's landed.
-- The web perimeter is **Better Auth inside the worker** (Better Auth 1.7.2): `/login` with e-mail
+- The web perimeter is **Better Auth inside the worker** (Better Auth 1.7.20): `/login` with e-mail
   OTP (registration closed to the owner registry ∪ `OWNER_BOOTSTRAP_EMAILS`), pairing-code rescue
   via `wrangler d1 execute`, `/mcp` over OAuth + `jwt()`, session cookie cache (5 min) with a
-  confirm-send bypass, and migrations `0016`–`0018`. `BETTER_AUTH_SECRET` is set for the
+  confirm-send bypass, and migrations `0016`–`0019`. `BETTER_AUTH_SECRET` is set for the
   maintainer's dev environment; auth fails closed outside `localhost` when it is unset.
   `pnpm setup:auth` machine-generates and uploads the secret and offers the WAF rate-limit rule
   for `/api/auth/*`; `scripts/setup-access.ts` and `scripts/smoke-access.ts` are deleted.

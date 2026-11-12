@@ -9,8 +9,34 @@ package.
 
 ## [Unreleased]
 
+### Added
+
+- **MCP v2 (`/mcp`).** A stateless SDK-v2 server (spec 2026-07-28 with a legacy 2025 path) with 20
+  tools: reads (`list_mailboxes`, `list_threads`, `read_thread`, `read_message`, `search_messages`,
+  `get_health`, `list_ops`, `list_config`), tier-1 mailbox-content actions (`save_draft`,
+  `cancel_draft`, `update_messages`) and approval-gated tools (`send`, `manage_mailbox`,
+  `manage_domain`, `manage_routing`, `manage_template`, `manage_api_key`, `remove_suppression`,
+  `restore`, `reconcile_stale`). Scopes `mail:read`, `mail:draft` (default consent), `mail:send`,
+  `mail:read:sensitive`, `admin`. OTP/reset/magic-link mail is flagged at ingest and redacted
+  without `mail:read:sensitive`; attachments and raw MIME are MCP resources.
+- **Approvals and passkeys.** `telegram_actions` became `approvals`; sends and control-plane changes
+  requested over MCP are approved at `/approve/:id` with a passkey bound to the intent and payload
+  hash (frozen snapshot, 10 min, single use, `intent_stale` on edit). MCP-origin drafts are sticky
+  and only send with an HMAC approval proof; Telegram notifies but cannot approve them. Passkey
+  registration needs a TOTP/e-mail-OTP step-up. API-key secrets are revealed once on the approval
+  page, never to the agent. Batch intents (≤ 20), soft deletes with `restore`.
+- **Client onboarding.** `pnpm operator mcp register|clients|revoke`; opt-in CIMD
+  (`MCP_CIMD_ENABLED`, default off) on a Workers-native guarded transport.
+- D1 migrations `0021` (Better Auth 1.7.20), `0022`, `0024`–`0028`; **apply them remotely before
+  deploying** (see `docs/OPERATIONS.md`).
+
 ### Changed
 
+- `better-auth`/`@better-auth/mcp` 1.7.20 (session JWTs are no longer accepted at `/mcp`);
+  `agents` 0.33 and `@modelcontextprotocol/server` 2.4.0. Existing MCP tokens need re-consent for
+  the new scopes; Telegram pending sends created before `0022` must be re-drafted.
+- The AGENTS.md/SECURITY.md sending invariant now covers control-plane changes; the transactional
+  plan's "keys never exposed via MCP" is superseded (`docs/plans/mcp-v2.md`).
 - **The auth perimeter moved from Cloudflare Access into the worker.** The issuer is now
   **Better Auth 1.7.2** running inside the Worker — observable in the worker's own code and logs,
   with no unverifiable edge perimeter to take on faith. `/login` opens a web session via e-mail

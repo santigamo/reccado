@@ -10,7 +10,8 @@ Telegram, MCP, or agents.
 
 - API-key sending is an explicit, human-created pre-authorization exception.
 - API keys are never exposed as MCP capabilities and are not available to agents through
-  existing MCP tools.
+  existing MCP tools. **Superseded by `docs/plans/mcp-v2.md` (P5):** `manage_api_key` exists as a
+  tier-2 admin tool (owner approval + passkey; the secret is shown only on the approval page).
 - The first version is template-only, mailbox-bound, sender-bound, one-recipient, and has
   no CC, BCC, arbitrary headers, or attachments.
 - `Idempotency-Key` is mandatory for every transactional request.
