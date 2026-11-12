@@ -717,6 +717,40 @@ async function recordPasskeyChange(
 	await notifyPasskeyChange(env as Env, action).catch(() => undefined);
 }
 
+const CONSENT_PATH = `${AUTH_BASE_PATH}/oauth2/consent`;
+/** Scopes that are only ever granted when the consent POST lists them explicitly. */
+const HIGH_RISK_CONSENT_SCOPES: ReadonlySet<string> = new Set(["mail:send", "mail:read:sensitive", "admin"]);
+
+/**
+ * Better Auth grants every originally requested scope when the consent body has
+ * no `scope`. Narrow that here: high-risk scopes survive only when the body
+ * names them, so a bare/forged accept can never grant admin, send or sensitive.
+ */
+export async function constrainConsentScopes(request: Request): Promise<Request> {
+	let body: { accept?: unknown; scope?: unknown; oauth_query?: unknown };
+	try {
+		body = (await request.clone().json()) as typeof body;
+	} catch {
+		return request;
+	}
+	if (body.accept !== true) return request;
+	const requested = new URLSearchParams(typeof body.oauth_query === "string" ? body.oauth_query : "")
+		.get("scope")
+		?.split(/\s+/)
+		.filter(Boolean) ?? [];
+	const ticked = new Set(typeof body.scope === "string" ? body.scope.split(/\s+/).filter(Boolean) : []);
+	const granted = requested.filter(
+		(scope) => !HIGH_RISK_CONSENT_SCOPES.has(scope) || ticked.has(scope),
+	);
+	const headers = new Headers(request.headers);
+	headers.delete("content-length");
+	return new Request(request.url, {
+		method: request.method,
+		headers,
+		body: JSON.stringify({ ...body, scope: granted.join(" ") }),
+	});
+}
+
 /**
  * The fetch-handler mounted at /api/auth/*.
  *
@@ -740,6 +774,9 @@ export async function handleAuthRequest(
 			if (gated) return gated;
 		}
 		let authRequest = request;
+		if (url.pathname === CONSENT_PATH && request.method === "POST") {
+			authRequest = await constrainConsentScopes(request);
+		}
 		if (
 			env.MCP_CIMD_ENABLED !== "true" &&
 			url.pathname === `${AUTH_BASE_PATH}/oauth2/authorize` &&
