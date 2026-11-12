@@ -2189,6 +2189,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				r2: this.env.MAIL_OBJECTS,
 				mailboxId: message.mailboxId,
 				transactionSync: (fn) => this.ctx.storage.transactionSync(fn),
+				authMail: this.env,
 			},
 			message,
 		);
