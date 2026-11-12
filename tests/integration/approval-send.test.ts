@@ -12,6 +12,7 @@ import {
 	fieldsFromSnapshot,
 	getIntentStatus,
 	getIntentView,
+	requestControlPlaneChange,
 } from "#/lib/approvals";
 import { confirmDraftSend } from "#/lib/outbound-send";
 import { renderApprovalPage } from "#/components/approval-page";
@@ -32,6 +33,7 @@ import migrationApprovals from "../../migrations/d1/0022_approvals.sql?raw";
 import migrationPasskey from "../../migrations/d1/0024_passkey.sql?raw";
 import migrationAudit from "../../migrations/d1/0025_outbound_audit.sql?raw";
 import migrationApprovalMeta from "../../migrations/d1/0026_approval_metadata.sql?raw";
+import migrationIntentPayload from "../../migrations/d1/0027_intent_payload.sql?raw";
 import { applyMigrations } from "../helpers/migrations";
 import { SoftAuthenticator, type AssertionResponse } from "../helpers/soft-authenticator";
 
@@ -58,6 +60,7 @@ beforeAll(async () => {
 		migrationPasskey,
 		migrationAudit,
 		migrationApprovalMeta,
+		migrationIntentPayload,
 	);
 	await db
 		.prepare(
@@ -118,7 +121,9 @@ async function pair(email: string): Promise<Jar> {
 	return jar;
 }
 
-async function registerOwner(email: string): Promise<{ userId: string; jar: Jar; authenticator: SoftAuthenticator }> {
+async function registerOwner(
+	email: string,
+): Promise<{ userId: string; jar: Jar; authenticator: SoftAuthenticator }> {
 	const jar = await pair(email);
 	const mail = stubMail();
 	const headers = { cookie: jar.header(), "content-type": "application/json", origin: ORIGIN };
@@ -155,14 +160,22 @@ async function registerOwner(email: string): Promise<{ userId: string; jar: Jar;
 	const verified = await handleAuthRequest(
 		new Request(`${ORIGIN}/api/auth/passkey/verify-registration`, {
 			method: "POST",
-			headers: { cookie: jar.header(), "content-type": "application/json", origin: ORIGIN, "x-passkey-stepup": proof },
+			headers: {
+				cookie: jar.header(),
+				"content-type": "application/json",
+				origin: ORIGIN,
+				"x-passkey-stepup": proof,
+			},
 			body: JSON.stringify({ response: credential, name: "Approval key" }),
 		}),
 		authEnv(),
 	);
 	jar.absorb(verified);
 	expect(verified.status, await verified.clone().text()).toBe(200);
-	const user = await db.prepare('SELECT id FROM "user" WHERE email = ?').bind(email).first<{ id: string }>();
+	const user = await db
+		.prepare('SELECT id FROM "user" WHERE email = ?')
+		.bind(email)
+		.first<{ id: string }>();
 	const passkey = await db
 		.prepare("SELECT credentialID FROM passkey WHERE userId = ?")
 		.bind(user?.id)
@@ -170,6 +183,139 @@ async function registerOwner(email: string): Promise<{ userId: string; jar: Jar;
 	authenticator.storedId = passkey?.credentialID ?? null;
 	return { userId: user?.id ?? "", jar, authenticator };
 }
+
+describe("control-plane approvals", () => {
+	it("executes once and rejects payload tampering", async () => {
+		const email = "control-owner@example.com";
+		const owner = await registerOwner(email);
+		const auth = { userId: owner.userId, email, owners: [email] };
+		const input = { primaryAddress: "control-create@example.com", displayName: "Initial" };
+		const intent = await requestControlPlaneChange(env, auth, "mailbox_create", input);
+		expect(
+			await db
+				.prepare("SELECT mailbox_id FROM mailboxes WHERE primary_address = ?")
+				.bind(input.primaryAddress)
+				.first(),
+		).toBeNull();
+		const assertion = await owner.authenticator.assertion(
+			await approvalChallenge(intent.id, intent.payloadHash),
+			1,
+		);
+		const result = await approveIntent(env, {
+			id: intent.id,
+			userId: owner.userId,
+			origin: ORIGIN,
+			assertion,
+		});
+		expect(result.status).toBe("executed");
+		expect(
+			(await approveIntent(env, { id: intent.id, userId: owner.userId, origin: ORIGIN, assertion }))
+				.status,
+		).toBe("executed");
+		const mailbox = await db
+			.prepare("SELECT * FROM mailboxes WHERE primary_address = ?")
+			.bind(input.primaryAddress)
+			.first<{ mailbox_id: string }>();
+		expect(mailbox).not.toBeNull();
+		const update = await requestControlPlaneChange(env, auth, "mailbox_update", {
+			mailboxId: mailbox!.mailbox_id,
+			body: { displayName: "Updated" },
+		});
+		const view = await getIntentView(env, update.id, { userId: owner.userId });
+		expect(renderApprovalPage(view)).toContain("Initial → Updated");
+		await db
+			.prepare("UPDATE approvals SET payload_json = ? WHERE token = ?")
+			.bind('{"body":{"displayName":"Evil"},"mailboxId":"x"}', update.id)
+			.run();
+		const tampered = await approveIntent(env, {
+			id: update.id,
+			userId: owner.userId,
+			origin: ORIGIN,
+			assertion: await owner.authenticator.assertion(
+				await approvalChallenge(update.id, update.payloadHash),
+				2,
+			),
+		});
+		expect(tampered.status).toBe("stale");
+		const disabled = await requestControlPlaneChange(env, auth, "mailbox_disable", {
+			mailboxId: mailbox!.mailbox_id,
+		});
+		expect(
+			(
+				await approveIntent(env, {
+					id: disabled.id,
+					userId: owner.userId,
+					origin: ORIGIN,
+					assertion: await owner.authenticator.assertion(
+						await approvalChallenge(disabled.id, disabled.payloadHash),
+						2,
+					),
+				})
+			).status,
+		).toBe("executed");
+		expect(
+			await db
+				.prepare("SELECT status FROM mailboxes WHERE mailbox_id = ?")
+				.bind(mailbox!.mailbox_id)
+				.first(),
+		).toMatchObject({ status: "disabled" });
+		const snapshot = await db
+			.prepare(
+				"SELECT payload_json FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ?",
+			)
+			.bind(mailbox!.mailbox_id)
+			.first<{ payload_json: string }>();
+		expect(JSON.parse(snapshot!.payload_json)).toMatchObject({
+			status: "active",
+			display_name: "Initial",
+		});
+		await expect(requestControlPlaneChange(env, auth, "unknown_kind", {})).rejects.toThrow();
+		await expect(
+			requestControlPlaneChange(env, { ...auth, email: "other@example.com" }, "mailbox_disable", {
+				mailboxId: mailbox!.mailbox_id,
+			}),
+		).rejects.toThrow();
+	});
+	it("reports partial batch failures and skips remaining operations", async () => {
+		const email = "control-batch@example.com";
+		const owner = await registerOwner(email);
+		const auth = { userId: owner.userId, email, owners: [email] };
+		const foreign = await db
+			.prepare("SELECT mailbox_id FROM mailboxes WHERE primary_address = ?")
+			.bind("control-create@example.com")
+			.first<{ mailbox_id: string }>();
+		await expect(
+			requestControlPlaneChange(env, auth, "mailbox_disable", { mailboxId: foreign!.mailbox_id }),
+		).rejects.toMatchObject({ code: "forbidden" });
+		const intent = await requestControlPlaneChange(env, auth, "mailbox_create", [
+			{ primaryAddress: "batch-first@example.com" },
+			{ primaryAddress: "invalid" },
+			{ primaryAddress: "batch-last@example.com" },
+		]);
+		const result = await approveIntent(env, {
+			id: intent.id,
+			userId: owner.userId,
+			origin: ORIGIN,
+			assertion: await owner.authenticator.assertion(
+				await approvalChallenge(intent.id, intent.payloadHash),
+				1,
+			),
+		});
+		expect(result.status).toBe("failed");
+		expect(result.result?.items.map((item) => [item.status, item.errorCode])).toEqual([
+			["executed", undefined],
+			["failed", "validation_error"],
+			["not_run", undefined],
+		]);
+		expect(
+			await db
+				.prepare(
+					"SELECT primary_address FROM mailboxes WHERE primary_address IN ('batch-first@example.com', 'batch-last@example.com')",
+				)
+				.all(),
+		).toMatchObject({ results: [{ primary_address: "batch-first@example.com" }] });
+	});
+});
 
 async function mcpDraft(bodyText: string) {
 	const mailboxId = `mbx_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
@@ -206,7 +352,10 @@ async function mcpDraft(bodyText: string) {
 }
 
 async function messageCount(stub: DurableObjectStub): Promise<number> {
-	return runInDurableObject(stub, async (_instance, state) => state.storage.sql.exec("SELECT id FROM messages").toArray().length);
+	return runInDurableObject(
+		stub,
+		async (_instance, state) => state.storage.sql.exec("SELECT id FROM messages").toArray().length,
+	);
 }
 
 async function sentRows(draftId: string) {
@@ -267,15 +416,18 @@ describe("mcp send approval", () => {
 
 		const ctx = createExecutionContext();
 		const web = await worker.fetch(
-			new Request(`${ORIGIN}/api/mailboxes/${draft.mailboxId}/drafts/${draft.draftId}/confirm-send`, {
-				method: "POST",
-				headers: {
-					"content-type": "application/json",
-					origin: ORIGIN,
-					cookie: owner.jar.header(),
+			new Request(
+				`${ORIGIN}/api/mailboxes/${draft.mailboxId}/drafts/${draft.draftId}/confirm-send`,
+				{
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						origin: ORIGIN,
+						cookie: owner.jar.header(),
+					},
+					body: JSON.stringify({ idempotencyKey: "web-attempt" }),
 				},
-				body: JSON.stringify({ idempotencyKey: "web-attempt" }),
-			}),
+			),
 			authEnv(),
 			ctx,
 		);
@@ -317,7 +469,9 @@ describe("mcp send approval", () => {
 			new Request(`${ORIGIN}/api/approvals/${intent.id}/approve`, {
 				method: "POST",
 				headers: { "content-type": "application/json", cookie: owner.jar.header() },
-				body: JSON.stringify({ assertion: { id: "x", rawId: "x", type: "public-key", response: {} } }),
+				body: JSON.stringify({
+					assertion: { id: "x", rawId: "x", type: "public-key", response: {} },
+				}),
 			}),
 			authEnv(),
 			createExecutionContext(),
@@ -337,7 +491,11 @@ describe("mcp send approval", () => {
 			approved = await worker.fetch(
 				new Request(`${ORIGIN}/api/approvals/${intent.id}/approve`, {
 					method: "POST",
-					headers: { "content-type": "application/json", origin: ORIGIN, cookie: owner.jar.header() },
+					headers: {
+						"content-type": "application/json",
+						origin: ORIGIN,
+						cookie: owner.jar.header(),
+					},
 					body: JSON.stringify({ assertion }),
 				}),
 				shared,
@@ -392,7 +550,10 @@ describe("mcp send approval", () => {
 			draftId: second.draftId,
 			payloadHash: second.payloadHash,
 		});
-		const assertion = await owner.authenticator.assertion(await approvalChallenge(intentA.id, first.payloadHash), 1);
+		const assertion = await owner.authenticator.assertion(
+			await approvalChallenge(intentA.id, first.payloadHash),
+			1,
+		);
 		const rejected = await approveIntent(env, {
 			id: intentB.id,
 			userId: owner.userId,
@@ -414,7 +575,10 @@ describe("mcp send approval", () => {
 			draftId: draft.draftId,
 			payloadHash: draft.payloadHash,
 		});
-		const assertion = await owner.authenticator.assertion(await approvalChallenge(intent.id, draft.payloadHash), 1);
+		const assertion = await owner.authenticator.assertion(
+			await approvalChallenge(intent.id, draft.payloadHash),
+			1,
+		);
 		const input = { id: intent.id, userId: owner.userId, origin: ORIGIN, assertion };
 		const [left, right] = await Promise.all([approveIntent(env, input), approveIntent(env, input)]);
 		const winners = [left, right].filter((result) => result.status === "sent" && !result.error);

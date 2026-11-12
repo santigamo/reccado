@@ -14,7 +14,10 @@
  * - `notifyIntentCreated` lives in `src/telegram/notify.ts` and calls `buildApprovalUrl`.
  */
 
-import { verifyAuthenticationResponse, type AuthenticationResponseJSON } from "@simplewebauthn/server";
+import {
+	verifyAuthenticationResponse,
+	type AuthenticationResponseJSON,
+} from "@simplewebauthn/server";
 import {
 	consumeApproval,
 	getApproval,
@@ -31,11 +34,27 @@ import { getSendingFeedbackStatus } from "./feedback-liveness";
 import { mailboxStub } from "./mailbox-stub";
 import { confirmDraftSend } from "./outbound-send";
 import { classifySensitive } from "./sensitive-mail";
+import {
+	canonicalJson,
+	controlPlaneKind,
+	hashPayload,
+	ownerForUser,
+} from "./control-plane-intents";
+import { AdminError } from "./admin/errors";
+export { registerControlPlaneKind, requestControlPlaneChange } from "./control-plane-intents";
 
 const MCP_TTL_MS = 10 * 60 * 1000;
 const PROOF_TTL_MS = 60 * 1000;
 
-export type IntentStatusName = "pending" | "approved" | "sent" | "denied" | "expired" | "stale";
+export type IntentStatusName =
+	| "pending"
+	| "approved"
+	| "sent"
+	| "denied"
+	| "expired"
+	| "stale"
+	| "executed"
+	| "failed";
 
 export type IntentField = { label: string; value: string };
 export type IntentWarning = { code: string; message: string };
@@ -48,6 +67,13 @@ export type IntentStatus = {
 		errorCode: string | null;
 	} | null;
 	deliveryFeedback: { domain: string | null; state: string } | null;
+	result?: {
+		items: Array<{
+			status: "executed" | "failed" | "not_run";
+			result?: unknown;
+			errorCode?: string;
+		}>;
+	} | null;
 };
 
 export type IntentView = {
@@ -287,7 +313,11 @@ async function feedbackFor(
 	}
 }
 
-async function readFrozen(env: Env, mailboxId: string, draftId: string): Promise<FrozenSend | null> {
+async function readFrozen(
+	env: Env,
+	mailboxId: string,
+	draftId: string,
+): Promise<FrozenSend | null> {
 	const response = await mailboxStub(env, mailboxId).fetch(
 		`https://mailbox-do/drafts/${encodeURIComponent(draftId)}/send-intent`,
 	);
@@ -314,7 +344,9 @@ function stringField(value: unknown): string {
 }
 
 function stringList(value: unknown): string[] {
-	return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+	return Array.isArray(value)
+		? value.filter((item): item is string => typeof item === "string")
+		: [];
 }
 
 /**
@@ -338,9 +370,7 @@ export function fieldsFromSnapshot(snapshot: Record<string, unknown>): {
 	const text = typeof snapshot.text === "string" ? snapshot.text : "";
 	const html = typeof snapshot.html === "string" ? snapshot.html : "";
 	const attachments = Array.isArray(snapshot.attachments) ? snapshot.attachments : [];
-	const fields: IntentField[] = [
-		{ label: "De", value: fromName ? `${fromName} <${from}>` : from },
-	];
+	const fields: IntentField[] = [{ label: "De", value: fromName ? `${fromName} <${from}>` : from }];
 	if (replyTo) fields.push({ label: "Reply-To", value: replyTo });
 	fields.push({ label: "Para", value: to.join(", ") });
 	if (cc.length) fields.push({ label: "Cc", value: cc.join(", ") });
@@ -351,7 +381,9 @@ export function fieldsFromSnapshot(snapshot: Record<string, unknown>): {
 	if (attachments.length) {
 		const hashes = attachments
 			.map((item) =>
-				item && typeof item === "object" && typeof (item as { sha256?: unknown }).sha256 === "string"
+				item &&
+				typeof item === "object" &&
+				typeof (item as { sha256?: unknown }).sha256 === "string"
 					? (item as { sha256: string }).sha256
 					: "",
 			)
@@ -375,7 +407,9 @@ async function warningsForSend(
 	const warnings: IntentWarning[] = [];
 	const domains = await listDomains(env.INDEX_DB).catch(() => []);
 	const hosted = new Set(
-		domains.filter((domain) => domain.status === "active").map((domain) => domain.domain.toLowerCase()),
+		domains
+			.filter((domain) => domain.status === "active")
+			.map((domain) => domain.domain.toLowerCase()),
 	);
 	const seen = new Set(seenAddresses.map((address) => address.trim().toLowerCase()));
 	for (const recipient of recipients.slice(0, 20)) {
@@ -421,12 +455,13 @@ type RenderInput = {
 	warnings: IntentWarning[];
 };
 
-const renderers: Record<string, (input: RenderInput) => { title: string; fields: IntentField[] }> = {
-	send: (input) => ({
-		title: "Revisar envío",
-		fields: input.snapshot ? fieldsFromSnapshot(input.snapshot).fields : [],
-	}),
-};
+const renderers: Record<string, (input: RenderInput) => { title: string; fields: IntentField[] }> =
+	{
+		send: (input) => ({
+			title: "Revisar envío",
+			fields: input.snapshot ? fieldsFromSnapshot(input.snapshot).fields : [],
+		}),
+	};
 
 function renderKind(kind: string, input: RenderInput): { title: string; fields: IntentField[] } {
 	return (renderers[kind] ?? (() => ({ title: "Solicitud", fields: [] })))(input);
@@ -448,6 +483,29 @@ function expiredStatus(): IntentStatus {
 export async function getIntentStatus(env: Env, id: string): Promise<IntentStatus> {
 	const row = await getApproval(env.INDEX_DB, id);
 	if (!row) return expiredStatus();
+	if (row.kind !== "send" && controlPlaneKind(row.kind)) {
+		const stored = await controlData(env, id);
+		if (row.decision === "denied") return { status: "denied", send: null, deliveryFeedback: null };
+		if (stored?.result_json) {
+			const result = JSON.parse(stored.result_json) as NonNullable<IntentStatus["result"]>;
+			return {
+				status: result.items.some((item) => item.status === "failed") ? "failed" : "executed",
+				send: null,
+				deliveryFeedback: null,
+				result,
+			};
+		}
+		if (row.decision === "approved")
+			return { status: "approved", send: null, deliveryFeedback: null };
+		if (new Date(row.expires_at).getTime() <= Date.now()) return expiredStatus();
+		if (
+			!stored?.payload_json ||
+			!row.payload_hash ||
+			!(await payloadMatches(stored.payload_json, row.payload_hash))
+		)
+			return { status: "stale", send: null, deliveryFeedback: null };
+		return { status: "pending", send: null, deliveryFeedback: null };
+	}
 	const send = await getOutboundSendByIntentId(env.INDEX_DB, id).catch(() => null);
 	let from: string | null = null;
 	let frozen: FrozenSend | null = null;
@@ -504,15 +562,40 @@ export async function getIntentView(
 		row.kind === "send" && row.mailbox_id && row.draft_id
 			? await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null)
 			: null;
-	const warnings =
+	let warnings =
 		row.kind === "send" && frozen
 			? await warningsForSend(env, frozen.snapshot, frozen.seenAddresses)
 			: [];
-	const rendered = renderKind(row.kind, {
+	let rendered = renderKind(row.kind, {
 		snapshot: frozen?.snapshot ?? null,
 		warnings,
 	});
-	const approvable = status.status === "pending" && Boolean(row.payload_hash) && passkeys.length > 0;
+	const definition = controlPlaneKind(row.kind);
+	if (definition && status.status === "pending") {
+		try {
+			const data = await controlData(env, id);
+			const actorAuth = await ownerForUser(env, actor.userId);
+			const payload: unknown = JSON.parse(data?.payload_json ?? "null");
+			const items = Array.isArray(payload) ? payload : [payload];
+			const parts = await Promise.all(
+				items.map((item) => definition.render(env, actorAuth, definition.validate(item))),
+			);
+			rendered = {
+				title: parts.length === 1 ? parts[0]!.title : `Cambios (${parts.length})`,
+				fields: parts.flatMap((part, i) =>
+					part.fields.map((field) => ({
+						...field,
+						label: parts.length === 1 ? field.label : `${i + 1}. ${field.label}`,
+					})),
+				),
+			};
+			warnings = parts.flatMap((part) => part.warnings);
+		} catch {
+			status.status = "stale";
+		}
+	}
+	const approvable =
+		status.status === "pending" && Boolean(row.payload_hash) && passkeys.length > 0;
 	return {
 		id: row.token,
 		kind: row.kind,
@@ -520,7 +603,8 @@ export async function getIntentView(
 		title: rendered.title,
 		fields: rendered.fields,
 		warnings,
-		challenge: approvable && row.payload_hash ? await approvalChallenge(row.token, row.payload_hash) : null,
+		challenge:
+			approvable && row.payload_hash ? await approvalChallenge(row.token, row.payload_hash) : null,
 		expiresAt: row.expires_at,
 		hasPasskey: passkeys.length > 0,
 		allowCredentials: approvable
@@ -555,7 +639,9 @@ async function verifyPasskey(
 				id: passkey.credentialID,
 				publicKey: decodeBase64(passkey.publicKey),
 				counter: Number(passkey.counter) || 0,
-				transports: (passkey.transports ?? "").split(",").filter(Boolean) as AuthenticatorTransport[],
+				transports: (passkey.transports ?? "")
+					.split(",")
+					.filter(Boolean) as AuthenticatorTransport[],
 			},
 		});
 		verified = result.verified;
@@ -577,7 +663,7 @@ export async function approveIntent(
 	},
 ): Promise<IntentStatus & { error?: string }> {
 	const row = await getApproval(env.INDEX_DB, input.id);
-	if (!row || !row.payload_hash || !row.mailbox_id || !row.draft_id) {
+	if (!row || !row.payload_hash || (row.kind === "send" && (!row.mailbox_id || !row.draft_id))) {
 		return { ...expiredStatus(), error: "expired" };
 	}
 	if (row.consumed_at || row.decision) {
@@ -597,9 +683,22 @@ export async function approveIntent(
 		return { ...(await getIntentStatus(env, input.id)), error: "invalid_assertion" };
 	}
 	if (row.kind === "send") {
-		const frozen = await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null);
+		const frozen = await readFrozen(env, row.mailbox_id!, row.draft_id!).catch(() => null);
 		if (!frozen || frozen.stale || frozen.payloadHash !== row.payload_hash) {
 			return { status: "stale", send: null, deliveryFeedback: null, error: "stale" };
+		}
+	} else if (controlPlaneKind(row.kind)) {
+		const stored = await controlData(env, row.token);
+		if (!stored?.payload_json || !(await payloadMatches(stored.payload_json, row.payload_hash)))
+			return { status: "stale", send: null, deliveryFeedback: null, error: "stale" };
+		try {
+			const actor = await ownerForUser(env, input.userId);
+			const definition = controlPlaneKind(row.kind)!;
+			const parsed: unknown = JSON.parse(stored.payload_json);
+			for (const item of Array.isArray(parsed) ? parsed : [parsed])
+				await definition.render(env, actor, definition.validate(item));
+		} catch {
+			return { ...(await getIntentStatus(env, input.id)), error: "forbidden" };
 		}
 	} else {
 		return { ...(await getIntentStatus(env, input.id)), error: "unsupported_kind" };
@@ -619,11 +718,72 @@ export async function approveIntent(
 		method: "passkey",
 		payloadHash: row.payload_hash,
 	});
-	const sent = await dispatchSend(env, row);
-	return sent;
+	if (row.kind === "send") return dispatchSend(env, row);
+	return dispatchControl(env, row, input.userId);
 }
 
-async function dispatchSend(env: Env, row: ApprovalRow): Promise<IntentStatus & { error?: string }> {
+async function controlData(
+	env: Env,
+	id: string,
+): Promise<{ payload_json: string | null; result_json: string | null } | null> {
+	return env.INDEX_DB.prepare("SELECT payload_json, result_json FROM approvals WHERE token = ?")
+		.bind(id)
+		.first();
+}
+async function payloadMatches(json: string, hash: string): Promise<boolean> {
+	try {
+		return canonicalJson(JSON.parse(json)) === json && (await hashPayload(json)) === hash;
+	} catch {
+		return false;
+	}
+}
+async function dispatchControl(env: Env, row: ApprovalRow, userId: string): Promise<IntentStatus> {
+	const definition = controlPlaneKind(row.kind)!;
+	const stored = await controlData(env, row.token);
+	if (
+		!stored?.payload_json ||
+		!row.payload_hash ||
+		!(await payloadMatches(stored.payload_json, row.payload_hash))
+	) {
+		await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?")
+			.bind(
+				JSON.stringify({ items: [{ status: "failed", errorCode: "payload_mismatch" }] }),
+				row.token,
+			)
+			.run();
+		return getIntentStatus(env, row.token);
+	}
+	const parsed: unknown = JSON.parse(stored.payload_json);
+	const items = Array.isArray(parsed) ? parsed : [parsed];
+	const results: NonNullable<IntentStatus["result"]>["items"] = [];
+	let failed = false;
+	for (const item of items) {
+		if (failed) {
+			results.push({ status: "not_run" });
+			continue;
+		}
+		try {
+			const actor = await ownerForUser(env, userId);
+			const result = await definition.execute(env, actor, definition.validate(item));
+			results.push({ status: "executed", result });
+		} catch (error) {
+			failed = true;
+			results.push({
+				status: "failed",
+				errorCode: error instanceof AdminError ? error.code : "execution_failed",
+			});
+		}
+	}
+	await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?")
+		.bind(JSON.stringify({ items: results }), row.token)
+		.run();
+	return getIntentStatus(env, row.token);
+}
+
+async function dispatchSend(
+	env: Env,
+	row: ApprovalRow,
+): Promise<IntentStatus & { error?: string }> {
 	if (row.kind !== "send" || !row.mailbox_id || !row.draft_id || !row.payload_hash) {
 		return { ...(await getIntentStatus(env, row.token)), error: "unsupported_kind" };
 	}
@@ -644,7 +804,10 @@ async function dispatchSend(env: Env, row: ApprovalRow): Promise<IntentStatus & 
 	const status = await getIntentStatus(env, row.token);
 	if (result.body.error === "intent_stale") return { ...status, status: "stale", error: "stale" };
 	if (result.body.sent !== true && result.body.status !== "sent") {
-		return { ...status, error: typeof result.body.error === "string" ? result.body.error : "not_sent" };
+		return {
+			...status,
+			error: typeof result.body.error === "string" ? result.body.error : "not_sent",
+		};
 	}
 	return status.status === "sent" ? status : { ...status, status: "sent" };
 }

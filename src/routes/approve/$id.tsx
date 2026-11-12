@@ -19,21 +19,25 @@ const loadApproval = createServerFn({ method: "GET" })
 		if (typeof id !== "string" || id.length === 0 || id.length > 200) throw new Error("missing id");
 		return id;
 	})
-	.handler(async ({ data }): Promise<{ unauthenticated: true } | { unauthenticated: false; view: ApprovalView }> => {
-		const { getRequest } = await import("@tanstack/react-start/server");
-		const { env } = await import("cloudflare:workers");
-		const { requireAuth } = await import("../../api/auth");
-		const { getIntentView } = await import("../../lib/approvals");
-		const request = getRequest();
-		try {
-			const auth = await requireAuth(request, env, { disableCookieCache: true });
-			const view = await getIntentView(env, data, { userId: auth.userId });
-			return { unauthenticated: false, view };
-		} catch (error) {
-			if (error instanceof Response && error.status === 401) return { unauthenticated: true };
-			throw error;
-		}
-	});
+	.handler(
+		async ({
+			data,
+		}): Promise<{ unauthenticated: true } | { unauthenticated: false; view: ApprovalView }> => {
+			const { getRequest } = await import("@tanstack/react-start/server");
+			const { env } = await import("cloudflare:workers");
+			const { requireAuth } = await import("../../api/auth");
+			const { getIntentView } = await import("../../lib/approvals");
+			const request = getRequest();
+			try {
+				const auth = await requireAuth(request, env, { disableCookieCache: true });
+				const view = await getIntentView(env, data, { userId: auth.userId });
+				return { unauthenticated: false, view };
+			} catch (error) {
+				if (error instanceof Response && error.status === 401) return { unauthenticated: true };
+				throw error;
+			}
+		},
+	);
 
 export const Route = createFileRoute("/approve/$id")({
 	loader: async ({ params }) => {
@@ -50,6 +54,8 @@ const STATUS_COPY: Record<string, string> = {
 	pending: "Pendiente de tu aprobación",
 	approved: "Aprobada. El envío está en curso.",
 	sent: "Enviado.",
+	executed: "Cambio aplicado.",
+	failed: "El cambio no se completó. Revisa el resultado de cada operación.",
 	denied: "Rechazada. No se ha enviado nada.",
 	expired: "Esta solicitud ha caducado.",
 	stale: "El borrador cambió después de la solicitud. No se ha enviado nada.",
@@ -132,16 +138,28 @@ function ApprovePage(): ReactElement {
 							<dt className="text-xs font-semibold uppercase tracking-wide text-[var(--sea-ink-soft)]">
 								{field.label}
 							</dt>
-							<dd className="mt-1 whitespace-pre-wrap text-sm text-[var(--sea-ink)]">{field.value}</dd>
+							<dd className="mt-1 whitespace-pre-wrap text-sm text-[var(--sea-ink)]">
+								{field.value}
+							</dd>
 						</div>
 					))}
 				</dl>
 				{view.status === "pending" && view.hasPasskey && view.challenge && (
 					<div className="mt-6 flex flex-wrap gap-3">
-						<button type="button" className={BUTTON_CLASS} disabled={busy} onClick={() => void approve()}>
+						<button
+							type="button"
+							className={BUTTON_CLASS}
+							disabled={busy}
+							onClick={() => void approve()}
+						>
 							Aprobar con passkey
 						</button>
-						<button type="button" className={QUIET_BUTTON_CLASS} disabled={busy} onClick={() => void deny()}>
+						<button
+							type="button"
+							className={QUIET_BUTTON_CLASS}
+							disabled={busy}
+							onClick={() => void deny()}
+						>
 							Rechazar
 						</button>
 					</div>
