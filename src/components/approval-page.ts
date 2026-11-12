@@ -18,6 +18,8 @@ const STATUS_COPY: Record<string, string> = {
 	pending: "Pendiente de tu aprobación",
 	approved: "Aprobada. El envío está en curso.",
 	sent: "Enviado.",
+	executed: "Cambio aplicado.",
+	failed: "El cambio no se completó. Revisa el resultado de cada operación.",
 	denied: "Rechazada. No se ha enviado nada.",
 	expired: "Esta solicitud ha caducado.",
 	stale: "El borrador cambió después de la solicitud. No se ha enviado nada.",
@@ -34,12 +36,11 @@ export function escapeHtml(value: string): string {
 
 export function renderApprovalPage(view: ApprovalPageModel): string {
 	const fields = view.fields
-		.map(
-			(field) =>
-				`<dt>${escapeHtml(field.label)}</dt><dd>${escapeHtml(field.value)}</dd>`,
-		)
+		.map((field) => `<dt>${escapeHtml(field.label)}</dt><dd>${escapeHtml(field.value)}</dd>`)
 		.join("");
-	const warnings = view.warnings.map((warning) => `<li>${escapeHtml(warning.message)}</li>`).join("");
+	const warnings = view.warnings
+		.map((warning) => `<li>${escapeHtml(warning.message)}</li>`)
+		.join("");
 	const actions =
 		view.status !== "pending"
 			? ""
