@@ -7,6 +7,7 @@ import { McpMailboxFacade } from "./mailbox-facade";
 import { mcpToolError, mcpToolResultJson } from "./errors";
 import { assertScope, McpScopeError, type McpAuthContext } from "./scopes";
 import * as adminReads from "./admin-reads";
+import { registerAdminTools } from "./admin-tools";
 import { registerSendTool } from "./send-tool";
 import type { IntentFlow } from "./intent-flow";
 
@@ -625,4 +626,5 @@ export function registerTools(
 		async () => runTool("list_config", "admin", null, () => adminReads.config(env, auth)),
 	);
 	registerSendTool(server, env, auth, origin, flow);
+	registerAdminTools(server, env, auth, origin, flow);
 }

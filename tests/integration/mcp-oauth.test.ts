@@ -780,7 +780,16 @@ describe("the /mcp bearer-token perimeter", () => {
 				"list_ops",
 				"list_config",
 				"send",
+				"manage_mailbox",
+				"manage_domain",
+				"manage_routing",
+				"manage_template",
+				"manage_api_key",
+				"remove_suppression",
+				"restore",
+				"reconcile_stale",
 			]);
+			for (const tool of tools.slice(12)) expect(tool.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false });
 			for (const tool of tools.slice(0, 5)) expect(tool.annotations.readOnlyHint).toBe(true);
 			expect(tools[5]?.annotations).toMatchObject({
 				readOnlyHint: false,

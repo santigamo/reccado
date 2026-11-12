@@ -1,0 +1,207 @@
+import type { McpServer, ServerContext } from "@modelcontextprotocol/server";
+import { z } from "zod";
+import { getApproval, insertOpsEvent } from "../db/d1";
+import { requestControlPlaneChange } from "../lib/control-plane-intents";
+import { notifyIntentCreated } from "../telegram/notify";
+import { mcpToolError } from "./errors";
+import { intentResponse, resolveIntentRetry, type IntentFlow } from "./intent-flow";
+import { assertScope } from "./scopes";
+import type { McpSendAuth } from "./types";
+
+const MAX_BATCH = 20;
+const RATE_LIMIT = 10;
+const rates = new Map<string, number>();
+const SECRET_KEY = /secret|token|plaintext/i;
+
+type Action = { kind: string; schema: z.ZodType<Record<string, unknown>> };
+const obj = <T extends z.ZodRawShape>(shape: T) => z.strictObject(shape) as unknown as z.ZodType<Record<string, unknown>>;
+const mailboxId = z.string().min(1);
+const body = <T extends z.ZodRawShape>(shape: T) => z.strictObject(shape);
+
+// Field names mirror the src/lib/admin/* service inputs; the server-side kind `validate` stays the authority.
+const TOOLS: Record<string, { description: string; actions: Record<string, Action> }> = {
+	manage_mailbox: {
+		description: "Create, update or disable a mailbox. Needs human approval on the approval page.",
+		actions: {
+			create: { kind: "mailbox_create", schema: obj({ primaryAddress: z.string().min(3), displayName: z.string().optional() }) },
+			update: { kind: "mailbox_update", schema: obj({ mailboxId, body: body({ displayName: z.string().nullable().optional(), status: z.literal("active").optional() }) }) },
+			disable: { kind: "mailbox_disable", schema: obj({ mailboxId }) },
+		},
+	},
+	manage_domain: {
+		description: "Add, provision, update or disable a domain. Needs human approval on the approval page.",
+		actions: {
+			add: { kind: "domain_add", schema: obj({ domain: z.string().min(3), zoneId: z.string().min(1) }) },
+			provision: { kind: "domain_provision", schema: obj({ domain: z.string().min(3), body: body({
+				subdomain: z.string().optional(),
+				dmarc: body({ policy: z.enum(["none", "quarantine", "reject"]), alignment: z.enum(["relaxed", "strict"]).optional(), rua: z.string().optional() }),
+				inbound: z.boolean().optional(),
+				mailbox: body({ address: z.string(), displayName: z.string().optional(), ownerEmail: z.string().optional() }).optional(),
+			}) }) },
+			update: { kind: "domain_update", schema: obj({ domain: z.string().min(3), body: body({ status: z.enum(["pending", "active", "disabled"]) }) }) },
+			disable: { kind: "domain_disable", schema: obj({ domain: z.string().min(3) }) },
+		},
+	},
+	manage_routing: {
+		description: "Add/remove aliases and upsert/remove routing rules. Needs human approval on the approval page.",
+		actions: {
+			alias_add: { kind: "alias_add", schema: obj({ aliasAddress: z.string().min(3), mailboxId }) },
+			alias_remove: { kind: "alias_remove", schema: obj({ aliasAddress: z.string().min(3) }) },
+			rule_upsert: { kind: "routing_rule_upsert", schema: obj({
+				ruleId: z.string().min(1).optional(),
+				domainId: z.string().min(1).optional(),
+				pattern: z.string().min(1).optional(),
+				priority: z.number().int().min(0).optional(),
+				ruleAction: z.enum(["store", "forward", "reject"]).optional(),
+				mailboxId: z.string().min(1).nullable().optional(),
+				forwardTo: z.array(z.string()).optional(),
+				rejectReason: z.string().nullable().optional(),
+				enabled: z.boolean().optional(),
+			}) },
+			rule_remove: { kind: "routing_rule_remove", schema: obj({ ruleId: z.string().min(1) }) },
+		},
+	},
+	manage_template: {
+		description: "Upsert or archive a transactional template. Needs human approval on the approval page.",
+		actions: {
+			upsert: { kind: "template_upsert", schema: obj({ mailboxId, templateId: z.string().min(1), body: body({ subject: z.string().min(1), body_text: z.string().nullable().optional(), body_html: z.string().nullable().optional() }) }) },
+			archive: { kind: "template_archive", schema: obj({ mailboxId, templateId: z.string().min(1) }) },
+		},
+	},
+	manage_api_key: {
+		description: "Create, rotate, revoke or change the scopes of a transactional API key. The secret is shown only to the human on the approval page and is never returned here. Needs human approval.",
+		actions: {
+			create: { kind: "api_key_create", schema: obj({ mailboxId, body: body({
+				environment: z.enum(["test", "live"]),
+				sender: z.string(),
+				senderName: z.string().nullable().optional(),
+				scopes: z.array(z.string()).min(1),
+				templateAllowlist: z.array(z.string()).optional(),
+				recipientPolicy: z.string().optional(),
+				quotaMax: z.number().int().positive().optional(),
+				expiresAt: z.string().optional(),
+			}) }) },
+			rotate: { kind: "api_key_rotate", schema: obj({ mailboxId, keyId: z.string().min(1) }) },
+			revoke: { kind: "api_key_revoke", schema: obj({ mailboxId, keyId: z.string().min(1) }) },
+			scopes: { kind: "api_key_scopes", schema: obj({ mailboxId, keyId: z.string().min(1), scopes: z.array(z.string()).min(1) }) },
+		},
+	},
+};
+
+const ANNOTATIONS = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } as const;
+const ERRORS = /^(insufficient_scope: admin|rate_limited|not_found|invalid_request_state|intent_stale|validation_error|tool_unavailable|invalid_origin)/;
+
+/** Drop anything that looks like a secret before the agent sees it. */
+export function stripSecrets(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stripSecrets);
+	if (value && typeof value === "object")
+		return Object.fromEntries(Object.entries(value).filter(([k]) => !SECRET_KEY.test(k)).map(([k, v]) => [k, stripSecrets(v)]));
+	return value;
+}
+
+class ToolFailure extends Error {}
+
+type Resolved = { kind: string; payload: unknown };
+
+function resolveOps(tool: string, params: Record<string, unknown>): Resolved {
+	const def = TOOLS[tool];
+	if (!def) throw new ToolFailure("tool_unavailable");
+	const raw = params.operations !== undefined ? params.operations : [{ ...params, intentId: undefined, operations: undefined }];
+	if (!Array.isArray(raw) || !raw.length || raw.length > MAX_BATCH) throw new ToolFailure("validation_error: operations must have 1-20 items");
+	let kind: string | undefined;
+	const payloads = raw.map((item) => {
+		if (!item || typeof item !== "object") throw new ToolFailure("validation_error: invalid operation");
+		const { action, ...rest } = item as Record<string, unknown>;
+		const entry = typeof action === "string" ? def.actions[action] : undefined;
+		if (!entry) throw new ToolFailure("validation_error: unknown action");
+		if (kind && kind !== entry.kind) throw new ToolFailure("validation_error: a batch must use a single action");
+		kind = entry.kind;
+		const cleaned = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
+		const parsed = entry.schema.safeParse(cleaned);
+		if (!parsed.success) throw new ToolFailure(`validation_error: ${parsed.error.issues[0]?.path.join(".") || "input"}`);
+		const out = { ...parsed.data };
+		// Routing rules name their effect `ruleAction` here to avoid clashing with the tool's `action`.
+		if ("ruleAction" in out) { out.action = out.ruleAction; delete out.ruleAction; }
+		return out;
+	});
+	return { kind: kind as string, payload: params.operations !== undefined ? payloads : payloads[0] };
+}
+
+async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, ctx: ServerContext | undefined, tool: string, params: Record<string, unknown>, resolve: () => Resolved, kinds: string[], audit: { intentId?: string }) {
+	assertScope(auth, "admin");
+	const key = `${auth.email}:${tool}:${Math.floor(Date.now() / 60000)}`;
+	const count = rates.get(key) ?? 0;
+	if (count >= RATE_LIMIT) throw new Error("rate_limited");
+	rates.set(key, count + 1);
+	const retry = ctx ? resolveIntentRetry(ctx) : undefined;
+	const given = typeof params.intentId === "string" ? params.intentId : undefined;
+	if (retry && given && retry !== given) throw new Error("invalid_request_state");
+	const existing = retry ?? given;
+	const message = `Revisa y aprueba el cambio en ${new URL(origin).host}`;
+	const transform = (status: Record<string, unknown>) => stripSecrets(status) as Record<string, unknown>;
+	if (existing) {
+		audit.intentId = existing;
+		const row = await getApproval(env.INDEX_DB, existing);
+		if (!row || row.origin !== "mcp" || !kinds.includes(row.kind)) throw new Error("not_found");
+		return intentResponse(env, retry ? flow : undefined, retry ? ctx : undefined, { intentId: existing, expiresAt: row.expires_at, origin, message, transform });
+	}
+	const { kind, payload } = resolve();
+	let created: { id: string; expiresAt: string };
+	try {
+		created = await requestControlPlaneChange(env, auth, kind, payload);
+	} catch (error) {
+		if (error instanceof Error && error.message === "invalid_intent_kind") throw new ToolFailure("tool_unavailable");
+		const code = (error as { code?: unknown }).code;
+		if (code === "validation_error") throw new ToolFailure("validation_error");
+		throw error;
+	}
+	audit.intentId = created.id;
+	await notifyIntentCreated(env, created.id).catch(() => undefined);
+	return intentResponse(env, flow, ctx, { intentId: created.id, expiresAt: created.expiresAt, origin, message, transform });
+}
+
+function register(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, tool: string, description: string, kinds: string[], opSchema: z.ZodType, resolve: (params: Record<string, unknown>) => Resolved) {
+	server.registerTool(tool, {
+		description: `${description} Returns a pending approval, or the executed result once approved. Re-call with intentId to check status.`,
+		inputSchema: opSchema as z.ZodObject,
+		outputSchema: z.record(z.string(), z.unknown()),
+		annotations: ANNOTATIONS,
+	}, async (params: Record<string, unknown>, ctx?: ServerContext) => {
+		const start = Date.now();
+		const audit: { intentId?: string } = {};
+		let reason: string | undefined;
+		try {
+			return await runIntent(env, auth, origin, flow, ctx, tool, params, () => resolve(params), kinds, audit);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "internal_error";
+			reason = ERRORS.test(message) ? message : "internal_error";
+			return mcpToolError(reason);
+		} finally {
+			await insertOpsEvent(env.INDEX_DB, { id: crypto.randomUUID(), event_type: "mcp.tool_call", severity: reason ? "warning" : "info", subject: auth.email, payload_json: JSON.stringify({ tool, scope: "admin", intent_id: audit.intentId ?? null, denied: Boolean(reason), reason: reason ?? null, latency_ms: Date.now() - start }) }).catch(() => undefined);
+		}
+	});
+}
+
+const loose = z.record(z.string(), z.unknown());
+export function registerAdminTools(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow?: IntentFlow) {
+	for (const [tool, def] of Object.entries(TOOLS)) {
+		const kinds = Object.values(def.actions).map((a) => a.kind);
+		const actions = Object.keys(def.actions);
+		const schema = z.looseObject({
+			action: z.enum(actions as [string, ...string[]]).optional().describe(`One of: ${actions.join(", ")}`),
+			operations: z.array(loose).max(MAX_BATCH).optional().describe("Batch of up to 20 operations with the same action; one approval covers all."),
+			intentId: z.string().min(1).optional(),
+		});
+		register(server, env, auth, origin, flow, tool, def.description, kinds, schema, (params) => resolveOps(tool, params));
+	}
+	const single = (tool: string, description: string, kind: string, shape: z.ZodRawShape) =>
+		register(server, env, auth, origin, flow, tool, description, [kind], z.object({ ...shape, intentId: z.string().min(1).optional() }), (params) => {
+			const { intentId: _i, ...rest } = params;
+			const parsed = z.strictObject(shape).safeParse(Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined)));
+			if (!parsed.success) throw new ToolFailure(`validation_error: ${parsed.error.issues[0]?.path.join(".") || "input"}`);
+			return { kind, payload: parsed.data };
+		});
+	single("remove_suppression", "Remove an address from a mailbox's suppression list. Needs human approval.", "suppression_remove", { mailboxId, body: body({ email: z.string().min(3), allowProviderRemoval: z.boolean().optional() }) });
+	single("restore", "Restore a previous admin change recorded by an ops event. Needs human approval.", "restore", { opsEventId: z.string().min(1) });
+	single("reconcile_stale", "Reconcile stale transactional send requests. Needs human approval.", "transactional_reconcile", {});
+}
