@@ -3,6 +3,7 @@ import adminSource from "../../src/mcp/admin-reads.ts?raw";
 import facadeSource from "../../src/mcp/mailbox-facade.ts?raw";
 import resourcesSource from "../../src/mcp/resources.ts?raw";
 import toolsSource from "../../src/mcp/tools.ts?raw";
+import sendSource from "../../src/mcp/send-tool.ts?raw";
 
 describe("MCP mailbox facade security", () => {
 	const FORBIDDEN_PATHS = [
@@ -62,8 +63,12 @@ describe("MCP tool registration safety", () => {
 		expect(toolsSource).toContain(`"${tool}"`);
 	});
 
-	it("does not register a send/send_email tool", () => {
-		expect(toolsSource).not.toContain('"send"');
+	it("registers approval-only send without a direct send path", () => {
+		expect(sendSource).toContain('"send"');
+		expect(sendSource).toContain("/request-send");
+		expect(sendSource).not.toContain("/confirm-send");
+		expect(sendSource).not.toContain("confirmDraftSend");
+		expect(sendSource).not.toContain("signMcpApprovalProof");
 		expect(toolsSource).not.toContain("send_email");
 		expect(toolsSource).not.toContain("confirm_send");
 	});

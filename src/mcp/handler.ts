@@ -7,7 +7,8 @@ import { requireMcpOwner, resolveOwnerEmails } from "./auth-import";
 import { registerTools } from "./tools";
 import { registerResources } from "./resources";
 import { scopesFromClaims } from "../lib/mcp-scopes";
-import type { McpAuthContext } from "./scopes";
+import type { McpSendAuth as McpAuthContext } from "./types";
+import { makeIntentCodec } from "./intent-flow";
 
 /**
  * The claims the owner gate consumes. Structural on purpose: `jose` is not a
@@ -34,12 +35,16 @@ async function runMcpServer(
 	auth: McpAuthContext,
 ): Promise<Response> {
 	const hostname = new URL(request.url).hostname;
+	const secret = env.BETTER_AUTH_SECRET?.trim();
+	const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+	if (!secret && !local) return Response.json({ error: "auth_unavailable" }, { status: 503 });
+	const codec = await makeIntentCodec(secret || `local:${env.PHASE0_DEBUG_TOKEN ?? ""}`, `${auth.userId}\0${auth.oauthClientId ?? ""}`);
 	const allowedHostnames = ["inbox.imsanti.dev", "localhost", "127.0.0.1", "[::1]"];
 	if (hostname.endsWith(".workers.dev")) allowedHostnames.push(hostname);
 	const handler = createMcpHandler(
-		() => {
-			const server = new McpServer({ name: "reccado", version: "1.0.0" });
-			registerTools(server, env, auth, new URL(request.url).origin);
+		(requestContext) => {
+			const server = new McpServer({ name: "reccado", version: "1.0.0" }, { requestState: { verify: codec.verify } });
+			registerTools(server, env, auth, new URL(request.url).origin, { era: requestContext.era, codec });
 			registerResources(server, env, auth);
 			return server;
 		},
@@ -111,6 +116,9 @@ export async function mcpHandler(
 				email: typeof claims.email === "string" ? claims.email : "",
 				owners: await resolveOwnerEmails(env),
 				scopes: scopesFromClaims(claims),
+				oauthClientId: typeof claims.client_id === "string" ? claims.client_id : undefined,
+				tokenSub: typeof claims.sub === "string" ? claims.sub : undefined,
+				tokenJti: typeof claims.jti === "string" ? claims.jti : undefined,
 			};
 			try {
 				requireMcpOwner(ownerAuth, env);

@@ -779,6 +779,7 @@ describe("the /mcp bearer-token perimeter", () => {
 				"get_health",
 				"list_ops",
 				"list_config",
+				"send",
 			]);
 			for (const tool of tools.slice(0, 5)) expect(tool.annotations.readOnlyHint).toBe(true);
 			expect(tools[5]?.annotations).toMatchObject({

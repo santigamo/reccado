@@ -61,3 +61,9 @@ export type McpDraftResult = {
 	status: "draft";
 	duplicate: boolean;
 };
+export type McpSendAuth = import("./scopes").McpAuthContext & {
+	oauthClientId?: string;
+	tokenSub?: string;
+	tokenJti?: string;
+};
+

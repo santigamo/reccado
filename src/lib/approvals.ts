@@ -274,6 +274,28 @@ export async function createIntent(
 	return { id, expiresAt, kind: input.kind, payloadHash: input.payloadHash };
 }
 
+/** Atomically share the one live MCP send approval for a draft. */
+export async function getOrCreatePendingIntent(
+	env: Env,
+	input: { kind: "send"; origin: "mcp"; mailboxId: string; draftId: string; payloadHash: string;
+		oauthClientId?: string | null; tokenSub?: string | null; tokenJti?: string | null },
+): Promise<{ intent: { id: string; expiresAt: string; payloadHash: string }; created: boolean }> {
+	if (!input.mailboxId || !input.draftId || !/^[a-f0-9]{64}$/.test(input.payloadHash)) throw new Error("invalid_intent_target");
+	const now = new Date().toISOString();
+	const id = randomId();
+	const expiresAt = new Date(Date.now() + MCP_TTL_MS).toISOString();
+	await env.INDEX_DB.prepare(`UPDATE approvals SET consumed_at = ? WHERE kind = 'send' AND origin = 'mcp' AND mailbox_id = ? AND draft_id = ? AND consumed_at IS NULL AND decision IS NULL AND expires_at <= ?`)
+		.bind(now, input.mailboxId, input.draftId, now).run();
+	const inserted = await env.INDEX_DB.prepare(`INSERT INTO approvals (token, kind, origin, mailbox_id, draft_id, payload_hash, created_at, expires_at, oauth_client_id, token_sub, token_jti) VALUES (?, 'send', 'mcp', ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`)
+		.bind(id, input.mailboxId, input.draftId, input.payloadHash, now, expiresAt, bounded(input.oauthClientId, 2048), bounded(input.tokenSub, 512), bounded(input.tokenJti, 512)).run();
+	const row = await env.INDEX_DB.prepare(`SELECT token, expires_at, payload_hash FROM approvals WHERE kind = 'send' AND origin = 'mcp' AND mailbox_id = ? AND draft_id = ? AND consumed_at IS NULL AND decision IS NULL`)
+		.bind(input.mailboxId, input.draftId).first<{ token: string; expires_at: string; payload_hash: string }>();
+	if (!row) throw new Error("intent_unavailable");
+	const created = (inserted.meta?.changes ?? 0) === 1;
+	if (created) await recordEvent(env, id, "approval.created", { kind: input.kind, origin: input.origin, mailboxId: input.mailboxId, draftId: input.draftId, payloadHash: input.payloadHash });
+	return { intent: { id: row.token, expiresAt: row.expires_at, payloadHash: row.payload_hash }, created };
+}
+
 async function recordEvent(
 	env: Env,
 	id: string,
