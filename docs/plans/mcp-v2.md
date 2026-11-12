@@ -7,7 +7,7 @@ Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test 
 `BETTER_AUTH_SECRET` **unset** (with it set, ~90 route tests fail on the base too).
 Baseline on fc22f6a: 66 files / 1132 tests green. After P0a+P0b+P2+P3-base+P4a merge (02b05cc): 77 files / 1162 tests green.
 
-After T13a merge (2026-11-12): 88 files / 1220 tests green. In flight: T12 `mcp-send-v2` (P4c, adds migration 0028 pending-intent unique index). Next: T13b `manage_*` tools (on top of T12's `src/mcp/intent-flow.ts`), then P6 docs, then single deploy (remote migrations 0021→0028). Workers back on Codex `gpt-6.1-terra` medium (Cursor quota exhausted 2026-11-12).
+After T13a + T12 merge (2026-11-12): 88 files / 1224 tests green, tsc + build OK. T12 = `send` tool + `src/mcp/intent-flow.ts` + migration 0028 (unique live pending intent per draft). Blocked: T13b-kinds (remaining control-plane kinds; spec in scratchpad) — Codex weekly limit until 2026-11-13 15:37, Cursor exhausted. Next: T13b `manage_*` tools (on top of T12's `src/mcp/intent-flow.ts`), then P6 docs, then single deploy (remote migrations 0021→0028). Workers back on Codex `gpt-6.1-terra` medium (Cursor quota exhausted 2026-11-12).
 
 This is the living plan for turning `/mcp` from a 5-tool read/draft endpoint that no client can
 currently connect to into the primary agent surface for Reccado: reading, drafting, **sending**,
@@ -308,7 +308,7 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       `base64url(sha256(id + payloadHash))`; approve/deny `POST /api/approvals/:id/*` (Origin must
       equal request origin, cookie cache off). DO sends an `mcp` draft only with an HMAC approval
       proof (`mcp-approval.v1`, 60 s) signed with `BETTER_AUTH_SECRET`.
-- [ ] `send` tool with MRTR URL elicitation + legacy pending path; Telegram notify-with-link
+- [x] (T12, merged 2026-11-12) `send` tool with MRTR URL elicitation + legacy pending path; Telegram notify-with-link
       for `mcp` intents; shared `src/mcp/intent-flow.ts`. (T12 `mcp-send`, in flight)
 - [x] Audit fields per §2.8 (approval_channel=mcp_approval, intent_id, payload_hash,
       oauth_client_id, token_sub, token_jti).
