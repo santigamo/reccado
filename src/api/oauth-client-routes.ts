@@ -1,5 +1,6 @@
 import type { Hono } from "hono";
 import { insertOpsEvent } from "../db/d1";
+import { requireMcpOwner } from "./auth";
 import type { ApiBindings } from "./hono";
 
 /**
@@ -139,6 +140,9 @@ async function revokeOwnedOAuthClient(
 			.bind(eventId, clientId, payload, new Date().toISOString()),
 	]);
 	if (changedRows(results[3]) === 0) return null;
+	// A delegation policy keyed to this client is dead weight once the client is gone. Best effort:
+	// deployments that have not run migration 0029 have no such table.
+	await db.prepare("DELETE FROM mcp_client_policies WHERE client_id = ?").bind(clientId).run().catch(() => undefined);
 	if (changedRows(results[4]) === 0) {
 		await insertOpsEvent(db, {
 			id: eventId,
@@ -158,7 +162,87 @@ async function revokeOwnedOAuthClient(
 	};
 }
 
+export type ConnectedApp = {
+	client_id: string;
+	name: string | null;
+	redirect_hosts: string[];
+	/** Scopes the owner consented to; empty when they never did. */
+	granted_scopes: string[];
+	authorized: boolean;
+	created_at: string | null;
+	/** Newest access token issued to this client for this owner. */
+	last_token_at: string | null;
+};
+
+/** better-auth stores scope lists as a JSON array or a space-separated string depending on the table. */
+export function parseScopeList(raw: unknown): string[] {
+	if (typeof raw !== "string" || !raw.trim()) return [];
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (Array.isArray(value)) return value.filter((v): v is string => typeof v === "string");
+	} catch {
+		// not JSON: fall through to the space-separated form
+	}
+	return raw.split(/\s+/).filter(Boolean);
+}
+
+function redirectHosts(raw: unknown): string[] {
+	const hosts = new Set<string>();
+	for (const uri of parseScopeList(raw)) {
+		try {
+			hosts.add(new URL(uri).host);
+		} catch {
+			// ignore unparsable redirect URIs
+		}
+	}
+	return [...hosts];
+}
+
+/** better-auth timestamps arrive as epoch ms, epoch seconds, or an ISO string depending on the adapter. */
+function toIso(value: unknown): string | null {
+	if (value === null || value === undefined || value === "") return null;
+	const n = typeof value === "number" ? value : /^\d+$/.test(String(value)) ? Number(value) : NaN;
+	const date = Number.isNaN(n) ? new Date(String(value)) : new Date(n < 1e11 ? n * 1000 : n);
+	return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+async function listOwnedClients(db: D1Database, ownerUserId: string): Promise<ConnectedApp[]> {
+	const clients = await db
+		.prepare(
+			`SELECT c."clientId" AS clientId, c."name" AS name, c."redirectUris" AS redirectUris, c."createdAt" AS createdAt,
+         (SELECT MAX(t."createdAt") FROM "oauthAccessToken" t WHERE t."clientId" = c."clientId" AND t."userId" = ?1) AS lastToken
+       FROM "oauthClient" c
+       WHERE c."userId" = ?1 OR EXISTS (SELECT 1 FROM "oauthConsent" k WHERE k."clientId" = c."clientId" AND k."userId" = ?1)
+       ORDER BY c."createdAt" DESC`,
+		)
+		.bind(ownerUserId)
+		.all<{ clientId: string; name: string | null; redirectUris: string | null; createdAt: unknown; lastToken: unknown }>();
+	const consents = await db
+		.prepare(`SELECT "clientId" AS clientId, "scopes" AS scopes FROM "oauthConsent" WHERE "userId" = ?`)
+		.bind(ownerUserId)
+		.all<{ clientId: string; scopes: string | null }>();
+	const granted = new Map<string, Set<string>>();
+	for (const consent of consents.results ?? []) {
+		const set = granted.get(consent.clientId) ?? new Set<string>();
+		for (const scope of parseScopeList(consent.scopes)) set.add(scope);
+		granted.set(consent.clientId, set);
+	}
+	return (clients.results ?? []).map((row) => ({
+		client_id: row.clientId,
+		name: row.name,
+		redirect_hosts: redirectHosts(row.redirectUris),
+		granted_scopes: [...(granted.get(row.clientId) ?? [])],
+		authorized: granted.has(row.clientId),
+		created_at: toIso(row.createdAt),
+		last_token_at: toIso(row.lastToken),
+	}));
+}
+
 export function registerOAuthClientRoutes(api: Hono<ApiBindings>): void {
+	api.get("/api/oauth-clients", async (c) => {
+		const auth = requireMcpOwner(c.get("auth")!, c.env);
+		return c.json({ clients: await listOwnedClients(c.env.INDEX_DB, auth.userId) });
+	});
 	api.post("/api/oauth-clients/:clientId/revoke", async (c) => {
 		const clientId = c.req.param("clientId");
 		if (!OAUTH_CLIENT_ID_PATTERN.test(clientId)) {
