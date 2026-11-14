@@ -24,7 +24,7 @@
 **Reccado is a self-hosted, full-serverless email inbox that runs entirely on your own Cloudflare
 account** — no third-party mail provider, no separate database to operate, no servers to patch.
 It ships a realtime inbox UI, an MCP endpoint for agents (read, draft and administer; every send and
-control-plane change needs your passkey approval), and a scoped transactional REST API for programmatic outbound mail.
+send and control-plane change needs your approval in Telegram or on the web), and a scoped transactional REST API for programmatic outbound mail.
 
 ## Table of contents
 
@@ -65,7 +65,7 @@ control-plane change needs your passkey approval), and a scoped transactional RE
   through the same confirm-send button. See [Telegram bridge](#telegram-bridge-optional).
 - **Agent-ready** — an MCP endpoint (`/mcp`, Better Auth OAuth + owner allowlist) exposes
   read/draft/admin tools for agents; sends and control-plane changes are only *requested* by the
-  agent and approved by you with a passkey. See [MCP for agents](#mcp-for-agents) and
+  agent and approved by you in Telegram or on the web. See [MCP for agents](#mcp-for-agents) and
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - **Transactional API (scoped, pre-authorized)** — external apps can send transactional mail
   through `POST /v1/mailboxes/:id/transactional/messages` with HMAC-hashed, mailbox-bound API keys
@@ -536,11 +536,19 @@ pnpm operator mcp register --host <your-host>   # prints the exact `claude mcp a
 Run the printed command, then approve the consent screen in the browser.
 
 **Approval flow.** When the agent asks to send an email or change configuration, nothing happens
-yet: the tool returns a link to `https://<your-host>/approve/<id>` (and you get a Telegram
-"Revisar solicitud" button if the bridge is on). You open it signed in as the owner, review what the
-server renders — recipients, subject, body, or the exact change — and approve with your passkey, or
-deny. Approvals expire after 10 minutes and are single use. If you have no passkey yet, enrol one at
-`/security` first. Details and limits: [`SECURITY.md`](SECURITY.md).
+yet: the tool returns a pending approval (frozen payload, bound by hash). With the Telegram bridge
+on, you get a card with ✅/❌ buttons; otherwise (or for API-key create/rotate/scopes, which reveal a
+secret) open `https://<your-host>/approve/<id>` signed in as the owner, review what the server
+renders — recipients, subject, body, or the exact change — and approve or deny. The agent can never
+approve. Approvals expire after 10 minutes and are single use. Turn on Telegram two-step
+verification: whoever controls that chat or your web session can approve.
+
+**Delegated clients (optional).** A client whose token has `admin` but not `mail:read` /
+`mail:read:sensitive` can be given a policy (`pnpm operator mcp policy set --client <id> --mailbox
+<id> --kinds template_upsert,… --link-domains example.com`) to auto-apply low-risk template,
+API-key-allowlist, suppression and restore changes on specific mailboxes, rate-limited, with a
+Telegram notice and ↩️ Deshacer. Sends are never auto-applied. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) and [`SECURITY.md`](SECURITY.md).
 
 ## Transactional API (optional)
 

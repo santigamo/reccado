@@ -375,6 +375,24 @@ Accepted residual risk:
 
 ---
 
+## 2026-11-14 decision: passkey → Telegram, delegated auto-apply
+
+The owner removed passkey approval. This **supersedes** the passkey parts below (§2.4/§2.5
+approval authority, P4's passkey/step-up work and the 2026-11-11 "Passkey per approval" and
+"Passkey guards against the agent" rows); the original text is kept as history.
+
+- Approval is now the ✅/❌ Telegram button (intent id + hash prefix, full hash re-checked; bound
+  chat + operator allow-list) or `/approve/:id` with the owner web session (Origin check, payload
+  hash posted back). The agent can never approve. API-key create/rotate/scopes are web-only.
+- Delegated clients (token with `admin`, without `mail:read`/`mail:read:sensitive`) with a policy
+  auto-apply template_upsert, template_archive, api_key_templates, api_key_revoke,
+  suppression_remove and restore on allowed mailboxes, rate-limited, link-checked, with before
+  snapshots and an undo notice. Sends are never auto. Rationale: the prompt-injection boundary is
+  the mail-reading token.
+- `manage_api_key` gains action `templates` (in-place allow-list edit). Migration `0029`; the
+  `0024` passkey table stays unused. Threat model: Telegram takeover or web-session theft can
+  approve (recommend Telegram 2FA). See `SECURITY.md` ("MCP").
+
 ## Decision log
 
 | Date | Decision | Why |
@@ -382,10 +400,11 @@ Accepted residual risk:
 | 2026-11-11 | Stateless SDK v2 + MRTR; no `McpAgent` DO | Spec 2026-07-28 removed sessions; `McpAgent` is the frozen v1 path |
 | 2026-11-11 | Stay on Better Auth; add CIMD; close DCR; register cmd as plan B | Better Auth already owns web login; CIMD is spec-preferred |
 | 2026-11-11 | Owner chose "confirm in the MCP client"; implemented as URL-mode approval page | Form-mode accept is not proof of a human (hooks / auto-answer) |
-| 2026-11-11 | Passkey per approval, challenge bound to intent + payload hash, no fallback | Only step a browser-driving agent cannot complete |
+| 2026-11-11 | ~~Passkey per approval, challenge bound to intent + payload hash, no fallback~~ **Superseded 2026-11-14** (Telegram button / web session) | Only step a browser-driving agent cannot complete |
 | 2026-11-11 | Tiers = mailbox content vs control plane | Reversible ≠ harmless (bounced mail, template sends, impersonation) |
 | 2026-11-11 | One `approvals` table (renamed `telegram_actions`); send authority stays in DO | Fewest concepts while respecting the DO-is-authoritative invariant |
-| 2026-11-11 | Human-authored Telegram/web sends keep current flow | Passkey guards against the agent, not the owner |
+| 2026-11-11 | Human-authored Telegram/web sends keep current flow | Approval guards against the agent, not the owner |
 | 2026-11-11 | Owner registry never exposed over MCP | Privilege-escalation target with no agent use case |
 | 2026-11-11 | CIMD on a Workers-native fetch transport (https only, no IP literals / local names / own zone, no redirects, size+timeout limits), **no** `global_fetch_strictly_public`, gated by `MCP_CIMD_ENABLED` (default false) until verified live | `@better-auth/cimd` demands exact-once DNS + address pinning, which Workers fetch cannot provide; Workers egress has no private network behind it and refuses raw-IP fetches. Deliberate, documented deviation; pre-registration remains the default path |
 | 2026-11-11 | Supersedes transactional-api.md "keys never exposed via MCP" (from P5) | Owner requested key admin over MCP; secret never reaches the agent |
+| 2026-11-14 | Passkey removed; Telegram button + web-session approval; delegated clients may auto-apply bounded low-risk kinds (never sends) | Owner decision; mail-reading tokens are the injection boundary |

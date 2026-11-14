@@ -29,7 +29,7 @@ Current repo status:
   send.
 - An MCP endpoint (`/mcp`, OAuth 2.1 bearer tokens plus the owner registry) ships read, draft,
   send-request and control-plane tools; every send and control-plane change needs owner approval
-  on `/approve/:id` with a passkey. See `src/mcp/*`, `docs/plans/mcp-v2.md` and `SECURITY.md`.
+  by the owner via Telegram button or `/approve/:id` (bounded delegated auto-apply aside). See `src/mcp/*`, `docs/plans/mcp-v2.md` and `SECURITY.md`.
 - A transactional REST API MVP (`/v1/.../transactional/...`) ships scoped, mailbox-bound API keys
   for operator-authorized programmatic sends; see `docs/plans/transactional-api.md`,
   `src/do/transactional-*`, and `docs/OPERATIONS.md`.
@@ -184,7 +184,7 @@ provider returned.
 - Public or OSS multi-user MCP should use OAuth 2.1 style scopes per tool.
 - MCP scopes should separate read, search, draft, label, and send.
 - The agent may read, draft and summarize, but it may not send, nor change the control plane,
-  without the owner's passkey approval on a server-rendered page.
+  without the owner's approval (Telegram button or web session) bound to the exact payload, except the bounded auto-apply of delegated clients that cannot read mail.
 - Prompt-injection defenses wrap every email-to-agent path.
 - Cloudflare API tokens for domain provisioning are narrow and environment-scoped.
 - Secrets live in Cloudflare bindings or deployment secrets, not source files.

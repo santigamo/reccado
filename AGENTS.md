@@ -35,14 +35,19 @@ informed decision from the user/supervisor.
 
 ### Outbound sending
 
-- **An agent may read, draft and act on mailbox content, but every outbound send and every
-  control-plane change it initiates requires the owner's approval on a server-rendered page
-  (`/approve/:id`), bound to the exact payload by a passkey with user verification.** The
-  `request-send` → `confirm-send` flow with an idempotency key remains the only sending path; there
-  is no shortcut. A draft created over MCP has a sticky `origin='mcp'` and the mailbox DO sends it
-  only with the HMAC approval proof (`mcp-approval.v1`) minted by that approval; web and Telegram
-  confirm refuse it (`approval_required`). Repeated `confirm-send` calls with the same idempotency
-  key must send at most once. This is a security boundary, not a UX preference — see
+- **An agent may read, draft and act on mailbox content, but every outbound send it initiates over
+  MCP requires the owner's approval, bound to the exact payload (`payload_hash`): the ✅/❌ Telegram
+  button (bound chat + operator allowlist only) or `/approve/:id` with the owner web session. The
+  agent can never approve.** Control-plane changes it initiates need the same approval, with one
+  bounded exception: a delegated client (token with `admin` and neither `mail:read` nor
+  `mail:read:sensitive`) with an owner-set policy may auto-apply a hard-coded set of low-risk kinds
+  (`src/lib/mcp-client-policy.ts`); **sends are never auto-applied**, and the owner registry is
+  never reachable over MCP. Secret-revealing kinds (API key create/rotate/scopes) are approvable
+  only on the web page. The `request-send` → `confirm-send` flow with an idempotency key remains the
+  only sending path; there is no shortcut. A draft created over MCP has a sticky `origin='mcp'` and
+  the mailbox DO sends it only with the HMAC approval proof (`mcp-approval.v1`) minted by that
+  approval; web and Telegram confirm refuse it (`approval_required`). Repeated `confirm-send` calls
+  with the same idempotency key must send at most once. This is a security boundary, not a UX preference — see
   `docs/ARCHITECTURE.md` ("Authentication and Security Model"), `SECURITY.md` ("MCP") and `SKILL.md`
   ("Hard invariant"). Owner-registry changes are never available over MCP.
 
@@ -128,11 +133,18 @@ actual repo state, fix this section rather than trusting it blindly.
   `manage_template`, `manage_api_key`, `remove_suppression`, `restore` and `reconcile_stale`, gated
   by scopes (`mail:read`, `mail:draft`, `mail:send`, `mail:read:sensitive`, `admin`). `send` and every
   control-plane tool only create an *approval* (table `approvals`, frozen payload + `payload_hash`,
-  10 min) that the owner approves at `/approve/:id` with a passkey; control-plane kinds live in
+  10 min, single use) that the owner approves with the ✅/❌ Telegram buttons
+  (`src/telegram/intent-cards.ts`) or on `/approve/:id` with the owner web session; passkeys,
+  WebAuthn and passkey step-up were removed on 2026-11-14 (the `0024` passkey table stays, unused).
+  Delegated OAuth clients with a policy (`pnpm operator mcp policy set|show|rm`,
+  `src/api/mcp-policy-routes.ts`) auto-apply template/API-key-allowlist/suppression/restore kinds
+  and notify on Telegram with ↩️ Deshacer (`src/telegram/auto-applied.ts`); `manage_api_key` action
+  `templates` edits a key's allowlist in place. Control-plane kinds live in
   `src/lib/control-plane-kinds/*`. Better Auth/`@better-auth/mcp` is 1.7.20, with
-  `@better-auth/passkey` and `@better-auth/cimd`; migrations run through `0028`
-  (`0021` Better Auth 1.7.20, `0022` approvals, `0024` passkey, `0025`–`0028` audit/approval
-  metadata, intent payload, pending uniqueness; `0023` does not exist). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
+  `@better-auth/cimd`; migrations run through `0029`
+  (`0021` Better Auth 1.7.20, `0022` approvals, `0024` passkey (unused), `0025`–`0028`
+  audit/approval metadata, intent payload, pending uniqueness, `0029` `mcp_client_policies` +
+  `approvals.approved_via`/`auto_refused`; `0023` does not exist). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
   Gateway) has not started — do not claim it. Cloudflare Email Sending lifecycle events are
   consumed by the `inbox-mcp-email-events` Queue and hard-bounce/complaint suppressions are
   enforced in the mailbox DO. The per-domain Email Sending event subscription is now created and

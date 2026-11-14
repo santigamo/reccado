@@ -11,6 +11,17 @@ package.
 
 ### Added
 
+- **Approval by Telegram button; delegated auto-apply (2026-11-14).** Passkey approval is removed.
+  The owner approves MCP sends and control-plane changes with ✅/❌ Telegram buttons (bound to intent
+  id + hash prefix, full `payload_hash` re-checked; bound chat + operator allow-list) or on
+  `/approve/:id` with the owner web session; API-key create/rotate/scopes stay web-only (secret shown
+  once). Delegated OAuth clients (`admin`, no `mail:read`/`mail:read:sensitive`) with a policy
+  (`pnpm operator mcp policy set|show|rm`) auto-apply `template_upsert`, `template_archive`,
+  `api_key_templates`, `api_key_revoke`, `suppression_remove`, `restore` on allowed mailboxes under
+  `max_auto_per_hour` and the template link-domain check, with an `admin.auto_applied` ops event and a
+  Telegram ↩️ Deshacer notice; anything else falls back to approval (`autoApplyRefused`). Sends are
+  never auto. `manage_api_key` action `templates` edits a key's allow-list in place. Migration
+  `0029` (`mcp_client_policies`, `approvals.approved_via`/`auto_refused`) — **apply before deploying**.
 - **MCP v2 (`/mcp`).** A stateless SDK-v2 server (spec 2026-07-28 with a legacy 2025 path) with 20
   tools: reads (`list_mailboxes`, `list_threads`, `read_thread`, `read_message`, `search_messages`,
   `get_health`, `list_ops`, `list_config`), tier-1 mailbox-content actions (`save_draft`,
@@ -19,7 +30,7 @@ package.
   `restore`, `reconcile_stale`). Scopes `mail:read`, `mail:draft` (default consent), `mail:send`,
   `mail:read:sensitive`, `admin`. OTP/reset/magic-link mail is flagged at ingest and redacted
   without `mail:read:sensitive`; attachments and raw MIME are MCP resources.
-- **Approvals and passkeys.** `telegram_actions` became `approvals`; sends and control-plane changes
+- **Approvals and passkeys.** *(Passkeys superseded 2026-11-14, see above.)* `telegram_actions` became `approvals`; sends and control-plane changes
   requested over MCP are approved at `/approve/:id` with a passkey bound to the intent and payload
   hash (frozen snapshot, 10 min, single use, `intent_stale` on edit). MCP-origin drafts are sticky
   and only send with an HMAC approval proof; Telegram notifies but cannot approve them. Passkey
@@ -29,6 +40,11 @@ package.
   (`MCP_CIMD_ENABLED`, default off) on a Workers-native guarded transport.
 - D1 migrations `0021` (Better Auth 1.7.20), `0022`, `0024`–`0028`; **apply them remotely before
   deploying** (see `docs/OPERATIONS.md`).
+
+### Removed
+
+- Passkeys, WebAuthn, passkey step-up and the Reflect polyfill. The `0024` passkey table stays,
+  unused. Auth mail isolation (OTP mail hidden from MCP) is unchanged.
 
 ### Changed
 
