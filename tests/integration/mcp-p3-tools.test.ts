@@ -35,16 +35,29 @@ const TOOL_NAMES = [
 	"restore",
 	"reconcile_stale",
 ] as const;
+const ALL_SCOPES = [
+	"mail:read",
+	"mail:read:sensitive",
+	"mail:draft",
+	"mail:send",
+	"config:read",
+	"mailboxes:write",
+	"templates:write",
+	"routing:write",
+	"domains:write",
+	"keys:write",
+	"suppressions:write",
+];
 const TOOL_SCOPES: Record<(typeof TOOL_NAMES)[number], string> = {
 	send: "mail:send",
-	manage_mailbox: "admin",
-	manage_domain: "admin",
-	manage_routing: "admin",
-	manage_template: "admin",
-	manage_api_key: "admin",
-	remove_suppression: "admin",
-	restore: "admin",
-	reconcile_stale: "admin",
+	manage_mailbox: "mailboxes:write",
+	manage_domain: "domains:write",
+	manage_routing: "routing:write",
+	manage_template: "templates:write",
+	manage_api_key: "keys:write",
+	remove_suppression: "suppressions:write",
+	restore: "mailboxes:write",
+	reconcile_stale: "keys:write",
 	list_mailboxes: "mail:read",
 	list_threads: "mail:read",
 	search_messages: "mail:read",
@@ -53,9 +66,9 @@ const TOOL_SCOPES: Record<(typeof TOOL_NAMES)[number], string> = {
 	save_draft: "mail:draft",
 	cancel_draft: "mail:draft",
 	update_messages: "mail:draft",
-	get_health: "admin",
-	list_ops: "admin",
-	list_config: "admin",
+	get_health: "config:read",
+	list_ops: "config:read",
+	list_config: "config:read",
 };
 
 type ToolBody = {
@@ -70,7 +83,7 @@ function actor(email: string, scopes: string[]): McpAuthContext {
 
 const reader = actor("reader@local", ["mail:read", "mail:draft"]);
 const drafter = actor("drafter@local", ["mail:read", "mail:draft"]);
-const admin = actor("admin@local", ["mail:read", "mail:draft", "admin"]);
+const admin = actor("admin@local", ["mail:read", "mail:draft", "config:read"]);
 const sensitive = actor("reader@local", ["mail:read", "mail:draft", "mail:read:sensitive"]);
 
 function serverFor(auth: McpAuthContext, toolEnv: Env = testEnv) {
@@ -213,25 +226,51 @@ async function messageRow(mailboxId: string, messageId: string) {
 }
 
 describe("MCP P3 tools", () => {
-	it("registers the catalogue in order for every token", () => {
-		expect(Object.keys(serverFor(reader)._registeredTools)).toEqual([...TOOL_NAMES]);
-		expect(Object.keys(serverFor(actor("empty@local", []))._registeredTools)).toEqual([
+	it("registers the full catalogue in order for a token holding every scope", () => {
+		expect(Object.keys(serverFor(actor("all@local", ALL_SCOPES))._registeredTools)).toEqual([
 			...TOOL_NAMES,
 		]);
 	});
 
-	it("denies each tool when its scope is absent", async () => {
-		const empty = actor("empty-scope@local", []);
+	it("lists only the tools whose scope was granted", () => {
+		const names = (scopes: string[]) =>
+			Object.keys(serverFor(actor("scoped@local", scopes))._registeredTools);
+		expect(names([])).toEqual([]);
+		expect(names(["mail:read", "mail:draft", "config:read"])).toEqual([
+			"list_mailboxes",
+			"list_threads",
+			"search_messages",
+			"read_message",
+			"read_thread",
+			"save_draft",
+			"cancel_draft",
+			"update_messages",
+			"get_health",
+			"list_ops",
+			"list_config",
+		]);
+		expect(names(["mail:send"])).toEqual(["send"]);
+		expect(names(["templates:write"])).toEqual(["manage_template", "restore"]);
+		expect(names(["keys:write"])).toEqual(["manage_api_key", "restore", "reconcile_stale"]);
+		expect(names(["routing:write", "suppressions:write"])).toEqual([
+			"manage_routing",
+			"remove_suppression",
+			"restore",
+		]);
+		// A legacy omnibus `admin` token matches nothing.
+		expect(names(["admin"])).toEqual([]);
+		expect(names(["mail:read"])).not.toContain("get_health");
+	});
+
+	it("registers each tool exactly when its required scope is granted", () => {
 		for (const name of TOOL_NAMES) {
-			const result = await callTool(empty, name, {});
-			expect(result.isError, name).toBe(true);
-			expect(textOf(result)).toBe(`insufficient_scope: ${TOOL_SCOPES[name]}`);
+			const needed = TOOL_SCOPES[name];
+			expect(Object.keys(serverFor(actor("with@local", [needed]))._registeredTools), name).toContain(name);
+			// `restore` is visible with any write scope, so removing one scope does not hide it.
+			if (name === "restore") continue;
+			const rest = ALL_SCOPES.filter((scope) => scope !== needed);
+			expect(Object.keys(serverFor(actor("without@local", rest))._registeredTools), name).not.toContain(name);
 		}
-		const readOnly = actor("readonly@local", ["mail:read"]);
-		expect(textOf(await callTool(readOnly, "save_draft", {}))).toBe("insufficient_scope: mail:draft");
-		expect(textOf(await callTool(readOnly, "get_health", {}))).toBe("insufficient_scope: admin");
-		const draftOnly = actor("draftonly@local", ["mail:draft"]);
-		expect(textOf(await callTool(draftOnly, "read_message", {}))).toBe("insufficient_scope: mail:read");
 	});
 
 	it("lists only the caller's mailboxes and audits the scope", async () => {

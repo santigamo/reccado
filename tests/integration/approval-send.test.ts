@@ -366,14 +366,14 @@ describe("mcp send approval", () => {
 		const makeHandler = (scopes: string[]) => {
 			const server = new McpServer({ name: "test", version: "1" });
 			registerSendTool(server, env as Env, { userId: email, email, scopes: new Set(scopes) }, ORIGIN, { era: "legacy", codec });
-			return (server as unknown as { _registeredTools: Record<string, { handler: (args: object, ctx: ServerContext) => Promise<Record<string, unknown>> }> })._registeredTools.send!.handler;
+			return (server as unknown as { _registeredTools: Record<string, { handler: (args: object, ctx: ServerContext) => Promise<Record<string, unknown>> }> })._registeredTools.send?.handler;
 		};
 		const params = { mailboxId: draft.mailboxId, draftId: draft.draftId };
 		const ctx = { mcpReq: { requestState: () => undefined } } as unknown as ServerContext;
-		const denied = await makeHandler([])(params, ctx);
-		expect(JSON.stringify(denied)).toContain("insufficient_scope: mail:send");
+		// Without mail:send the tool is not even registered (scope-filtered tools/list).
+		expect(makeHandler([])).toBeUndefined();
 		expect(await db.prepare("SELECT token FROM approvals WHERE draft_id = ?").bind(draft.draftId).first()).toBeNull();
-		const handler = makeHandler(["mail:send"]);
+		const handler = makeHandler(["mail:send"])!;
 		await runInDurableObject(draft.stub, async (_instance, state) => { state.storage.sql.exec("UPDATE outbound_drafts SET origin = 'web' WHERE id = ?", draft.draftId); });
 		expect(JSON.stringify(await handler(params, ctx))).toContain("draft_not_agent_owned");
 		await runInDurableObject(draft.stub, async (_instance, state) => { state.storage.sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", draft.draftId); });

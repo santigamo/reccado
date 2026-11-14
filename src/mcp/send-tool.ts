@@ -7,12 +7,13 @@ import { mailboxStub } from "../lib/mailbox-stub";
 import { notifyIntentCreated } from "../telegram/notify";
 import { mcpToolError, mcpToolResultJson } from "./errors";
 import { respondWithIntent, resolveIntentRetry, statusForIntent, type IntentFlow } from "./intent-flow";
-import { assertScope } from "./scopes";
+import { assertScope, scopeFilteredServer } from "./scopes";
 import type { McpSendAuth } from "./types";
 
 const rates = new Map<string, number>();
 
-export function registerSendTool(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow?: IntentFlow) {
+export function registerSendTool(rawServer: McpServer, env: Env, auth: McpSendAuth, origin: string, flow?: IntentFlow) {
+	const server = scopeFilteredServer(rawServer, auth);
 	server.registerTool("send", {
 		description: "Request human approval to send an agent-created draft, or check an existing intent.",
 		inputSchema: z.object({ mailboxId: z.string().min(1), draftId: z.string().min(1), intentId: z.string().min(1).optional() }),
@@ -71,7 +72,7 @@ export function registerSendTool(server: McpServer, env: Env, auth: McpSendAuth,
 			return await respondWithIntent(flow, ctx, { intentId: intent.id, expiresAt: intent.expiresAt, approvalUrl, message: `Aprueba el envío en Telegram o revísalo en ${new URL(origin).host}` });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "internal_error";
-			reason = /^(insufficient_scope: mail:send|rate_limited|too_many_pending_approvals|not_found|draft_not_agent_owned|draft_not_editable|invalid_request_state|intent_stale)$/.test(message) ? message : "internal_error";
+			reason = /^(insufficient_scope: [a-z:]+|rate_limited|too_many_pending_approvals|not_found|draft_not_agent_owned|draft_not_editable|invalid_request_state|intent_stale)$/.test(message) ? message : "internal_error";
 			return mcpToolError(reason);
 		} finally {
 			await insertOpsEvent(env.INDEX_DB, { id: crypto.randomUUID(), event_type: "mcp.tool_call", severity: reason ? "warning" : "info", subject: auth.email, payload_json: JSON.stringify({ tool: "send", scope: "mail:send", mailbox_id: params.mailboxId, intent_id: intentId ?? null, denied: Boolean(reason), reason: reason ?? null, latency_ms: Date.now() - start }) }).catch(() => undefined);

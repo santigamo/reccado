@@ -6,7 +6,8 @@ import { notifyIntentCreated } from "../telegram/notify";
 import { notifyAutoApplied } from "../telegram/auto-applied";
 import { mcpToolError, mcpToolResultJson } from "./errors";
 import { intentResponse, resolveIntentRetry, type IntentFlow } from "./intent-flow";
-import { assertScope } from "./scopes";
+import { RESTORE_SCOPES, TOOL_SCOPES } from "../lib/mcp-scopes";
+import { assertScope, scopeFilteredServer } from "./scopes";
 import type { McpSendAuth } from "./types";
 
 const MAX_BATCH = 20;
@@ -91,7 +92,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 };
 
 const ANNOTATIONS = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } as const;
-const ERRORS = /^(insufficient_scope: admin|rate_limited|too_many_pending_approvals|not_found|invalid_request_state|intent_stale|validation_error|tool_unavailable|invalid_origin)/;
+const ERRORS = /^(insufficient_scope: [a-z:]+|rate_limited|too_many_pending_approvals|not_found|invalid_request_state|intent_stale|validation_error|tool_unavailable|invalid_origin)/;
 
 /** Drop anything that looks like a secret before the agent sees it. */
 export function stripSecrets(value: unknown): unknown {
@@ -136,7 +137,12 @@ function resolveOps(tool: string, params: Record<string, unknown>): Resolved {
 }
 
 async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, ctx: ServerContext | undefined, tool: string, params: Record<string, unknown>, resolve: () => Resolved, kinds: string[], audit: { intentId?: string }) {
-	assertScope(auth, "admin");
+	if (tool === "restore") {
+		const held = RESTORE_SCOPES.find((scope) => auth.scopes.has(scope));
+		if (!held) assertScope(auth, RESTORE_SCOPES[0]!);
+	} else {
+		assertScope(auth, TOOL_SCOPES[tool] ?? "admin");
+	}
 	const key = `${auth.email}:${tool}:${Math.floor(Date.now() / 60000)}`;
 	const count = rates.get(key) ?? 0;
 	if (count >= RATE_LIMIT) throw new Error("rate_limited");
@@ -194,13 +200,14 @@ function register(server: McpServer, env: Env, auth: McpSendAuth, origin: string
 			reason = ERRORS.test(message) ? message : "internal_error";
 			return mcpToolError(reason);
 		} finally {
-			await insertOpsEvent(env.INDEX_DB, { id: crypto.randomUUID(), event_type: "mcp.tool_call", severity: reason ? "warning" : "info", subject: auth.email, payload_json: JSON.stringify({ tool, scope: "admin", intent_id: audit.intentId ?? null, denied: Boolean(reason), reason: reason ?? null, latency_ms: Date.now() - start }) }).catch(() => undefined);
+			await insertOpsEvent(env.INDEX_DB, { id: crypto.randomUUID(), event_type: "mcp.tool_call", severity: reason ? "warning" : "info", subject: auth.email, payload_json: JSON.stringify({ tool, scope: tool === "restore" ? (RESTORE_SCOPES.find((scope) => auth.scopes.has(scope)) ?? RESTORE_SCOPES[0]) : (TOOL_SCOPES[tool] ?? null), intent_id: audit.intentId ?? null, denied: Boolean(reason), reason: reason ?? null, latency_ms: Date.now() - start }) }).catch(() => undefined);
 		}
 	});
 }
 
 const loose = z.record(z.string(), z.unknown());
-export function registerAdminTools(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow?: IntentFlow) {
+export function registerAdminTools(rawServer: McpServer, env: Env, auth: McpSendAuth, origin: string, flow?: IntentFlow) {
+	const server = scopeFilteredServer(rawServer, auth);
 	for (const [tool, def] of Object.entries(TOOLS)) {
 		const kinds = Object.values(def.actions).map((a) => a.kind);
 		const actions = Object.keys(def.actions);

@@ -250,10 +250,10 @@ describe("CIMD opt-in", () => {
 				token_endpoint_auth_method: "none",
 			}),
 		);
-		for (const requested of [null, "mail:read mail:draft admin"]) {
+		for (const requested of [null, "mail:read mail:draft keys:write"]) {
 			const { oauthQuery, verifier } = await runAuthorize(clientId, cookie, requested);
 			expect(new URLSearchParams(oauthQuery).get("scope")).toBe(
-				requested ?? "mail:read mail:draft",
+				requested ?? "mail:read mail:draft config:read",
 			);
 			expect(new URLSearchParams(oauthQuery).get("redirect_uri")).toBe("https://client.example/cb");
 			const client = await run(
@@ -287,8 +287,8 @@ describe("CIMD opt-in", () => {
 			);
 			expect(token.status).toBe(200);
 			const body = (await token.json()) as { scope: string };
-			// A bare consent (no explicit tick) never grants the high-risk `admin` scope.
-			expect(body.scope).toBe("mail:read mail:draft");
+			// A bare consent (no explicit tick) never grants a high-risk scope (keys:write).
+			expect(body.scope).toBe(requested ? "mail:read mail:draft" : "mail:read mail:draft config:read");
 		}
 		const rows = await testEnv.INDEX_DB.prepare(
 			"SELECT id FROM ops_events WHERE event_type = 'mcp.client_first_seen' AND subject = ?",
@@ -335,7 +335,7 @@ describe("CIMD opt-in", () => {
 		}
 	});
 
-	it("denies admin and disables URL clients by default", async () => {
+	it("denies high-risk scopes and disables URL clients by default", async () => {
 		const { cookie } = await ownerSessionAndClient("cimd-deny-owner");
 		const clientId = "https://deny-client.test/metadata";
 		const disabled = await run(
@@ -354,7 +354,7 @@ describe("CIMD opt-in", () => {
 				token_endpoint_auth_method: "none",
 			}),
 		);
-		const { oauthQuery } = await runAuthorize(clientId, cookie, "admin");
+		const { oauthQuery } = await runAuthorize(clientId, cookie, "keys:write");
 		const consent = await postJson(
 			"/api/auth/oauth2/consent",
 			{ accept: false, oauth_query: oauthQuery },
@@ -789,23 +789,16 @@ describe("the /mcp bearer-token perimeter", () => {
 				"get_health",
 				"list_ops",
 				"list_config",
-				"send",
-				"manage_mailbox",
-				"manage_domain",
-				"manage_routing",
-				"manage_template",
-				"manage_api_key",
-				"remove_suppression",
-				"restore",
-				"reconcile_stale",
 			]);
-			for (const tool of tools.slice(12)) expect(tool.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false });
 			for (const tool of tools.slice(0, 5)) expect(tool.annotations.readOnlyHint).toBe(true);
+			for (const tool of tools.slice(1, 5)) expect(tool.annotations.openWorldHint).toBe(true);
+			expect(tools[0]?.annotations.openWorldHint).toBe(false);
 			expect(tools[5]?.annotations).toMatchObject({
 				readOnlyHint: false,
 				destructiveHint: false,
 				idempotentHint: true,
 			});
+			for (const tool of tools.slice(8)) expect(tool.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
 			for (const tool of tools) expect(tool.outputSchema).toBeTruthy();
 			const result = await call("tools/call", { name: "list_mailboxes", arguments: {} }, modern);
 			expect(result.result.structuredContent, JSON.stringify(result)).toEqual({ mailboxes: [] });

@@ -127,10 +127,10 @@ async function handlerFor(tool: string, auth: Record<string, unknown>, era: "leg
 	const server = new McpServer({ name: "test", version: "1" }, { requestState: { verify: codec.verify } });
 	registerTools(server, env as Env, auth as never, ORIGIN, { era, codec });
 	const registered = (server as unknown as { _registeredTools: Record<string, { handler: Handler; annotations?: Record<string, unknown> }> })._registeredTools;
-	return { handler: registered[tool]!.handler, registered, codec };
+	return { handler: registered[tool]?.handler as Handler, registered, codec };
 }
 const context = (state?: unknown) => ({ mcpReq: { requestState: () => state } }) as unknown as ServerContext;
-const ADMIN = ["mail:read", "admin"];
+const ADMIN = ["mail:read", "mailboxes:write", "templates:write", "routing:write", "domains:write", "keys:write", "suppressions:write"];
 const approvals = async () => (await db.prepare("SELECT COUNT(*) AS n FROM approvals").first<{ n: number }>())!.n;
 
 async function approveWeb(intentId: string, owner: { userId: string }) {
@@ -151,13 +151,11 @@ describe("mcp admin tools", () => {
 		expect((registered.manage_api_key as unknown as { description: string }).description).toContain("never returned here");
 	});
 
-	it("denies without the admin scope and creates no intent", async () => {
-		const auth = { userId: "u", email: "noscope@example.com", scopes: new Set(["mail:read"]) };
-		const before = await approvals();
-		const { handler } = await handlerFor("manage_mailbox", auth, "legacy");
-		const result = await handler({ action: "disable", mailboxId: "x" }, context());
-		expect(JSON.stringify(result)).toContain("insufficient_scope: admin");
-		expect(await approvals()).toBe(before);
+	it("does not register a tool whose scope is missing, so no intent can be created", async () => {
+		const auth = { userId: "u", email: "noscope@example.com", scopes: new Set(["mail:read", "admin"]) };
+		const { registered } = await handlerFor("manage_mailbox", auth, "legacy");
+		expect(registered.manage_mailbox).toBeUndefined();
+		expect(registered.manage_domain).toBeUndefined();
 	});
 
 	it("rejects invalid actions and fields without creating an intent", async () => {
