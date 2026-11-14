@@ -5,7 +5,6 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { handleAuthRequest } from "#/api/better-auth";
 import { insertMailbox } from "#/db/d1";
 import {
-	approvalChallenge,
 	approveIntent,
 	createIntent,
 	denyIntent,
@@ -17,7 +16,6 @@ import {
 } from "#/lib/approvals";
 import { confirmDraftSend } from "#/lib/outbound-send";
 import { renderApprovalPage } from "#/components/approval-page";
-import type { AuthMailSender } from "#/lib/better-auth";
 import worker from "../../src/server";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
@@ -31,7 +29,6 @@ import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql
 import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
 import migrationAuthUpgrade from "../../migrations/d1/0021_better_auth_1_7_20.sql?raw";
 import migrationApprovals from "../../migrations/d1/0022_approvals.sql?raw";
-import migrationPasskey from "../../migrations/d1/0024_passkey.sql?raw";
 import migrationAudit from "../../migrations/d1/0025_outbound_audit.sql?raw";
 import migrationApprovalMeta from "../../migrations/d1/0026_approval_metadata.sql?raw";
 import migrationIntentPayload from "../../migrations/d1/0027_intent_payload.sql?raw";
@@ -42,7 +39,6 @@ import { makeIntentCodec } from "../../src/mcp/intent-flow";
 import * as notification from "../../src/telegram/notify";
 import { vi } from "vitest";
 import { applyMigrations } from "../helpers/migrations";
-import { SoftAuthenticator, type AssertionResponse } from "../helpers/soft-authenticator";
 
 const db = env.INDEX_DB;
 const ORIGIN = "https://example.com";
@@ -64,7 +60,6 @@ beforeAll(async () => {
 		migrationTwoFactor,
 		migrationAuthUpgrade,
 		migrationApprovals,
-		migrationPasskey,
 		migrationAudit,
 		migrationApprovalMeta,
 		migrationIntentPayload,
@@ -96,16 +91,6 @@ class Jar {
 	}
 }
 
-function stubMail(): AuthMailSender & { calls: Array<{ text: string }> } {
-	const calls: Array<{ text: string }> = [];
-	return {
-		calls,
-		async sendMail(message: { text: string }) {
-			calls.push({ text: message.text });
-		},
-	} as AuthMailSender & { calls: Array<{ text: string }> };
-}
-
 async function pair(email: string): Promise<Jar> {
 	const code = crypto.randomUUID().replaceAll("-", "").slice(0, 24);
 	const now = new Date().toISOString();
@@ -129,67 +114,31 @@ async function pair(email: string): Promise<Jar> {
 	return jar;
 }
 
-async function registerOwner(
-	email: string,
-): Promise<{ userId: string; jar: Jar; authenticator: SoftAuthenticator }> {
+async function registerOwner(email: string): Promise<{ userId: string; jar: Jar }> {
 	const jar = await pair(email);
-	const mail = stubMail();
-	const headers = { cookie: jar.header(), "content-type": "application/json", origin: ORIGIN };
-	const started = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/step-up`, { method: "POST", headers, body: "{}" }),
-		authEnv(),
-		{ mailSender: mail },
-	);
-	jar.absorb(started);
-	expect(started.status, await started.clone().text()).toBe(200);
-	const code = mail.calls[0]?.text.match(/\b(\d{6})\b/)?.[1] ?? "";
-	const issued = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/step-up`, {
-			method: "POST",
-			headers,
-			body: JSON.stringify({ code }),
-		}),
-		authEnv(),
-	);
-	jar.absorb(issued);
-	expect(issued.status, await issued.clone().text()).toBe(200);
-	const { proof } = (await issued.json()) as { proof: string };
-	const optionsResponse = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/generate-register-options`, {
-			headers: { cookie: jar.header(), origin: ORIGIN, "x-passkey-stepup": proof },
-		}),
-		authEnv(),
-	);
-	jar.absorb(optionsResponse);
-	expect(optionsResponse.status, await optionsResponse.clone().text()).toBe(200);
-	const options = (await optionsResponse.json()) as { challenge: string; rp: { id: string } };
-	const authenticator = new SoftAuthenticator(options.rp.id, ORIGIN);
-	const credential = await authenticator.registration(options.challenge);
-	const verified = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/verify-registration`, {
-			method: "POST",
-			headers: {
-				cookie: jar.header(),
-				"content-type": "application/json",
-				origin: ORIGIN,
-				"x-passkey-stepup": proof,
-			},
-			body: JSON.stringify({ response: credential, name: "Approval key" }),
-		}),
-		authEnv(),
-	);
-	jar.absorb(verified);
-	expect(verified.status, await verified.clone().text()).toBe(200);
 	const user = await db
 		.prepare('SELECT id FROM "user" WHERE email = ?')
 		.bind(email)
 		.first<{ id: string }>();
-	const passkey = await db
-		.prepare("SELECT credentialID FROM passkey WHERE userId = ?")
-		.bind(user?.id)
-		.first<{ credentialID: string }>();
-	authenticator.storedId = passkey?.credentialID ?? null;
-	return { userId: user?.id ?? "", jar, authenticator };
+	return { userId: user?.id ?? "", jar };
+}
+
+/** Web approval as the owner (the session was already checked at the route). */
+async function webApprove(
+	target: Env,
+	owner: { userId: string },
+	intent: { id: string; payloadHash?: string },
+) {
+	const stored = await db
+		.prepare("SELECT payload_hash FROM approvals WHERE token = ?")
+		.bind(intent.id)
+		.first<{ payload_hash: string }>();
+	return approveIntent(target, {
+		id: intent.id,
+		payloadHash: intent.payloadHash ?? stored?.payload_hash ?? "",
+		channel: "web",
+		approver: owner.userId,
+	});
 }
 
 describe("control-plane approvals", () => {
@@ -216,15 +165,7 @@ describe("control-plane approvals", () => {
 		const view = await getIntentView(env, intent.id, { userId: second.userId });
 		expect(view.status).toBe("stale");
 		expect(view.fields).toEqual([]);
-		const result = await approveIntent(env, {
-			id: intent.id,
-			userId: second.userId,
-			origin: ORIGIN,
-			assertion: await second.authenticator.assertion(
-				await approvalChallenge(intent.id, intent.payloadHash),
-				1,
-			),
-		});
+		const result = await webApprove(env, { userId: second.userId }, { id: intent.id });
 		expect(result.error).toBe("forbidden");
 		expect(
 			await db
@@ -245,19 +186,10 @@ describe("control-plane approvals", () => {
 				.bind(input.primaryAddress)
 				.first(),
 		).toBeNull();
-		const assertion = await owner.authenticator.assertion(
-			await approvalChallenge(intent.id, intent.payloadHash),
-			1,
-		);
-		const result = await approveIntent(env, {
-			id: intent.id,
-			userId: owner.userId,
-			origin: ORIGIN,
-			assertion,
-		});
+		const result = await webApprove(env, { userId: owner.userId }, { id: intent.id });
 		expect(result.status).toBe("executed");
 		expect(
-			(await approveIntent(env, { id: intent.id, userId: owner.userId, origin: ORIGIN, assertion }))
+			(await webApprove(env, { userId: owner.userId }, { id: intent.id }))
 				.status,
 		).toBe("executed");
 		const mailbox = await db
@@ -275,30 +207,14 @@ describe("control-plane approvals", () => {
 			.prepare("UPDATE approvals SET payload_json = ? WHERE token = ?")
 			.bind('{"body":{"displayName":"Evil"},"mailboxId":"x"}', update.id)
 			.run();
-		const tampered = await approveIntent(env, {
-			id: update.id,
-			userId: owner.userId,
-			origin: ORIGIN,
-			assertion: await owner.authenticator.assertion(
-				await approvalChallenge(update.id, update.payloadHash),
-				2,
-			),
-		});
+		const tampered = await webApprove(env, { userId: owner.userId }, { id: update.id });
 		expect(tampered.status).toBe("stale");
 		const disabled = await requestControlPlaneChange(env, auth, "mailbox_disable", {
 			mailboxId: mailbox!.mailbox_id,
 		});
 		expect(
 			(
-				await approveIntent(env, {
-					id: disabled.id,
-					userId: owner.userId,
-					origin: ORIGIN,
-					assertion: await owner.authenticator.assertion(
-						await approvalChallenge(disabled.id, disabled.payloadHash),
-						2,
-					),
-				})
+				await webApprove(env, { userId: owner.userId }, { id: disabled.id })
 			).status,
 		).toBe("executed");
 		expect(
@@ -340,15 +256,7 @@ describe("control-plane approvals", () => {
 			{ primaryAddress: "invalid" },
 			{ primaryAddress: "batch-last@example.com" },
 		]);
-		const result = await approveIntent(env, {
-			id: intent.id,
-			userId: owner.userId,
-			origin: ORIGIN,
-			assertion: await owner.authenticator.assertion(
-				await approvalChallenge(intent.id, intent.payloadHash),
-				1,
-			),
-		});
+		const result = await webApprove(env, { userId: owner.userId }, { id: intent.id });
 		expect(result.status).toBe("failed");
 		expect(result.result?.items.map((item) => [item.status, item.errorCode])).toEqual([
 			["executed", undefined],
@@ -477,7 +385,7 @@ describe("mcp send approval", () => {
 		await draft.stub.fetch(`https://mailbox-do/drafts/${draft.draftId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ bodyText: "changed" }) });
 		expect((await handler({ ...params, intentId: result.intentId }, ctx)).structuredContent).toMatchObject({ status: "stale" });
 	});
-	it("shares a pending intent across concurrent MCP requests and completes after passkey approval", async () => {
+	it("shares a pending intent across concurrent MCP requests and completes after human approval", async () => {
 		const owner = await registerOwner("mcp-tool-owner@example.com");
 		const draft = await mcpDraft("Tool send");
 		await db.prepare("UPDATE mailboxes SET owner_email = ? WHERE mailbox_id = ?").bind("mcp-tool-owner@example.com", draft.mailboxId).run();
@@ -497,14 +405,13 @@ describe("mcp send approval", () => {
 			expect(first.intentId).toBe(second.intentId);
 			expect(notify).toHaveBeenCalledTimes(1);
 			expect(JSON.stringify(a)).toContain(`/approve/${first.intentId}`);
-			expect(JSON.stringify(a)).toContain("Revisa y aprueba el envío en example.com");
+			expect(JSON.stringify(a)).toContain("Aprueba el envío en Telegram o revísalo en example.com");
 			const pending = await handler(params, context(first));
 			expect(pending.resultType).toBe("input_required");
-			const assertion = await owner.authenticator.assertion(await approvalChallenge(first.intentId, draft.payloadHash), 1);
 			const shared = env as Env;
 			const oldSecret = shared.BETTER_AUTH_SECRET;
 			shared.BETTER_AUTH_SECRET = TEST_SECRET;
-			try { expect((await approveIntent(shared, { id: first.intentId, userId: owner.userId, origin: ORIGIN, assertion })).status).toBe("sent"); }
+			try { expect((await webApprove(shared, { userId: owner.userId }, { id: first.intentId })).status).toBe("sent"); }
 			finally { shared.BETTER_AUTH_SECRET = oldSecret; }
 			const sent = await handler(params, context(first));
 			expect(sent.structuredContent).toMatchObject({ status: "sent", intentId: first.intentId });
@@ -525,7 +432,6 @@ describe("mcp send approval", () => {
 		const html = renderApprovalPage({
 			title: "Revisar envío",
 			status: "pending",
-			hasPasskey: true,
 			fields: [{ label: "Mensaje", value: "<script>alert(1)</script>" }],
 			warnings: [{ message: "fuera" }],
 		});
@@ -534,7 +440,7 @@ describe("mcp send approval", () => {
 		expect(html).not.toContain(AGENT_SUMMARY);
 	});
 
-	it("refuses web confirm-send and a telegram-mode confirm, and sends once with a passkey", async () => {
+	it("refuses web confirm-send and a telegram-mode confirm, and sends once on web approval", async () => {
 		const owner = await registerOwner("approve-once@example.com");
 		const draft = await mcpDraft(`Hola <script>alert(1)</script> ${AGENT_SUMMARY}`);
 		const intent = await createIntent(env, {
@@ -603,17 +509,13 @@ describe("mcp send approval", () => {
 			new Request(`${ORIGIN}/api/approvals/${intent.id}/approve`, {
 				method: "POST",
 				headers: { "content-type": "application/json", cookie: owner.jar.header() },
-				body: JSON.stringify({
-					assertion: { id: "x", rawId: "x", type: "public-key", response: {} },
-				}),
+				body: JSON.stringify({ payloadHash: draft.payloadHash }),
 			}),
 			authEnv(),
 			createExecutionContext(),
 		);
 		expect(missingOrigin.status).toBe(403);
 
-		const challenge = await approvalChallenge(intent.id, draft.payloadHash);
-		const assertion = await owner.authenticator.assertion(challenge, 1);
 		// The mailbox DO reads its own env, which is the isolate env. The signer has
 		// to use that same object or the proof HMAC will not match.
 		const shared = env as Env;
@@ -630,7 +532,7 @@ describe("mcp send approval", () => {
 						origin: ORIGIN,
 						cookie: owner.jar.header(),
 					},
-					body: JSON.stringify({ assertion }),
+					body: JSON.stringify({ payloadHash: draft.payloadHash }),
 				}),
 				shared,
 				approvedCtx,
@@ -655,28 +557,16 @@ describe("mcp send approval", () => {
 			token_jti: "token-jti",
 		});
 
-		const replay = await approveIntent(env, {
-			id: intent.id,
-			userId: owner.userId,
-			origin: ORIGIN,
-			assertion,
-		});
+		const replay = await webApprove(env, { userId: owner.userId }, { id: intent.id });
 		expect(replay.status).toBe("sent");
 		expect(await messageCount(draft.stub)).toBe(1);
 		expect(await sentRows(draft.draftId)).toHaveLength(1);
 	});
 
-	it("rejects an assertion bound to a different intent", async () => {
+	it("rejects a payload hash that is not the stored one", async () => {
 		const owner = await registerOwner("binding@example.com");
 		const first = await mcpDraft("one");
 		const second = await mcpDraft("two");
-		const intentA = await createIntent(env, {
-			kind: "send",
-			origin: "mcp",
-			mailboxId: first.mailboxId,
-			draftId: first.draftId,
-			payloadHash: first.payloadHash,
-		});
 		const intentB = await createIntent(env, {
 			kind: "send",
 			origin: "mcp",
@@ -684,17 +574,12 @@ describe("mcp send approval", () => {
 			draftId: second.draftId,
 			payloadHash: second.payloadHash,
 		});
-		const assertion = await owner.authenticator.assertion(
-			await approvalChallenge(intentA.id, first.payloadHash),
-			1,
+		const rejected = await webApprove(
+			env,
+			{ userId: owner.userId },
+			{ id: intentB.id, payloadHash: first.payloadHash },
 		);
-		const rejected = await approveIntent(env, {
-			id: intentB.id,
-			userId: owner.userId,
-			origin: ORIGIN,
-			assertion,
-		});
-		expect(rejected.error).toBe("invalid_assertion");
+		expect(rejected.error).toBe("stale");
 		expect((await getIntentStatus(env, intentB.id)).status).toBe("pending");
 		expect(await messageCount(second.stub)).toBe(0);
 	});
@@ -709,13 +594,20 @@ describe("mcp send approval", () => {
 			draftId: draft.draftId,
 			payloadHash: draft.payloadHash,
 		});
-		const assertion = await owner.authenticator.assertion(
-			await approvalChallenge(intent.id, draft.payloadHash),
-			1,
-		);
-		const input = { id: intent.id, userId: owner.userId, origin: ORIGIN, assertion };
-		const [left, right] = await Promise.all([approveIntent(env, input), approveIntent(env, input)]);
-		const winners = [left, right].filter((result) => result.status === "sent" && !result.error);
+		const shared = env as Env;
+		const savedSecret = shared.BETTER_AUTH_SECRET;
+		shared.BETTER_AUTH_SECRET = TEST_SECRET;
+		let left: Awaited<ReturnType<typeof webApprove>>;
+		let right: Awaited<ReturnType<typeof webApprove>>;
+		try {
+			[left, right] = await Promise.all([
+				webApprove(shared, owner, intent),
+				webApprove(shared, owner, intent),
+			]);
+		} finally {
+			shared.BETTER_AUTH_SECRET = savedSecret;
+		}
+		const winners = [left, right].filter((result) => result.status === "sent" && !result.error && !result.resolved);
 		expect(winners).toHaveLength(1);
 		expect(await messageCount(draft.stub)).toBe(1);
 		expect(await sentRows(draft.draftId)).toHaveLength(1);
@@ -735,12 +627,7 @@ describe("mcp send approval", () => {
 			.prepare("UPDATE approvals SET expires_at = ? WHERE token = ?")
 			.bind(new Date(Date.now() - 1000).toISOString(), expired.id)
 			.run();
-		const expiredResult = await approveIntent(env, {
-			id: expired.id,
-			userId: owner.userId,
-			origin: ORIGIN,
-			assertion: await owner.authenticator.assertion("unused", 1),
-		});
+		const expiredResult = await webApprove(env, { userId: owner.userId }, { id: expired.id });
 		expect(expiredResult.status).toBe("expired");
 		expect(await messageCount(expiredDraft.stub)).toBe(0);
 
@@ -758,16 +645,7 @@ describe("mcp send approval", () => {
 			body: JSON.stringify({ bodyText: "changed after the intent" }),
 		});
 		expect(edited.ok).toBe(true);
-		const staleAssertion = await owner.authenticator.assertion(
-			await approvalChallenge(stale.id, staleDraft.payloadHash),
-			2,
-		);
-		const staleResult = await approveIntent(env, {
-			id: stale.id,
-			userId: owner.userId,
-			origin: ORIGIN,
-			assertion: staleAssertion,
-		});
+		const staleResult = await webApprove(env, { userId: owner.userId }, { id: stale.id });
 		expect(staleResult.error).toBe("stale");
 		expect(await messageCount(staleDraft.stub)).toBe(0);
 		const stillOpen = await db
@@ -785,51 +663,9 @@ describe("mcp send approval", () => {
 			payloadHash: deniedDraft.payloadHash,
 		});
 		expect((await denyIntent(env, denied.id)).status).toBe("denied");
-		const deniedResult = await approveIntent(env, {
-			id: denied.id,
-			userId: owner.userId,
-			origin: ORIGIN,
-			assertion: staleAssertion,
-		});
+		const deniedResult = await webApprove(env, { userId: owner.userId }, { id: denied.id });
 		expect(deniedResult.status).toBe("denied");
 		expect(await messageCount(deniedDraft.stub)).toBe(0);
 		expect((await getIntentStatus(env, "does-not-exist")).status).toBe("expired");
-	});
-
-	it("refuses approval when the owner has no passkey", async () => {
-		const jar = await pair("no-passkey@example.com");
-		const user = await db
-			.prepare('SELECT id FROM "user" WHERE email = ?')
-			.bind("no-passkey@example.com")
-			.first<{ id: string }>();
-		const draft = await mcpDraft("no key");
-		const intent = await createIntent(env, {
-			kind: "send",
-			origin: "mcp",
-			mailboxId: draft.mailboxId,
-			draftId: draft.draftId,
-			payloadHash: draft.payloadHash,
-		});
-		const view = await getIntentView(env, intent.id, { userId: user?.id ?? "" });
-		expect(view.hasPasskey).toBe(false);
-		expect(view.challenge).toBeNull();
-		const page = renderApprovalPage(view);
-		expect(page).toContain("/security#passkeys");
-		expect(page).not.toContain("Aprobar con passkey");
-		const result = await approveIntent(env, {
-			id: intent.id,
-			userId: user?.id ?? "",
-			origin: ORIGIN,
-			assertion: {
-				id: "none",
-				rawId: "none",
-				type: "public-key",
-				response: { clientDataJSON: "e30", authenticatorData: "e30", signature: "e30" },
-				clientExtensionResults: {},
-			} as AssertionResponse,
-		});
-		expect(result.error).toBe("no_passkey");
-		expect(await messageCount(draft.stub)).toBe(0);
-		expect(jar.header().length).toBeGreaterThan(0);
 	});
 });

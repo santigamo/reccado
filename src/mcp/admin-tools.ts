@@ -21,7 +21,7 @@ const body = <T extends z.ZodRawShape>(shape: T) => z.strictObject(shape);
 // Field names mirror the src/lib/admin/* service inputs; the server-side kind `validate` stays the authority.
 const TOOLS: Record<string, { description: string; actions: Record<string, Action> }> = {
 	manage_mailbox: {
-		description: "Create, update or disable a mailbox. Needs human approval on the approval page.",
+		description: "Create, update or disable a mailbox. Needs human approval: approve in Telegram or on the approval page.",
 		actions: {
 			create: { kind: "mailbox_create", schema: obj({ primaryAddress: z.string().min(3), displayName: z.string().optional() }) },
 			update: { kind: "mailbox_update", schema: obj({ mailboxId, body: body({ displayName: z.string().nullable().optional(), status: z.literal("active").optional() }) }) },
@@ -29,7 +29,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 		},
 	},
 	manage_domain: {
-		description: "Add, provision, update or disable a domain. Needs human approval on the approval page.",
+		description: "Add, provision, update or disable a domain. Needs human approval: approve in Telegram or on the approval page.",
 		actions: {
 			add: { kind: "domain_add", schema: obj({ domain: z.string().min(3), zoneId: z.string().min(1) }) },
 			provision: { kind: "domain_provision", schema: obj({ domain: z.string().min(3), body: body({
@@ -43,7 +43,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 		},
 	},
 	manage_routing: {
-		description: "Add/remove aliases and upsert/remove routing rules. Needs human approval on the approval page.",
+		description: "Add/remove aliases and upsert/remove routing rules. Needs human approval: approve in Telegram or on the approval page.",
 		actions: {
 			alias_add: { kind: "alias_add", schema: obj({ aliasAddress: z.string().min(3), mailboxId }) },
 			alias_remove: { kind: "alias_remove", schema: obj({ aliasAddress: z.string().min(3) }) },
@@ -62,14 +62,14 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 		},
 	},
 	manage_template: {
-		description: "Upsert or archive a transactional template. Needs human approval on the approval page.",
+		description: "Upsert or archive a transactional template. Needs human approval: approve in Telegram or on the approval page.",
 		actions: {
 			upsert: { kind: "template_upsert", schema: obj({ mailboxId, templateId: z.string().min(1), body: body({ subject: z.string().min(1), body_text: z.string().nullable().optional(), body_html: z.string().nullable().optional() }) }) },
 			archive: { kind: "template_archive", schema: obj({ mailboxId, templateId: z.string().min(1) }) },
 		},
 	},
 	manage_api_key: {
-		description: "Create, rotate, revoke or change the scopes of a transactional API key. The secret is shown only to the human on the approval page and is never returned here. Needs human approval.",
+		description: "Create, rotate, revoke or change the scopes of a transactional API key. The secret is shown only to the human on the approval page (approve it there, not in Telegram) and is never returned here. Needs human approval.",
 		actions: {
 			create: { kind: "api_key_create", schema: obj({ mailboxId, body: body({
 				environment: z.enum(["test", "live"]),

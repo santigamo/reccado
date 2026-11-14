@@ -2,10 +2,8 @@ import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { handleAuthRequest } from "#/api/better-auth";
 import {
-	approvalChallenge,
 	approveIntent,
 } from "#/lib/approvals";
-import type { AuthMailSender } from "#/lib/better-auth";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationOwnerColumn from "../../migrations/d1/0003_mailbox_owner.sql?raw";
@@ -22,7 +20,6 @@ import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql
 import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
 import migrationAuthUpgrade from "../../migrations/d1/0021_better_auth_1_7_20.sql?raw";
 import migrationApprovals from "../../migrations/d1/0022_approvals.sql?raw";
-import migrationPasskey from "../../migrations/d1/0024_passkey.sql?raw";
 import migrationAudit from "../../migrations/d1/0025_outbound_audit.sql?raw";
 import migrationApprovalMeta from "../../migrations/d1/0026_approval_metadata.sql?raw";
 import migrationIntentPayload from "../../migrations/d1/0027_intent_payload.sql?raw";
@@ -35,7 +32,6 @@ import { makeIntentCodec } from "../../src/mcp/intent-flow";
 import * as notification from "../../src/telegram/notify";
 import { vi } from "vitest";
 import { applyMigrations } from "../helpers/migrations";
-import { SoftAuthenticator } from "../helpers/soft-authenticator";
 
 const db = env.INDEX_DB;
 const ORIGIN = "https://example.com";
@@ -60,7 +56,6 @@ beforeAll(async () => {
 		migrationTwoFactor,
 		migrationAuthUpgrade,
 		migrationApprovals,
-		migrationPasskey,
 		migrationAudit,
 		migrationApprovalMeta,
 		migrationIntentPayload,
@@ -92,16 +87,6 @@ class Jar {
 	}
 }
 
-function stubMail(): AuthMailSender & { calls: Array<{ text: string }> } {
-	const calls: Array<{ text: string }> = [];
-	return {
-		calls,
-		async sendMail(message: { text: string }) {
-			calls.push({ text: message.text });
-		},
-	} as AuthMailSender & { calls: Array<{ text: string }> };
-}
-
 async function pair(email: string): Promise<Jar> {
 	const code = crypto.randomUUID().replaceAll("-", "").slice(0, 24);
 	const now = new Date().toISOString();
@@ -125,67 +110,13 @@ async function pair(email: string): Promise<Jar> {
 	return jar;
 }
 
-async function registerOwner(
-	email: string,
-): Promise<{ userId: string; jar: Jar; authenticator: SoftAuthenticator }> {
+async function registerOwner(email: string): Promise<{ userId: string; jar: Jar }> {
 	const jar = await pair(email);
-	const mail = stubMail();
-	const headers = { cookie: jar.header(), "content-type": "application/json", origin: ORIGIN };
-	const started = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/step-up`, { method: "POST", headers, body: "{}" }),
-		authEnv(),
-		{ mailSender: mail },
-	);
-	jar.absorb(started);
-	expect(started.status, await started.clone().text()).toBe(200);
-	const code = mail.calls[0]?.text.match(/\b(\d{6})\b/)?.[1] ?? "";
-	const issued = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/step-up`, {
-			method: "POST",
-			headers,
-			body: JSON.stringify({ code }),
-		}),
-		authEnv(),
-	);
-	jar.absorb(issued);
-	expect(issued.status, await issued.clone().text()).toBe(200);
-	const { proof } = (await issued.json()) as { proof: string };
-	const optionsResponse = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/generate-register-options`, {
-			headers: { cookie: jar.header(), origin: ORIGIN, "x-passkey-stepup": proof },
-		}),
-		authEnv(),
-	);
-	jar.absorb(optionsResponse);
-	expect(optionsResponse.status, await optionsResponse.clone().text()).toBe(200);
-	const options = (await optionsResponse.json()) as { challenge: string; rp: { id: string } };
-	const authenticator = new SoftAuthenticator(options.rp.id, ORIGIN);
-	const credential = await authenticator.registration(options.challenge);
-	const verified = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/verify-registration`, {
-			method: "POST",
-			headers: {
-				cookie: jar.header(),
-				"content-type": "application/json",
-				origin: ORIGIN,
-				"x-passkey-stepup": proof,
-			},
-			body: JSON.stringify({ response: credential, name: "Approval key" }),
-		}),
-		authEnv(),
-	);
-	jar.absorb(verified);
-	expect(verified.status, await verified.clone().text()).toBe(200);
 	const user = await db
 		.prepare('SELECT id FROM "user" WHERE email = ?')
 		.bind(email)
 		.first<{ id: string }>();
-	const passkey = await db
-		.prepare("SELECT credentialID FROM passkey WHERE userId = ?")
-		.bind(user?.id)
-		.first<{ credentialID: string }>();
-	authenticator.storedId = passkey?.credentialID ?? null;
-	return { userId: user?.id ?? "", jar, authenticator };
+	return { userId: user?.id ?? "", jar };
 }
 
 
@@ -201,10 +132,13 @@ const context = (state?: unknown) => ({ mcpReq: { requestState: () => state } })
 const ADMIN = ["mail:read", "admin"];
 const approvals = async () => (await db.prepare("SELECT COUNT(*) AS n FROM approvals").first<{ n: number }>())!.n;
 
-async function approve(owner: Awaited<ReturnType<typeof registerOwner>>, intentId: string) {
+async function approveWeb(intentId: string, owner: { userId: string }) {
 	const row = await db.prepare("SELECT payload_hash FROM approvals WHERE token = ?").bind(intentId).first<{ payload_hash: string }>();
-	const assertion = await owner.authenticator.assertion(await approvalChallenge(intentId, row!.payload_hash), 1);
-	return approveIntent(env, { id: intentId, userId: owner.userId, origin: ORIGIN, assertion });
+	return approveIntent(env, { id: intentId, payloadHash: row!.payload_hash, channel: "web", approver: owner.userId });
+}
+
+async function approve(owner: Awaited<ReturnType<typeof registerOwner>>, intentId: string) {
+	return approveWeb(intentId, owner);
 }
 
 describe("mcp admin tools", () => {
@@ -293,7 +227,6 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 	const email = "kinds-mcp@example.com";
 	let owner: Awaited<ReturnType<typeof registerOwner>>;
 	let auth: Record<string, unknown>;
-	let counter = 100;
 	beforeAll(async () => {
 		owner = await registerOwner(email);
 		auth = { userId: owner.userId, email, owners: [email], scopes: new Set(ADMIN) };
@@ -304,9 +237,7 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		return { handler, result, content: result.structuredContent as { status: string; intentId: string; result?: unknown } };
 	}
 	async function approveNext(intentId: string) {
-		const row = await db.prepare("SELECT payload_hash FROM approvals WHERE token = ?").bind(intentId).first<{ payload_hash: string }>();
-		const assertion = await owner.authenticator.assertion(await approvalChallenge(intentId, row!.payload_hash), counter++);
-		return approveIntent(env, { id: intentId, userId: owner.userId, origin: ORIGIN, assertion });
+		return approveWeb(intentId, owner);
 	}
 
 	it("manage_domain add: pending until approved, then registered", async () => {
@@ -374,7 +305,6 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 	const emailB = "principal-b@example.com";
 	let a: Awaited<ReturnType<typeof registerOwner>>;
 	let b: Awaited<ReturnType<typeof registerOwner>>;
-	let counter = 500;
 	const authFor = (owner: { userId: string }, email: string, extra: Record<string, unknown> = {}) => ({
 		userId: owner.userId,
 		email,
@@ -399,9 +329,7 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 		const { content } = await pending(authFor(a, emailA), "principal-created@example.com");
 		const row = await db.prepare("SELECT oauth_client_id, token_sub, token_jti FROM approvals WHERE token = ?").bind(content.intentId).first();
 		expect(row).toEqual({ oauth_client_id: "client-1", token_sub: a.userId, token_jti: "jti-1" });
-		const challenge = await db.prepare("SELECT payload_hash FROM approvals WHERE token = ?").bind(content.intentId).first<{ payload_hash: string }>();
-		const assertion = await a.authenticator.assertion(await approvalChallenge(content.intentId, challenge!.payload_hash), counter++);
-		expect((await approveIntent(env, { id: content.intentId, userId: a.userId, origin: ORIGIN, assertion })).status).toBe("executed");
+		expect((await approveWeb(content.intentId, a)).status).toBe("executed");
 		const event = await db.prepare("SELECT payload_json FROM ops_events WHERE id = ?").bind(`approval.executed:${content.intentId}`).first<{ payload_json: string }>();
 		expect(JSON.parse(event!.payload_json)).toMatchObject({ oauth_client_id: "client-1", token_sub: a.userId, token_jti: "jti-1", approver_user_id: a.userId, kind: "mailbox_create" });
 	});
@@ -416,9 +344,7 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 
 	it("refuses approval by an owner other than the intent's creator", async () => {
 		const { content } = await pending(authFor(a, emailA), "principal-cross@example.com");
-		const row = await db.prepare("SELECT payload_hash FROM approvals WHERE token = ?").bind(content.intentId).first<{ payload_hash: string }>();
-		const assertion = await b.authenticator.assertion(await approvalChallenge(content.intentId, row!.payload_hash), counter++);
-		const result = await approveIntent(env, { id: content.intentId, userId: b.userId, origin: ORIGIN, assertion });
+		const result = await approveWeb(content.intentId, b);
 		expect(result.error).toBe("forbidden");
 		expect(result.status).toBe("pending");
 	});
@@ -437,7 +363,7 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 		expect((await pending(authFor(a, emailA), "cap-other@example.com")).result.isError).not.toBe(true);
 	});
 
-	it("coalesces Telegram notifications to one per minute per token subject", async () => {
+	it("sends one card (with its own buttons) per intent; coalescing only shortens the text", async () => {
 		await db.prepare("INSERT OR REPLACE INTO runtime_config (key, value, updated_at) VALUES ('telegram.chat_id', '999', ?)").bind(new Date().toISOString()).run();
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ ok: true, result: { message_id: 1 } }));
 		try {
@@ -449,7 +375,16 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 			fetchSpy.mockClear();
 			for (const id of ids) await notification.notifyIntentCreated(telegramEnv, id);
 			const sent = fetchSpy.mock.calls.filter(([input]) => String(input instanceof Request ? input.url : input).includes("sendMessage"));
-			expect(sent.length).toBe(1);
+			expect(sent.length).toBe(2);
+			const bodies = sent.map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { text: string; reply_markup: { inline_keyboard: Array<Array<{ callback_data?: string }>> } });
+			for (const [i, body] of bodies.entries()) {
+				const data = body.reply_markup.inline_keyboard[0]!.map((button) => button.callback_data);
+				expect(data[0]).toMatch(new RegExp(`^ia:${ids[i]}:[a-f0-9]{8}$`));
+				expect(data[1]).toMatch(new RegExp(`^ix:${ids[i]}:[a-f0-9]{8}$`));
+			}
+			// Only the second (coalesced) one is the compact notice.
+			expect(bodies[0]!.text).toContain("notify-0@example.com");
+			expect(bodies[1]!.text).not.toContain("notify-0@example.com");
 		} finally { fetchSpy.mockRestore(); }
 	});
 });

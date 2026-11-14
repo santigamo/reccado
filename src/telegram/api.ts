@@ -44,6 +44,7 @@ export type TelegramMessage = {
 	caption_entities?: TelegramEntity[];
 	reply_to_message?: TelegramMessage;
 	is_topic_message?: boolean;
+	reply_markup?: Record<string, unknown>;
 };
 
 export type TelegramEntity = {

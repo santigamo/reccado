@@ -636,13 +636,13 @@ export async function approveIntent(
 		channel: ApprovalChannel;
 		approver: string;
 	},
-): Promise<IntentStatus & { error?: string; reveal?: IntentField[] }> {
+): Promise<IntentStatus & { error?: string; reveal?: IntentField[]; resolved?: boolean }> {
 	const row = await getApproval(env.INDEX_DB, input.id);
 	if (!row || !row.payload_hash || (row.kind === "send" && (!row.mailbox_id || !row.draft_id))) {
 		return { ...expiredStatus(), error: "expired" };
 	}
 	if (row.consumed_at || row.decision) {
-		return getIntentStatus(env, input.id);
+		return { ...(await getIntentStatus(env, input.id)), resolved: true };
 	}
 	if (new Date(row.expires_at).getTime() <= Date.now()) {
 		await recordEvent(env, row.token, "approval.expired", { kind: row.kind });
@@ -684,7 +684,7 @@ export async function approveIntent(
 		return { ...(await getIntentStatus(env, input.id)), error: "unsupported_kind" };
 	}
 	const won = await consumeApproval(env.INDEX_DB, row.token, "approved");
-	if (!won) return getIntentStatus(env, input.id);
+	if (!won) return { ...(await getIntentStatus(env, input.id)), resolved: true };
 	await recordEvent(env, row.token, "approval.approved", {
 		kind: row.kind,
 		channel: input.channel,

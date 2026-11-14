@@ -19,6 +19,7 @@ import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { mcp } from "@better-auth/mcp";
 import { cimd } from "@better-auth/cimd";
 import { emailOTP, jwt, twoFactor } from "better-auth/plugins";
+import { insertOpsEvent } from "../db/d1";
 import { consumePairingCode, type PairingClaim } from "../db/owners";
 import { RUNTIME_CONFIG_KEYS, getRuntimeConfig } from "../db/runtime-config";
 import {
