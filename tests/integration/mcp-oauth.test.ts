@@ -152,7 +152,7 @@ const INITIALIZE = {
 async function runAuthorize(
 	clientId: string,
 	cookie: string,
-	scope: string | null = "mail:read mail:draft",
+	scope: string | null = "mail:read mail:draft config:read",
 ): Promise<{ oauthQuery: string; verifier: string }> {
 	const verifierBytes = crypto.getRandomValues(new Uint8Array(32));
 	const verifier = btoa(String.fromCharCode(...verifierBytes))
