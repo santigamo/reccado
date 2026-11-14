@@ -1,5 +1,5 @@
 /**
- * Human approval of an agent-originated action (Telegram button or owner-session web click).
+ * Human approval of an agent-originated action (owner-session web click on `/approve/:id`).
  *
  * The mailbox Durable Object remains the send authority. This module mints an
  * unguessable intent, renders only the frozen snapshot, and — after a human
@@ -87,11 +87,10 @@ export type IntentView = {
 	warnings: IntentWarning[];
 	payloadHash: string | null;
 	expiresAt: string | null;
-	/** True for kinds that reveal a one-time secret: only the web approve may execute them. */
-	webOnly: boolean;
 };
 
-export type ApprovalChannel = "telegram" | "web";
+/** Approval is web-only: the owner session on `/approve/:id`. Telegram only notifies. */
+export type ApprovalChannel = "web";
 
 export type McpApprovalProof = {
 	intentId: string;
@@ -528,13 +527,6 @@ export async function getIntentStatus(env: Env, id: string): Promise<IntentStatu
 	return { status: "pending", send: null, deliveryFeedback };
 }
 
-/** Kinds whose result carries a one-time secret: only the owner's web session may execute them. */
-export const WEB_ONLY_KINDS: ReadonlySet<string> = new Set([
-	"api_key_create",
-	"api_key_rotate",
-	"api_key_scopes",
-]);
-
 export async function getIntentView(
 	env: Env,
 	id: string,
@@ -544,7 +536,7 @@ export async function getIntentView(
 }
 
 /**
- * The same server-rendered view for the Telegram card. There is no web session there, so
+ * The same server-rendered view for the Telegram notice. There is no web session there, so
  * control-plane fields render as the owner whose token created the intent.
  */
 export async function getIntentCard(env: Env, id: string): Promise<IntentView> {
@@ -565,7 +557,6 @@ async function buildView(env: Env, id: string, userId: string | null): Promise<I
 			warnings: [],
 			payloadHash: null,
 			expiresAt: null,
-			webOnly: false,
 		};
 	}
 	const frozen =
@@ -587,27 +578,13 @@ async function buildView(env: Env, id: string, userId: string | null): Promise<I
 			const data = await controlData(env, id);
 			const actorAuth = await ownerForUser(env, userId);
 			const payload: unknown = JSON.parse(data?.payload_json ?? "null");
-			const items = Array.isArray(payload) ? payload : [payload];
-			const parts = await Promise.all(
-				items.map((item) => renderWithSafetyNet(definition, env, actorAuth, definition.validate(item))),
-			);
-			rendered = {
-				title: parts.length === 1 ? parts[0]!.title : `Cambios (${parts.length})`,
-				fields: parts.flatMap((part, i) =>
-					part.fields.map((field) => ({
-						...field,
-						label: parts.length === 1 ? field.label : `${i + 1}. ${field.label}`,
-					})),
-				),
-			};
-			warnings = parts.flatMap((part) => part.warnings);
+			const part = await renderWithSafetyNet(definition, env, actorAuth, definition.validate(payload));
+			rendered = { title: part.title, fields: part.fields };
+			warnings = part.warnings;
 		} catch {
 			status.status = "stale";
 		}
 	}
-	const autoRefused = (row as { auto_refused?: string | null }).auto_refused;
-	if (autoRefused)
-		warnings = [{ code: "auto_apply_refused", message: `No se aplicó automáticamente: ${autoRefused}` }, ...warnings];
 	return {
 		id: row.token,
 		kind: row.kind,
@@ -617,7 +594,6 @@ async function buildView(env: Env, id: string, userId: string | null): Promise<I
 		warnings,
 		payloadHash: status.status === "pending" ? row.payload_hash : null,
 		expiresAt: row.expires_at,
-		webOnly: WEB_ONLY_KINDS.has(row.kind),
 	};
 }
 
@@ -655,15 +631,11 @@ export async function approveIntent(
 		return { status: "stale", send: null, deliveryFeedback: null, error: "stale" };
 	}
 	// Multi-owner safety: an MCP intent is approved only by the owner whose token created it.
-	if (input.channel === "web" && row.token_sub && row.token_sub !== input.approver) {
+	if (row.token_sub && row.token_sub !== input.approver) {
 		return { ...(await getIntentStatus(env, input.id)), error: "forbidden" };
 	}
-	if (input.channel === "telegram" && WEB_ONLY_KINDS.has(row.kind)) {
-		return { ...(await getIntentStatus(env, input.id)), error: "web_required" };
-	}
-	// The owner a control-plane change executes as: the web approver, or, from Telegram
-	// (no web session), the owner whose token created the intent.
-	const actorUserId = input.channel === "web" ? input.approver : row.token_sub;
+	// The owner a control-plane change executes as: the web approver.
+	const actorUserId = input.approver;
 	if (row.kind === "send") {
 		const frozen = await readFrozen(env, row.mailbox_id!, row.draft_id!).catch(() => null);
 		if (!frozen || frozen.stale || frozen.payloadHash !== row.payload_hash) {
@@ -678,8 +650,7 @@ export async function approveIntent(
 			const actor = await ownerForUser(env, actorUserId);
 			const definition = controlPlaneKind(row.kind)!;
 			const parsed: unknown = JSON.parse(stored.payload_json);
-			for (const item of Array.isArray(parsed) ? parsed : [parsed])
-				await definition.render(env, actor, definition.validate(item));
+			await definition.render(env, actor, definition.validate(parsed));
 		} catch {
 			return { ...(await getIntentStatus(env, input.id)), error: "forbidden" };
 		}
@@ -738,7 +709,6 @@ async function dispatchControl(
 		return getIntentStatus(env, row.token);
 	}
 	const parsed: unknown = JSON.parse(stored.payload_json);
-	const items = Array.isArray(parsed) ? parsed : [parsed];
 	const results: NonNullable<IntentStatus["result"]>["items"] = [];
 	const principal = {
 		kind: row.kind,
@@ -752,25 +722,19 @@ async function dispatchControl(
 	};
 	let failed = false;
 	const reveal: IntentField[] = [];
-	for (const item of items) {
-		if (failed) {
-			results.push({ status: "not_run" });
-			continue;
-		}
-		try {
-			const actor = await ownerForUser(env, userId);
-			const result = await definition.execute(env, actor, definition.validate(item));
-			// One-time secrets go only to the approving owner's HTTP response, never into result_json.
-			const split = definition.redact ? definition.redact(result) : { stored: result };
-			reveal.push(...(split.secrets ?? []));
-			results.push({ status: "executed", result: split.stored });
-		} catch (error) {
-			failed = true;
-			results.push({
-				status: "failed",
-				errorCode: error instanceof AdminError ? error.code : "execution_failed",
-			});
-		}
+	try {
+		const actor = await ownerForUser(env, userId);
+		const result = await definition.execute(env, actor, definition.validate(parsed));
+		// One-time secrets go only to the approving owner's HTTP response, never into result_json.
+		const split = definition.redact ? definition.redact(result) : { stored: result };
+		reveal.push(...(split.secrets ?? []));
+		results.push({ status: "executed", result: split.stored });
+	} catch (error) {
+		failed = true;
+		results.push({
+			status: "failed",
+			errorCode: error instanceof AdminError ? error.code : "execution_failed",
+		});
 	}
 	await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?")
 		.bind(JSON.stringify({ items: results }), row.token)

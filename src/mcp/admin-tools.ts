@@ -3,13 +3,11 @@ import { z } from "zod";
 import { getApproval, insertOpsEvent } from "../db/d1";
 import { requestControlPlaneChange } from "../lib/control-plane-intents";
 import { notifyIntentCreated } from "../telegram/notify";
-import { notifyAutoApplied } from "../telegram/auto-applied";
 import { mcpToolError, mcpToolResultJson } from "./errors";
 import { intentResponse, resolveIntentRetry, type IntentFlow } from "./intent-flow";
 import { assertScope } from "./scopes";
 import type { McpSendAuth } from "./types";
 
-const MAX_BATCH = 20;
 const RATE_LIMIT = 10;
 const rates = new Map<string, number>();
 const SECRET_KEY = /secret|token|plaintext/i;
@@ -22,7 +20,7 @@ const body = <T extends z.ZodRawShape>(shape: T) => z.strictObject(shape);
 // Field names mirror the src/lib/admin/* service inputs; the server-side kind `validate` stays the authority.
 const TOOLS: Record<string, { description: string; actions: Record<string, Action> }> = {
 	manage_mailbox: {
-		description: "Create, update or disable a mailbox. Needs human approval: approve in Telegram or on the approval page.",
+		description: "Create, update or disable a mailbox. Applied immediately; every change keeps a before-snapshot you can undo with `restore`.",
 		actions: {
 			create: { kind: "mailbox_create", schema: obj({ primaryAddress: z.string().min(3), displayName: z.string().optional() }) },
 			update: { kind: "mailbox_update", schema: obj({ mailboxId, body: body({ displayName: z.string().nullable().optional(), status: z.literal("active").optional() }) }) },
@@ -30,7 +28,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 		},
 	},
 	manage_domain: {
-		description: "Add, provision, update or disable a domain. Needs human approval: approve in Telegram or on the approval page.",
+		description: "Add, provision, update or disable a domain. update applies immediately (undoable with `restore`); add, provision and disable need the owner's approval on the web approval page.",
 		actions: {
 			add: { kind: "domain_add", schema: obj({ domain: z.string().min(3), zoneId: z.string().min(1) }) },
 			provision: { kind: "domain_provision", schema: obj({ domain: z.string().min(3), body: body({
@@ -44,7 +42,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 		},
 	},
 	manage_routing: {
-		description: "Add/remove aliases and upsert/remove routing rules. Needs human approval: approve in Telegram or on the approval page.",
+		description: "Add/remove aliases and upsert/remove routing rules. Applied immediately, except a forward rule whose destination is outside the owner's domains, which needs the owner's approval on the web approval page.",
 		actions: {
 			alias_add: { kind: "alias_add", schema: obj({ aliasAddress: z.string().min(3), mailboxId }) },
 			alias_remove: { kind: "alias_remove", schema: obj({ aliasAddress: z.string().min(3) }) },
@@ -63,14 +61,14 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 		},
 	},
 	manage_template: {
-		description: "Upsert or archive a transactional template. Needs human approval: approve in Telegram or on the approval page.",
+		description: "Upsert or archive a transactional template. Applied immediately; every change keeps a before-snapshot you can undo with `restore`.",
 		actions: {
 			upsert: { kind: "template_upsert", schema: obj({ mailboxId, templateId: z.string().min(1), body: body({ subject: z.string().min(1), body_text: z.string().nullable().optional(), body_html: z.string().nullable().optional() }) }) },
 			archive: { kind: "template_archive", schema: obj({ mailboxId, templateId: z.string().min(1) }) },
 		},
 	},
 	manage_api_key: {
-		description: "Create, rotate, revoke, change the scopes of (scopes: issues a replacement key) or edit the template allowlist of (templates: in place, no new secret) a transactional API key. A secret, when one is issued, is shown only to the human on the approval page (approve it there, not in Telegram) and is never returned here. Needs human approval unless this client's delegation policy allows the change.",
+		description: "Create, rotate, revoke, change the scopes of (scopes: issues a replacement key) or edit the template allowlist of (templates: in place, no new secret) a transactional API key. revoke and templates apply immediately. create, rotate and scopes issue a secret, so they need the owner's approval on the web approval page; the secret is shown only there and is never returned here.",
 		actions: {
 			create: { kind: "api_key_create", schema: obj({ mailboxId, body: body({
 				environment: z.enum(["test", "live"]),
@@ -111,28 +109,19 @@ function pruneRates(map: Map<string, number>): void {
 
 type Resolved = { kind: string; payload: unknown };
 
-function resolveOps(tool: string, params: Record<string, unknown>): Resolved {
+function resolveOp(tool: string, params: Record<string, unknown>): Resolved {
 	const def = TOOLS[tool];
 	if (!def) throw new ToolFailure("tool_unavailable");
-	const raw = params.operations !== undefined ? params.operations : [{ ...params, intentId: undefined, operations: undefined }];
-	if (!Array.isArray(raw) || !raw.length || raw.length > MAX_BATCH) throw new ToolFailure("validation_error: operations must have 1-20 items");
-	let kind: string | undefined;
-	const payloads = raw.map((item) => {
-		if (!item || typeof item !== "object") throw new ToolFailure("validation_error: invalid operation");
-		const { action, ...rest } = item as Record<string, unknown>;
-		const entry = typeof action === "string" ? def.actions[action] : undefined;
-		if (!entry) throw new ToolFailure("validation_error: unknown action");
-		if (kind && kind !== entry.kind) throw new ToolFailure("validation_error: a batch must use a single action");
-		kind = entry.kind;
-		const cleaned = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
-		const parsed = entry.schema.safeParse(cleaned);
-		if (!parsed.success) throw new ToolFailure(`validation_error: ${parsed.error.issues[0]?.path.join(".") || "input"}`);
-		const out = { ...parsed.data };
-		// Routing rules name their effect `ruleAction` here to avoid clashing with the tool's `action`.
-		if ("ruleAction" in out) { out.action = out.ruleAction; delete out.ruleAction; }
-		return out;
-	});
-	return { kind: kind as string, payload: params.operations !== undefined ? payloads : payloads[0] };
+	const { action, intentId: _intentId, ...rest } = params;
+	const entry = typeof action === "string" ? def.actions[action] : undefined;
+	if (!entry) throw new ToolFailure("validation_error: unknown action");
+	const cleaned = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
+	const parsed = entry.schema.safeParse(cleaned);
+	if (!parsed.success) throw new ToolFailure(`validation_error: ${parsed.error.issues[0]?.path.join(".") || "input"}`);
+	const out = { ...parsed.data };
+	// Routing rules name their effect `ruleAction` here to avoid clashing with the tool's `action`.
+	if ("ruleAction" in out) { out.action = out.ruleAction; delete out.ruleAction; }
+	return { kind: entry.kind, payload: out };
 }
 
 async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, ctx: ServerContext | undefined, tool: string, params: Record<string, unknown>, resolve: () => Resolved, kinds: string[], audit: { intentId?: string }) {
@@ -168,18 +157,17 @@ async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: Inte
 	}
 	audit.intentId = created.id;
 	if (created.applied) {
-		// Delegated client under a policy: applied without approval; the owner is told and can undo.
-		await notifyAutoApplied(env, { intentId: created.id, kind, applied: created.applied }).catch(() => undefined);
-		const failed = created.applied.items.some((item) => item.status === "failed");
-		return mcpToolResultJson(transform({ status: failed ? "failed" : "applied", intentId: created.id, result: { items: created.applied.items } }));
+		// Direct change: already executed as the owner; secrets were stripped by the kind's `redact`.
+		const { status, result, errorCode, snapshotIds } = created.applied;
+		return mcpToolResultJson(transform(status === "applied" ? { status, result, snapshotIds } : { status, error: errorCode, snapshotIds }));
 	}
 	await notifyIntentCreated(env, created.id).catch(() => undefined);
-	return intentResponse(env, flow, ctx, { intentId: created.id, expiresAt: created.expiresAt, origin, message, transform, ...(created.autoApplyRefused ? { autoApplyRefused: created.autoApplyRefused } : {}) });
+	return intentResponse(env, flow, ctx, { intentId: created.id, expiresAt: created.expiresAt, origin, message, transform });
 }
 
 function register(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, tool: string, description: string, kinds: string[], opSchema: z.ZodType, resolve: (params: Record<string, unknown>) => Resolved) {
 	server.registerTool(tool, {
-		description: `${description} Returns a pending approval, or the executed result once approved. Re-call with intentId to check status. A delegated client (no mail read scope) with an owner-set policy gets eligible low-risk changes applied immediately (status "applied"); otherwise pending, with autoApplyRefused explaining a failed policy check.`,
+		description: `${description} One change per call. A direct change returns {status:"applied", result, snapshotIds} (undo with the restore tool). A change that needs owner approval returns a pending approval with a web URL (the owner approves only on that page; Telegram just notifies); re-call with intentId to check its status/result.`,
 		inputSchema: opSchema as z.ZodObject,
 		outputSchema: z.record(z.string(), z.unknown()),
 		annotations: ANNOTATIONS,
@@ -199,17 +187,15 @@ function register(server: McpServer, env: Env, auth: McpSendAuth, origin: string
 	});
 }
 
-const loose = z.record(z.string(), z.unknown());
 export function registerAdminTools(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow?: IntentFlow) {
 	for (const [tool, def] of Object.entries(TOOLS)) {
 		const kinds = Object.values(def.actions).map((a) => a.kind);
 		const actions = Object.keys(def.actions);
 		const schema = z.looseObject({
 			action: z.enum(actions as [string, ...string[]]).optional().describe(`One of: ${actions.join(", ")}`),
-			operations: z.array(loose).max(MAX_BATCH).optional().describe("Batch of up to 20 operations with the same action; one approval covers all."),
 			intentId: z.string().min(1).optional(),
 		});
-		register(server, env, auth, origin, flow, tool, def.description, kinds, schema, (params) => resolveOps(tool, params));
+		register(server, env, auth, origin, flow, tool, def.description, kinds, schema, (params) => resolveOp(tool, params));
 	}
 	const single = (tool: string, description: string, kind: string, shape: z.ZodRawShape) =>
 		register(server, env, auth, origin, flow, tool, description, [kind], z.object({ ...shape, intentId: z.string().min(1).optional() }), (params) => {
@@ -218,7 +204,7 @@ export function registerAdminTools(server: McpServer, env: Env, auth: McpSendAut
 			if (!parsed.success) throw new ToolFailure(`validation_error: ${parsed.error.issues[0]?.path.join(".") || "input"}`);
 			return { kind, payload: parsed.data };
 		});
-	single("remove_suppression", "Remove an address from a mailbox's suppression list. Needs human approval.", "suppression_remove", { mailboxId, body: body({ email: z.string().min(3), allowProviderRemoval: z.boolean().optional() }) });
-	single("restore", "Restore a previous admin change recorded by an ops event. Needs human approval.", "restore", { opsEventId: z.string().min(1) });
-	single("reconcile_stale", "Reconcile stale transactional send requests. Needs human approval.", "transactional_reconcile", {});
+	single("remove_suppression", "Remove an address from a mailbox's suppression list. Needs the owner's approval on the web approval page.", "suppression_remove", { mailboxId, body: body({ email: z.string().min(3), allowProviderRemoval: z.boolean().optional() }) });
+	single("restore", "Restore a previous admin change from a snapshotId (an ops event id). Applied immediately, except restoring a forward rule to a destination outside the owner's domains, which needs the owner's approval.", "restore", { opsEventId: z.string().min(1) });
+	single("reconcile_stale", "Reconcile stale transactional send requests (marks them for manual review). Applied immediately.", "transactional_reconcile", {});
 }

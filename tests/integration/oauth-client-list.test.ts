@@ -78,16 +78,12 @@ beforeAll(async () => {
 		migrationAuthUpgrade as string,
 		migrationPasskey as string,
 	);
-	// Only the table the revoke cleanup touches; migration 0029 also alters `approvals`.
-	await testEnv.INDEX_DB.prepare(
-		`CREATE TABLE IF NOT EXISTS mcp_client_policies (client_id TEXT PRIMARY KEY, owner_email TEXT NOT NULL, mailbox_ids_json TEXT NOT NULL DEFAULT '[]', auto_kinds_json TEXT NOT NULL DEFAULT '[]', link_domains_json TEXT NOT NULL DEFAULT '[]', allow_variable_links INTEGER NOT NULL DEFAULT 0, max_auto_per_hour INTEGER NOT NULL DEFAULT 20, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
-	).run();
 });
 
 beforeEach(async () => {
 	await testEnv.INDEX_DB.prepare("DELETE FROM owner_identities").run();
 	await testEnv.INDEX_DB.prepare('DELETE FROM "rateLimit"').run();
-	for (const table of ["oauthAccessToken", "oauthRefreshToken", "oauthConsent", "oauthClient", "mcp_client_policies"]) {
+	for (const table of ["oauthAccessToken", "oauthRefreshToken", "oauthConsent", "oauthClient"]) {
 		await testEnv.INDEX_DB.prepare(`DELETE FROM "${table}"`).run();
 	}
 });
@@ -126,16 +122,11 @@ describe("GET /api/oauth-clients", () => {
 		expect(stranger.status).toBe(403);
 	});
 
-	it("revoke also removes the client's delegation policy", async () => {
-		const { cookie, userId } = await sessionCookieFor(OWNER);
-		await insertClient("c-pol", "Delegated", userId, "https://d.example/cb", Date.now());
-		await insertConsent("c-pol", userId, ["admin"]);
-		await testEnv.INDEX_DB.prepare(
-			`INSERT INTO mcp_client_policies (client_id, owner_email, created_at, updated_at) VALUES ('c-pol', ?, 'x', 'x')`,
-		).bind(OWNER).run();
-		const response = await run(new Request(`${ORIGIN}/api/oauth-clients/c-pol/revoke`, { method: "POST", headers: { cookie } }));
-		expect(response.status, await response.clone().text()).toBe(200);
-		const left = await testEnv.INDEX_DB.prepare("SELECT COUNT(*) AS n FROM mcp_client_policies").first<{ n: number }>();
-		expect(left?.n).toBe(0);
+	it("the delegation policy routes are gone", async () => {
+		const { cookie } = await sessionCookieFor(OWNER);
+		for (const [method, path] of [["GET", "/api/mcp-client-policies"], ["PUT", "/api/mcp-client-policies/c-x"], ["DELETE", "/api/mcp-client-policies/c-x"]] as const) {
+			const response = await run(new Request(`${ORIGIN}${path}`, { method, headers: { cookie, origin: ORIGIN, "content-type": "application/json" }, body: method === "PUT" ? "{}" : undefined }));
+			expect(response.status, `${method} ${path}`).toBe(404);
+		}
 	});
 });
