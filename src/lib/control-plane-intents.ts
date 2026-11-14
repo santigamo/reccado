@@ -243,6 +243,8 @@ async function applyDirect(
 	const since = new Date().toISOString();
 	let outcome: DirectOutcome;
 	try {
+		// Same pre-flight an approval gets (ownership, existence, conflicts) so a refusal reports its own code.
+		await definition.render(env, auth, payload);
 		const result = await definition.execute(env, auth, payload);
 		outcome = {
 			status: "applied",
