@@ -1,6 +1,7 @@
 import type { AuthContext } from "../api/auth";
 import { requireMcpOwner, resolveOwnerEmails } from "../api/auth";
 import { getMailbox, insertOpsEvent } from "../db/d1";
+import { evaluateAutoApply, isDelegatedToken, type McpClientPolicy } from "./mcp-client-policy";
 import { requireMailboxOwner } from "./admin/access";
 import { AdminError } from "./admin/errors";
 import { createMailbox, deleteMailbox, patchMailbox } from "./admin/mailboxes";
@@ -171,6 +172,8 @@ export async function ownerForUser(env: Env, userId: string): Promise<AuthContex
 }
 export type IntentPrincipal = {
 	oauthClientId?: string | null;
+	/** Token scopes; a delegated client (admin without any mail read scope) may auto-apply per policy. */
+	scopes?: ReadonlySet<string>;
 	tokenSub?: string | null;
 	tokenJti?: string | null;
 };
@@ -193,28 +196,161 @@ export async function assertPendingCapacity(
 		.first<{ n: number }>();
 	if ((row?.n ?? 0) >= MAX_PENDING_INTENTS_PER_SUB) throw new Error("too_many_pending_approvals");
 }
+const newToken = (): string => {
+	const bytes = crypto.getRandomValues(new Uint8Array(32));
+	return btoa(String.fromCharCode(...bytes))
+		.replaceAll("+", "-")
+		.replaceAll("/", "_")
+		.replaceAll("=", "");
+};
+
+export type AppliedItem = { status: "executed" | "failed" | "not_run"; result?: unknown; errorCode?: string };
+export type AppliedChange = {
+	id: string;
+	items: AppliedItem[];
+	/** Before-snapshot ops event ids written by each item (restorable ones only), in item order. */
+	snapshotIds: string[][];
+};
+
+/** Restorable snapshots a template item wrote since `since`. Archived snapshots cannot be restored. */
+async function snapshotsSince(env: Env, kind: string, item: Operation, since: string): Promise<string[]> {
+	if (kind !== "template_upsert" || typeof item.mailboxId !== "string" || typeof item.templateId !== "string") return [];
+	const rows = await env.INDEX_DB.prepare(
+		"SELECT id FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ? AND created_at >= ? ORDER BY created_at",
+	)
+		.bind(`${item.mailboxId}:${item.templateId}`, since)
+		.all<{ id: string }>();
+	return (rows.results ?? []).map((row) => row.id);
+}
+
+/**
+ * Executes an already-validated batch now, recording it as an approvals row decided without a
+ * human click (`approved_via`). Mirrors what an approved intent does: same execute, same
+ * ownership checks (the owner's own auth), results stored with secrets removed.
+ */
+export async function applyControlPlaneNow(
+	env: Env,
+	auth: AuthContext,
+	input: {
+		kind: string;
+		validated: Operation[];
+		isBatch: boolean;
+		principal: IntentPrincipal;
+		via: "auto" | "undo";
+		clientId?: string | null;
+	},
+): Promise<AppliedChange> {
+	const definition = controlPlaneKind(input.kind);
+	if (!definition) throw new Error("invalid_intent_kind");
+	const json = canonicalJson(input.isBatch ? input.validated : input.validated[0]);
+	const payloadHash = await hashPayload(json);
+	const id = newToken();
+	const now = new Date();
+	await env.INDEX_DB.prepare(
+		"INSERT INTO approvals (token, kind, created_at, expires_at, payload_hash, consumed_at, decision, approved_via, origin, payload_json, oauth_client_id, token_sub, token_jti) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, 'mcp', ?, ?, ?, ?)",
+	)
+		.bind(
+			id, input.kind, now.toISOString(), new Date(now.getTime() + 600000).toISOString(), payloadHash, now.toISOString(),
+			input.via, json,
+			bound(input.principal.oauthClientId, 2048), bound(input.principal.tokenSub, 512), bound(input.principal.tokenJti, 512),
+		)
+		.run();
+	const items: AppliedItem[] = [];
+	const snapshotIds: string[][] = [];
+	let failed = false;
+	for (const item of input.validated) {
+		if (failed) {
+			items.push({ status: "not_run" });
+			snapshotIds.push([]);
+			continue;
+		}
+		const since = new Date().toISOString();
+		try {
+			const result = await definition.execute(env, auth, item);
+			items.push({ status: "executed", result: (definition.redact ? definition.redact(result) : { stored: result }).stored });
+			snapshotIds.push(await snapshotsSince(env, input.kind, item, since));
+		} catch (error) {
+			failed = true;
+			items.push({ status: "failed", errorCode: error instanceof AdminError ? error.code : "execution_failed" });
+			snapshotIds.push([]);
+		}
+	}
+	await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?").bind(JSON.stringify({ items }), id).run();
+	await insertOpsEvent(env.INDEX_DB, {
+		id: `approval.executed:${id}`,
+		event_type: "approval.executed",
+		severity: failed ? "warning" : "info",
+		subject: id,
+		payload_json: JSON.stringify({
+			kind: input.kind, intent_id: id, approved_via: input.via,
+			oauth_client_id: input.principal.oauthClientId ?? null, token_sub: input.principal.tokenSub ?? null,
+			approver_user_id: auth.userId, outcomes: items.map((item) => item.status),
+		}),
+	}).catch(() => undefined);
+	if (input.via === "auto") {
+		for (const [i, item] of input.validated.entries()) {
+			if (items[i]?.status !== "executed") continue;
+			await insertOpsEvent(env.INDEX_DB, {
+				id: `auto_applied:${id}:${i}`,
+				event_type: "admin.auto_applied",
+				severity: "info",
+				subject: input.clientId ?? "",
+				payload_json: JSON.stringify({
+					client_id: input.clientId ?? null, kind: input.kind, mailbox: typeof item.mailboxId === "string" ? item.mailboxId : null,
+					intent_id: id, snapshot_ids: snapshotIds[i] ?? [],
+				}),
+			}).catch(() => undefined);
+		}
+	}
+	return { id, items, snapshotIds };
+}
+
+export type ControlPlaneRequest = { id: string; expiresAt: string; payloadHash: string } & {
+	/** Set when the change was applied immediately under the client's policy. */
+	applied?: AppliedChange & { policy: McpClientPolicy; variableLinks: string[]; summaries: string[]; targets: string[] };
+	/** Set when a policy exists but a check failed, so the change is pending a human approval. */
+	autoApplyRefused?: string;
+};
+
 export async function requestControlPlaneChange(
 	env: Env,
 	auth: AuthContext,
 	kind: string,
 	payload: unknown | unknown[],
 	principal: IntentPrincipal = {},
-): Promise<{ id: string; expiresAt: string; payloadHash: string }> {
+): Promise<ControlPlaneRequest> {
 	requireMcpOwner(auth, env);
-	await assertPendingCapacity(env, principal.tokenSub);
+	const delegated = isDelegatedToken(principal.scopes);
+	// A delegated client that auto-applies never occupies a pending slot, so only check capacity up front for the rest.
+	if (!delegated) await assertPendingCapacity(env, principal.tokenSub);
 	const definition = controlPlaneKind(kind);
 	if (!definition) throw new Error("invalid_intent_kind");
 	const items = Array.isArray(payload) ? payload : [payload];
 	if (!items.length || items.length > 100) throw new Error("invalid_payload");
 	const validated = items.map(definition.validate);
-	for (const item of validated) await definition.render(env, auth, item);
+	const summaries: string[] = [];
+	for (const item of validated) summaries.push((await definition.render(env, auth, item)).title);
+	let autoApplyRefused: string | undefined;
+	if (delegated) {
+		const decision = await evaluateAutoApply(env, auth, principal, kind, validated);
+		if (decision.auto) {
+			const applied = await applyControlPlaneNow(env, auth, {
+				kind, validated, isBatch: Array.isArray(payload), principal, via: "auto", clientId: decision.policy.clientId,
+			});
+			return {
+				id: applied.id, expiresAt: new Date().toISOString(), payloadHash: "",
+				applied: {
+					...applied, policy: decision.policy, variableLinks: decision.variableLinks, summaries,
+					targets: validated.map((item) => [item.mailboxId, item.templateId ?? item.keyId ?? item.opsEventId].filter((v) => typeof v === "string").join("/")),
+				},
+			};
+		}
+		autoApplyRefused = decision.refused;
+		await assertPendingCapacity(env, principal.tokenSub);
+	}
 	const json = canonicalJson(Array.isArray(payload) ? validated : validated[0]);
 	const payloadHash = await hashPayload(json);
-	const bytes = crypto.getRandomValues(new Uint8Array(32));
-	const id = btoa(String.fromCharCode(...bytes))
-		.replaceAll("+", "-")
-		.replaceAll("/", "_")
-		.replaceAll("=", "");
+	const id = newToken();
 	const now = new Date();
 	const expiresAt = new Date(now.getTime() + 600000).toISOString();
 	await env.INDEX_DB.prepare(
@@ -232,5 +368,11 @@ export async function requestControlPlaneChange(
 			bound(principal.tokenJti, 512),
 		)
 		.run();
-	return { id, expiresAt, payloadHash };
+	if (autoApplyRefused)
+		// Kept on the row so the approval page can show why the change was not applied automatically.
+		await env.INDEX_DB.prepare("UPDATE approvals SET auto_refused = ? WHERE token = ?")
+			.bind(autoApplyRefused.slice(0, 300), id)
+			.run()
+			.catch(() => undefined);
+	return { id, expiresAt, payloadHash, ...(autoApplyRefused ? { autoApplyRefused } : {}) };
 }

@@ -15,6 +15,7 @@ import {
 	registerMailboxSuppressionRoutes,
 } from "./mailbox-routes";
 import { registerApprovalRoutes } from "./approval-routes";
+import { registerMcpPolicyRoutes } from "./mcp-policy-routes";
 import { registerOAuthClientRoutes } from "./oauth-client-routes";
 import { registerTelegramRoutes } from "./telegram-routes";
 
@@ -425,6 +426,7 @@ export function createApiApp(): Hono<ApiBindings> {
 	registerMailboxSuppressionRoutes(api);
 	registerAdminRoutes(api);
 	registerOAuthClientRoutes(api);
+	registerMcpPolicyRoutes(api);
 	registerTelegramRoutes(api);
 	registerApprovalRoutes(api);
 

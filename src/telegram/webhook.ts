@@ -29,6 +29,7 @@ import {
 	type TelegramMessage,
 	type TelegramUpdate,
 } from "./api";
+import { handleUndoCallback, UNDO_CALLBACK_PREFIX } from "./auto-applied";
 import { adoptTelegramChat, refreshChatTopicSupport, resolveTelegramChatId } from "./binding";
 import {
 	CARD_CALLBACK_PREFIX,
@@ -627,6 +628,7 @@ async function handleCallbackQuery(
 		return;
 	}
 	const data = query.data ?? "";
+	if (data.startsWith(UNDO_CALLBACK_PREFIX)) return handleUndoCallback(env, config, query);
 	// Routed after the allowlist check and before anything else: the triage buttons
 	// carry a verb, not a token, so their guard is entirely the check above. The
 	// send-confirmation protocol below keeps its token table -- a draft id does not
