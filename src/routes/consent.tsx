@@ -33,11 +33,11 @@ const fetchClientName = createServerFn({ method: "GET" })
 /** Plain-Spanish risk line shown next to each high-risk scope's checkbox. */
 const HIGH_RISK_LINES: Record<string, string> = {
 	"mail:send":
-		"Permite pedir envíos de correo en tu nombre. Cada envío sigue necesitando tu aprobación con passkey, pero el cliente podrá redactar y proponer mensajes sin límite.",
+		"Permite pedir envíos de correo en tu nombre. Cada envío sigue necesitando tu aprobación en Telegram o en la página de aprobación, pero el cliente podrá redactar y proponer mensajes sin límite.",
 	"mail:read:sensitive":
 		"Expone códigos de verificación y enlaces de restablecimiento de contraseña de tus otros servicios que lleguen a tus buzones. Los correos de autenticación de esta instancia nunca se exponen.",
 	admin:
-		"Permite proponer cambios de configuración: dominios, buzones, alias, reglas, plantillas y claves de API. Cada cambio sigue necesitando tu aprobación con passkey.",
+		"Permite proponer cambios de configuración: dominios, buzones, alias, reglas, plantillas y claves de API. Cada cambio sigue necesitando tu aprobación en Telegram o en la página de aprobación.",
 };
 const HIGH_RISK_SCOPES: ReadonlySet<string> = new Set(Object.keys(HIGH_RISK_LINES));
 

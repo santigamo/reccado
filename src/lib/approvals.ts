@@ -605,6 +605,9 @@ async function buildView(env: Env, id: string, userId: string | null): Promise<I
 			status.status = "stale";
 		}
 	}
+	const autoRefused = (row as { auto_refused?: string | null }).auto_refused;
+	if (autoRefused)
+		warnings = [{ code: "auto_apply_refused", message: `No se aplicó automáticamente: ${autoRefused}` }, ...warnings];
 	return {
 		id: row.token,
 		kind: row.kind,
