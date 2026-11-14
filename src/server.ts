@@ -1,4 +1,3 @@
-import "./lib/reflect-polyfill";
 import { createApiApp } from "./api/hono";
 import { requireAuth } from "./api/auth";
 import * as templates from "./lib/admin/templates";
@@ -10,7 +9,7 @@ import { mailboxStub } from "./lib/mailbox-stub";
 /**
  * Anti-framing headers for every server-rendered HTML response (/approve/:id,
  * /security, /consent, /login, ...), so no other origin — including same-site
- * siblings — can frame a page that asks for a passkey. The approval page also
+ * siblings — can frame a page that asks for an approval. The approval page also
  * sends no Referer (its URL carries the intent id).
  */
 export function withHtmlSecurityHeaders(response: Response, pathname: string): Response {

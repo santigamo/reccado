@@ -1,10 +1,9 @@
-import "./reflect-polyfill";
 /**
- * Passkey approval of an agent-originated action.
+ * Human approval of an agent-originated action (Telegram button or owner-session web click).
  *
  * The mailbox Durable Object remains the send authority. This module mints an
- * unguessable intent, renders only the frozen snapshot, and — after a WebAuthn
- * assertion bound to that exact intent — consumes the row once and hands the DO
+ * unguessable intent, renders only the frozen snapshot, and — after a human
+ * approval bound to that exact intent (id + payload_hash) — consumes the row once and hands the DO
  * a short-lived proof. No other caller can make an `mcp` draft send.
  *
  * Exported for the next task (the MCP `send` tool), which must not grow a second
@@ -15,10 +14,6 @@ import "./reflect-polyfill";
  * - `notifyIntentCreated` lives in `src/telegram/notify.ts` and calls `buildApprovalUrl`.
  */
 
-import {
-	verifyAuthenticationResponse,
-	type AuthenticationResponseJSON,
-} from "@simplewebauthn/server";
 import {
 	consumeApproval,
 	getApproval,
@@ -90,25 +85,19 @@ export type IntentView = {
 	title: string;
 	fields: IntentField[];
 	warnings: IntentWarning[];
-	challenge: string | null;
+	payloadHash: string | null;
 	expiresAt: string | null;
-	hasPasskey: boolean;
-	allowCredentials: Array<{ id: string; transports: string[] }>;
+	/** True for kinds that reveal a one-time secret: only the web approve may execute them. */
+	webOnly: boolean;
 };
+
+export type ApprovalChannel = "telegram" | "web";
 
 export type McpApprovalProof = {
 	intentId: string;
 	payloadHash: string;
 	exp: number;
 	sig: string;
-};
-
-type PasskeyRow = {
-	id: string;
-	credentialID: string;
-	publicKey: string;
-	counter: number;
-	transports: string | null;
 };
 
 type FrozenSend = {
@@ -124,14 +113,6 @@ function base64url(bytes: Uint8Array): string {
 	return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
-function decodeBase64(value: string): Uint8Array<ArrayBuffer> {
-	const binary = atob(value);
-	const buffer = new ArrayBuffer(binary.length);
-	const bytes = new Uint8Array(buffer);
-	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-	return bytes;
-}
-
 function timingSafeEqual(a: string, b: string): boolean {
 	if (a.length !== b.length) return false;
 	let diff = 0;
@@ -143,15 +124,6 @@ function randomId(): string {
 	const bytes = new Uint8Array(32);
 	crypto.getRandomValues(bytes);
 	return base64url(bytes);
-}
-
-/** `base64url(sha256(id ‖ payload_hash))`. The two strings are concatenated as UTF-8. */
-export async function approvalChallenge(id: string, payloadHash: string): Promise<string> {
-	const digest = await crypto.subtle.digest(
-		"SHA-256",
-		new TextEncoder().encode(`${id}${payloadHash}`),
-	);
-	return base64url(new Uint8Array(digest));
 }
 
 /**
@@ -496,15 +468,6 @@ function renderKind(kind: string, input: RenderInput): { title: string; fields: 
 	return (renderers[kind] ?? (() => ({ title: "Solicitud", fields: [] })))(input);
 }
 
-async function listPasskeys(env: Env, userId: string): Promise<PasskeyRow[]> {
-	const result = await env.INDEX_DB.prepare(
-		"SELECT id, credentialID, publicKey, counter, transports FROM passkey WHERE userId = ?",
-	)
-		.bind(userId)
-		.all<PasskeyRow>();
-	return result.results ?? [];
-}
-
 function expiredStatus(): IntentStatus {
 	return { status: "expired", send: null, deliveryFeedback: null };
 }
@@ -565,11 +528,31 @@ export async function getIntentStatus(env: Env, id: string): Promise<IntentStatu
 	return { status: "pending", send: null, deliveryFeedback };
 }
 
+/** Kinds whose result carries a one-time secret: only the owner's web session may execute them. */
+export const WEB_ONLY_KINDS: ReadonlySet<string> = new Set([
+	"api_key_create",
+	"api_key_rotate",
+	"api_key_scopes",
+]);
+
 export async function getIntentView(
 	env: Env,
 	id: string,
 	actor: { userId: string },
 ): Promise<IntentView> {
+	return buildView(env, id, actor.userId);
+}
+
+/**
+ * The same server-rendered view for the Telegram card. There is no web session there, so
+ * control-plane fields render as the owner whose token created the intent.
+ */
+export async function getIntentCard(env: Env, id: string): Promise<IntentView> {
+	const row = await getApproval(env.INDEX_DB, id);
+	return buildView(env, id, row?.token_sub ?? null);
+}
+
+async function buildView(env: Env, id: string, userId: string | null): Promise<IntentView> {
 	const row = await getApproval(env.INDEX_DB, id);
 	const status = await getIntentStatus(env, id);
 	if (!row) {
@@ -580,13 +563,11 @@ export async function getIntentView(
 			title: "Solicitud caducada",
 			fields: [],
 			warnings: [],
-			challenge: null,
+			payloadHash: null,
 			expiresAt: null,
-			hasPasskey: false,
-			allowCredentials: [],
+			webOnly: false,
 		};
 	}
-	const passkeys = await listPasskeys(env, actor.userId).catch(() => []);
 	const frozen =
 		row.kind === "send" && row.mailbox_id && row.draft_id
 			? await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null)
@@ -602,8 +583,9 @@ export async function getIntentView(
 	const definition = controlPlaneKind(row.kind);
 	if (definition && status.status === "pending") {
 		try {
+			if (!userId) throw new AdminError("Forbidden", "forbidden", 403);
 			const data = await controlData(env, id);
-			const actorAuth = await ownerForUser(env, actor.userId);
+			const actorAuth = await ownerForUser(env, userId);
 			const payload: unknown = JSON.parse(data?.payload_json ?? "null");
 			const items = Array.isArray(payload) ? payload : [payload];
 			const parts = await Promise.all(
@@ -623,8 +605,6 @@ export async function getIntentView(
 			status.status = "stale";
 		}
 	}
-	const approvable =
-		status.status === "pending" && Boolean(row.payload_hash) && passkeys.length > 0;
 	return {
 		id: row.token,
 		kind: row.kind,
@@ -632,63 +612,29 @@ export async function getIntentView(
 		title: rendered.title,
 		fields: rendered.fields,
 		warnings,
-		challenge:
-			approvable && row.payload_hash ? await approvalChallenge(row.token, row.payload_hash) : null,
+		payloadHash: status.status === "pending" ? row.payload_hash : null,
 		expiresAt: row.expires_at,
-		hasPasskey: passkeys.length > 0,
-		allowCredentials: approvable
-			? passkeys.map((passkey) => ({
-					id: passkey.credentialID,
-					transports: (passkey.transports ?? "").split(",").filter(Boolean),
-				}))
-			: [],
+		webOnly: WEB_ONLY_KINDS.has(row.kind),
 	};
 }
 
-async function verifyPasskey(
-	env: Env,
-	userId: string,
-	origin: string,
-	challenge: string,
-	assertion: AuthenticationResponseJSON,
-): Promise<{ passkey: PasskeyRow; newCounter: number } | null> {
-	const passkeys = await listPasskeys(env, userId);
-	const passkey = passkeys.find((row) => row.credentialID === assertion.id);
-	if (!passkey) return null;
-	let verified = false;
-	let newCounter = passkey.counter;
-	try {
-		const result = await verifyAuthenticationResponse({
-			response: assertion,
-			expectedChallenge: challenge,
-			expectedOrigin: origin,
-			expectedRPID: new URL(origin).hostname,
-			requireUserVerification: true,
-			credential: {
-				id: passkey.credentialID,
-				publicKey: decodeBase64(passkey.publicKey),
-				counter: Number(passkey.counter) || 0,
-				transports: (passkey.transports ?? "")
-					.split(",")
-					.filter(Boolean) as AuthenticatorTransport[],
-			},
-		});
-		verified = result.verified;
-		newCounter = result.authenticationInfo.newCounter;
-	} catch {
-		return null;
-	}
-	if (!verified) return null;
-	return { passkey, newCounter };
-}
-
+/**
+ * Human approval of one intent.
+ *
+ * `payloadHash` is what the approver was shown (web page / Telegram button prefix is
+ * resolved to the full hash by the caller after loading the row). It must equal the stored
+ * hash, so an approval can never apply to a payload other than the one rendered. `approver`
+ * is the owner's user id on the web, or the operator's Telegram user id on Telegram; the
+ * caller is responsible for having authenticated it (owner session / operator allowlist).
+ * The agent has no code path here: nothing reachable over MCP calls this function.
+ */
 export async function approveIntent(
 	env: Env,
 	input: {
 		id: string;
-		userId: string;
-		origin: string;
-		assertion: AuthenticationResponseJSON;
+		payloadHash: string;
+		channel: ApprovalChannel;
+		approver: string;
 	},
 ): Promise<IntentStatus & { error?: string; reveal?: IntentField[] }> {
 	const row = await getApproval(env.INDEX_DB, input.id);
@@ -702,19 +648,19 @@ export async function approveIntent(
 		await recordEvent(env, row.token, "approval.expired", { kind: row.kind });
 		return { ...(await getIntentStatus(env, input.id)), error: "expired" };
 	}
+	if (!timingSafeEqual(input.payloadHash, row.payload_hash)) {
+		return { status: "stale", send: null, deliveryFeedback: null, error: "stale" };
+	}
 	// Multi-owner safety: an MCP intent is approved only by the owner whose token created it.
-	if (row.token_sub && row.token_sub !== input.userId) {
+	if (input.channel === "web" && row.token_sub && row.token_sub !== input.approver) {
 		return { ...(await getIntentStatus(env, input.id)), error: "forbidden" };
 	}
-	const passkeys = await listPasskeys(env, input.userId).catch(() => []);
-	if (passkeys.length === 0) {
-		return { ...(await getIntentStatus(env, input.id)), error: "no_passkey" };
+	if (input.channel === "telegram" && WEB_ONLY_KINDS.has(row.kind)) {
+		return { ...(await getIntentStatus(env, input.id)), error: "web_required" };
 	}
-	const challenge = await approvalChallenge(row.token, row.payload_hash);
-	const verified = await verifyPasskey(env, input.userId, input.origin, challenge, input.assertion);
-	if (!verified) {
-		return { ...(await getIntentStatus(env, input.id)), error: "invalid_assertion" };
-	}
+	// The owner a control-plane change executes as: the web approver, or, from Telegram
+	// (no web session), the owner whose token created the intent.
+	const actorUserId = input.channel === "web" ? input.approver : row.token_sub;
 	if (row.kind === "send") {
 		const frozen = await readFrozen(env, row.mailbox_id!, row.draft_id!).catch(() => null);
 		if (!frozen || frozen.stale || frozen.payloadHash !== row.payload_hash) {
@@ -725,7 +671,8 @@ export async function approveIntent(
 		if (!stored?.payload_json || !(await payloadMatches(stored.payload_json, row.payload_hash)))
 			return { status: "stale", send: null, deliveryFeedback: null, error: "stale" };
 		try {
-			const actor = await ownerForUser(env, input.userId);
+			if (!actorUserId) throw new AdminError("Forbidden", "forbidden", 403);
+			const actor = await ownerForUser(env, actorUserId);
 			const definition = controlPlaneKind(row.kind)!;
 			const parsed: unknown = JSON.parse(stored.payload_json);
 			for (const item of Array.isArray(parsed) ? parsed : [parsed])
@@ -736,27 +683,19 @@ export async function approveIntent(
 	} else {
 		return { ...(await getIntentStatus(env, input.id)), error: "unsupported_kind" };
 	}
-	const counter = await env.INDEX_DB.prepare(
-		"UPDATE passkey SET counter = ? WHERE id = ? AND counter = ?",
-	)
-		.bind(verified.newCounter, verified.passkey.id, Number(verified.passkey.counter) || 0)
-		.run();
-	if ((counter.meta?.changes ?? 0) !== 1) {
-		return { ...(await getIntentStatus(env, input.id)), error: "replay" };
-	}
 	const won = await consumeApproval(env.INDEX_DB, row.token, "approved");
 	if (!won) return getIntentStatus(env, input.id);
 	await recordEvent(env, row.token, "approval.approved", {
 		kind: row.kind,
-		method: "passkey",
+		channel: input.channel,
+		approver: input.approver,
 		payloadHash: row.payload_hash,
-		approverUserId: input.userId,
 		oauthClientId: row.oauth_client_id ?? null,
 		tokenSub: row.token_sub ?? null,
 		tokenJti: row.token_jti ?? null,
 	});
 	if (row.kind === "send") return dispatchSend(env, row);
-	return dispatchControl(env, row, input.userId);
+	return dispatchControl(env, row, actorUserId!, { channel: input.channel, approver: input.approver });
 }
 
 async function controlData(
@@ -778,6 +717,7 @@ async function dispatchControl(
 	env: Env,
 	row: ApprovalRow,
 	userId: string,
+	approval: { channel: ApprovalChannel; approver: string },
 ): Promise<IntentStatus & { reveal?: IntentField[] }> {
 	const definition = controlPlaneKind(row.kind)!;
 	const stored = await controlData(env, row.token);
@@ -804,6 +744,8 @@ async function dispatchControl(
 		token_sub: row.token_sub ?? null,
 		token_jti: row.token_jti ?? null,
 		approver_user_id: userId,
+		approval_channel: approval.channel,
+		approver: approval.approver,
 	};
 	let failed = false;
 	const reveal: IntentField[] = [];
@@ -877,7 +819,11 @@ async function dispatchSend(
 	return status.status === "sent" ? status : { ...status, status: "sent" };
 }
 
-export async function denyIntent(env: Env, id: string): Promise<IntentStatus> {
+export async function denyIntent(
+	env: Env,
+	id: string,
+	by?: { channel: ApprovalChannel; approver: string },
+): Promise<IntentStatus> {
 	const row = await getApproval(env.INDEX_DB, id);
 	if (!row) return expiredStatus();
 	if (row.consumed_at || row.decision) return getIntentStatus(env, id);
@@ -887,6 +833,10 @@ export async function denyIntent(env: Env, id: string): Promise<IntentStatus> {
 	}
 	const won = await consumeApproval(env.INDEX_DB, id, "denied");
 	if (!won) return getIntentStatus(env, id);
-	await recordEvent(env, id, "approval.denied", { kind: row.kind });
+	await recordEvent(env, id, "approval.denied", {
+		kind: row.kind,
+		channel: by?.channel ?? null,
+		approver: by?.approver ?? null,
+	});
 	return getIntentStatus(env, id);
 }

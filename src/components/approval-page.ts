@@ -11,7 +11,6 @@ export type ApprovalPageModel = {
 	status: string;
 	fields: Array<{ label: string; value: string; format?: "text" | "pre" | "list" }>;
 	warnings: Array<{ message: string }>;
-	hasPasskey: boolean;
 };
 
 const STATUS_COPY: Record<string, string> = {
@@ -56,9 +55,7 @@ export function renderApprovalPage(view: ApprovalPageModel): string {
 	const actions =
 		view.status !== "pending"
 			? ""
-			: view.hasPasskey
-				? `<button type="button">Aprobar con passkey</button><button type="button">Rechazar</button>`
-				: `<p>Para aprobar hace falta una passkey.</p><a href="/security#passkeys">Registrar una passkey</a>`;
+			: `<button type="button">Aprobar</button><button type="button">Rechazar</button>`;
 	return (
 		`<article>` +
 		`<h1>${escapeHtml(view.title)}</h1>` +

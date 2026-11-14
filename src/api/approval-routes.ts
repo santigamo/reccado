@@ -1,6 +1,4 @@
-import "../lib/reflect-polyfill";
 import type { Hono } from "hono";
-import type { AuthenticationResponseJSON } from "@simplewebauthn/server";
 import { requireAuth } from "./auth";
 import type { ApiBindings } from "./hono";
 
@@ -34,14 +32,14 @@ export function registerApprovalRoutes(api: Hono<ApiBindings>): void {
 		if (origin instanceof Response) return origin;
 		const auth = await owner(c.req.raw, c.env);
 		if (auth instanceof Response) return auth;
-		const assertion = await readAssertion(c.req.raw);
-		if (assertion instanceof Response) return assertion;
+		const payloadHash = await readPayloadHash(c.req.raw);
+		if (payloadHash instanceof Response) return payloadHash;
 		const { approveIntent } = await import("../lib/approvals");
 		const result = await approveIntent(c.env, {
 			id: c.req.param("id"),
-			userId: auth.userId,
-			origin,
-			assertion,
+			payloadHash,
+			channel: "web",
+			approver: auth.userId,
 		});
 		const status = result.error ? statusFor(result.error) : 200;
 		return json(result, status);
@@ -82,31 +80,21 @@ function sameOrigin(request: Request): string | Response {
 
 function statusFor(error: string): number {
 	if (error === "expired") return 410;
-	if (error === "invalid_assertion") return 401;
+	if (error === "forbidden") return 403;
 	return 409;
 }
 
-async function readAssertion(request: Request): Promise<AuthenticationResponseJSON | Response> {
+/** The hash the owner saw on the page; the service compares it with the stored one. */
+async function readPayloadHash(request: Request): Promise<string | Response> {
 	let body: unknown;
 	try {
 		body = await request.json();
 	} catch {
 		return json({ error: "invalid_body" }, 400);
 	}
-	const assertion = (body as { assertion?: unknown } | null)?.assertion;
-	if (!isAssertion(assertion)) return json({ error: "invalid_body" }, 400);
-	return assertion;
-}
-
-function isAssertion(value: unknown): value is AuthenticationResponseJSON {
-	if (!value || typeof value !== "object") return false;
-	const record = value as Record<string, unknown>;
-	const response = record.response;
-	return (
-		typeof record.id === "string" &&
-		typeof record.rawId === "string" &&
-		record.type === "public-key" &&
-		!!response &&
-		typeof response === "object"
-	);
+	const hash = (body as { payloadHash?: unknown } | null)?.payloadHash;
+	if (typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash)) {
+		return json({ error: "invalid_body" }, 400);
+	}
+	return hash;
 }
