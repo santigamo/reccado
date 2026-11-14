@@ -31,6 +31,13 @@ import {
 import { resolveOwnerEmails } from "./auth";
 import { authMailHeader } from "../lib/auth-mail";
 import { DEFAULT_MCP_SCOPES, MCP_SCOPES } from "../lib/mcp-scopes";
+import {
+	REGISTRATION_PATH_SUFFIX,
+	REGISTRATION_RATE_LIMIT,
+	checkRegistrationBody,
+	sha256Hex,
+} from "../lib/oauth-client-hygiene";
+import { notifyClientConnected } from "../telegram/client-connected";
 
 /** The path better-auth mounts under in the worker (server.ts proxies /api/* to the Hono app). */
 export const AUTH_BASE_PATH = "/api/auth";
@@ -102,6 +109,89 @@ async function recordMcpClient(db: D1Database, clientId: string): Promise<void> 
 		)
 		.bind(id, clientId, new Date().toISOString())
 		.run();
+}
+
+async function recordClientRegistered(
+	env: AuthEnv,
+	request: Request,
+	response: Response,
+	redirectHosts: string[],
+): Promise<void> {
+	try {
+		const body = (await response.clone().json()) as { client_id?: string; client_name?: string };
+		if (!body.client_id) return;
+		const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+		await insertOpsEvent(env.INDEX_DB, {
+			id: crypto.randomUUID(),
+			event_type: "mcp.client_registered",
+			severity: "info",
+			subject: body.client_id,
+			payload_json: JSON.stringify({
+				client_id: body.client_id,
+				client_name: body.client_name ?? null,
+				redirect_hosts: redirectHosts,
+				ip_hash: (await sha256Hex(ip)).slice(0, 16),
+			}),
+		});
+	} catch (error) {
+		console.warn("mcp.client_registered.record_failed", error instanceof Error ? error.message : error);
+	}
+}
+
+/** Reads the consent POST (already scope-constrained) and says whether this client has never been consented. */
+async function detectFirstConsent(
+	env: AuthEnv,
+	request: Request,
+): Promise<{ clientId: string; scopes: string[] } | null> {
+	try {
+		const body = (await request.clone().json()) as { accept?: unknown; scope?: unknown; oauth_query?: unknown };
+		if (body.accept !== true) return null;
+		const clientId = new URLSearchParams(typeof body.oauth_query === "string" ? body.oauth_query : "").get("client_id");
+		if (!clientId) return null;
+		const existing = await env.INDEX_DB.prepare(`SELECT 1 AS n FROM "oauthConsent" WHERE "clientId" = ? LIMIT 1`)
+			.bind(clientId)
+			.first();
+		if (existing) return null;
+		const scopes = typeof body.scope === "string" ? body.scope.split(/\s+/).filter(Boolean) : [];
+		return { clientId, scopes };
+	} catch {
+		return null;
+	}
+}
+
+async function announceFirstConsent(
+	env: AuthEnv,
+	first: { clientId: string; scopes: string[] },
+): Promise<void> {
+	try {
+		const row = await env.INDEX_DB.prepare(`SELECT "name", "redirectUris" FROM "oauthClient" WHERE "clientId" = ?`)
+			.bind(first.clientId)
+			.first<{ name: string | null; redirectUris: string | null }>();
+		let uris: unknown = [];
+		try {
+			uris = JSON.parse(row?.redirectUris ?? "[]");
+		} catch {
+			uris = String(row?.redirectUris ?? "").split(",");
+		}
+		const redirectHosts = [
+			...new Set(
+				(Array.isArray(uris) ? uris : []).flatMap((u) => {
+					try {
+						return [new URL(String(u)).host];
+					} catch {
+						return [];
+					}
+				}),
+			),
+		];
+		await notifyClientConnected(env as Env, {
+			clientName: row?.name || first.clientId,
+			redirectHosts,
+			scopes: first.scopes,
+		});
+	} catch (error) {
+		console.warn("mcp.first_consent.notify_failed", error instanceof Error ? error.message : error);
+	}
 }
 
 /** Thrown by createAuth when the issuer cannot run at all; handleAuthRequest maps it to 503. */
@@ -209,6 +299,9 @@ export async function createAuth(
 		rateLimit: {
 			enabled: true,
 			storage: "database",
+			// Open DCR (below): cap anonymous client registrations per IP. Counted in
+			// D1 by better-auth, so the limit holds across isolates.
+			customRules: { [REGISTRATION_PATH_SUFFIX]: { ...REGISTRATION_RATE_LIMIT } },
 		},
 		plugins: [
 			emailOTP({
@@ -256,10 +349,14 @@ export async function createAuth(
 				loginPage: "/login",
 				// The owner reviews client identity and requested permissions here.
 				consentPage: "/consent",
-				// Session-backed dynamic client registration (RFC 7591): a request with
-				// no owner session is rejected (allowUnauthenticatedClientRegistration
-				// stays false), so a stranger cannot mint client rows. The single
-				// operator registers their MCP client while logged in to the dashboard.
+				// Open dynamic client registration (RFC 7591), the standard way a hosted MCP
+				// server is connected: the client is added by URL, discovers the metadata and
+				// registers itself. Registering grants nothing -- the owner still has to log in
+				// (owner registry + e-mail OTP) and consent per client and scope. Hardening is
+				// in handleAuthRequest (redirect-URI/name validation, ops event), the per-IP
+				// rate limit above and the hourly sweep of never-consented clients
+				// (src/lib/oauth-client-hygiene.ts).
+				allowUnauthenticatedClientRegistration: true,
 				allowDynamicClientRegistration: true,
 				// The owner gate consumes the token's email; the provider's fixed
 				// access-token claims carry only sub/aud/scope, so add the identity here.
@@ -471,8 +568,43 @@ export async function handleAuthRequest(
 			url.searchParams.set("scope", DEFAULT_MCP_SCOPES.join(" "));
 			authRequest = new Request(url, request);
 		}
+		let registrationHosts: string[] = [];
+		if (url.pathname === `${AUTH_BASE_PATH}${REGISTRATION_PATH_SUFFIX}` && request.method === "POST") {
+			let raw: unknown = null;
+			try {
+				raw = await request.clone().json();
+			} catch {
+				// falls through to the validation error below
+			}
+			const checked = checkRegistrationBody(raw);
+			if (!checked.ok) {
+				return Response.json(
+					{ error: checked.error, error_description: checked.description },
+					{ status: 400, headers: { "cache-control": "no-store" } },
+				);
+			}
+			registrationHosts = checked.redirectHosts;
+			const headers = new Headers(request.headers);
+			headers.delete("content-length");
+			authRequest = new Request(request.url, {
+				method: "POST",
+				headers,
+				body: JSON.stringify(checked.body),
+			});
+		}
+		// First-consent detection must read the state BEFORE the consent is stored.
+		let firstConsent: { clientId: string; scopes: string[] } | null = null;
+		if (url.pathname === CONSENT_PATH && request.method === "POST") {
+			firstConsent = await detectFirstConsent(env, authRequest);
+		}
 		const auth = await createAuth(env, { request: authRequest, mailSender: opts.mailSender });
 		const response = await auth.handler(authRequest);
+		if (registrationHosts.length > 0 && response.status === 201) {
+			await recordClientRegistered(env, request, response, registrationHosts);
+		}
+		if (firstConsent && response.ok) {
+			await announceFirstConsent(env, firstConsent);
+		}
 		const clientId = url.searchParams.get("client_id");
 		if (
 			clientId &&
