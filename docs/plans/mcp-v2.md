@@ -1,6 +1,6 @@
 # MCP v2 — a full-capability, spec-native MCP server
 
-Status: **in progress** (integration branch `feat/mcp-v2`) · Owner: Santi · Created: 2026-11-11 · Last updated: 2026-11-11
+Status: **in progress** (integration branch `feat/mcp-v2`) · Owner: Santi · Created: 2026-11-11 · Last updated: 2026-11-14
 
 Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test values:
 `PHASE0_DEBUG_TOKEN`, `MAILBOX_JURISDICTION=none`, a fake `TRANSACTIONAL_API_KEY_PEPPER`, and
@@ -123,6 +123,8 @@ alias is reversible, but mail bounced meanwhile is lost forever).
 (itself tier 2). No new soft-delete columns.
 
 ### 2.5 Approvals (one table, two authorities, one surface)
+
+> **Superseded in part 2026-11-14:** passkey approval/step-up was removed; see "2026-11-14 decision" before the decision log.
 - **Send authority stays in the mailbox DO**: the intent is the existing `request-send` state.
   The DO stores a **frozen snapshot** of the message (recipients, headers, body, attachments by
   content hash) and its `payload_hash`. Sending uses the snapshot, never the live draft, and
@@ -283,6 +285,8 @@ Each phase ends with the AGENTS.md handoff block, evidence against `reccado-dev`
       route does; labels are not a message action today (dropped from the tool).
 
 ### P4 — Approvals, passkey, send
+
+> **Superseded in part 2026-11-14:** passkey approval/step-up was removed; see "2026-11-14 decision" before the decision log.
 - [x] Migration `0022_approvals.sql`: `telegram_actions` → `approvals` (+ `kind`,
       `payload_hash`, `consumed_at`, `origin`); Telegram flows unchanged. (T5, merged)
       Deploy note: Telegram Send buttons / pending sends created before 0022 have no hash and
