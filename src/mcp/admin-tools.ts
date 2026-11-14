@@ -178,7 +178,7 @@ async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: Inte
 
 function register(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, tool: string, description: string, kinds: string[], opSchema: z.ZodType, resolve: (params: Record<string, unknown>) => Resolved) {
 	server.registerTool(tool, {
-		description: `${description} Returns a pending approval, or the executed result once approved. Re-call with intentId to check status.`,
+		description: `${description} Returns a pending approval, or the executed result once approved. Re-call with intentId to check status. A delegated client (no mail read scope) with an owner-set policy gets eligible low-risk changes applied immediately (status "applied"); otherwise pending, with autoApplyRefused explaining a failed policy check.`,
 		inputSchema: opSchema as z.ZodObject,
 		outputSchema: z.record(z.string(), z.unknown()),
 		annotations: ANNOTATIONS,

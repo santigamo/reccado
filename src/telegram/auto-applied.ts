@@ -49,9 +49,9 @@ export async function notifyAutoApplied(
 
 async function snapshotRefs(env: Env, intentId: string): Promise<SnapshotRef[]> {
 	const rows = await env.INDEX_DB.prepare(
-		"SELECT id, payload_json FROM ops_events WHERE event_type = 'admin.auto_applied' AND id LIKE ? ORDER BY id",
+		"SELECT id, payload_json FROM ops_events WHERE event_type = 'admin.auto_applied' AND substr(id, 1, ?) = ? ORDER BY id",
 	)
-		.bind(`auto_applied:${intentId}:%`)
+		.bind(`auto_applied:${intentId}:`.length, `auto_applied:${intentId}:`)
 		.all<{ id: string; payload_json: string }>();
 	const refs: SnapshotRef[] = [];
 	for (const row of rows.results ?? []) {
