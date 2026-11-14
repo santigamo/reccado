@@ -70,13 +70,47 @@ export function formatAgo(thenMs: number, nowMs: number = Date.now()): string {
 /** Plain-Spanish risk line shown next to each high-risk scope's checkbox. */
 const HIGH_RISK_LINES: Record<string, string> = {
 	"mail:send":
-		"Permite pedir envíos de correo en tu nombre. Cada envío sigue necesitando tu aprobación en Telegram o en la página de aprobación, pero el cliente podrá redactar y proponer mensajes sin límite.",
+		"Permite pedir envíos de correo en tu nombre. Cada envío sigue necesitando tu aprobación en la página de aprobación, pero el cliente podrá redactar y proponer mensajes sin límite.",
 	"mail:read:sensitive":
 		"Expone códigos de verificación y enlaces de restablecimiento de contraseña de tus otros servicios que lleguen a tus buzones. Los correos de autenticación de esta instancia nunca se exponen.",
-	admin:
-		"Permite proponer cambios de configuración: dominios, buzones, alias, reglas, plantillas y claves de API. Cada cambio sigue necesitando tu aprobación en Telegram o en la página de aprobación.",
+	"keys:write":
+		"Permite crear, rotar, revocar y cambiar los permisos de claves de API. Crear o rotar una clave necesita tu aprobación; el secreto solo lo ves tú.",
+	"routing:write":
+		"Permite crear alias y reglas de enrutado, incluido reenviar correo a direcciones externas (esto último necesita tu aprobación).",
+	"domains:write":
+		"Permite añadir, configurar y desactivar dominios. Añadir, provisionar o desactivar un dominio necesita tu aprobación.",
 };
 const HIGH_RISK_SCOPES: ReadonlySet<string> = new Set(Object.keys(HIGH_RISK_LINES));
+
+/** Plain-Spanish description of every scope, and the group it is shown under. */
+const SCOPE_DESCRIPTIONS: Record<string, string> = {
+	"mail:read": "Leer mensajes y buscar en los buzones.",
+	"mail:draft": "Crear y editar borradores, y organizar mensajes (leído, archivar, papelera).",
+	"mail:send": "Solicitar el envío de mensajes, sujeto a tu aprobación.",
+	"mail:read:sensitive": "Leer códigos de verificación y enlaces sensibles de otros servicios.",
+	"config:read": "Ver el estado del servicio, eventos y la configuración (sin secretos).",
+	"mailboxes:write": "Crear, renombrar y desactivar buzones.",
+	"templates:write": "Crear, editar y archivar plantillas de correo transaccional.",
+	"routing:write": "Gestionar alias y reglas de enrutado.",
+	"domains:write": "Gestionar dominios.",
+	"keys:write": "Gestionar claves de API transaccionales.",
+	"suppressions:write": "Quitar direcciones de la lista de supresión (necesita tu aprobación).",
+};
+const SCOPE_GROUPS: ReadonlyArray<{ title: string; scopes: readonly string[] }> = [
+	{ title: "Correo", scopes: ["mail:read", "mail:read:sensitive", "mail:draft", "mail:send"] },
+	{
+		title: "Configuración",
+		scopes: [
+			"config:read",
+			"mailboxes:write",
+			"templates:write",
+			"routing:write",
+			"domains:write",
+			"keys:write",
+			"suppressions:write",
+		],
+	},
+];
 
 export const Route = createFileRoute("/consent")({
 	validateSearch: (
@@ -143,13 +177,7 @@ function ConsentPage(): ReactElement {
 		["claude.ai", "anthropic.com", "localhost", "127.0.0.1", "[::1]"].some(
 			(host) => redirectName === host || redirectName.endsWith(`.${host}`),
 		);
-	const descriptions: Record<string, string> = {
-		"mail:read": "Leer mensajes y buscar en el buzón.",
-		"mail:draft": "Crear y editar borradores.",
-		"mail:send": "Solicitar el envío de mensajes, sujeto a confirmación humana.",
-		"mail:read:sensitive": "Leer el contenido sensible y los archivos adjuntos.",
-		admin: "Administrar la configuración y los recursos de Reccado.",
-	};
+	const descriptions = SCOPE_DESCRIPTIONS;
 
 	async function respond(accept: boolean): Promise<void> {
 		setBusy(true);
@@ -216,17 +244,33 @@ function ConsentPage(): ReactElement {
 
 				{scopes.length > 0 && (
 					<div className="mb-6">
-						<p className="mb-2 text-sm text-[var(--sea-ink-soft)]">Requested access</p>
-						<ul className="flex flex-wrap gap-2">
-							{scopes.map((s) => (
-								<li
-									key={s}
-									className="rounded-full border border-[rgba(50,143,151,0.3)] bg-[rgba(79,184,178,0.14)] px-3 py-1 font-mono text-xs text-[var(--lagoon-deep)]"
-								>
-									{s}: {descriptions[s] ?? "Permiso desconocido; revisa antes de aprobar."}
-								</li>
+						<p className="mb-2 text-sm text-[var(--sea-ink-soft)]">Acceso solicitado</p>
+						{[
+							...SCOPE_GROUPS.map((g) => ({
+								title: g.title,
+								items: scopes.filter((s) => g.scopes.includes(s)),
+							})),
+							{
+								title: "Otros",
+								items: scopes.filter((s) => !SCOPE_GROUPS.some((g) => g.scopes.includes(s))),
+							},
+						]
+							.filter((g) => g.items.length > 0)
+							.map((g) => (
+								<div key={g.title} className="mb-3">
+									<p className="mb-1 text-xs font-semibold uppercase">{g.title}</p>
+									<ul className="flex flex-wrap gap-2">
+										{g.items.map((s) => (
+											<li
+												key={s}
+												className="rounded-full border border-[rgba(50,143,151,0.3)] bg-[rgba(79,184,178,0.14)] px-3 py-1 font-mono text-xs text-[var(--lagoon-deep)]"
+											>
+												{s}: {descriptions[s] ?? "Permiso desconocido; revisa antes de aprobar."}
+											</li>
+										))}
+									</ul>
+								</div>
 							))}
-						</ul>
 					</div>
 				)}
 

@@ -5,10 +5,11 @@ import { insertOpsEvent } from "../db/d1";
 import { AdminError } from "../lib/admin/errors";
 import { McpMailboxFacade } from "./mailbox-facade";
 import { mcpToolError, mcpToolResultJson } from "./errors";
-import { assertScope, McpScopeError, type McpAuthContext } from "./scopes";
+import { assertScope, McpScopeError, scopeFilteredServer, type McpAuthContext } from "./scopes";
 import * as adminReads from "./admin-reads";
 import { registerAdminTools } from "./admin-tools";
 import { registerSendTool } from "./send-tool";
+import { TOOL_SCOPES } from "../lib/mcp-scopes";
 import type { IntentFlow } from "./intent-flow";
 
 type RateLimitMap = Map<string, number>;
@@ -82,11 +83,7 @@ async function auditMcpCall(
 			subject: auth.email,
 			payload_json: JSON.stringify({
 				tool: toolName,
-				scope: ["save_draft", "cancel_draft", "update_messages"].includes(toolName)
-					? "mail:draft"
-					: ["get_health", "list_ops", "list_config"].includes(toolName)
-						? "admin"
-						: "mail:read",
+				scope: TOOL_SCOPES[toolName] ?? "mail:read",
 				mailbox_id: mailboxId,
 				result_count: details.result_count ?? null,
 				latency_ms: details.latency_ms ?? null,
@@ -100,12 +97,13 @@ async function auditMcpCall(
 }
 
 export function registerTools(
-	server: McpServer,
+	rawServer: McpServer,
 	env: Env,
 	auth: McpAuthContext,
 	origin: string,
 	flow?: IntentFlow,
 ): void {
+	const server = scopeFilteredServer(rawServer, auth);
 	const facade = new McpMailboxFacade(env, auth);
 	async function denied(tool: string, mailboxId: string | null, scope: string, start: number) {
 		try {
@@ -171,7 +169,7 @@ export function registerTools(
 					}),
 				),
 			}),
-			annotations: { readOnlyHint: true },
+			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		async () => {
 			const start = Date.now();
@@ -246,7 +244,7 @@ export function registerTools(
 					}),
 				),
 			}),
-			annotations: { readOnlyHint: true },
+			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
 		},
 		async (params) => {
 			const start = Date.now();
@@ -310,7 +308,7 @@ export function registerTools(
 					}),
 				),
 			}),
-			annotations: { readOnlyHint: true },
+			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
 		},
 		async (params) => {
 			const start = Date.now();
@@ -393,7 +391,7 @@ export function registerTools(
 					),
 				}),
 			}),
-			annotations: { readOnlyHint: true },
+			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
 		},
 		async (params) => {
 			const start = Date.now();
@@ -446,7 +444,7 @@ export function registerTools(
 				messages: z.array(z.record(z.string(), z.unknown())),
 				warning: z.string(),
 			}),
-			annotations: { readOnlyHint: true },
+			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
 		},
 		async (params) => {
 			const result = await runTool("read_thread", "mail:read", params.mailboxId, async () => ({
@@ -502,7 +500,7 @@ export function registerTools(
 					duplicate: z.boolean(),
 				}),
 			}),
-			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 		},
 		async (params) => {
 			const start = Date.now();
@@ -555,7 +553,7 @@ export function registerTools(
 			description: "Cancel a draft. This never sends email.",
 			inputSchema: z.object({ mailboxId: z.string().min(1), draftId: z.string().min(1) }),
 			outputSchema: z.object({ draft_id: z.string(), status: z.string() }),
-			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
 		},
 		async (params) =>
 			runTool("cancel_draft", "mail:draft", params.mailboxId, () =>
@@ -574,7 +572,7 @@ export function registerTools(
 				action: z.enum(["mark_read", "mark_unread", "archive", "restore_inbox", "trash"]),
 			}),
 			outputSchema: z.object({ message_ids: z.array(z.string()), action: z.string() }),
-			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
 		},
 		async (params) =>
 			runTool("update_messages", "mail:draft", params.mailboxId, () =>
@@ -588,9 +586,9 @@ export function registerTools(
 			description: "Read service health, including sending feedback liveness.",
 			inputSchema: z.object({}),
 			outputSchema: z.record(z.string(), z.unknown()),
-			annotations: { readOnlyHint: true },
+			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
 		},
-		async () => runTool("get_health", "admin", null, () => adminReads.health(env, auth, origin)),
+		async () => runTool("get_health", "config:read", null, () => adminReads.health(env, auth, origin)),
 	);
 	server.registerTool(
 		"list_ops",
@@ -604,10 +602,10 @@ export function registerTools(
 				offset: z.number().int().min(0).default(0),
 			}),
 			outputSchema: z.record(z.string(), z.unknown()),
-			annotations: { readOnlyHint: true },
+			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
 		},
 		async (params) =>
-			runTool("list_ops", "admin", params.mailboxId ?? null, () =>
+			runTool("list_ops", "config:read", params.mailboxId ?? null, () =>
 				adminReads.operations(env, auth, {
 					kind: params.kind ?? "events",
 					mailboxId: params.mailboxId,
@@ -624,9 +622,9 @@ export function registerTools(
 				"Read domains, mailboxes, aliases, rules, templates and API key metadata without secrets.",
 			inputSchema: z.object({}),
 			outputSchema: z.record(z.string(), z.unknown()),
-			annotations: { readOnlyHint: true },
+			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
 		},
-		async () => runTool("list_config", "admin", null, () => adminReads.config(env, auth)),
+		async () => runTool("list_config", "config:read", null, () => adminReads.config(env, auth)),
 	);
 	registerSendTool(server, env, auth, origin, flow);
 	registerAdminTools(server, env, auth, origin, flow);

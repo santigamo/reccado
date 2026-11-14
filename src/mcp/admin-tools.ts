@@ -5,7 +5,8 @@ import { requestControlPlaneChange } from "../lib/control-plane-intents";
 import { notifyIntentCreated } from "../telegram/notify";
 import { mcpToolError, mcpToolResultJson } from "./errors";
 import { intentResponse, resolveIntentRetry, type IntentFlow } from "./intent-flow";
-import { assertScope } from "./scopes";
+import { RESTORE_SCOPES, TOOL_SCOPES } from "../lib/mcp-scopes";
+import { assertScope, scopeFilteredServer } from "./scopes";
 import type { McpSendAuth } from "./types";
 
 const RATE_LIMIT = 10;
@@ -89,7 +90,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 };
 
 const ANNOTATIONS = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } as const;
-const ERRORS = /^(insufficient_scope: admin|rate_limited|too_many_pending_approvals|not_found|invalid_request_state|intent_stale|validation_error|tool_unavailable|invalid_origin)/;
+const ERRORS = /^(insufficient_scope: [a-z:]+|rate_limited|too_many_pending_approvals|not_found|invalid_request_state|intent_stale|validation_error|tool_unavailable|invalid_origin)/;
 
 /** Drop anything that looks like a secret before the agent sees it. */
 export function stripSecrets(value: unknown): unknown {
@@ -124,8 +125,42 @@ function resolveOp(tool: string, params: Record<string, unknown>): Resolved {
 	return { kind: entry.kind, payload: out };
 }
 
+const SNAPSHOT_SCOPES: Record<string, string> = {
+	mailbox: "mailboxes:write",
+	domain: "domains:write",
+	alias: "routing:write",
+	routing_rule: "routing:write",
+	template: "templates:write",
+};
+
+/** Write scope for the resource a before-snapshot recorded; null when the snapshot is unknown (the kind reports that itself). */
+export async function restoreScopeFor(env: Env, opsEventId: string): Promise<string | null> {
+	const row = await env.INDEX_DB.prepare("SELECT payload_json FROM ops_events WHERE id = ? AND event_type = 'admin.before_snapshot'")
+		.bind(opsEventId)
+		.first<{ payload_json: string }>();
+	if (!row) return null;
+	try {
+		const snap = JSON.parse(row.payload_json) as { entity?: string; mailbox_id?: unknown };
+		// Snapshots written before `entity` existed are mailbox rows.
+		const entity = snap.entity ?? (typeof snap.mailbox_id === "string" ? "mailbox" : undefined);
+		return (entity && SNAPSHOT_SCOPES[entity]) || null;
+	} catch {
+		return null;
+	}
+}
+
 async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, ctx: ServerContext | undefined, tool: string, params: Record<string, unknown>, resolve: () => Resolved, kinds: string[], audit: { intentId?: string }) {
-	assertScope(auth, "admin");
+	if (tool === "restore") {
+		const held = RESTORE_SCOPES.find((scope) => auth.scopes.has(scope));
+		if (!held) assertScope(auth, RESTORE_SCOPES[0]!);
+		// The snapshot's own resource decides which write scope is needed.
+		if (typeof params.opsEventId === "string") {
+			const needed = await restoreScopeFor(env, params.opsEventId);
+			if (needed) assertScope(auth, needed);
+		}
+	} else {
+		assertScope(auth, TOOL_SCOPES[tool] ?? "admin");
+	}
 	const key = `${auth.email}:${tool}:${Math.floor(Date.now() / 60000)}`;
 	const count = rates.get(key) ?? 0;
 	if (count >= RATE_LIMIT) throw new Error("rate_limited");
@@ -182,12 +217,13 @@ function register(server: McpServer, env: Env, auth: McpSendAuth, origin: string
 			reason = ERRORS.test(message) ? message : "internal_error";
 			return mcpToolError(reason);
 		} finally {
-			await insertOpsEvent(env.INDEX_DB, { id: crypto.randomUUID(), event_type: "mcp.tool_call", severity: reason ? "warning" : "info", subject: auth.email, payload_json: JSON.stringify({ tool, scope: "admin", intent_id: audit.intentId ?? null, denied: Boolean(reason), reason: reason ?? null, latency_ms: Date.now() - start }) }).catch(() => undefined);
+			await insertOpsEvent(env.INDEX_DB, { id: crypto.randomUUID(), event_type: "mcp.tool_call", severity: reason ? "warning" : "info", subject: auth.email, payload_json: JSON.stringify({ tool, scope: tool === "restore" ? (RESTORE_SCOPES.find((scope) => auth.scopes.has(scope)) ?? RESTORE_SCOPES[0]) : (TOOL_SCOPES[tool] ?? null), intent_id: audit.intentId ?? null, denied: Boolean(reason), reason: reason ?? null, latency_ms: Date.now() - start }) }).catch(() => undefined);
 		}
 	});
 }
 
-export function registerAdminTools(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow?: IntentFlow) {
+export function registerAdminTools(rawServer: McpServer, env: Env, auth: McpSendAuth, origin: string, flow?: IntentFlow) {
+	const server = scopeFilteredServer(rawServer, auth);
 	for (const [tool, def] of Object.entries(TOOLS)) {
 		const kinds = Object.values(def.actions).map((a) => a.kind);
 		const actions = Object.keys(def.actions);

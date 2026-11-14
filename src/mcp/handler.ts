@@ -6,7 +6,7 @@ import { recordDeploymentOrigin } from "../db/runtime-config";
 import { requireMcpOwner, resolveOwnerEmails } from "./auth-import";
 import { registerTools } from "./tools";
 import { registerResources } from "./resources";
-import { scopesFromClaims } from "../lib/mcp-scopes";
+import { insufficientScope, neededScopeFor, scopesFromClaims, toolPermitted } from "../lib/mcp-scopes";
 import type { McpSendAuth as McpAuthContext } from "./types";
 import { makeIntentCodec } from "./intent-flow";
 
@@ -21,6 +21,25 @@ type McpAccessTokenClaims = {
 	scope?: unknown;
 	[key: string]: unknown;
 };
+
+/** The scope a JSON-RPC `tools/call` needs but the token lacks, or null when the call is fine / not a tool call. */
+export async function missingScopeForToolCall(request: Request, granted: ReadonlySet<string>): Promise<string | null> {
+	if (request.method !== "POST") return null;
+	let body: unknown;
+	try {
+		body = await request.clone().json();
+	} catch {
+		return null;
+	}
+	for (const message of Array.isArray(body) ? body : [body]) {
+		if (!message || typeof message !== "object") continue;
+		const { method, params } = message as { method?: unknown; params?: { name?: unknown } };
+		if (method !== "tools/call" || typeof params?.name !== "string") continue;
+		const needed = neededScopeFor(params.name);
+		if (needed && !toolPermitted(granted, params.name)) return needed;
+	}
+	return null;
+}
 
 /** The SDK's validated serving era, available inside its per-request factory. */
 export function isLegacyMcpRequest(context: McpRequestContext): boolean {
@@ -160,6 +179,12 @@ export async function mcpHandler(
 			} catch {
 				// No execution context to defer onto; the next request will record it.
 			}
+
+			// A tool call the token's scopes do not permit (e.g. from a stale
+			// tools/list, or an old `admin` token) gets the spec insufficient_scope
+			// challenge naming the exact scope, instead of "unknown tool".
+			const blocked = await missingScopeForToolCall(req, ownerAuth.scopes);
+			if (blocked) return insufficientScope(blocked, `${new URL(resource).origin}/.well-known/oauth-protected-resource/mcp`);
 
 			return runMcpServer(req, env, ctx, ownerAuth);
 		},

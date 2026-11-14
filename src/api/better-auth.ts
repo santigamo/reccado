@@ -30,7 +30,7 @@ import {
 } from "../lib/better-auth";
 import { resolveOwnerEmails } from "./auth";
 import { authMailHeader } from "../lib/auth-mail";
-import { DEFAULT_MCP_SCOPES, MCP_SCOPES } from "../lib/mcp-scopes";
+import { DEFAULT_MCP_SCOPES, HIGH_RISK_MCP_SCOPES, MCP_SCOPES } from "../lib/mcp-scopes";
 import {
 	REGISTRATION_PATH_SUFFIX,
 	REGISTRATION_RATE_LIMIT,
@@ -492,12 +492,12 @@ function serializeSessionCookie(
 
 const CONSENT_PATH = `${AUTH_BASE_PATH}/oauth2/consent`;
 /** Scopes that are only ever granted when the consent POST lists them explicitly. */
-const HIGH_RISK_CONSENT_SCOPES: ReadonlySet<string> = new Set(["mail:send", "mail:read:sensitive", "admin"]);
+const HIGH_RISK_CONSENT_SCOPES: ReadonlySet<string> = HIGH_RISK_MCP_SCOPES;
 
 /**
  * Better Auth grants every originally requested scope when the consent body has
  * no `scope`. Narrow that here: high-risk scopes survive only when the body
- * names them, so a bare/forged accept can never grant admin, send or sensitive.
+ * names them, so a bare/forged accept can never grant send, sensitive reads, key, routing or domain scopes.
  */
 export async function constrainConsentScopes(request: Request): Promise<Request> {
 	let body: { accept?: unknown; scope?: unknown; oauth_query?: unknown };

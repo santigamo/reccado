@@ -127,10 +127,10 @@ async function handlerFor(tool: string, auth: Record<string, unknown>, era: "leg
 	const server = new McpServer({ name: "test", version: "1" }, { requestState: { verify: codec.verify } });
 	registerTools(server, env as Env, auth as never, ORIGIN, { era, codec });
 	const registered = (server as unknown as { _registeredTools: Record<string, { handler: Handler; annotations?: Record<string, unknown> }> })._registeredTools;
-	return { handler: registered[tool]!.handler, registered, codec };
+	return { handler: registered[tool]?.handler as Handler, registered, codec };
 }
 const context = (state?: unknown) => ({ mcpReq: { requestState: () => state } }) as unknown as ServerContext;
-const ADMIN = ["mail:read", "admin"];
+const ADMIN = ["mail:read", "mailboxes:write", "templates:write", "routing:write", "domains:write", "keys:write", "suppressions:write"];
 const approvals = async () => (await db.prepare("SELECT COUNT(*) AS n FROM approvals").first<{ n: number }>())!.n;
 
 async function approveWeb(intentId: string, owner: { userId: string }) {
@@ -151,13 +151,11 @@ describe("mcp admin tools", () => {
 		expect((registered.manage_api_key as unknown as { description: string }).description).toContain("never returned here");
 	});
 
-	it("denies without the admin scope and creates no intent", async () => {
-		const auth = { userId: "u", email: "noscope@example.com", scopes: new Set(["mail:read"]) };
-		const before = await approvals();
-		const { handler } = await handlerFor("manage_mailbox", auth, "legacy");
-		const result = await handler({ action: "disable", mailboxId: "x" }, context());
-		expect(JSON.stringify(result)).toContain("insufficient_scope: admin");
-		expect(await approvals()).toBe(before);
+	it("does not register a tool whose scope is missing, so no intent can be created", async () => {
+		const auth = { userId: "u", email: "noscope@example.com", scopes: new Set(["mail:read", "admin"]) };
+		const { registered } = await handlerFor("manage_mailbox", auth, "legacy");
+		expect(registered.manage_mailbox).toBeUndefined();
+		expect(registered.manage_domain).toBeUndefined();
 	});
 
 	it("rejects invalid actions and fields without creating an intent", async () => {
@@ -314,6 +312,31 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		expect(await db.prepare("SELECT status FROM domains WHERE id = ?").bind(domain!.id).first()).toEqual({ status: "active" });
 		const again = await call("restore", { opsEventId: snap!.id });
 		expect(again.content).toMatchObject({ status: "failed", error: "snapshot_consumed" });
+	});
+
+	it("restore requires the write scope of the snapshot's resource", async () => {
+		const expected: Record<string, string> = {
+			mailbox: "mailboxes:write",
+			domain: "domains:write",
+			alias: "routing:write",
+			routing_rule: "routing:write",
+			template: "templates:write",
+		};
+		const all = ["mailboxes:write", "domains:write", "routing:write", "templates:write"];
+		for (const [entity, needed] of Object.entries(expected)) {
+			const id = `scope-snap-${entity}`;
+			await db.prepare("INSERT INTO ops_events (id, event_type, severity, subject, payload_json, created_at) VALUES (?, 'admin.before_snapshot', 'info', ?, ?, datetime('now'))")
+				.bind(id, `subj-${entity}`, JSON.stringify({ entity, by: "someone@example.com" }))
+				.run();
+			// Holding every write scope except the matching one is refused with the exact scope.
+			const lacking = { ...auth, scopes: new Set(all.filter((scope) => scope !== needed)) };
+			const denied = await (await handlerFor("restore", lacking, "legacy")).handler({ opsEventId: id }, context());
+			expect(JSON.stringify(denied), entity).toContain(`insufficient_scope: ${needed}`);
+			// With the matching scope the scope gate passes (the kind then fails on foreign ownership, not scope).
+			const held = { ...auth, scopes: new Set([needed]) };
+			const passed = await (await handlerFor("restore", held, "legacy")).handler({ opsEventId: id }, context());
+			expect(JSON.stringify(passed), entity).not.toContain("insufficient_scope");
+		}
 	});
 
 	it("reconcile_stale accepts an empty payload", async () => {
