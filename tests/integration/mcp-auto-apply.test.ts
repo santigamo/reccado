@@ -3,6 +3,8 @@ import { McpServer, type ServerContext } from "@modelcontextprotocol/server";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { handleAuthRequest } from "#/api/better-auth";
 import { insertMailbox } from "#/db/d1";
+import { getIntentView } from "#/lib/approvals";
+import { createKey, listKeys } from "#/lib/admin/api-keys";
 import { requestControlPlaneChange } from "#/lib/control-plane-intents";
 import { upsertClientPolicy } from "#/lib/mcp-client-policy";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
@@ -231,5 +233,67 @@ describe("delegated auto-apply", () => {
 		const r = await requestControlPlaneChange(env, auth(), "template_upsert", tpl("foreign", "<p>x</p>"), principal(DELEGATED, "foreign-client"));
 		expect(r.applied).toBeUndefined();
 		expect(r.autoApplyRefused).toMatch(/another owner/);
+	});
+
+	describe("api keys", () => {
+		const keys = async () =>
+			((await listKeys(env, auth(), { mailboxId: MBX })).value as { keys: Array<{ keyId: string; status: string; templateAllowlist?: string[] }> }).keys;
+		let keyId = "";
+		const keyPolicy = () => setPolicy({ autoKinds: ["api_key_templates", "api_key_revoke"] });
+
+		it("setup: a key allowed to use 'welcome'", async () => {
+			await createKey(env, auth(), {
+				mailboxId: MBX,
+				body: { environment: "live", sender: `${MBX}@auto.example`, scopes: ["transactional:send", "transactional:templates:use"], templateAllowlist: ["welcome"], recipientPolicy: "someone@example.net" },
+			});
+			keyId = (await keys()).find((k) => k.status === "active")!.keyId;
+		});
+
+		it("api_key_templates is pending for a token that can read mail", async () => {
+			await keyPolicy();
+			const r = await requestControlPlaneChange(env, auth(), "api_key_templates", { mailboxId: MBX, keyId, add: ["reset"] }, principal(["admin", "mail:read"]));
+			expect(r.applied).toBeUndefined();
+			expect((await keys()).find((k) => k.keyId === keyId)?.templateAllowlist).toEqual(["welcome"]);
+			expect(await approvalRow(r.id)).toMatchObject({ decision: null, approved_via: null });
+		});
+
+		it("api_key_templates auto-applies in place for a delegated client, without revealing a secret", async () => {
+			await keyPolicy();
+			const r = await requestControlPlaneChange(env, auth(), "api_key_templates", { mailboxId: MBX, keyId, add: ["reset"] }, principal());
+			expect(r.applied?.items).toEqual([expect.objectContaining({ status: "executed" })]);
+			expect(JSON.stringify(r.applied?.items)).not.toMatch(/rck_/);
+			const active = (await keys()).filter((k) => k.status === "active");
+			expect(active).toHaveLength(1);
+			expect(active[0]).toMatchObject({ keyId, templateAllowlist: ["welcome", "reset"] });
+			expect(await approvalRow(r.id)).toMatchObject({ approved_via: "auto" });
+			expect((await autoEvents()).at(-1)).toMatchObject({ kind: "api_key_templates", mailbox: MBX, intent_id: r.id });
+		});
+
+		it("api_key_templates falls back to pending when the kind is not in the policy", async () => {
+			await setPolicy({ autoKinds: ["api_key_revoke"] });
+			const r = await requestControlPlaneChange(env, auth(), "api_key_templates", { mailboxId: MBX, keyId, remove: ["reset"] }, principal());
+			expect(r.autoApplyRefused).toMatch(/api_key_templates.*not in/);
+		});
+
+		it("api_key_revoke auto-applies for a delegated client, and rotate/scopes never do", async () => {
+			await keyPolicy();
+			for (const kind of ["api_key_rotate", "api_key_scopes"]) {
+				const r = await requestControlPlaneChange(env, auth(), kind, kind === "api_key_rotate" ? { mailboxId: MBX, keyId } : { mailboxId: MBX, keyId, scopes: ["transactional:status"] }, principal());
+				expect(r.applied, kind).toBeUndefined();
+				expect(r.autoApplyRefused, kind).toMatch(/never auto-applied/);
+			}
+			const revoked = await requestControlPlaneChange(env, auth(), "api_key_revoke", { mailboxId: MBX, keyId }, principal());
+			expect(revoked.applied?.items).toEqual([expect.objectContaining({ status: "executed" })]);
+			expect((await keys()).find((k) => k.keyId === keyId)?.status).not.toBe("active");
+			expect((await autoEvents()).at(-1)).toMatchObject({ kind: "api_key_revoke", mailbox: MBX });
+		});
+	});
+
+	it("shows why a change was not auto-applied as the first warning of the approval view", async () => {
+		await setPolicy();
+		const r = await requestControlPlaneChange(env, auth(), "template_upsert", tpl("view-refused", '<a href="https://evil.example/x">x</a>'), principal());
+		const view = await getIntentView(env, r.id, { userId });
+		expect(view.status).toBe("pending");
+		expect(view.warnings[0]).toMatchObject({ code: "auto_apply_refused", message: expect.stringContaining("evil.example") });
 	});
 });
