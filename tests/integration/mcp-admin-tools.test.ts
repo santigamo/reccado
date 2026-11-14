@@ -314,6 +314,31 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		expect(again.content).toMatchObject({ status: "failed", error: "snapshot_consumed" });
 	});
 
+	it("restore requires the write scope of the snapshot's resource", async () => {
+		const expected: Record<string, string> = {
+			mailbox: "mailboxes:write",
+			domain: "domains:write",
+			alias: "routing:write",
+			routing_rule: "routing:write",
+			template: "templates:write",
+		};
+		const all = ["mailboxes:write", "domains:write", "routing:write", "templates:write"];
+		for (const [entity, needed] of Object.entries(expected)) {
+			const id = `scope-snap-${entity}`;
+			await db.prepare("INSERT INTO ops_events (id, event_type, severity, subject, payload_json, created_at) VALUES (?, 'admin.before_snapshot', 'info', ?, ?, datetime('now'))")
+				.bind(id, `subj-${entity}`, JSON.stringify({ entity, by: "someone@example.com" }))
+				.run();
+			// Holding every write scope except the matching one is refused with the exact scope.
+			const lacking = { ...auth, scopes: new Set(all.filter((scope) => scope !== needed)) };
+			const denied = await (await handlerFor("restore", lacking, "legacy")).handler({ opsEventId: id }, context());
+			expect(JSON.stringify(denied), entity).toContain(`insufficient_scope: ${needed}`);
+			// With the matching scope the scope gate passes (the kind then fails on foreign ownership, not scope).
+			const held = { ...auth, scopes: new Set([needed]) };
+			const passed = await (await handlerFor("restore", held, "legacy")).handler({ opsEventId: id }, context());
+			expect(JSON.stringify(passed), entity).not.toContain("insufficient_scope");
+		}
+	});
+
 	it("reconcile_stale accepts an empty payload", async () => {
 		const { content } = await call("reconcile_stale", {});
 		expect(content.status).toBe("applied");

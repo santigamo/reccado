@@ -125,10 +125,39 @@ function resolveOp(tool: string, params: Record<string, unknown>): Resolved {
 	return { kind: entry.kind, payload: out };
 }
 
+const SNAPSHOT_SCOPES: Record<string, string> = {
+	mailbox: "mailboxes:write",
+	domain: "domains:write",
+	alias: "routing:write",
+	routing_rule: "routing:write",
+	template: "templates:write",
+};
+
+/** Write scope for the resource a before-snapshot recorded; null when the snapshot is unknown (the kind reports that itself). */
+export async function restoreScopeFor(env: Env, opsEventId: string): Promise<string | null> {
+	const row = await env.INDEX_DB.prepare("SELECT payload_json FROM ops_events WHERE id = ? AND event_type = 'admin.before_snapshot'")
+		.bind(opsEventId)
+		.first<{ payload_json: string }>();
+	if (!row) return null;
+	try {
+		const snap = JSON.parse(row.payload_json) as { entity?: string; mailbox_id?: unknown };
+		// Snapshots written before `entity` existed are mailbox rows.
+		const entity = snap.entity ?? (typeof snap.mailbox_id === "string" ? "mailbox" : undefined);
+		return (entity && SNAPSHOT_SCOPES[entity]) || null;
+	} catch {
+		return null;
+	}
+}
+
 async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, ctx: ServerContext | undefined, tool: string, params: Record<string, unknown>, resolve: () => Resolved, kinds: string[], audit: { intentId?: string }) {
 	if (tool === "restore") {
 		const held = RESTORE_SCOPES.find((scope) => auth.scopes.has(scope));
 		if (!held) assertScope(auth, RESTORE_SCOPES[0]!);
+		// The snapshot's own resource decides which write scope is needed.
+		if (typeof params.opsEventId === "string") {
+			const needed = await restoreScopeFor(env, params.opsEventId);
+			if (needed) assertScope(auth, needed);
+		}
 	} else {
 		assertScope(auth, TOOL_SCOPES[tool] ?? "admin");
 	}
