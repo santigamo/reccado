@@ -30,6 +30,7 @@ async function suppression(env: Env, auth: Parameters<typeof requireMailboxOwner
 }
 
 registerControlPlaneKind("suppression_remove", {
+	approval: "required",
 	covers: ["mailboxId", "body.email", "body.allowProviderRemoval"],
 	validate: (value) => strict(suppressionSchema, value),
 	render: async (env, auth, payload) => {
@@ -88,6 +89,7 @@ async function reconcileTargets(env: Env, auth: Parameters<typeof requireMailbox
 	return out;
 }
 registerControlPlaneKind("transactional_reconcile", {
+	approval: "direct",
 	covers: ["mailboxId"],
 	validate: (value) => strict(reconcileSchema, value),
 	render: async (env, auth, payload) => {

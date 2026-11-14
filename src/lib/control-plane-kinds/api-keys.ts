@@ -100,6 +100,7 @@ function redactSecret(result: unknown): { stored: unknown; secrets?: IntentField
 }
 
 registerControlPlaneKind("api_key_create", {
+	approval: "required",
 	covers: ["mailboxId", "body"],
 	validate: (value) => {
 		const row = strict(createSchema, value);
@@ -134,6 +135,7 @@ registerControlPlaneKind("api_key_create", {
 });
 
 registerControlPlaneKind("api_key_rotate", {
+	approval: "required",
 	covers: ["mailboxId", "keyId"],
 	validate: (value) => strict(keySchema, value),
 	render: async (env, auth, payload) => {
@@ -159,6 +161,7 @@ registerControlPlaneKind("api_key_rotate", {
 });
 
 registerControlPlaneKind("api_key_revoke", {
+	approval: "direct",
 	covers: ["mailboxId", "keyId"],
 	validate: (value) => strict(keySchema, value),
 	render: async (env, auth, payload) => {
@@ -184,6 +187,7 @@ registerControlPlaneKind("api_key_revoke", {
  * same settings and revokes the old one. The new secret is revealed once, like a create.
  */
 registerControlPlaneKind("api_key_scopes", {
+	approval: "required",
 	covers: ["mailboxId", "keyId", "scopes", "templateAllowlist"],
 	validate: (value) => strict(scopesSchema, value),
 	render: async (env, auth, payload) => {
@@ -243,6 +247,7 @@ registerControlPlaneKind("api_key_scopes", {
  * stay the same, so the integration needs no change.
  */
 registerControlPlaneKind("api_key_templates", {
+	approval: "direct",
 	covers: ["mailboxId", "keyId", "add", "remove", "set"],
 	validate: (value) => {
 		const row = strict(templatesSchema, value);

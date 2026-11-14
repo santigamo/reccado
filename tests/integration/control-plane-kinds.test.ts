@@ -14,6 +14,8 @@ import {
 	requestControlPlaneChange,
 } from "#/lib/approvals";
 import { renderApprovalPage } from "#/components/approval-page";
+import { controlPlaneKind } from "#/lib/control-plane-intents";
+import { renderWithSafetyNet } from "#/lib/control-plane-registry";
 import { mailboxStub } from "#/lib/mailbox-stub";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
@@ -133,9 +135,25 @@ beforeAll(async () => {
 });
 
 async function request(kind: string, payload: unknown) {
-	return requestControlPlaneChange(env, auth, kind, payload);
+	const intent = await requestControlPlaneChange(env, auth, kind, payload);
+	// A direct change that failed reports its AdminError code; surface it the way a refused request does.
+	if (intent.applied?.status === "failed") throw Object.assign(new Error(intent.applied.errorCode), { code: intent.applied.errorCode });
+	return intent;
 }
-async function approve(intent: { id: string; payloadHash: string }) {
+/** What the owner would be shown for a kind's payload (direct kinds never pend, so render it directly). */
+async function preview(kind: string, payload: unknown) {
+	const definition = controlPlaneKind(kind)!;
+	const rendered = await renderWithSafetyNet(definition, env, auth, definition.validate(payload));
+	return { id: "preview", kind, status: "pending" as const, ...rendered, payloadHash: "h", expiresAt: null };
+}
+async function approve(intent: { id: string; payloadHash: string; applied?: { status: string; result?: unknown; errorCode?: string } }) {
+	// Direct kinds already ran at request time; shape their outcome like an approved intent.
+	if (intent.applied)
+		return {
+			status: intent.applied.status === "applied" ? ("executed" as const) : ("failed" as const),
+			result: { items: [{ status: intent.applied.status === "applied" ? "executed" : "failed", result: intent.applied.result }] },
+			reveal: undefined as Array<{ value: string }> | undefined,
+		};
 	return approveIntent(env, {
 		id: intent.id,
 		payloadHash: intent.payloadHash,
@@ -220,9 +238,7 @@ describe("routing", () => {
 		await applied("domain_add", { domain: "kinds-r.example", zoneId: "zoneR" });
 		await newMailbox("mbx_kinds_r", "main@kinds-r.example");
 		const payload = { aliasAddress: "sales@kinds-r.example", mailboxId: "mbx_kinds_r" };
-		const intent = await request("alias_add", payload);
-		expect(await db.prepare("SELECT 1 FROM aliases WHERE alias_address = ?").bind(payload.aliasAddress).first()).toBeNull();
-		await approve(intent);
+		await applied("alias_add", payload);
 		await expect(request("alias_add", payload)).rejects.toMatchObject({ code: "alias_exists" });
 		await applied("alias_remove", { aliasAddress: payload.aliasAddress });
 		expect(await db.prepare("SELECT 1 FROM aliases WHERE alias_address = ?").bind(payload.aliasAddress).first()).toBeNull();
@@ -282,13 +298,12 @@ describe("templates", () => {
 		const base = { mailboxId: "mbx_kinds_t", templateId: "welcome" };
 		const tpl = (subject: string, body_text?: string) => ({ ...base, body: { subject, body_text } });
 		await applied("template_upsert", tpl("Hola", "uno"));
-		const next = await request("template_upsert", tpl("Hola 2", "uno dos"));
-		const rendered = await view(next);
+		const rendered = await preview("template_upsert", tpl("Hola 2", "uno dos"));
 		const text = JSON.stringify(rendered.fields);
 		expect(text).toContain("Hola → Hola 2");
 		expect(text).toContain("- uno");
 		expect(text).toContain("+ uno dos");
-		await approve(next);
+		await applied("template_upsert", tpl("Hola 2", "uno dos"));
 		await applied("template_archive", { mailboxId: "mbx_kinds_t", templateId: "welcome" });
 		await expect(
 			request("template_archive", { mailboxId: "mbx_kinds_foreign", templateId: "welcome" }),
@@ -305,7 +320,7 @@ describe("approval page fidelity", () => {
 		await applied("domain_add", { domain: "kinds-f.example", zoneId: "zf" });
 		const base = { mailboxId: "mbx_kinds_f", templateId: "promo" };
 		await applied("template_upsert", { ...base, body: { subject: "Hi", body_text: "old line\nkeep" } });
-		const intent = await request("template_upsert", {
+		const v = await preview("template_upsert", {
 			...base,
 			body: {
 				subject: "Hi 2",
@@ -313,7 +328,6 @@ describe("approval page fidelity", () => {
 				body_html: '<p onclick="x()">Go <a href="https://kinds-f.example/ok">ok</a> <a href="https://phish.example/x?a=1&b=2">pay</a></p><script>alert(1)</script>',
 			},
 		});
-		const v = await view(intent);
 		const html = renderApprovalPage({ ...v, fields: v.fields, warnings: v.warnings });
 		expect(html).toContain("Pay now at https://evil.example/pay.");
 		expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
@@ -364,6 +378,7 @@ describe("approval page fidelity", () => {
 	it("safety net appends payload keys a kind did not render", async () => {
 		registerControlPlaneKind("synthetic_hidden", {
 			covers: ["shown"],
+			approval: "required",
 			validate: (value) => value as Record<string, unknown>,
 			render: async () => ({
 				title: "Sintético",
@@ -488,8 +503,7 @@ describe("api key template allowlist (in place)", () => {
 		expect(denied.json.error).toBe("template_not_allowed");
 	});
 	it("renders old → new with a warning for a template that does not exist, no key_replaced", async () => {
-		const intent = await request("api_key_templates", { mailboxId: MBX, keyId, add: ["reset"] });
-		const v = await view(intent);
+		const v = await preview("api_key_templates", { mailboxId: MBX, keyId, add: ["reset"] });
 		const row = v.fields.find((f) => f.label === "Plantillas permitidas")!;
 		expect(row.value).toBe("welcome → welcome, +reset");
 		expect(v.fields.find((f) => f.label === "Añadidas")?.value).toBe("reset");
@@ -543,9 +557,7 @@ describe("api key template allowlist (in place)", () => {
 		await expect(
 			request("api_key_templates", { mailboxId: "mbx_kinds_foreign", keyId, add: ["a"] }),
 		).rejects.toMatchObject({ code: "forbidden" });
-		const intent = await request("api_key_templates", { mailboxId: MBX, keyId, set: [] });
-		const result = await approve(intent);
-		expect(result.status).not.toBe("executed");
+		await expect(request("api_key_templates", { mailboxId: MBX, keyId, set: [] })).rejects.toBeTruthy();
 		expect((await keys()).find((k) => k.keyId === keyId)?.templateAllowlist).toEqual(["b", "c"]);
 	});
 	it("the DO refuses bad ids, over-long lists, a revoked key and an unknown key", async () => {
@@ -611,13 +623,12 @@ describe("suppressions and reconcile", () => {
 			)
 			.bind(old, old)
 			.run();
-		const intent = await request("transactional_reconcile", { mailboxId: "mbx_kinds_s" });
-		const rendered = await view(intent);
+		const rendered = await preview("transactional_reconcile", { mailboxId: "mbx_kinds_s" });
 		expect(JSON.stringify(rendered.fields)).toContain('"1"');
 		expect(rendered.warnings[0]?.message).toContain("No se reenvía");
 		const before = await db.prepare("SELECT COUNT(*) AS n FROM outbound_sends").first<{ n: number }>();
-		await approve(intent);
-		expect((await getIntentStatus(env, intent.id)).status).toBe("executed");
+		const done = await request("transactional_reconcile", { mailboxId: "mbx_kinds_s" });
+		expect(done.applied?.status).toBe("applied");
 		expect((await db.prepare("SELECT COUNT(*) AS n FROM outbound_sends").first<{ n: number }>())?.n).toBe(
 			before?.n,
 		);

@@ -5,7 +5,7 @@ import { handleAuthRequest } from "#/api/better-auth";
 import { insertMailbox } from "#/db/d1";
 import { createIntent, getIntentStatus, requestControlPlaneChange } from "#/lib/approvals";
 import { deriveWebhookSecret } from "#/telegram/api";
-import { intentCallbackData } from "#/telegram/intent-cards";
+import { notifyIntentCreated } from "#/telegram/notify";
 import worker from "../../src/server";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
@@ -151,7 +151,7 @@ function stubTelegram(): TelegramCall[] {
 	return calls;
 }
 
-/** One ✅/❌ press arriving at the webhook, exactly as Telegram delivers it. */
+/** One callback press arriving at the webhook, exactly as Telegram delivers it. */
 async function press(
 	data: string,
 	options: { from?: number; chat?: number } = {},
@@ -186,11 +186,6 @@ async function press(
 	expect(response.status).toBe(200);
 	return calls;
 }
-
-const toast = (calls: TelegramCall[]) =>
-	calls.find((call) => call.method === "answerCallbackQuery")?.body.text;
-const edited = (calls: TelegramCall[]) =>
-	String(calls.find((call) => call.method === "editMessageText")?.body.text ?? "");
 
 async function mcpDraft(bodyText: string) {
 	const mailboxId = `mbx_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
@@ -260,114 +255,64 @@ async function sentRows(draftId: string) {
 
 const ownerAuth = () => ({ userId: owner.userId, email: OWNER_EMAIL, owners: [OWNER_EMAIL] });
 
-describe("telegram intent approval: sends", () => {
-	it("approves once, reaches the DO with a valid proof, and a second press is already resolved", async () => {
-		const { draft, intent } = await sendIntent("telegram send");
-		const approve = intentCallbackData("approve", intent.id, intent.payloadHash);
-		expect(new TextEncoder().encode(approve).length).toBeLessThanOrEqual(64);
+describe("telegram notices for MCP approval requests", () => {
+	const legacy = (id: string, hash: string, verb: "ia" | "ix") => `${verb}:${id}:${hash.slice(0, 8)}`;
 
-		const first = await press(approve);
-		expect(toast(first)).toBe("Aprobado");
-		expect(edited(first)).toContain("✅ Aprobado");
-		expect((await getIntentStatus(shared, intent.id)).status).toBe("sent");
-		expect(await messageCount(draft.stub)).toBe(1);
-		expect(await sentRows(draft.draftId)).toEqual([
-			{ intent_id: intent.id, approval_channel: "mcp_approval" },
-		]);
-		const event = await db
-			.prepare("SELECT payload_json FROM ops_events WHERE id = ?")
-			.bind(`approval.approved:${intent.id}`)
-			.first<{ payload_json: string }>();
-		expect(JSON.parse(event!.payload_json)).toMatchObject({ channel: "telegram", approver: OPERATOR });
-
-		const second = await press(approve);
-		expect(toast(second)).toBe("Ya resuelto");
-		expect(await messageCount(draft.stub)).toBe(1);
-		expect(await sentRows(draft.draftId)).toHaveLength(1);
-	});
-
-	it("refuses a press from a user who is not an operator", async () => {
-		const { draft, intent } = await sendIntent("stranger");
-		const calls = await press(intentCallbackData("approve", intent.id, intent.payloadHash), {
-			from: 111,
-		});
-		expect(toast(calls)).toBe("No autorizado");
-		expect(calls.some((call) => call.method === "editMessageText")).toBe(false);
+	it("the old approve/deny callbacks do nothing: Telegram can no longer approve or deny", async () => {
+		const { draft, intent } = await sendIntent("no telegram approval");
+		for (const verb of ["ia", "ix"] as const) {
+			const calls = await press(legacy(intent.id, intent.payloadHash, verb));
+			expect(calls.some((call) => call.method === "editMessageText")).toBe(false);
+			expect(calls.some((call) => call.method === "sendMessage")).toBe(false);
+		}
 		expect((await getIntentStatus(shared, intent.id)).status).toBe("pending");
 		expect(await messageCount(draft.stub)).toBe(0);
+		expect(await sentRows(draft.draftId)).toEqual([]);
 	});
 
-	it("refuses a press from an operator in a chat that is not the bound one", async () => {
-		const { draft, intent } = await sendIntent("wrong chat");
-		const calls = await press(intentCallbackData("approve", intent.id, intent.payloadHash), {
-			chat: 555,
+	it("a send approval request gets one notice with the web link and no ✅/❌ buttons", async () => {
+		const { intent } = await sendIntent("notice");
+		const calls = stubTelegram();
+		await notifyIntentCreated(shared, intent.id);
+		const sent = calls.filter((call) => call.method === "sendMessage");
+		expect(sent).toHaveLength(1);
+		const body = sent[0]!.body as { text: string; reply_markup: { inline_keyboard: Array<Array<{ callback_data?: string; url?: string }>> } };
+		const buttons = body.reply_markup.inline_keyboard.flat();
+		expect(buttons.some((button) => button.callback_data !== undefined)).toBe(false);
+		expect(buttons.map((button) => button.url)).toEqual([`${ORIGIN}/approve/${intent.id}`]);
+		expect(body.text).toContain(`${ORIGIN}/approve/${intent.id}`);
+	});
+
+	it("a critical control-plane request gets a notice; a direct change sends nothing", async () => {
+		await insertMailbox(db, {
+			mailbox_id: "mbx_tg_notice",
+			primary_address: "k@tg-notice.example",
+			display_name: null,
+			status: "active",
+			owner_email: OWNER_EMAIL,
 		});
-		expect(toast(calls)).toBe("No autorizado");
-		expect((await getIntentStatus(shared, intent.id)).status).toBe("pending");
-		expect(await messageCount(draft.stub)).toBe(0);
-	});
-
-	it("refuses a tampered hash prefix and a draft edited after the card", async () => {
-		const { draft, intent } = await sendIntent("tamper");
-		const forged = intentCallbackData("approve", intent.id, "f".repeat(64));
-		const calls = await press(forged);
-		expect(toast(calls)).toBe("Ya no vale");
-		expect((await getIntentStatus(shared, intent.id)).status).toBe("pending");
-
-		const edit = await draft.stub.fetch(`https://mailbox-do/drafts/${draft.draftId}`, {
-			method: "PATCH",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ bodyText: "changed after the card" }),
-		});
-		expect(edit.ok).toBe(true);
-		const stale = await press(intentCallbackData("approve", intent.id, intent.payloadHash));
-		expect(toast(stale)).toBe("Ya no vale: el contenido cambió");
-		expect(await messageCount(draft.stub)).toBe(0);
-	});
-
-	it("refuses an expired intent", async () => {
-		const { draft, intent } = await sendIntent("expired");
-		await db
-			.prepare("UPDATE approvals SET expires_at = ? WHERE token = ?")
-			.bind(new Date(Date.now() - 1000).toISOString(), intent.id)
-			.run();
-		const calls = await press(intentCallbackData("approve", intent.id, intent.payloadHash));
-		expect(toast(calls)).toBe("Caducado");
-		expect(await messageCount(draft.stub)).toBe(0);
-	});
-
-	it("denies, and a later approve press does nothing", async () => {
-		const { draft, intent } = await sendIntent("deny");
-		const denied = await press(intentCallbackData("deny", intent.id, intent.payloadHash));
-		expect(toast(denied)).toBe("Rechazado");
-		expect(edited(denied)).toContain("❌ Rechazado");
-		expect((await getIntentStatus(shared, intent.id)).status).toBe("denied");
-		const late = await press(intentCallbackData("approve", intent.id, intent.payloadHash));
-		expect(toast(late)).toBe("Ya resuelto");
-		expect(await messageCount(draft.stub)).toBe(0);
+		const principal = { tokenSub: owner.userId, oauthClientId: "client" };
+		const direct = await requestControlPlaneChange(shared, ownerAuth(), "mailbox_update", { mailboxId: "mbx_tg_notice", body: { displayName: "Notice" } }, principal);
+		expect(direct.applied?.status).toBe("applied");
+		const calls = stubTelegram();
+		const pendingIntent = await requestControlPlaneChange(
+			shared,
+			ownerAuth(),
+			"api_key_create",
+			{ mailboxId: "mbx_tg_notice", body: { environment: "test", sender: "k@tg-notice.example", scopes: ["transactional:status"] } },
+			principal,
+		);
+		expect(pendingIntent.applied).toBeUndefined();
+		await notifyIntentCreated(shared, pendingIntent.id);
+		const sent = calls.filter((call) => call.method === "sendMessage");
+		expect(sent).toHaveLength(1);
+		expect(String(sent[0]!.body.text)).toContain(`${ORIGIN}/approve/${pendingIntent.id}`);
+		expect(JSON.stringify(sent[0]!.body)).not.toContain("callback_data");
 	});
 });
 
-describe("telegram intent approval: control plane", () => {
-	it("executes a plain change from Telegram as the owner who requested it", async () => {
-		const intent = await requestControlPlaneChange(
-			shared,
-			ownerAuth(),
-			"mailbox_create",
-			{ primaryAddress: "tg-created@example.com" },
-			{ tokenSub: owner.userId, oauthClientId: "client" },
-		);
-		const calls = await press(intentCallbackData("approve", intent.id, intent.payloadHash));
-		expect(toast(calls)).toBe("Aprobado");
-		expect(
-			await db
-				.prepare("SELECT 1 AS hit FROM mailboxes WHERE primary_address = ?")
-				.bind("tg-created@example.com")
-				.first(),
-		).toEqual({ hit: 1 });
-	});
-
-	it("does not execute an API key change from Telegram and points to the web page", async () => {
+describe("control plane approval on the web", () => {
+	it("an API key change executes only on the owner's web page, which shows the secret exactly once", async () => {
 		await insertMailbox(db, {
 			mailbox_id: "mbx_tg_key",
 			primary_address: "k@tg-key.example",
@@ -385,9 +330,8 @@ describe("telegram intent approval: control plane", () => {
 			},
 			{ tokenSub: owner.userId, oauthClientId: "client" },
 		);
-		const calls = await press(intentCallbackData("approve", intent.id, intent.payloadHash));
-		expect(toast(calls)).toBe("Abre el enlace para aprobar y ver la clave");
-		expect(edited(calls)).toContain("Abre el enlace para aprobar y ver la clave");
+		const pressed = await press(`ia:${intent.id}:${intent.payloadHash.slice(0, 8)}`);
+		expect(pressed.some((call) => call.method === "editMessageText")).toBe(false);
 		expect((await getIntentStatus(shared, intent.id)).status).toBe("pending");
 		const row = await db
 			.prepare("SELECT decision, result_json FROM approvals WHERE token = ?")
@@ -395,7 +339,6 @@ describe("telegram intent approval: control plane", () => {
 			.first<{ decision: string | null; result_json: string | null }>();
 		expect(row).toEqual({ decision: null, result_json: null });
 
-		// The owner's web session executes it and sees the secret exactly once.
 		const approveWeb = async () => {
 			const ctx = createExecutionContext();
 			const response = await worker.fetch(

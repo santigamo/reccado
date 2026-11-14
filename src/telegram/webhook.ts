@@ -29,7 +29,6 @@ import {
 	type TelegramMessage,
 	type TelegramUpdate,
 } from "./api";
-import { handleUndoCallback, UNDO_CALLBACK_PREFIX } from "./auto-applied";
 import { adoptTelegramChat, refreshChatTopicSupport, resolveTelegramChatId } from "./binding";
 import {
 	CARD_CALLBACK_PREFIX,
@@ -58,7 +57,6 @@ import { fetchMailboxMessage } from "./messages";
 import { DIGEST_CALLBACK_VERB } from "./noise";
 import { claimTelegramPairing, type PairingOutcome, resolveTelegramOperators } from "./operators";
 import { mailboxStub } from "../lib/mailbox-stub";
-import { handleIntentCallback, isIntentCallback } from "./intent-cards";
 
 /** How long an inline Send button stays live. */
 const ACTION_TTL_MS = DRAFT_PREVIEW_TTL_MS;
@@ -628,7 +626,6 @@ async function handleCallbackQuery(
 		return;
 	}
 	const data = query.data ?? "";
-	if (data.startsWith(UNDO_CALLBACK_PREFIX)) return handleUndoCallback(env, config, query);
 	// Routed after the allowlist check and before anything else: the triage buttons
 	// carry a verb, not a token, so their guard is entirely the check above. The
 	// send-confirmation protocol below keeps its token table -- a draft id does not
@@ -656,11 +653,6 @@ async function handleCallbackQuery(
 			return;
 		}
 		await handleCardCallback(env, config, query);
-		return;
-	}
-	// MCP intent approvals (sends and control-plane changes): ✅/❌ bound to intent + payload hash.
-	if (isIntentCallback(data)) {
-		await handleIntentCallback(env, config, query);
 		return;
 	}
 	const [kind, token] = [data.slice(0, 1), data.slice(2)];

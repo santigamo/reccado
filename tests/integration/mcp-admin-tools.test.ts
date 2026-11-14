@@ -163,7 +163,8 @@ describe("mcp admin tools", () => {
 		const auth = { userId: owner.userId, email: "invalid-admin@example.com", owners: ["invalid-admin@example.com"], scopes: new Set(ADMIN) };
 		const { handler } = await handlerFor("manage_mailbox", auth, "legacy");
 		const before = await approvals();
-		for (const args of [{ action: "explode" }, { action: "create" }, { action: "create", primaryAddress: "a@b.co", extra: 1 }, { operations: [] }, { operations: Array.from({ length: 21 }, () => ({ action: "disable", mailboxId: "m" })) }]) {
+		// Batches are gone: `operations` is just an unknown field.
+		for (const args of [{ action: "explode" }, { action: "create" }, { action: "create", primaryAddress: "a@b.co", extra: 1 }, { operations: [] }, { action: "create", operations: [{ action: "create", primaryAddress: "a@b.co" }] }]) {
 			const result = await handler(args, context());
 			expect(result.isError, JSON.stringify(args)).toBe(true);
 		}
@@ -174,24 +175,24 @@ describe("mcp admin tools", () => {
 		const email = "legacy-admin@example.com";
 		const owner = await registerOwner(email);
 		const auth = { userId: owner.userId, email, owners: [email], scopes: new Set(ADMIN) };
-		const { handler } = await handlerFor("manage_mailbox", auth, "legacy");
-		const args = { action: "create", primaryAddress: "mcp-created@example.com", displayName: "Agent" };
+		const { handler } = await handlerFor("manage_domain", auth, "legacy");
+		const args = { action: "add", domain: "mcp-legacy.example", zoneId: "zone-legacy" };
 		const pending = (await handler(args, context())).structuredContent as { status: string; intentId: string; approvalUrl: string };
 		expect(pending).toMatchObject({ status: "pending", approvalUrl: `${ORIGIN}/approve/${pending.intentId}` });
 		expect((await approve(owner, pending.intentId)).status).toBe("executed");
 		const done = (await handler({ intentId: pending.intentId }, context())).structuredContent as { status: string; result?: unknown };
 		expect(done.status).toBe("executed");
-		expect(await db.prepare("SELECT mailbox_id FROM mailboxes WHERE primary_address = ?").bind("mcp-created@example.com").first()).not.toBeNull();
+		expect(await db.prepare("SELECT id FROM domains WHERE domain = ?").bind("mcp-legacy.example").first()).not.toBeNull();
 	});
 
 	it("elicits the approval URL for modern clients and completes on retry", async () => {
 		const email = "modern-admin@example.com";
 		const owner = await registerOwner(email);
 		const auth = { userId: owner.userId, email, owners: [email], scopes: new Set(ADMIN) };
-		const { handler, codec } = await handlerFor("manage_mailbox", auth, "modern");
+		const { handler, codec } = await handlerFor("manage_domain", auth, "modern");
 		const notify = vi.spyOn(notification, "notifyIntentCreated").mockRejectedValue(new Error("offline"));
 		try {
-			const args = { action: "create", primaryAddress: "modern-created@example.com" };
+			const args = { action: "add", domain: "mcp-modern.example", zoneId: "zone-modern" };
 			const first = await handler(args, context());
 			expect(first.resultType).toBe("input_required");
 			const state = await codec.verify(first.requestState as string, context());
@@ -204,21 +205,24 @@ describe("mcp admin tools", () => {
 		} finally { notify.mockRestore(); }
 	});
 
-	it("batches operations into one intent with per-item results", async () => {
-		const email = "batch-admin@example.com";
+	it("applies a direct change immediately: no approval row, no Telegram notice, secrets stripped", async () => {
+		const email = "direct-admin@example.com";
 		const owner = await registerOwner(email);
 		const auth = { userId: owner.userId, email, owners: [email], scopes: new Set(ADMIN) };
 		const { handler } = await handlerFor("manage_mailbox", auth, "legacy");
-		const before = await approvals();
-		const pending = (await handler({ operations: [
-			{ action: "create", primaryAddress: "batch-a@example.com" },
-			{ action: "create", primaryAddress: "batch-b@example.com" },
-		] }, context())).structuredContent as { intentId: string };
-		expect(await approvals()).toBe(before + 1);
-		expect((await approve(owner, pending.intentId)).status).toBe("executed");
-		const done = (await handler({ intentId: pending.intentId }, context())).structuredContent as { result?: unknown };
-		expect(JSON.stringify(done.result)).toContain("batch-a@example.com");
-		expect(JSON.stringify(done.result)).toContain("batch-b@example.com");
+		const notify = vi.spyOn(notification, "notifyIntentCreated");
+		try {
+			const before = await approvals();
+			const result = await handler({ action: "create", primaryAddress: "direct-created@example.com", displayName: "Agent" }, context());
+			const content = result.structuredContent as { status: string; result?: Record<string, unknown>; snapshotIds: string[] };
+			expect(content.status).toBe("applied");
+			expect(content.result).toBeDefined();
+			expect(await approvals()).toBe(before);
+			expect(notify).not.toHaveBeenCalled();
+			expect(await db.prepare("SELECT mailbox_id FROM mailboxes WHERE primary_address = ?").bind("direct-created@example.com").first()).not.toBeNull();
+			const event = await db.prepare("SELECT payload_json FROM ops_events WHERE event_type = 'admin.applied' AND subject = 'mailbox_create' ORDER BY created_at DESC LIMIT 1").first<{ payload_json: string }>();
+			expect(JSON.parse(event!.payload_json)).toMatchObject({ kind: "mailbox_create", outcome: "applied", approver_user_id: owner.userId });
+		} finally { notify.mockRestore(); }
 	});
 });
 
@@ -279,7 +283,7 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		expect((await approveNext(content.intentId)).reveal).toBeUndefined();
 	});
 
-	it("manage_api_key templates: pending intent, rendered old → new, applied in place with no secret", async () => {
+	it("manage_api_key templates: applied in place immediately with no secret", async () => {
 		await insertMailbox(db, { mailbox_id: "mbx_mcp_tpl", primary_address: "tpl@mcp-kinds.example", display_name: null, status: "active", owner_email: email });
 		const created = await call("manage_api_key", {
 			action: "create",
@@ -290,15 +294,8 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		const { keys } = (await (await mailboxStub(env, "mbx_mcp_tpl").fetch("https://mailbox-do/transactional/api-keys")).json()) as { keys: Array<{ keyId: string }> };
 		const keyId = keys[0]!.keyId;
 		const { content, result } = await call("manage_api_key", { action: "templates", mailboxId: "mbx_mcp_tpl", keyId, add: ["invoice"] });
-		expect(content.status).toBe("pending");
+		expect(content.status).toBe("applied");
 		expect(JSON.stringify(result)).not.toContain("rck_");
-		const view = await getIntentView(env, content.intentId, { userId: owner.userId });
-		expect(view.fields.find((f) => f.label === "Plantillas permitidas")?.value).toBe("welcome → welcome, +invoice");
-		expect(view.warnings.map((w) => w.message)).toContain("la plantilla invoice no existe todavía");
-		expect(view.warnings.map((w) => w.code)).not.toContain("key_replaced");
-		const approved = await approveNext(content.intentId);
-		expect(approved.status).toBe("executed");
-		expect(approved.reveal).toBeUndefined();
 		const after = (await (await mailboxStub(env, "mbx_mcp_tpl").fetch("https://mailbox-do/transactional/api-keys")).json()) as { keys: Array<{ keyId: string; templateAllowlist: string[] }> };
 		expect(after.keys).toHaveLength(1);
 		expect(after.keys[0]).toMatchObject({ keyId, templateAllowlist: ["welcome", "invoice"] });
@@ -311,16 +308,15 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		expect(domain?.status).toBe("disabled");
 		const snap = await db.prepare("SELECT id FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ?").bind(domain!.id).first<{ id: string }>();
 		const restore = await call("restore", { opsEventId: snap!.id });
-		expect(restore.content.status).toBe("pending");
-		expect((await approveNext(restore.content.intentId)).status).toBe("executed");
+		expect(restore.content.status).toBe("applied");
 		expect(await db.prepare("SELECT status FROM domains WHERE id = ?").bind(domain!.id).first()).toEqual({ status: "active" });
 		const again = await call("restore", { opsEventId: snap!.id });
-		expect(again.result.isError).toBe(true);
+		expect(again.content).toMatchObject({ status: "failed", error: "snapshot_consumed" });
 	});
 
 	it("reconcile_stale accepts an empty payload", async () => {
 		const { content } = await call("reconcile_stale", {});
-		expect(content.status).toBe("pending");
+		expect(content.status).toBe("applied");
 	});
 });
 
@@ -344,8 +340,8 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 		b = await registerOwner(emailB);
 	});
 	const pending = async (auth: Record<string, unknown>, address: string) => {
-		const { handler } = await handlerFor("manage_mailbox", auth, "legacy");
-		const result = await handler({ action: "create", primaryAddress: address }, context());
+		const { handler } = await handlerFor("manage_domain", auth, "legacy");
+		const result = await handler({ action: "add", domain: address.replace("@", "."), zoneId: "z" }, context());
 		return { handler, result, content: result.structuredContent as { intentId: string } };
 	};
 
@@ -355,12 +351,12 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 		expect(row).toEqual({ oauth_client_id: "client-1", token_sub: a.userId, token_jti: "jti-1" });
 		expect((await approveWeb(content.intentId, a)).status).toBe("executed");
 		const event = await db.prepare("SELECT payload_json FROM ops_events WHERE id = ?").bind(`approval.executed:${content.intentId}`).first<{ payload_json: string }>();
-		expect(JSON.parse(event!.payload_json)).toMatchObject({ oauth_client_id: "client-1", token_sub: a.userId, token_jti: "jti-1", approver_user_id: a.userId, kind: "mailbox_create" });
+		expect(JSON.parse(event!.payload_json)).toMatchObject({ oauth_client_id: "client-1", token_sub: a.userId, token_jti: "jti-1", approver_user_id: a.userId, kind: "domain_add" });
 	});
 
 	it("hides an intent's status from a different principal", async () => {
 		const { content } = await pending(authFor(a, emailA), "principal-hidden@example.com");
-		const { handler } = await handlerFor("manage_mailbox", authFor(b, emailB), "legacy");
+		const { handler } = await handlerFor("manage_domain", authFor(b, emailB), "legacy");
 		const result = await handler({ intentId: content.intentId }, context());
 		expect(result.isError).toBe(true);
 		expect(JSON.stringify(result)).toContain("not_found");
@@ -387,7 +383,7 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 		expect((await pending(authFor(a, emailA), "cap-other@example.com")).result.isError).not.toBe(true);
 	});
 
-	it("sends one card (with its own buttons) per intent; coalescing only shortens the text", async () => {
+	it("notifies once per approval request with the link and no approve/deny buttons", async () => {
 		await db.prepare("INSERT OR REPLACE INTO runtime_config (key, value, updated_at) VALUES ('telegram.chat_id', '999', ?)").bind(new Date().toISOString()).run();
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => Response.json({ ok: true, result: { message_id: 1 } }));
 		try {
@@ -400,15 +396,99 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 			for (const id of ids) await notification.notifyIntentCreated(telegramEnv, id);
 			const sent = fetchSpy.mock.calls.filter(([input]) => String(input instanceof Request ? input.url : input).includes("sendMessage"));
 			expect(sent.length).toBe(2);
-			const bodies = sent.map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { text: string; reply_markup: { inline_keyboard: Array<Array<{ callback_data?: string }>> } });
+			const bodies = sent.map(([, init]) => JSON.parse(String((init as RequestInit).body)) as { text: string; reply_markup: { inline_keyboard: Array<Array<{ callback_data?: string; url?: string }>> } });
 			for (const [i, body] of bodies.entries()) {
-				const data = body.reply_markup.inline_keyboard[0]!.map((button) => button.callback_data);
-				expect(data[0]).toMatch(new RegExp(`^ia:${ids[i]}:[a-f0-9]{8}$`));
-				expect(data[1]).toMatch(new RegExp(`^ix:${ids[i]}:[a-f0-9]{8}$`));
+				const buttons = body.reply_markup.inline_keyboard.flat();
+				expect(buttons.every((button) => button.callback_data === undefined)).toBe(true);
+				expect(buttons.map((button) => button.url)).toEqual([`${ORIGIN}/approve/${ids[i]}`]);
+				expect(body.text).toContain(`${ORIGIN}/approve/${ids[i]}`);
 			}
 			// Only the second (coalesced) one is the compact notice.
-			expect(bodies[0]!.text).toContain("notify-0@example.com");
-			expect(bodies[1]!.text).not.toContain("notify-0@example.com");
+			expect(bodies[0]!.text).toContain("notify-0.example.com");
+			expect(bodies[1]!.text).not.toContain("notify-0.example.com");
 		} finally { fetchSpy.mockRestore(); }
+	});
+});
+
+describe("mcp approval modes", () => {
+	const email = "modes-mcp@example.com";
+	let owner: Awaited<ReturnType<typeof registerOwner>>;
+	let auth: Record<string, unknown>;
+	beforeAll(async () => {
+		owner = await registerOwner(email);
+		auth = { userId: owner.userId, email, owners: [email], scopes: new Set(ADMIN), tokenSub: owner.userId };
+		await db.prepare("INSERT INTO domains (id, domain, zone_id, status, created_at, updated_at) VALUES ('dom_modes', 'modes.example', 'z', 'active', ?, ?)").bind(new Date().toISOString(), new Date().toISOString()).run().catch(() => undefined);
+		await insertMailbox(db, { mailbox_id: "mbx_modes", primary_address: "main@modes.example", display_name: null, status: "active", owner_email: email });
+	});
+	async function call(tool: string, args: object) {
+		const { handler } = await handlerFor(tool, auth, "legacy");
+		const result = await handler(args, context());
+		return { result, content: result.structuredContent as { status: string; intentId?: string; result?: unknown; error?: string } };
+	}
+
+	it("forward rules: internal destinations apply directly, external ones pend", async () => {
+		const domain = await db.prepare("SELECT id FROM domains WHERE domain = 'modes.example'").first<{ id: string }>();
+		const rule = (pattern: string, forwardTo: string[]) => ({ action: "rule_upsert", domainId: domain!.id, pattern, priority: 1, ruleAction: "forward", forwardTo });
+		expect((await call("manage_routing", rule("in@modes.example", ["other@modes.example"]))).content.status).toBe("applied");
+		expect(await db.prepare("SELECT 1 FROM routing_rules WHERE pattern = 'in@modes.example'").first()).not.toBeNull();
+		const external = await call("manage_routing", rule("out@modes.example", ["spy@elsewhere.test"]));
+		expect(external.content.status).toBe("pending");
+		expect(await db.prepare("SELECT 1 FROM routing_rules WHERE pattern = 'out@modes.example'").first()).toBeNull();
+		expect((await approveWeb(external.content.intentId!, owner)).status).toBe("executed");
+		expect(await db.prepare("SELECT 1 FROM routing_rules WHERE pattern = 'out@modes.example'").first()).not.toBeNull();
+	});
+
+	it("editing an existing internal forward rule to an external destination pends", async () => {
+		const existing = await db.prepare("SELECT id FROM routing_rules WHERE pattern = 'in@modes.example'").first<{ id: string }>();
+		const { content } = await call("manage_routing", { action: "rule_upsert", ruleId: existing!.id, forwardTo: ["spy@elsewhere.test"] });
+		expect(content.status).toBe("pending");
+	});
+
+	it("every critical kind pends and executes only after web approval", async () => {
+		const pendingCases: Array<[string, Record<string, unknown>]> = [
+			["manage_domain", { action: "add", domain: "crit-a.example", zoneId: "z" }],
+			["manage_domain", { action: "provision", domain: "crit-b.example", body: { dmarc: { policy: "none" } } }],
+			["manage_domain", { action: "disable", domain: "modes.example" }],
+			["manage_api_key", { action: "create", mailboxId: "mbx_modes", body: { environment: "test", sender: "main@modes.example", scopes: ["transactional:status"] } }],
+			["manage_api_key", { action: "rotate", mailboxId: "mbx_modes", keyId: "key_x" }],
+			["manage_api_key", { action: "scopes", mailboxId: "mbx_modes", keyId: "key_x", scopes: ["transactional:status"] }],
+			["remove_suppression", { mailboxId: "mbx_modes", body: { email: "bounced@example.net" } }],
+		];
+		for (const [tool, args] of pendingCases) {
+			const { content, result } = await call(tool, args);
+			// Kinds whose target does not exist fail rendering (before a pending row); the rest must pend.
+			if (result.isError) continue;
+			expect(content.status, `${tool} ${JSON.stringify(args)}`).toBe("pending");
+		}
+		const pendingKinds = await db.prepare("SELECT kind FROM approvals WHERE token_sub = ? AND origin = 'mcp' AND decision IS NULL").bind(owner.userId).all<{ kind: string }>();
+		const kinds = new Set(pendingKinds.results.map((r) => r.kind));
+		for (const kind of ["domain_add", "domain_provision", "domain_disable", "api_key_create"]) expect(kinds.has(kind), kind).toBe(true);
+	});
+
+	it("non-critical kinds never create an approval", async () => {
+		const before = await approvals();
+		const cases: Array<[string, Record<string, unknown>]> = [
+			["manage_template", { action: "upsert", mailboxId: "mbx_modes", templateId: "welcome", body: { subject: "Hola" } }],
+			["manage_mailbox", { action: "update", mailboxId: "mbx_modes", body: { displayName: "Modes" } }],
+			["manage_routing", { action: "alias_add", aliasAddress: "alias@modes.example", mailboxId: "mbx_modes" }],
+			["manage_domain", { action: "update", domain: "modes.example", body: { status: "active" } }],
+			["reconcile_stale", {}],
+		];
+		for (const [tool, args] of cases) {
+			const { content } = await call(tool, args);
+			expect(content.status, `${tool} ${JSON.stringify(args)}`).toBe("applied");
+		}
+		expect(await approvals()).toBe(before);
+	});
+
+	it("a direct change is undone with restore, and a tool result never carries a secret", async () => {
+		const first = await call("manage_template", { action: "upsert", mailboxId: "mbx_modes", templateId: "undo", body: { subject: "Uno" } });
+		const second = await call("manage_template", { action: "upsert", mailboxId: "mbx_modes", templateId: "undo", body: { subject: "Dos" } });
+		const snapshotIds = (second.content as unknown as { snapshotIds: string[] }).snapshotIds;
+		expect(first.content.status).toBe("applied");
+		expect(snapshotIds.length).toBeGreaterThan(0);
+		const restored = await call("restore", { opsEventId: snapshotIds[0] });
+		expect(restored.content.status).toBe("applied");
+		expect(JSON.stringify(restored.result)).not.toMatch(/rck_/);
 	});
 });

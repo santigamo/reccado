@@ -68,8 +68,6 @@ beforeAll(async () => {
 		migrationTwoFactor as string,
 		migrationAuthUpgrade as string,
 		migrationPasskey as string,
-		// 0029 also ALTERs approvals; only the policies table matters here.
-		"CREATE TABLE mcp_client_policies (client_id TEXT PRIMARY KEY, owner_email TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
 	);
 	const jwks = await (await run(new Request(`${ORIGIN}/api/auth/jwks`))).text();
 	const realFetch = globalThis.fetch;
@@ -282,16 +280,12 @@ describe("stale client sweep", () => {
 			).bind(`row-${id}`, id, '["https://c.example/cb"]', createdAt).run();
 		await insert("sweep-old-unused", now - 25 * 3600_000);
 		await insert("sweep-new-unused", now - 1 * 3600_000);
-		await insert("sweep-old-policy", now - 25 * 3600_000);
-		await testEnv.INDEX_DB.prepare(
-			`INSERT INTO mcp_client_policies (client_id, owner_email, created_at, updated_at) VALUES ('sweep-old-policy', ?, 'x', 'x')`,
-		).bind(OWNER).run();
 		const removed = await sweepStaleOAuthClients(testEnv.INDEX_DB, now);
 		expect(removed).toBe(1);
 		const left = await testEnv.INDEX_DB.prepare(
 			`SELECT "clientId" FROM "oauthClient" WHERE "clientId" LIKE 'sweep-%' ORDER BY 1`,
 		).all<{ clientId: string }>();
-		expect(left.results.map((r) => r.clientId)).toEqual(["sweep-new-unused", "sweep-old-policy"]);
+		expect(left.results.map((r) => r.clientId)).toEqual(["sweep-new-unused"]);
 	});
 });
 

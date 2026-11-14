@@ -15,7 +15,14 @@ export type Rendered = {
 	 */
 	covers?: string[];
 };
+export type ApprovalMode = "required" | "direct";
 export type ControlPlaneKind = {
+	/**
+	 * `required`: irreversible / exfiltrating, so it pends until the owner approves on `/approve/:id`.
+	 * `direct`: applied immediately with the token's scope (before-snapshot + ops event kept).
+	 * A function decides from the (validated) payload.
+	 */
+	approval: ApprovalMode | ((env: Env, auth: AuthContext, payload: Operation) => Promise<ApprovalMode>);
 	/** Static payload paths this kind always renders (merged with `Rendered.covers`). */
 	covers?: string[];
 	validate: (payload: unknown) => Operation;
@@ -33,6 +40,9 @@ export function registerControlPlaneKind(kind: string, definition: ControlPlaneK
 	if (!/^[a-z][a-z0-9_]{0,31}$/.test(kind) || kind === "send" || registry.has(kind))
 		throw new Error("invalid_intent_kind");
 	registry.set(kind, definition);
+}
+export async function approvalModeFor(kind: ControlPlaneKind, env: Env, auth: AuthContext, payload: Operation): Promise<ApprovalMode> {
+	return typeof kind.approval === "function" ? kind.approval(env, auth, payload) : kind.approval;
 }
 export function controlPlaneKind(kind: string): ControlPlaneKind | undefined {
 	return registry.get(kind);

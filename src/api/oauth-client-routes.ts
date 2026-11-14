@@ -140,9 +140,6 @@ async function revokeOwnedOAuthClient(
 			.bind(eventId, clientId, payload, new Date().toISOString()),
 	]);
 	if (changedRows(results[3]) === 0) return null;
-	// A delegation policy keyed to this client is dead weight once the client is gone. Best effort:
-	// deployments that have not run migration 0029 have no such table.
-	await db.prepare("DELETE FROM mcp_client_policies WHERE client_id = ?").bind(clientId).run().catch(() => undefined);
 	if (changedRows(results[4]) === 0) {
 		await insertOpsEvent(db, {
 			id: eventId,

@@ -1,11 +1,11 @@
 import type { AuthContext } from "../api/auth";
 import { requireMcpOwner, resolveOwnerEmails } from "../api/auth";
 import { getMailbox, insertOpsEvent } from "../db/d1";
-import { evaluateAutoApply, isDelegatedToken, type McpClientPolicy } from "./mcp-client-policy";
 import { requireMailboxOwner } from "./admin/access";
 import { AdminError } from "./admin/errors";
 import { createMailbox, deleteMailbox, patchMailbox } from "./admin/mailboxes";
 import {
+	approvalModeFor,
 	controlPlaneKind,
 	operation,
 	registerControlPlaneKind,
@@ -40,6 +40,7 @@ async function checkCreateOwner(env: Env, auth: AuthContext, payload: Operation)
 }
 
 registerControlPlaneKind("mailbox_create", {
+	approval: "direct",
 	covers: ["primaryAddress", "displayName"],
 	validate: (value) => {
 		const row = operation(value, ["primaryAddress", "displayName"]);
@@ -67,6 +68,7 @@ registerControlPlaneKind("mailbox_create", {
 	},
 });
 registerControlPlaneKind("mailbox_update", {
+	approval: "direct",
 	covers: ["mailboxId", "body.displayName", "body.status"],
 	validate: (value) => {
 		const row = operation(value, ["mailboxId", "body"]);
@@ -113,6 +115,7 @@ registerControlPlaneKind("mailbox_update", {
 	},
 });
 registerControlPlaneKind("mailbox_disable", {
+	approval: "direct",
 	covers: ["mailboxId"],
 	validate: (value) => {
 		const row = operation(value, ["mailboxId"]);
@@ -172,7 +175,7 @@ export async function ownerForUser(env: Env, userId: string): Promise<AuthContex
 }
 export type IntentPrincipal = {
 	oauthClientId?: string | null;
-	/** Token scopes; a delegated client (admin without any mail read scope) may auto-apply per policy. */
+	/** Token scopes (informational; scope gating happens in the MCP layer). */
 	scopes?: ReadonlySet<string>;
 	tokenSub?: string | null;
 	tokenJti?: string | null;
@@ -204,151 +207,97 @@ const newToken = (): string => {
 		.replaceAll("=", "");
 };
 
-export type AppliedItem = { status: "executed" | "failed" | "not_run"; result?: unknown; errorCode?: string };
-export type AppliedChange = {
-	id: string;
-	items: AppliedItem[];
-	/** Before-snapshot ops event ids written by each item (restorable ones only), in item order. */
-	snapshotIds: string[][];
+export type DirectOutcome = {
+	status: "applied" | "failed";
+	/** Result with one-time secrets removed (`redact`); absent on failure. */
+	result?: unknown;
+	errorCode?: string;
+	/** `admin.before_snapshot` ops event ids the change wrote, usable with the `restore` kind. */
+	snapshotIds: string[];
 };
 
-/** Restorable snapshots a template item wrote since `since`. Archived snapshots cannot be restored. */
-async function snapshotsSince(env: Env, kind: string, item: Operation, since: string): Promise<string[]> {
-	if (kind !== "template_upsert" || typeof item.mailboxId !== "string" || typeof item.templateId !== "string") return [];
+/** Restorable before-snapshots this owner's change wrote since `since`. */
+async function snapshotsSince(env: Env, auth: AuthContext, since: string): Promise<string[]> {
 	const rows = await env.INDEX_DB.prepare(
-		"SELECT id FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ? AND created_at >= ? ORDER BY created_at",
+		"SELECT id FROM ops_events WHERE event_type = 'admin.before_snapshot' AND created_at >= ? AND json_extract(payload_json, '$.by') = ? ORDER BY created_at LIMIT 10",
 	)
-		.bind(`${item.mailboxId}:${item.templateId}`, since)
+		.bind(since, auth.email)
 		.all<{ id: string }>();
 	return (rows.results ?? []).map((row) => row.id);
 }
 
 /**
- * Executes an already-validated batch now, recording it as an approvals row decided without a
- * human click (`approved_via`). Mirrors what an approved intent does: same execute, same
- * ownership checks (the owner's own auth), results stored with secrets removed.
+ * Executes a validated `direct` change now as the owner (same ownership checks as an approved
+ * intent) and records it as an `admin.applied` ops event naming the client/token. Snapshots the
+ * kind wrote stay in `ops_events`, so the `restore` tool can undo the change.
  */
-export async function applyControlPlaneNow(
+async function applyDirect(
 	env: Env,
 	auth: AuthContext,
-	input: {
-		kind: string;
-		validated: Operation[];
-		isBatch: boolean;
-		principal: IntentPrincipal;
-		via: "auto" | "undo";
-		clientId?: string | null;
-	},
-): Promise<AppliedChange> {
-	const definition = controlPlaneKind(input.kind);
-	if (!definition) throw new Error("invalid_intent_kind");
-	const json = canonicalJson(input.isBatch ? input.validated : input.validated[0]);
-	const payloadHash = await hashPayload(json);
-	const id = newToken();
-	const now = new Date();
-	await env.INDEX_DB.prepare(
-		"INSERT INTO approvals (token, kind, created_at, expires_at, payload_hash, consumed_at, decision, approved_via, origin, payload_json, oauth_client_id, token_sub, token_jti) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, 'mcp', ?, ?, ?, ?)",
-	)
-		.bind(
-			id, input.kind, now.toISOString(), new Date(now.getTime() + 600000).toISOString(), payloadHash, now.toISOString(),
-			input.via, json,
-			bound(input.principal.oauthClientId, 2048), bound(input.principal.tokenSub, 512), bound(input.principal.tokenJti, 512),
-		)
-		.run();
-	const items: AppliedItem[] = [];
-	const snapshotIds: string[][] = [];
-	let failed = false;
-	for (const item of input.validated) {
-		if (failed) {
-			items.push({ status: "not_run" });
-			snapshotIds.push([]);
-			continue;
-		}
-		const since = new Date().toISOString();
-		try {
-			const result = await definition.execute(env, auth, item);
-			items.push({ status: "executed", result: (definition.redact ? definition.redact(result) : { stored: result }).stored });
-			snapshotIds.push(await snapshotsSince(env, input.kind, item, since));
-		} catch (error) {
-			failed = true;
-			items.push({ status: "failed", errorCode: error instanceof AdminError ? error.code : "execution_failed" });
-			snapshotIds.push([]);
-		}
+	kind: string,
+	payload: Operation,
+	principal: IntentPrincipal,
+): Promise<DirectOutcome & { id: string }> {
+	const definition = controlPlaneKind(kind)!;
+	const id = crypto.randomUUID();
+	const since = new Date().toISOString();
+	let outcome: DirectOutcome;
+	try {
+		// Same pre-flight an approval gets (ownership, existence, conflicts) so a refusal reports its own code.
+		await definition.render(env, auth, payload);
+		const result = await definition.execute(env, auth, payload);
+		outcome = {
+			status: "applied",
+			result: (definition.redact ? definition.redact(result) : { stored: result }).stored,
+			snapshotIds: await snapshotsSince(env, auth, since),
+		};
+	} catch (error) {
+		outcome = {
+			status: "failed",
+			errorCode: error instanceof AdminError ? error.code : "execution_failed",
+			snapshotIds: await snapshotsSince(env, auth, since).catch(() => []),
+		};
 	}
-	await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?").bind(JSON.stringify({ items }), id).run();
 	await insertOpsEvent(env.INDEX_DB, {
-		id: `approval.executed:${id}`,
-		event_type: "approval.executed",
-		severity: failed ? "warning" : "info",
-		subject: id,
+		id: `admin.applied:${id}`,
+		event_type: "admin.applied",
+		severity: outcome.status === "applied" ? "info" : "warning",
+		subject: kind,
 		payload_json: JSON.stringify({
-			kind: input.kind, intent_id: id, approved_via: input.via,
-			oauth_client_id: input.principal.oauthClientId ?? null, token_sub: input.principal.tokenSub ?? null,
-			approver_user_id: auth.userId, outcomes: items.map((item) => item.status),
+			kind,
+			outcome: outcome.status,
+			error_code: outcome.errorCode ?? null,
+			oauth_client_id: principal.oauthClientId ?? null,
+			token_sub: principal.tokenSub ?? null,
+			token_jti: principal.tokenJti ?? null,
+			approver_user_id: auth.userId,
+			snapshot_ids: outcome.snapshotIds,
 		}),
 	}).catch(() => undefined);
-	if (input.via === "auto") {
-		for (const [i, item] of input.validated.entries()) {
-			if (items[i]?.status !== "executed") continue;
-			await insertOpsEvent(env.INDEX_DB, {
-				id: `auto_applied:${id}:${i}`,
-				event_type: "admin.auto_applied",
-				severity: "info",
-				subject: input.clientId ?? "",
-				payload_json: JSON.stringify({
-					client_id: input.clientId ?? null, kind: input.kind, mailbox: typeof item.mailboxId === "string" ? item.mailboxId : null,
-					intent_id: id, snapshot_ids: snapshotIds[i] ?? [],
-				}),
-			}).catch(() => undefined);
-		}
-	}
-	return { id, items, snapshotIds };
+	return { ...outcome, id };
 }
 
-export type ControlPlaneRequest = { id: string; expiresAt: string; payloadHash: string } & {
-	/** Set when the change was applied immediately under the client's policy. */
-	applied?: AppliedChange & { policy: McpClientPolicy; variableLinks: string[]; summaries: string[]; targets: string[] };
-	/** Set when a policy exists but a check failed, so the change is pending a human approval. */
-	autoApplyRefused?: string;
-};
+/** `applied` is set when the change was direct and has already run; otherwise it is a pending approval. */
+export type ControlPlaneRequest = { id: string; expiresAt: string; payloadHash: string; applied?: DirectOutcome };
 
 export async function requestControlPlaneChange(
 	env: Env,
 	auth: AuthContext,
 	kind: string,
-	payload: unknown | unknown[],
+	payload: unknown,
 	principal: IntentPrincipal = {},
 ): Promise<ControlPlaneRequest> {
 	requireMcpOwner(auth, env);
-	const delegated = isDelegatedToken(principal.scopes);
-	// A delegated client that auto-applies never occupies a pending slot, so only check capacity up front for the rest.
-	if (!delegated) await assertPendingCapacity(env, principal.tokenSub);
 	const definition = controlPlaneKind(kind);
 	if (!definition) throw new Error("invalid_intent_kind");
-	const items = Array.isArray(payload) ? payload : [payload];
-	if (!items.length || items.length > 100) throw new Error("invalid_payload");
-	const validated = items.map(definition.validate);
-	const summaries: string[] = [];
-	for (const item of validated) summaries.push((await definition.render(env, auth, item)).title);
-	let autoApplyRefused: string | undefined;
-	if (delegated) {
-		const decision = await evaluateAutoApply(env, auth, principal, kind, validated);
-		if (decision.auto) {
-			const applied = await applyControlPlaneNow(env, auth, {
-				kind, validated, isBatch: Array.isArray(payload), principal, via: "auto", clientId: decision.policy.clientId,
-			});
-			return {
-				id: applied.id, expiresAt: new Date().toISOString(), payloadHash: "",
-				applied: {
-					...applied, policy: decision.policy, variableLinks: decision.variableLinks, summaries,
-					targets: validated.map((item) => [item.mailboxId, item.templateId ?? item.keyId ?? item.opsEventId].filter((v) => typeof v === "string").join("/")),
-				},
-			};
-		}
-		autoApplyRefused = decision.refused;
-		await assertPendingCapacity(env, principal.tokenSub);
+	const validated = definition.validate(payload);
+	if ((await approvalModeFor(definition, env, auth, validated)) === "direct") {
+		const { id, ...applied } = await applyDirect(env, auth, kind, validated, principal);
+		return { id, expiresAt: new Date().toISOString(), payloadHash: "", applied };
 	}
-	const json = canonicalJson(Array.isArray(payload) ? validated : validated[0]);
+	await assertPendingCapacity(env, principal.tokenSub);
+	await definition.render(env, auth, validated);
+	const json = canonicalJson(validated);
 	const payloadHash = await hashPayload(json);
 	const id = newToken();
 	const now = new Date();
@@ -368,11 +317,5 @@ export async function requestControlPlaneChange(
 			bound(principal.tokenJti, 512),
 		)
 		.run();
-	if (autoApplyRefused)
-		// Kept on the row so the approval page can show why the change was not applied automatically.
-		await env.INDEX_DB.prepare("UPDATE approvals SET auto_refused = ? WHERE token = ?")
-			.bind(autoApplyRefused.slice(0, 300), id)
-			.run()
-			.catch(() => undefined);
-	return { id, expiresAt, payloadHash, ...(autoApplyRefused ? { autoApplyRefused } : {}) };
+	return { id, expiresAt, payloadHash };
 }

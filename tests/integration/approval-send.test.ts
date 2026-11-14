@@ -152,6 +152,7 @@ describe("control-plane approvals", () => {
 			status: "active",
 			owner_email: "control-first@example.com",
 		});
+		// api_key_create needs approval (it issues a secret), so it pends and the second owner is refused at the page.
 		const intent = await requestControlPlaneChange(
 			env,
 			{
@@ -159,117 +160,80 @@ describe("control-plane approvals", () => {
 				email: "control-first@example.com",
 				owners: ["control-first@example.com"],
 			},
-			"mailbox_update",
-			{ mailboxId: "mbx_control_private", body: { displayName: "New" } },
+			"api_key_create",
+			{
+				mailboxId: "mbx_control_private",
+				body: { environment: "test", sender: "private-control@example.com", scopes: ["transactional:status"] },
+			},
 		);
+		expect(intent.applied).toBeUndefined();
 		const view = await getIntentView(env, intent.id, { userId: second.userId });
 		expect(view.status).toBe("stale");
 		expect(view.fields).toEqual([]);
 		const result = await webApprove(env, { userId: second.userId }, { id: intent.id });
 		expect(result.error).toBe("forbidden");
-		expect(
-			await db
-				.prepare("SELECT display_name FROM mailboxes WHERE mailbox_id = ?")
-				.bind("mbx_control_private")
-				.first(),
-		).toEqual({ display_name: "Private" });
+		expect((await getIntentStatus(env, intent.id)).status).toBe("pending");
 	});
-	it("executes once and rejects payload tampering", async () => {
+	it("applies direct kinds immediately with a snapshot and refuses other owners", async () => {
 		const email = "control-owner@example.com";
 		const owner = await registerOwner(email);
 		const auth = { userId: owner.userId, email, owners: [email] };
 		const input = { primaryAddress: "control-create@example.com", displayName: "Initial" };
-		const intent = await requestControlPlaneChange(env, auth, "mailbox_create", input);
-		expect(
-			await db
-				.prepare("SELECT mailbox_id FROM mailboxes WHERE primary_address = ?")
-				.bind(input.primaryAddress)
-				.first(),
-		).toBeNull();
-		const result = await webApprove(env, { userId: owner.userId }, { id: intent.id });
-		expect(result.status).toBe("executed");
-		expect(
-			(await webApprove(env, { userId: owner.userId }, { id: intent.id }))
-				.status,
-		).toBe("executed");
+		const created = await requestControlPlaneChange(env, auth, "mailbox_create", input);
+		expect(created.applied?.status).toBe("applied");
 		const mailbox = await db
 			.prepare("SELECT * FROM mailboxes WHERE primary_address = ?")
 			.bind(input.primaryAddress)
 			.first<{ mailbox_id: string }>();
 		expect(mailbox).not.toBeNull();
-		const update = await requestControlPlaneChange(env, auth, "mailbox_update", {
-			mailboxId: mailbox!.mailbox_id,
-			body: { displayName: "Updated" },
-		});
-		const view = await getIntentView(env, update.id, { userId: owner.userId });
-		expect(renderApprovalPage(view)).toContain("Initial → Updated");
-		await db
-			.prepare("UPDATE approvals SET payload_json = ? WHERE token = ?")
-			.bind('{"body":{"displayName":"Evil"},"mailboxId":"x"}', update.id)
-			.run();
-		const tampered = await webApprove(env, { userId: owner.userId }, { id: update.id });
-		expect(tampered.status).toBe("stale");
-		const disabled = await requestControlPlaneChange(env, auth, "mailbox_disable", {
-			mailboxId: mailbox!.mailbox_id,
-		});
+		const disabled = await requestControlPlaneChange(env, auth, "mailbox_disable", { mailboxId: mailbox!.mailbox_id });
+		expect(disabled.applied?.status).toBe("applied");
 		expect(
-			(
-				await webApprove(env, { userId: owner.userId }, { id: disabled.id })
-			).status,
-		).toBe("executed");
-		expect(
-			await db
-				.prepare("SELECT status FROM mailboxes WHERE mailbox_id = ?")
-				.bind(mailbox!.mailbox_id)
-				.first(),
+			await db.prepare("SELECT status FROM mailboxes WHERE mailbox_id = ?").bind(mailbox!.mailbox_id).first(),
 		).toMatchObject({ status: "disabled" });
 		const snapshot = await db
-			.prepare(
-				"SELECT payload_json FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ?",
-			)
+			.prepare("SELECT id, payload_json FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ?")
 			.bind(mailbox!.mailbox_id)
+			.first<{ id: string; payload_json: string }>();
+		expect(JSON.parse(snapshot!.payload_json)).toMatchObject({ status: "active", display_name: "Initial" });
+		expect(disabled.applied?.snapshotIds).toContain(snapshot!.id);
+		const event = await db
+			.prepare("SELECT payload_json FROM ops_events WHERE event_type = 'admin.applied' AND subject = 'mailbox_disable'")
 			.first<{ payload_json: string }>();
-		expect(JSON.parse(snapshot!.payload_json)).toMatchObject({
-			status: "active",
-			display_name: "Initial",
-		});
-		await expect(requestControlPlaneChange(env, auth, "unknown_kind", {})).rejects.toThrow();
+		expect(JSON.parse(event!.payload_json)).toMatchObject({ kind: "mailbox_disable", outcome: "applied", approver_user_id: owner.userId });
+		// A non-owner is refused before anything runs.
 		await expect(
 			requestControlPlaneChange(env, { ...auth, email: "other@example.com" }, "mailbox_disable", {
 				mailboxId: mailbox!.mailbox_id,
 			}),
+		).rejects.toBeTruthy();
+		const foreignMailbox = await requestControlPlaneChange(env, auth, "mailbox_disable", { mailboxId: "mbx_not_mine" });
+		expect(foreignMailbox.applied).toMatchObject({ status: "failed" });
+		await expect(requestControlPlaneChange(env, auth, "unknown_kind", {})).rejects.toThrow();
+		await expect(
+			requestControlPlaneChange(env, auth, "mailbox_create", [{ primaryAddress: "batch@example.com" }]),
 		).rejects.toThrow();
 	});
-	it("reports partial batch failures and skips remaining operations", async () => {
-		const email = "control-batch@example.com";
+	it("executes an approval once and rejects payload tampering", async () => {
+		const email = "control-approve@example.com";
 		const owner = await registerOwner(email);
 		const auth = { userId: owner.userId, email, owners: [email] };
-		const foreign = await db
-			.prepare("SELECT mailbox_id FROM mailboxes WHERE primary_address = ?")
-			.bind("control-create@example.com")
-			.first<{ mailbox_id: string }>();
-		await expect(
-			requestControlPlaneChange(env, auth, "mailbox_disable", { mailboxId: foreign!.mailbox_id }),
-		).rejects.toMatchObject({ code: "forbidden" });
-		const intent = await requestControlPlaneChange(env, auth, "mailbox_create", [
-			{ primaryAddress: "batch-first@example.com" },
-			{ primaryAddress: "invalid" },
-			{ primaryAddress: "batch-last@example.com" },
-		]);
-		const result = await webApprove(env, { userId: owner.userId }, { id: intent.id });
-		expect(result.status).toBe("failed");
-		expect(result.result?.items.map((item) => [item.status, item.errorCode])).toEqual([
-			["executed", undefined],
-			["failed", "validation_error"],
-			["not_run", undefined],
-		]);
-		expect(
-			await db
-				.prepare(
-					"SELECT primary_address FROM mailboxes WHERE primary_address IN ('batch-first@example.com', 'batch-last@example.com')",
-				)
-				.all(),
-		).toMatchObject({ results: [{ primary_address: "batch-first@example.com" }] });
+		const intent = await requestControlPlaneChange(env, auth, "domain_add", { domain: "control-once.example", zoneId: "z1" });
+		expect(intent.applied).toBeUndefined();
+		const row = () => db.prepare("SELECT id FROM domains WHERE domain = 'control-once.example'").first();
+		expect(await row()).toBeNull();
+		expect((await webApprove(env, { userId: owner.userId }, { id: intent.id })).status).toBe("executed");
+		expect((await webApprove(env, { userId: owner.userId }, { id: intent.id })).status).toBe("executed");
+		expect(await row()).not.toBeNull();
+		const next = await requestControlPlaneChange(env, auth, "domain_add", { domain: "control-tamper.example", zoneId: "z2" });
+		const view = await getIntentView(env, next.id, { userId: owner.userId });
+		expect(renderApprovalPage(view)).toContain("control-tamper.example");
+		await db
+			.prepare("UPDATE approvals SET payload_json = ? WHERE token = ?")
+			.bind('{"domain":"evil.example","zoneId":"x"}', next.id)
+			.run();
+		expect((await webApprove(env, { userId: owner.userId }, { id: next.id })).status).toBe("stale");
+		expect(await db.prepare("SELECT id FROM domains WHERE domain = 'evil.example'").first()).toBeNull();
 	});
 });
 
