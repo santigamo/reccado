@@ -1233,7 +1233,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	}
 
 	/**
-	 * Widens `api_key_events.event_type` to admit 'sender_name_updated'.
+	 * Widens `api_key_events.event_type` to admit 'sender_name_updated' and 'template_allowlist_updated'.
 	 *
 	 * A CHECK constraint cannot be altered in SQLite, so a mailbox provisioned
 	 * before this event type existed would reject the audit row — and because the
@@ -1249,14 +1249,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		const ddl = this.ctx.storage.sql
 			.exec("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_key_events'")
 			.toArray()[0] as { sql?: string } | undefined;
-		if (!ddl?.sql || ddl.sql.includes("sender_name_updated")) return;
+		if (!ddl?.sql || ddl.sql.includes("template_allowlist_updated")) return;
 
 		this.ctx.storage.sql.exec("ALTER TABLE api_key_events RENAME TO api_key_events_old");
 		this.ctx.storage.sql.exec(`CREATE TABLE api_key_events (
   id TEXT PRIMARY KEY,
   key_id TEXT NOT NULL,
   event_type TEXT NOT NULL
-    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated')),
+    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated', 'template_allowlist_updated')),
   metadata_json TEXT,
   created_at TEXT NOT NULL
 )`);

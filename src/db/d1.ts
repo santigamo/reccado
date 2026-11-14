@@ -584,6 +584,7 @@ export async function upsertIngestEvent(
          mailbox_id = excluded.mailbox_id,
          message_local_id = excluded.message_local_id,
          raw_r2_key = excluded.raw_r2_key,
+         template_allowlist_json = excluded.template_allowlist_json,
          status = excluded.status,
          error_code = excluded.error_code,
          updated_at = excluded.updated_at`,
@@ -1026,6 +1027,7 @@ export async function upsertApiKeyProjection(
         status, created_at, updated_at, revoked_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(key_id) DO UPDATE SET
+         template_allowlist_json = excluded.template_allowlist_json,
          status = excluded.status,
          updated_at = excluded.updated_at,
          revoked_at = excluded.revoked_at`,
