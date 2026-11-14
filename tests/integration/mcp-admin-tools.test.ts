@@ -29,6 +29,7 @@ import migrationIntentPayload from "../../migrations/d1/0027_intent_payload.sql?
 import migrationPendingUnique from "../../migrations/d1/0028_approval_pending_unique.sql?raw";
 import { McpServer, type ServerContext } from "@modelcontextprotocol/server";
 import { insertMailbox } from "#/db/d1";
+import { mailboxStub } from "#/lib/mailbox-stub";
 import { getIntentView } from "#/lib/approvals";
 import { registerTools } from "../../src/mcp/tools";
 import { makeIntentCodec } from "../../src/mcp/intent-flow";
@@ -347,6 +348,31 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		expect((done.structuredContent as { status: string }).status).toBe("executed");
 		expect(JSON.stringify(done)).not.toContain(secret);
 		expect((await approveNext(content.intentId)).reveal).toBeUndefined();
+	});
+
+	it("manage_api_key templates: pending intent, rendered old → new, applied in place with no secret", async () => {
+		await insertMailbox(db, { mailbox_id: "mbx_mcp_tpl", primary_address: "tpl@mcp-kinds.example", display_name: null, status: "active", owner_email: email });
+		const created = await call("manage_api_key", {
+			action: "create",
+			mailboxId: "mbx_mcp_tpl",
+			body: { environment: "test", sender: "tpl@mcp-kinds.example", scopes: ["transactional:send", "transactional:templates:use"], templateAllowlist: ["welcome"] },
+		});
+		expect((await approveNext(created.content.intentId)).status).toBe("executed");
+		const { keys } = (await (await mailboxStub(env, "mbx_mcp_tpl").fetch("https://mailbox-do/transactional/api-keys")).json()) as { keys: Array<{ keyId: string }> };
+		const keyId = keys[0]!.keyId;
+		const { content, result } = await call("manage_api_key", { action: "templates", mailboxId: "mbx_mcp_tpl", keyId, add: ["invoice"] });
+		expect(content.status).toBe("pending");
+		expect(JSON.stringify(result)).not.toContain("rck_");
+		const view = await getIntentView(env, content.intentId, { userId: owner.userId });
+		expect(view.fields.find((f) => f.label === "Plantillas permitidas")?.value).toBe("welcome → welcome, +invoice");
+		expect(view.warnings.map((w) => w.message)).toContain("la plantilla invoice no existe todavía");
+		expect(view.warnings.map((w) => w.code)).not.toContain("key_replaced");
+		const approved = await approveNext(content.intentId);
+		expect(approved.status).toBe("executed");
+		expect(approved.reveal).toBeUndefined();
+		const after = (await (await mailboxStub(env, "mbx_mcp_tpl").fetch("https://mailbox-do/transactional/api-keys")).json()) as { keys: Array<{ keyId: string; templateAllowlist: string[] }> };
+		expect(after.keys).toHaveLength(1);
+		expect(after.keys[0]).toMatchObject({ keyId, templateAllowlist: ["welcome", "invoice"] });
 	});
 
 	it("restore tool: disable a domain, then restore it through the tools", async () => {
