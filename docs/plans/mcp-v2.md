@@ -399,6 +399,17 @@ approval authority, P4's passkey/step-up work and the 2026-11-11 "Passkey per ap
 - Deployed 2026-11-14 to reccado-dev (version `8ef95e4e`), migration `0029` applied remotely after a
   rehearsal on a fresh export of the live D1; suite 96 files / 1331 tests green, no tsyringe in the bundle.
 
+## 2026-11-14 decision: standard MCP connection
+
+Connecting follows the hosted-MCP standard: `claude mcp add --transport http reccado https://<host>/mcp`
+(or a custom connector URL), discovery, open RFC 7591 DCR, browser login + consent. Supersedes
+§2.2 "DCR closed" (CIMD stays off). Hardening: D1-backed 10 registrations/h/IP, https or loopback
+redirect URIs only, never-consented clients swept after 24 h, consent shows client name + redirect
+host, Telegram notice on first consent. `/security` → "Aplicaciones conectadas" lists/revokes
+clients and edits delegation policies; `pnpm operator mcp register|policy` remain as fallbacks.
+Open: custom-scheme redirects (e.g. Cursor `cursor://`) are refused until an allow-list is decided.
+Deployed to reccado-dev version `c1f2159f` (99 files / 1346 tests green).
+
 ## Decision log
 
 | Date | Decision | Why |
