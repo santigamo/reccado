@@ -142,6 +142,7 @@ async function renderUpsert(env: Env, auth: AuthContext, payload: Operation) {
 }
 
 registerControlPlaneKind("template_upsert", {
+	approval: "direct",
 	covers: ["mailboxId", "templateId", "body.subject", "body.body_text", "body.body_html"],
 	validate: (value) => strict(upsertSchema, value),
 	render: renderUpsert,
@@ -173,6 +174,7 @@ async function existing(env: Env, auth: AuthContext, payload: Operation) {
 	return row;
 }
 registerControlPlaneKind("template_archive", {
+	approval: "direct",
 	covers: ["mailboxId", "templateId"],
 	validate: (value) => strict(archiveSchema, value),
 	render: async (env, auth, payload) => {

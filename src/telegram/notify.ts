@@ -17,18 +17,19 @@ import {
 } from "./api";
 import { chatSupportsTopics, resolveTelegramChatId } from "./binding";
 import { inboundNotificationKeyboard } from "./cards";
-import { renderInboundNotification } from "./format";
+import { renderInboundNotification, telegramEscape } from "./format";
 import { intentCardKeyboard, renderIntentCardText } from "./intent-cards";
 import { isFirstContact } from "./index-rows";
 import { fetchMailboxAttachments } from "./messages";
 import { flushTelegramDigest, isQuietNow, isSenderMuted, retainNotification } from "./noise";
 
-/** Coalescing only shortens the notice text; every intent still gets its own buttons. */
+/** Coalescing only shortens the notice text; every approval request still gets its own notice and link. */
 export const INTENT_NOTIFY_COALESCE_MS = 60_000;
 
 /**
- * Sends the approval card for an MCP intent: a server-rendered summary (warnings first),
- * a link to the detail page, and ✅/❌ buttons bound to this intent and its payload hash.
+ * Notifies the owner of an MCP approval request (send or critical control-plane kind): a
+ * server-rendered summary (warnings first) and the `/approve/:id` link. No approve/deny buttons;
+ * direct (non-critical) changes never reach this function.
  */
 export async function notifyIntentCreated(env: Env, intentId: string): Promise<void> {
 	const principal = await env.INDEX_DB.prepare("SELECT token_sub, created_at FROM approvals WHERE token = ?")
@@ -55,8 +56,8 @@ export async function notifyIntentCreated(env: Env, intentId: string): Promise<v
 	const view = await getIntentCard(env, intentId);
 	await sendMessage(config, {
 		chatId,
-		text: renderIntentCardText(view, { compact: coalesced }),
-		replyMarkup: intentCardKeyboard(view, url),
+		text: `${renderIntentCardText(view, { compact: coalesced })}\n${telegramEscape(url)}`,
+		replyMarkup: intentCardKeyboard(url),
 	});
 }
 

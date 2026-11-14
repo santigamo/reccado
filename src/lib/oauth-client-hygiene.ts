@@ -89,7 +89,7 @@ export async function sha256Hex(value: string): Promise<string> {
 /**
  * Deletes dynamically registered clients that never got a consent or a token and are
  * older than 24 h, along with anything that points at them. Clients with an owner
- * (registered from a session), a delegation policy, a consent, or any token are kept.
+ * (registered from a session), a consent, or any token are kept.
  * Returns the number of clients removed.
  */
 export async function sweepStaleOAuthClients(db: D1Database, now: number): Promise<number> {
@@ -102,7 +102,6 @@ export async function sweepStaleOAuthClients(db: D1Database, now: number): Promi
 			   AND NOT EXISTS (SELECT 1 FROM "oauthConsent" x WHERE x."clientId" = c."clientId")
 			   AND NOT EXISTS (SELECT 1 FROM "oauthAccessToken" t WHERE t."clientId" = c."clientId")
 			   AND NOT EXISTS (SELECT 1 FROM "oauthRefreshToken" r WHERE r."clientId" = c."clientId")
-			   AND NOT EXISTS (SELECT 1 FROM mcp_client_policies p WHERE p.client_id = c."clientId")
 			 LIMIT 200`,
 		)
 		.bind(cutoff)

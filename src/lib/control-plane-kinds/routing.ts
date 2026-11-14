@@ -65,14 +65,28 @@ async function ownedMailbox(env: Env, auth: AuthContext, mailboxId: string) {
 	return mailbox;
 }
 
-async function externalForwards(env: Env, addresses: string[]) {
+/** Destinations outside the owner's registered domains. */
+export async function externalAddresses(env: Env, addresses: string[]): Promise<string[]> {
 	const owned = new Set((await listDomains(env.INDEX_DB)).map((d) => d.domain.toLowerCase()));
-	return addresses
-		.filter((address) => !owned.has((address.split("@")[1] ?? "").toLowerCase()))
+	return addresses.filter((address) => !owned.has((address.split("@")[1] ?? "").toLowerCase()));
+}
+
+async function externalForwards(env: Env, addresses: string[]) {
+	return (await externalAddresses(env, addresses))
 		.map((address) => ({
 			code: "external_forward",
 			message: `Reenvío a una dirección externa: ${address}`,
 		}));
+}
+
+/** A forward rule needs owner approval iff its effective destination list leaves the owner's domains. */
+async function ruleApproval(env: Env, _auth: AuthContext, payload: Operation) {
+	const p = payload as z.infer<typeof ruleUpsertSchema>;
+	const before = p.ruleId ? await getRoutingRule(env.INDEX_DB, p.ruleId) : null;
+	const action = p.action ?? before?.action;
+	if (action !== "forward") return "direct" as const;
+	const forward = p.forwardTo ?? (before ? (JSON.parse(before.forward_to_json) as string[]) : []);
+	return (await externalAddresses(env, forward)).length ? ("required" as const) : ("direct" as const);
 }
 
 async function checkRuleOwnership(env: Env, auth: AuthContext, ids: Array<string | null | undefined>) {
@@ -114,6 +128,7 @@ async function renderRule(env: Env, auth: AuthContext, payload: Operation) {
 }
 
 registerControlPlaneKind("alias_add", {
+	approval: "direct",
 	covers: ["aliasAddress", "mailboxId"],
 	validate: (value) => strict(aliasAddSchema, value),
 	render: async (env, auth, payload) => {
@@ -146,6 +161,7 @@ async function ownedAlias(env: Env, auth: AuthContext, aliasAddress: string) {
 	return { alias, mailbox };
 }
 registerControlPlaneKind("alias_remove", {
+	approval: "direct",
 	covers: ["aliasAddress"],
 	validate: (value) => strict(aliasRemoveSchema, value),
 	render: async (env, auth, payload) => {
@@ -170,6 +186,7 @@ registerControlPlaneKind("alias_remove", {
 });
 
 registerControlPlaneKind("routing_rule_upsert", {
+	approval: ruleApproval,
 	covers: ["ruleId", "domainId", "pattern", "priority", "action", "mailboxId", "forwardTo", "rejectReason", "enabled"],
 	validate: (value) => strict(ruleUpsertSchema, value),
 	render: renderRule,
@@ -191,6 +208,7 @@ async function ownedRule(env: Env, auth: AuthContext, ruleId: string) {
 	return rule;
 }
 registerControlPlaneKind("routing_rule_remove", {
+	approval: "direct",
 	covers: ["ruleId"],
 	validate: (value) => strict(ruleRemoveSchema, value),
 	render: async (env, auth, payload) => {

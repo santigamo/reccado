@@ -80,6 +80,7 @@ async function disableWarnings(env: Env, name: string) {
 }
 
 registerControlPlaneKind("domain_add", {
+	approval: "required",
 	covers: ["domain", "zoneId"],
 	validate: (value) => strict(addSchema, value),
 	render: async (env, auth, payload) => {
@@ -99,6 +100,7 @@ registerControlPlaneKind("domain_add", {
 });
 
 registerControlPlaneKind("domain_provision", {
+	approval: "required",
 	covers: ["domain", "body"],
 	validate: (value) => strict(provisionSchema, value),
 	render: async (env, auth, payload) => {
@@ -154,6 +156,7 @@ registerControlPlaneKind("domain_provision", {
 });
 
 registerControlPlaneKind("domain_update", {
+	approval: "direct",
 	covers: ["domain", "body.status"],
 	validate: (value) => strict(updateSchema, value),
 	render: async (env, auth, payload) => {
@@ -178,6 +181,7 @@ registerControlPlaneKind("domain_update", {
 });
 
 registerControlPlaneKind("domain_disable", {
+	approval: "required",
 	covers: ["domain"],
 	validate: (value) => strict(disableSchema, value),
 	render: async (env, auth, payload) => {

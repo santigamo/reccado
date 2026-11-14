@@ -19,6 +19,7 @@ import { patchRule } from "../admin/routing";
 import { updateTemplate } from "../admin/templates";
 import { registerControlPlaneKind, strict, type Operation } from "../control-plane-registry";
 import { activeTemplate } from "./templates";
+import { externalAddresses } from "./routing";
 import type { SnapshotEntity } from "./snapshot";
 
 const restoreSchema = z.object({ opsEventId: z.string().min(1).max(100) }).strict();
@@ -179,7 +180,16 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 	}
 }
 
+/** Restoring a forward rule that leaves the owner's domains re-opens an exfiltration path, so it needs approval. */
+async function restoreApproval(env: Env, auth: AuthContext, payload: Operation) {
+	const snap = await loadSnapshot(env, auth, String(payload.opsEventId));
+	if (snap.entity !== "routing_rule" || snap.action !== "forward" || typeof snap.forward_to_json !== "string") return "direct" as const;
+	const forward = JSON.parse(snap.forward_to_json) as string[];
+	return (await externalAddresses(env, forward)).length ? ("required" as const) : ("direct" as const);
+}
+
 registerControlPlaneKind("restore", {
+	approval: restoreApproval,
 	covers: ["opsEventId"],
 	validate: (value) => strict(restoreSchema, value),
 	render: async (env, auth, payload) => {
