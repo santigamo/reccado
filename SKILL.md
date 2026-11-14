@@ -24,7 +24,7 @@ confirmation step.**
 In this codebase that confirmation is the `request-send` → `confirm-send` flow
 (`POST /api/mailboxes/{mailboxId}/drafts/{draftId}/request-send` then
 `.../confirm-send`), each gated by its own idempotency key. Over MCP the `send` tool only creates an
-approval intent; the owner approves it at `/approve/:id` with a passkey, and the DO sends an
+approval intent; the owner approves it with the Telegram ✅/❌ buttons or at `/approve/:id` with the owner web session, and the DO sends an
 MCP-origin draft only with that approval's HMAC proof, so an agent cannot reach `confirm-send` by
 itself. The one deliberate exception to per-message confirmation is the transactional REST API,
 where an operator-created, mailbox-bound API key is itself the pre-authorization — see
@@ -251,14 +251,16 @@ The MCP endpoint (`/mcp`) authenticates with Better Auth OAuth tokens plus the o
 `SECURITY.md`, "MCP"). Tools: `list_mailboxes`, `list_threads`, `read_thread`, `read_message`,
 `search_messages`, `save_draft`, `cancel_draft`, `update_messages`, `send`, `get_health`, `list_ops`,
 `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`, `manage_template`,
-`manage_api_key`, `remove_suppression`, `restore`, `reconcile_stale` (`src/mcp/*`). Scopes:
+`manage_api_key` (actions incl. `templates`, an in-place allowlist edit), `remove_suppression`, `restore`, `reconcile_stale` (`src/mcp/*`). Scopes:
 `mail:read`, `mail:draft` (default consent), `mail:send`, `mail:read:sensitive`, `admin`.
 
 Connect a client with `pnpm operator mcp register` (prints the `claude mcp add` command; see
 `docs/OPERATIONS.md`). `send` and every `manage_*`/`restore`/`reconcile_stale` call only create an
-approval intent: the agent gets a `/approve/:id` URL and the owner approves it with a passkey. An
-agent must never try to approve, replay or bypass that step, and the owner registry is not reachable
-over MCP. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
+approval intent: the agent gets a `/approve/:id` URL and the owner approves it in Telegram or on that
+page (API-key secrets only on the page). The one exception is a delegated client (`admin`, no mail
+read scope) with an owner-set policy, which auto-applies a few low-risk kinds; sends are never
+auto. An agent must never try to approve, replay or bypass that step, and the owner registry is not
+reachable over MCP. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
 `mailboxes.owner_email` for pre-existing mailboxes so the owner-scoped MCP lookups can serve them.
 
 ## Verification checklist
