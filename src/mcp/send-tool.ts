@@ -43,7 +43,7 @@ export function registerSendTool(server: McpServer, env: Env, auth: McpSendAuth,
 				if (retry && status.status === "pending" && flow && ctx) {
 					const approvalUrl = buildApprovalUrl(origin, intentId);
 					if (!approvalUrl) throw new Error("invalid_origin");
-					return await respondWithIntent(flow, ctx, { intentId, expiresAt: row.expires_at, approvalUrl, message: `Revisa y aprueba el envío en ${new URL(origin).host}` });
+					return await respondWithIntent(flow, ctx, { intentId, expiresAt: row.expires_at, approvalUrl, message: `Aprueba el envío en Telegram o revísalo en ${new URL(origin).host}` });
 				}
 				return mcpToolResultJson(status);
 			}
@@ -68,7 +68,7 @@ export function registerSendTool(server: McpServer, env: Env, auth: McpSendAuth,
 			const approvalUrl = buildApprovalUrl(origin, intent.id);
 			if (!approvalUrl) throw new Error("invalid_origin");
 			if (!flow || !ctx) return mcpToolResultJson({ status: "pending", intentId: intent.id, approvalUrl, expiresAt: intent.expiresAt });
-			return await respondWithIntent(flow, ctx, { intentId: intent.id, expiresAt: intent.expiresAt, approvalUrl, message: `Revisa y aprueba el envío en ${new URL(origin).host}` });
+			return await respondWithIntent(flow, ctx, { intentId: intent.id, expiresAt: intent.expiresAt, approvalUrl, message: `Aprueba el envío en Telegram o revísalo en ${new URL(origin).host}` });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "internal_error";
 			reason = /^(insufficient_scope: mail:send|rate_limited|too_many_pending_approvals|not_found|draft_not_agent_owned|draft_not_editable|invalid_request_state|intent_stale)$/.test(message) ? message : "internal_error";

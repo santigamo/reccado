@@ -1,7 +1,6 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { createServerFn } from "@tanstack/react-start";
 import { useState, type ReactElement } from "react";
-import { authenticatePasskey } from "../../components/webauthn";
 
 type ApprovalView = {
 	id: string;
@@ -9,9 +8,7 @@ type ApprovalView = {
 	title: string;
 	fields: Array<{ label: string; value: string; format?: "text" | "pre" | "list" }>;
 	warnings: Array<{ code: string; message: string }>;
-	challenge: string | null;
-	hasPasskey: boolean;
-	allowCredentials: Array<{ id: string; transports: string[] }>;
+	payloadHash: string | null;
 };
 
 const loadApproval = createServerFn({ method: "GET" })
@@ -74,18 +71,14 @@ function ApprovePage(): ReactElement {
 	const [reveal, setReveal] = useState<Array<{ label: string; value: string }> | null>(null);
 
 	async function approve(): Promise<void> {
-		if (!view.challenge) return;
+		if (!view.payloadHash) return;
 		setBusy(true);
 		setError(null);
 		try {
-			const assertion = await authenticatePasskey({
-				challenge: view.challenge,
-				allowCredentials: view.allowCredentials,
-			});
 			const response = await fetch(`/api/approvals/${encodeURIComponent(view.id)}/approve`, {
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ assertion }),
+				body: JSON.stringify({ payloadHash: view.payloadHash }),
 			});
 			if (!response.ok) {
 				setError("No se ha aprobado. La solicitud sigue pendiente o ya no vale.");
@@ -196,7 +189,7 @@ function ApprovePage(): ReactElement {
 						</button>
 					</section>
 				)}
-				{!reveal && view.status === "pending" && view.hasPasskey && view.challenge && (
+				{!reveal && view.status === "pending" && view.payloadHash && (
 					<div className="mt-6 flex flex-wrap gap-3">
 						<button
 							type="button"
@@ -204,7 +197,7 @@ function ApprovePage(): ReactElement {
 							disabled={busy}
 							onClick={() => void approve()}
 						>
-							Aprobar con passkey
+							Aprobar
 						</button>
 						<button
 							type="button"
@@ -215,14 +208,6 @@ function ApprovePage(): ReactElement {
 							Rechazar
 						</button>
 					</div>
-				)}
-				{view.status === "pending" && !view.hasPasskey && (
-					<p className="mt-6 text-sm text-[var(--sea-ink)]">
-						Para aprobar hace falta una passkey.{" "}
-						<a className="underline" href="/security#passkeys">
-							Registrar una passkey
-						</a>
-					</p>
 				)}
 				{error && <p className="mt-4 text-sm text-red-500">{error}</p>}
 			</article>

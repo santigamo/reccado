@@ -1,5 +1,5 @@
 import { getMailbox, insertOpsEvent, insertTelegramLink } from "../db/d1";
-import { buildApprovalUrl } from "../lib/approvals";
+import { buildApprovalUrl, getIntentCard } from "../lib/approvals";
 import { getRuntimeConfig, RUNTIME_CONFIG_KEYS } from "../db/runtime-config";
 import {
 	claimTelegramTopic,
@@ -8,7 +8,6 @@ import {
 } from "../db/telegram-topics";
 import {
 	createForumTopic,
-	inlineKeyboard,
 	isMissingTopicError,
 	readTelegramConfig,
 	sendMessage,
@@ -19,24 +18,24 @@ import {
 import { chatSupportsTopics, resolveTelegramChatId } from "./binding";
 import { inboundNotificationKeyboard } from "./cards";
 import { renderInboundNotification } from "./format";
+import { intentCardKeyboard, renderIntentCardText } from "./intent-cards";
 import { isFirstContact } from "./index-rows";
 import { fetchMailboxAttachments } from "./messages";
 import { flushTelegramDigest, isQuietNow, isSenderMuted, retainNotification } from "./noise";
 
-export function intentNotificationKeyboard(url: string): Record<string, unknown> {
-	return inlineKeyboard([[{ text: "Revisar solicitud", url }]]);
-}
-
-/** Notify the owner without exposing an action that can approve over Telegram. */
+/** Coalescing only shortens the notice text; every intent still gets its own buttons. */
 export const INTENT_NOTIFY_COALESCE_MS = 60_000;
 
+/**
+ * Sends the approval card for an MCP intent: a server-rendered summary (warnings first),
+ * a link to the detail page, and ✅/❌ buttons bound to this intent and its payload hash.
+ */
 export async function notifyIntentCreated(env: Env, intentId: string): Promise<void> {
-	// Coalesce: one ping per token subject per minute. Durable (read from D1) so it holds
-	// across isolates; the earlier intent's notification already points the owner at the inbox of requests.
 	const principal = await env.INDEX_DB.prepare("SELECT token_sub, created_at FROM approvals WHERE token = ?")
 		.bind(intentId)
 		.first<{ token_sub: string | null; created_at: string }>()
 		.catch(() => null);
+	let coalesced = false;
 	if (principal?.token_sub) {
 		const since = new Date(Date.parse(principal.created_at) - INTENT_NOTIFY_COALESCE_MS).toISOString();
 		const earlier = await env.INDEX_DB.prepare(
@@ -45,7 +44,7 @@ export async function notifyIntentCreated(env: Env, intentId: string): Promise<v
 			.bind(principal.token_sub, intentId, since, principal.created_at)
 			.first()
 			.catch(() => null);
-		if (earlier) return;
+		coalesced = Boolean(earlier);
 	}
 	const config = readTelegramConfig(env);
 	const chatId = await resolveTelegramChatId(env);
@@ -53,24 +52,11 @@ export async function notifyIntentCreated(env: Env, intentId: string): Promise<v
 	if (!config || !chatId || !origin) return;
 	const url = buildApprovalUrl(origin, intentId);
 	if (!url) return;
+	const view = await getIntentCard(env, intentId);
 	await sendMessage(config, {
 		chatId,
-		text: "Hay una solicitud pendiente de aprobación.",
-		replyMarkup: intentNotificationKeyboard(url),
-	});
-}
-
-/** Best-effort notice that a passkey was added or removed. Never blocks the auth response. */
-export async function notifyPasskeyChange(env: Env, action: "added" | "removed"): Promise<void> {
-	const config = readTelegramConfig(env);
-	const chatId = await resolveTelegramChatId(env);
-	if (!config || !chatId) return;
-	await sendMessage(config, {
-		chatId,
-		text:
-			action === "added"
-				? "Se ha registrado una passkey en tu cuenta de Reccado."
-				: "Se ha eliminado una passkey de tu cuenta de Reccado.",
+		text: renderIntentCardText(view, { compact: coalesced }),
+		replyMarkup: intentCardKeyboard(view, url),
 	});
 }
 

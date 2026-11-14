@@ -5,7 +5,6 @@ import { handleAuthRequest } from "#/api/better-auth";
 import { insertMailbox } from "#/db/d1";
 import { addSuppression } from "#/do/mailbox-suppressions";
 import {
-	approvalChallenge,
 	approveIntent,
 	getIntentStatus,
 	getIntentView,
@@ -14,7 +13,6 @@ import {
 } from "#/lib/approvals";
 import { renderApprovalPage } from "#/components/approval-page";
 import { mailboxStub } from "#/lib/mailbox-stub";
-import type { AuthMailSender } from "#/lib/better-auth";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationOwnerColumn from "../../migrations/d1/0003_mailbox_owner.sql?raw";
@@ -31,13 +29,11 @@ import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql
 import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
 import migrationAuthUpgrade from "../../migrations/d1/0021_better_auth_1_7_20.sql?raw";
 import migrationApprovals from "../../migrations/d1/0022_approvals.sql?raw";
-import migrationPasskey from "../../migrations/d1/0024_passkey.sql?raw";
 import migrationAudit from "../../migrations/d1/0025_outbound_audit.sql?raw";
 import migrationApprovalMeta from "../../migrations/d1/0026_approval_metadata.sql?raw";
 import migrationIntentPayload from "../../migrations/d1/0027_intent_payload.sql?raw";
 import migrationPendingUnique from "../../migrations/d1/0028_approval_pending_unique.sql?raw";
 import { applyMigrations } from "../helpers/migrations";
-import { SoftAuthenticator } from "../helpers/soft-authenticator";
 
 const db = env.INDEX_DB;
 const ORIGIN = "https://example.com";
@@ -62,7 +58,6 @@ beforeAll(async () => {
 		migrationTwoFactor,
 		migrationAuthUpgrade,
 		migrationApprovals,
-		migrationPasskey,
 		migrationAudit,
 		migrationApprovalMeta,
 		migrationIntentPayload,
@@ -92,16 +87,6 @@ class Jar {
 	}
 }
 
-function stubMail(): AuthMailSender & { calls: Array<{ text: string }> } {
-	const calls: Array<{ text: string }> = [];
-	return {
-		calls,
-		async sendMail(message: { text: string }) {
-			calls.push({ text: message.text });
-		},
-	} as AuthMailSender & { calls: Array<{ text: string }> };
-}
-
 async function pair(email: string): Promise<Jar> {
 	const code = crypto.randomUUID().replaceAll("-", "").slice(0, 24);
 	const now = new Date().toISOString();
@@ -125,67 +110,13 @@ async function pair(email: string): Promise<Jar> {
 	return jar;
 }
 
-async function registerOwner(
-	email: string,
-): Promise<{ userId: string; jar: Jar; authenticator: SoftAuthenticator }> {
+async function registerOwner(email: string): Promise<{ userId: string; jar: Jar }> {
 	const jar = await pair(email);
-	const mail = stubMail();
-	const headers = { cookie: jar.header(), "content-type": "application/json", origin: ORIGIN };
-	const started = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/step-up`, { method: "POST", headers, body: "{}" }),
-		authEnv(),
-		{ mailSender: mail },
-	);
-	jar.absorb(started);
-	expect(started.status, await started.clone().text()).toBe(200);
-	const code = mail.calls[0]?.text.match(/\b(\d{6})\b/)?.[1] ?? "";
-	const issued = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/step-up`, {
-			method: "POST",
-			headers,
-			body: JSON.stringify({ code }),
-		}),
-		authEnv(),
-	);
-	jar.absorb(issued);
-	expect(issued.status, await issued.clone().text()).toBe(200);
-	const { proof } = (await issued.json()) as { proof: string };
-	const optionsResponse = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/generate-register-options`, {
-			headers: { cookie: jar.header(), origin: ORIGIN, "x-passkey-stepup": proof },
-		}),
-		authEnv(),
-	);
-	jar.absorb(optionsResponse);
-	expect(optionsResponse.status, await optionsResponse.clone().text()).toBe(200);
-	const options = (await optionsResponse.json()) as { challenge: string; rp: { id: string } };
-	const authenticator = new SoftAuthenticator(options.rp.id, ORIGIN);
-	const credential = await authenticator.registration(options.challenge);
-	const verified = await handleAuthRequest(
-		new Request(`${ORIGIN}/api/auth/passkey/verify-registration`, {
-			method: "POST",
-			headers: {
-				cookie: jar.header(),
-				"content-type": "application/json",
-				origin: ORIGIN,
-				"x-passkey-stepup": proof,
-			},
-			body: JSON.stringify({ response: credential, name: "Approval key" }),
-		}),
-		authEnv(),
-	);
-	jar.absorb(verified);
-	expect(verified.status, await verified.clone().text()).toBe(200);
 	const user = await db
 		.prepare('SELECT id FROM "user" WHERE email = ?')
 		.bind(email)
 		.first<{ id: string }>();
-	const passkey = await db
-		.prepare("SELECT credentialID FROM passkey WHERE userId = ?")
-		.bind(user?.id)
-		.first<{ credentialID: string }>();
-	authenticator.storedId = passkey?.credentialID ?? null;
-	return { userId: user?.id ?? "", jar, authenticator };
+	return { userId: user?.id ?? "", jar };
 }
 
 
@@ -193,7 +124,6 @@ type Owner = Awaited<ReturnType<typeof registerOwner>>;
 const EMAIL = "kinds-owner@example.com";
 let owner: Owner;
 let auth: { userId: string; email: string; owners: string[] };
-let counter = 1;
 
 beforeAll(async () => {
 	owner = await registerOwner(EMAIL);
@@ -206,12 +136,9 @@ async function request(kind: string, payload: unknown) {
 async function approve(intent: { id: string; payloadHash: string }) {
 	return approveIntent(env, {
 		id: intent.id,
-		userId: owner.userId,
-		origin: ORIGIN,
-		assertion: await owner.authenticator.assertion(
-			await approvalChallenge(intent.id, intent.payloadHash),
-			counter++,
-		),
+		payloadHash: intent.payloadHash,
+		channel: "web",
+		approver: owner.userId,
 	});
 }
 async function applied(kind: string, payload: unknown) {

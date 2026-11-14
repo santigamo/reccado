@@ -1,10 +1,10 @@
 /**
  * Marker + detection for this instance's own authentication e-mail (sign-in
- * OTP, passkey step-up OTP, password reset).
+ * OTP, password reset).
  *
  * Why: the owner's login address may be served by this very instance, so an
  * agent with mailbox read access could read its own sign-in codes and walk
- * around the passkey boundary. Auth mail is therefore invisible to MCP
+ * around the approval boundary. Auth mail is therefore invisible to MCP
  * regardless of scope. Detection is deliberately fail-closed: a valid marker
  * OR a matching sender is each enough to hide a message.
  */

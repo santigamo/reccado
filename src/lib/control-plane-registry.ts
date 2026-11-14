@@ -11,7 +11,7 @@ export type Rendered = {
 	/**
 	 * Dotted payload paths (`body.scopes`) this render shows the owner. A path covers itself
 	 * and everything below it. Payload leaves not covered are appended raw by
-	 * `renderWithSafetyNet`, so a kind can never hide a field the passkey approves.
+	 * `renderWithSafetyNet`, so a kind can never hide a field the owner approves.
 	 */
 	covers?: string[];
 };
