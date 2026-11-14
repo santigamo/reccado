@@ -396,6 +396,8 @@ approval authority, P4's passkey/step-up work and the 2026-11-11 "Passkey per ap
 - `manage_api_key` gains action `templates` (in-place allow-list edit). Migration `0029`; the
   `0024` passkey table stays unused. Threat model: Telegram takeover or web-session theft can
   approve (recommend Telegram 2FA). See `SECURITY.md` ("MCP").
+- Deployed 2026-11-14 to reccado-dev (version `8ef95e4e`), migration `0029` applied remotely after a
+  rehearsal on a fresh export of the live D1; suite 96 files / 1331 tests green, no tsyringe in the bundle.
 
 ## Decision log
 
