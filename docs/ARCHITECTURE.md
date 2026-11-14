@@ -2,7 +2,7 @@
 
 ## Status
 
-- Status: Tier A architecture plus an MCP endpoint (read/draft/send-request/admin, approval-gated) and the
+- Status: Tier A architecture plus an MCP endpoint (scoped read/draft/send-request/control-plane; approval only for irreversible actions) and the
   transactional API MVP are implemented in this repository; the rest of Tier B (EmailAgent,
   Vectorize/RAG, AI Gateway, long Workflow sagas) remains roadmap-only.
 - Date: 2026-08-19 (updated from 2026-07-01 for the MCP endpoint and transactional API MVP).
@@ -28,8 +28,9 @@ Current repo status:
   R2 raw storage, Queue ingest, D1 cross-mailbox index, realtime UI, and human-confirmed outbound
   send.
 - An MCP endpoint (`/mcp`, OAuth 2.1 bearer tokens plus the owner registry) ships read, draft,
-  send-request and control-plane tools; every send and control-plane change needs owner approval
-  by the owner via Telegram button or `/approve/:id` (bounded delegated auto-apply aside). See `src/mcp/*`, `docs/plans/mcp-v2.md` and `SECURITY.md`.
+  send-request and control-plane tools behind fine-grained `resource:action` scopes (no `admin`); every send
+  and a short list of irreversible / exfiltrating control-plane kinds need owner approval on `/approve/:id`
+  with the owner web session (Telegram only notifies); all other writes apply directly and are undoable via `restore`. See `src/mcp/*`, `docs/plans/mcp-v2.md` and `SECURITY.md`.
 - A transactional REST API MVP (`/v1/.../transactional/...`) ships scoped, mailbox-bound API keys
   for operator-authorized programmatic sends; see `docs/plans/transactional-api.md`,
   `src/do/transactional-*`, and `docs/OPERATIONS.md`.
@@ -182,9 +183,11 @@ provider returned.
 - R2 objects are private; downloads go through authorized Workers or signed access.
 - Queue payloads contain metadata only, reducing sensitive content exposure in retry systems.
 - Public or OSS multi-user MCP should use OAuth 2.1 style scopes per tool.
-- MCP scopes should separate read, search, draft, label, and send.
+- MCP scopes are `resource:action` (`mail:read`, `mail:draft`, `mail:send`, `config:read`, `templates:write`, `keys:write`, …); there is no omnibus `admin`.
 - The agent may read, draft and summarize, but it may not send, nor change the control plane,
-  without the owner's approval (Telegram button or web session) bound to the exact payload, except the bounded auto-apply of delegated clients that cannot read mail.
+  without the owner's approval (`/approve/:id`, owner web session) bound to the exact payload, for sends and the
+  irreversible / exfiltrating control-plane kinds; other control-plane writes apply directly with their narrow scope
+  and a before-snapshot (`restore` undoes them).
 - Prompt-injection defenses wrap every email-to-agent path.
 - Cloudflare API tokens for domain provisioning are narrow and environment-scoped.
 - Secrets live in Cloudflare bindings or deployment secrets, not source files.

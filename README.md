@@ -519,13 +519,15 @@ a valid code.
 
 ## MCP for agents
 
-`/mcp` lets an agent work your mailboxes over OAuth. With the default consent (`mail:read`,
-`mail:draft`) it can list, search and read mail (OTP and reset links are redacted), save and cancel
-drafts, and mark/archive/trash messages. With extra scopes it can also request a send (`mail:send`)
-and read or change configuration — mailboxes, domains, aliases, routing rules, templates, API keys,
-suppressions (`admin`). It can never touch the owner registry.
+`/mcp` lets an agent work your mailboxes over OAuth. Scopes are narrow (`resource:action`, no
+omnibus `admin`) and you tick them at consent; the agent's `tools/list` shows only what you
+granted. With the default consent (`mail:read`, `mail:draft`, `config:read`) it can list, search and
+read mail (OTP and reset links are redacted), save and cancel drafts, mark/archive/trash messages
+and read health, ops and configuration. Extra scopes unlock the rest: `mail:send`,
+`mail:read:sensitive`, `mailboxes:write`, `templates:write`, `routing:write`, `domains:write`,
+`keys:write`, `suppressions:write`. It can never touch the owner registry.
 
-**Connect a client the standard way** — add the URL, log in, consent. No setup step on your side:
+**Connect a client the standard way** — one URL, then a browser login. No setup step on your side:
 
 ```bash
 claude mcp add --transport http reccado https://<your-host>/mcp
@@ -535,30 +537,24 @@ claude mcp add --transport http reccado https://<your-host>/mcp
 - **claude.ai:** Settings → Connectors → *Add custom connector* → URL `https://<your-host>/mcp`.
 - **Cursor, ChatGPT and other clients:** add `https://<your-host>/mcp` as a remote MCP server.
 
-The client discovers the OAuth metadata, registers itself (open RFC 7591 registration; it gets
-nothing by registering), and opens your browser for the owner login (e-mail OTP) and the consent
-screen. **You choose the scopes on the consent screen:** `mail:read` and `mail:draft` are on by
-default; `mail:send`, `mail:read:sensitive` and `admin` each need their own tick. For a *delegated
-product client* (an app that only manages templates/keys for you), tick only `admin` and then set its
-delegation policy — with the CLI (`pnpm operator mcp policy set …`) or in the web
-UI at `/security` → *Aplicaciones conectadas*. The first time a new app is consented you also get a
-Telegram notice naming it. `pnpm operator mcp register` remains as an optional fallback that
-pre-registers a client and prints a command with `--client-id`. Cursor's custom-scheme callback
-(`cursor://…`) is not accepted at registration; see `SECURITY.md` ("MCP").
+The client discovers the OAuth metadata and identifies itself by Client ID Metadata Document (CIMD,
+on by default) or, as a compatibility fallback, open RFC 7591 registration (it gets nothing by
+registering), then opens your browser for the owner login (e-mail OTP) and the consent screen.
+**You choose the scopes there.** `mail:send`, `mail:read:sensitive`, `keys:write`, `routing:write`
+and `domains:write` each need their own tick. A *product maintenance client* (an app that only keeps
+a product's templates and API keys in shape) gets just `templates:write` + `keys:write`. The first
+time a new app is consented you also get a Telegram notice. Revoke any app under `/security` →
+*Aplicaciones conectadas*. `pnpm operator mcp register` remains as an optional pre-registration
+fallback.
 
-**Approval flow.** When the agent asks to send an email or change configuration, nothing happens
-yet: the tool returns a pending approval (frozen payload, bound by hash). With the Telegram bridge
-on, you get a card with ✅/❌ buttons; otherwise (or for API-key create/rotate/scopes, which reveal a
-secret) open `https://<your-host>/approve/<id>` signed in as the owner, review what the server
-renders — recipients, subject, body, or the exact change — and approve or deny. The agent can never
-approve. Approvals expire after 10 minutes and are single use. Turn on Telegram two-step
-verification: whoever controls that chat or your web session can approve.
-
-**Delegated clients (optional).** A client whose token has `admin` but not `mail:read` /
-`mail:read:sensitive` can be given a policy (`pnpm operator mcp policy set --client <id> --mailbox
-<id> --kinds template_upsert,… --link-domains example.com`) to auto-apply low-risk template,
-API-key-allowlist, suppression and restore changes on specific mailboxes, rate-limited, with a
-Telegram notice and ↩️ Deshacer. Sends are never auto-applied. See
+**Approval is only for irreversible actions.** Sends, API-key create/rotate/scopes (they issue a
+secret), suppression removal, domain add/provision/disable, and aliases or forward rules pointing
+outside your domains return a pending approval (frozen payload, bound by hash) and a link:
+open `https://<your-host>/approve/<id>` signed in as the owner, review what the server renders, and
+approve or deny. Approval happens **only there**; Telegram just sends a notice with the link (no
+✅/❌ buttons). The agent can never approve. Approvals expire after 10 minutes and are single use.
+**Everything else applies directly** with its scope (templates, internal aliases, mailbox changes,
+key revoke, …), keeps a before-snapshot, and can be undone with the `restore` tool. See
 [`docs/OPERATIONS.md`](docs/OPERATIONS.md) and [`SECURITY.md`](SECURITY.md).
 
 ## Transactional API (optional)

@@ -20,24 +20,31 @@ package.
   "Cliente nuevo" note; the first consent of a client sends a Telegram "Nueva app conectada" notice.
   `/.well-known/oauth-authorization-server` is served at the root as well as the issuer-suffixed path.
   `pnpm operator mcp register` stays as an optional fallback.
-- **Approval by Telegram button; delegated auto-apply (2026-11-14).** Passkey approval is removed.
-  The owner approves MCP sends and control-plane changes with ✅/❌ Telegram buttons (bound to intent
-  id + hash prefix, full `payload_hash` re-checked; bound chat + operator allow-list) or on
-  `/approve/:id` with the owner web session; API-key create/rotate/scopes stay web-only (secret shown
-  once). Delegated OAuth clients (`admin`, no `mail:read`/`mail:read:sensitive`) with a policy
-  (`pnpm operator mcp policy set|show|rm`) auto-apply `template_upsert`, `template_archive`,
-  `api_key_templates`, `api_key_revoke`, `suppression_remove`, `restore` on allowed mailboxes under
-  `max_auto_per_hour` and the template link-domain check, with an `admin.auto_applied` ops event and a
-  Telegram ↩️ Deshacer notice; anything else falls back to approval (`autoApplyRefused`). Sends are
-  never auto. `manage_api_key` action `templates` edits a key's allow-list in place. Migration
-  `0029` (`mcp_client_policies`, `approvals.approved_via`/`auto_refused`) — **apply before deploying**.
+- **Final MCP permission model (2026-11-14).** Supersedes the earlier same-day Telegram-button and
+  delegated-auto-apply entries. Scopes are fine-grained `resource:action` with no omnibus `admin`:
+  `mail:read`, `mail:read:sensitive`, `mail:draft`, `mail:send`, `config:read`, `mailboxes:write`,
+  `templates:write`, `routing:write`, `domains:write`, `keys:write`, `suppressions:write`.
+  `tools/list` shows only tools whose scope was granted; a call missing a scope gets the spec
+  `insufficient_scope` signal naming it. Owner approval (only on `/approve/:id` with the owner web
+  session; Telegram sends a notice with the link, no ✅/❌ buttons) is now required only for `send`,
+  aliases/forward rules to destinations outside the owner's domains, `api_key_create|rotate|scopes`,
+  `suppression_remove` and `domain_add|provision|disable`. Every other write (templates,
+  `api_key_templates`, `api_key_revoke`, mailbox kinds, internal aliases/rules, `domain_update`,
+  `restore`, `reconcile_stale`, `update_messages`) applies directly with its scope, keeps
+  `before_snapshot` + ops events and is undoable with `restore`. CIMD is on (`MCP_CIMD_ENABLED=true`),
+  open DCR stays as fallback.
+- **Removed (2026-11-14):** delegation policies (table `mcp_client_policies`, `pnpm operator mcp
+  policy`, the `/security` policy editor, auto-apply, template link checker, Telegram
+  auto-applied/undo), Telegram ✅/❌ approval for MCP intents, and batch intents (one operation per
+  call). Migration `0030` drops `mcp_client_policies` (`0029` was already applied) — **apply `0030`
+  before deploying**. Existing tokens with the old `admin` scope match no tool: reconnect and
+  re-consent.
 - **MCP v2 (`/mcp`).** A stateless SDK-v2 server (spec 2026-07-28 with a legacy 2025 path) with 20
   tools: reads (`list_mailboxes`, `list_threads`, `read_thread`, `read_message`, `search_messages`,
   `get_health`, `list_ops`, `list_config`), tier-1 mailbox-content actions (`save_draft`,
-  `cancel_draft`, `update_messages`) and approval-gated tools (`send`, `manage_mailbox`,
+  `cancel_draft`, `update_messages`) and tools gated by scope and, for irreversible kinds, approval (`send`, `manage_mailbox`,
   `manage_domain`, `manage_routing`, `manage_template`, `manage_api_key`, `remove_suppression`,
-  `restore`, `reconcile_stale`). Scopes `mail:read`, `mail:draft` (default consent), `mail:send`,
-  `mail:read:sensitive`, `admin`. OTP/reset/magic-link mail is flagged at ingest and redacted
+  `restore`, `reconcile_stale`). Scopes: see the final permission model entry above. OTP/reset/magic-link mail is flagged at ingest and redacted
   without `mail:read:sensitive`; attachments and raw MIME are MCP resources.
 - **Approvals and passkeys.** *(Passkeys superseded 2026-11-14, see above.)* `telegram_actions` became `approvals`; sends and control-plane changes
   requested over MCP are approved at `/approve/:id` with a passkey bound to the intent and payload
