@@ -196,6 +196,14 @@ export default {
 			const { handleLocalEmailSimulation } = await import("./cloudflare/local-email");
 			return handleLocalEmailSimulation(request, env, ctx);
 		}
+		// Some MCP clients fetch the RFC 8414 document at the bare root path instead of
+		// the issuer-suffixed one (/.well-known/oauth-authorization-server/api/auth, the
+		// issuer being <origin>/api/auth). Serve the same metadata for both.
+		if (url.pathname === "/.well-known/oauth-authorization-server") {
+			const aliased = new URL(request.url);
+			aliased.pathname = "/.well-known/oauth-authorization-server/api/auth";
+			return api.fetch(new Request(aliased, request), env, ctx);
+		}
 		if (
 			url.pathname.startsWith("/api/") ||
 			url.pathname === "/mcp" ||

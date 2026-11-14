@@ -525,15 +525,26 @@ drafts, and mark/archive/trash messages. With extra scopes it can also request a
 and read or change configuration — mailboxes, domains, aliases, routing rules, templates, API keys,
 suppressions (`admin`). It can never touch the owner registry.
 
-**Connect Claude Code** with a pre-registered client (needs an operator session; see
-[`docs/OPERATIONS.md`](docs/OPERATIONS.md)):
+**Connect a client the standard way** — add the URL, log in, consent. No setup step on your side:
 
 ```bash
-pnpm operator login --env dev --host <your-host> --email <owner>
-pnpm operator mcp register --host <your-host>   # prints the exact `claude mcp add ...` command
+claude mcp add --transport http reccado https://<your-host>/mcp
 ```
 
-Run the printed command, then approve the consent screen in the browser.
+- **Claude Code:** the command above, then `/mcp` → *reccado* → authenticate.
+- **claude.ai:** Settings → Connectors → *Add custom connector* → URL `https://<your-host>/mcp`.
+- **Cursor, ChatGPT and other clients:** add `https://<your-host>/mcp` as a remote MCP server.
+
+The client discovers the OAuth metadata, registers itself (open RFC 7591 registration; it gets
+nothing by registering), and opens your browser for the owner login (e-mail OTP) and the consent
+screen. **You choose the scopes on the consent screen:** `mail:read` and `mail:draft` are on by
+default; `mail:send`, `mail:read:sensitive` and `admin` each need their own tick. For a *delegated
+product client* (an app that only manages templates/keys for you), tick only `admin` and then set its
+delegation policy — with the CLI (`pnpm operator mcp policy set …`) or in the web
+UI at `/security` → *Aplicaciones conectadas*. The first time a new app is consented you also get a
+Telegram notice naming it. `pnpm operator mcp register` remains as an optional fallback that
+pre-registers a client and prints a command with `--client-id`. Cursor's custom-scheme callback
+(`cursor://…`) is not accepted at registration; see `SECURITY.md` ("MCP").
 
 **Approval flow.** When the agent asks to send an email or change configuration, nothing happens
 yet: the tool returns a pending approval (frozen payload, bound by hash). With the Telegram bridge

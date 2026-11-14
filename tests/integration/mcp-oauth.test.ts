@@ -585,11 +585,20 @@ describe("the /mcp bearer-token perimeter", () => {
 		expect(metadata.authorization_servers).toEqual([`${ORIGIN}/api/auth`]);
 	});
 
-	it("rejects unauthenticated dynamic client registration", async () => {
+	it("accepts unauthenticated registration (open DCR) but grants nothing without login", async () => {
 		const response = await postJson("/api/auth/oauth2/register", {
 			redirect_uris: ["https://stranger.example/cb"],
+			token_endpoint_auth_method: "none",
 		});
-		expect(response.status).toBe(401);
+		expect(response.status).toBe(201);
+		const { client_id: clientId } = (await response.json()) as { client_id: string };
+		const authorize = await run(
+			new Request(
+				`${ORIGIN}/api/auth/oauth2/authorize?response_type=code&client_id=${clientId}&redirect_uri=${encodeURIComponent("https://stranger.example/cb")}&code_challenge=${"a".repeat(43)}&code_challenge_method=S256&resource=${encodeURIComponent(RESOURCE)}`,
+				{ redirect: "manual" },
+			),
+		);
+		expect(authorize.headers.get("location") ?? "").toMatch(/^\/login/);
 	});
 
 	it("registers, lists and revokes an owner public PKCE client", async () => {

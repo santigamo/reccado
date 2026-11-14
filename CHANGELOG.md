@@ -11,6 +11,15 @@ package.
 
 ### Added
 
+- **Standard MCP connection (2026-11-14).** `claude mcp add --transport http reccado https://<host>/mcp`
+  (and claude.ai custom connectors, Cursor, …) now works with no operator step: unauthenticated
+  RFC 7591 client registration is open on `/api/auth/oauth2/register`, hardened by a D1-backed
+  per-IP limit (10/hour), https-or-loopback `redirect_uris`, sanitized/capped `client_name`, an hourly
+  sweep of never-consented clients older than 24 h, and an `mcp.client_registered` ops event. Nothing
+  is granted before owner login + consent. The consent page shows client name, redirect host and a
+  "Cliente nuevo" note; the first consent of a client sends a Telegram "Nueva app conectada" notice.
+  `/.well-known/oauth-authorization-server` is served at the root as well as the issuer-suffixed path.
+  `pnpm operator mcp register` stays as an optional fallback.
 - **Approval by Telegram button; delegated auto-apply (2026-11-14).** Passkey approval is removed.
   The owner approves MCP sends and control-plane changes with ✅/❌ Telegram buttons (bound to intent
   id + hash prefix, full `payload_hash` re-checked; bound chat + operator allow-list) or on

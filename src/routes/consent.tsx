@@ -30,6 +30,43 @@ const fetchClientName = createServerFn({ method: "GET" })
 		}
 	});
 
+/**
+ * Whether this client has ever been consented, and when it registered. Open dynamic
+ * client registration means a never-seen client is the normal case for a freshly added
+ * MCP connection, and the owner should be told so. Non-sensitive: a timestamp and a bool.
+ */
+const fetchClientHistory = createServerFn({ method: "GET" })
+	.validator((input: { clientId: string }) => input)
+	.handler(
+		async ({ data }): Promise<{ registeredAt: number | null; consentedBefore: boolean }> => {
+			try {
+				const { env } = await import("cloudflare:workers");
+				const db = (env as unknown as { INDEX_DB: D1Database }).INDEX_DB;
+				const client = await db
+					.prepare(`SELECT "createdAt" AS created_at FROM "oauthClient" WHERE "clientId" = ?`)
+					.bind(data.clientId)
+					.first<{ created_at: number | null }>();
+				const consent = await db
+					.prepare(`SELECT 1 AS n FROM "oauthConsent" WHERE "clientId" = ? LIMIT 1`)
+					.bind(data.clientId)
+					.first();
+				return { registeredAt: client?.created_at ?? null, consentedBefore: Boolean(consent) };
+			} catch {
+				return { registeredAt: null, consentedBefore: true };
+			}
+		},
+	);
+
+/** "hace 5 min" / "hace 3 h" / "hace 2 d" */
+export function formatAgo(thenMs: number, nowMs: number = Date.now()): string {
+	const minutes = Math.max(0, Math.round((nowMs - thenMs) / 60000));
+	if (minutes < 1) return "hace un momento";
+	if (minutes < 60) return `hace ${minutes} min`;
+	const hours = Math.round(minutes / 60);
+	if (hours < 48) return `hace ${hours} h`;
+	return `hace ${Math.round(hours / 24)} d`;
+}
+
 /** Plain-Spanish risk line shown next to each high-risk scope's checkbox. */
 const HIGH_RISK_LINES: Record<string, string> = {
 	"mail:send":
@@ -50,9 +87,19 @@ export const Route = createFileRoute("/consent")({
 		...(typeof search.redirect_uri === "string" ? { redirect_uri: search.redirect_uri } : {}),
 	}),
 	loaderDeps: ({ search }) => ({ clientId: search.client_id }),
-	loader: async ({ deps }): Promise<{ clientName: string | null }> => {
-		if (!deps.clientId) return { clientName: null };
-		return fetchClientName({ data: { clientId: deps.clientId } });
+	loader: async ({
+		deps,
+	}): Promise<{
+		clientName: string | null;
+		registeredAt: number | null;
+		consentedBefore: boolean;
+	}> => {
+		if (!deps.clientId) return { clientName: null, registeredAt: null, consentedBefore: true };
+		const [name, history] = await Promise.all([
+			fetchClientName({ data: { clientId: deps.clientId } }),
+			fetchClientHistory({ data: { clientId: deps.clientId } }),
+		]);
+		return { ...name, ...history };
 	},
 	component: ConsentPage,
 });
@@ -69,7 +116,7 @@ export const Route = createFileRoute("/consent")({
  * endpoint returns (with the authorization code, or the access_denied error).
  */
 function ConsentPage(): ReactElement {
-	const { clientName } = Route.useLoaderData();
+	const { clientName, registeredAt, consentedBefore } = Route.useLoaderData();
 	const { client_id: clientId, scope, redirect_uri: redirectUri } = Route.useSearch();
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
@@ -87,12 +134,14 @@ function ConsentPage(): ReactElement {
 			return null;
 		}
 	};
-	const clientHost = hostOf(clientId);
 	const redirectHost = hostOf(redirectUri);
+	// DCR client ids are opaque random strings, so identity is judged by where the
+	// authorization code will be sent.
+	const redirectName = redirectHost?.split(":")[0] ?? null;
 	const known =
-		clientHost &&
-		["claude.ai", "anthropic.com", "localhost"].some(
-			(host) => clientHost.split(":")[0] === host || clientHost.split(":")[0]?.endsWith(`.${host}`),
+		redirectName &&
+		["claude.ai", "anthropic.com", "localhost", "127.0.0.1", "[::1]"].some(
+			(host) => redirectName === host || redirectName.endsWith(`.${host}`),
 		);
 	const descriptions: Record<string, string> = {
 		"mail:read": "Leer mensajes y buscar en el buzón.",
@@ -138,13 +187,19 @@ function ConsentPage(): ReactElement {
 		<main className="page-wrap px-4 pb-8 pt-14">
 			<section className="island-shell rise-in mx-auto max-w-md rounded-[2rem] px-6 py-10">
 				<p className="island-kicker mb-3">Reccado</p>
-				<p className="mb-2 break-all text-lg font-semibold">
-					{clientHost ?? clientId ?? "Cliente desconocido"}
+				<p className="mb-1 break-words text-2xl font-bold">
+					{clientName ?? "Nombre no disponible"}
 				</p>
-				<p className="mb-3 text-sm">
-					Cliente: {clientName ?? "Nombre no disponible"} · Destino:{" "}
-					{redirectHost ?? "No disponible"}
+				<p className="mb-3 break-all text-sm">
+					Redirige a: <span className="font-mono font-semibold">{redirectHost ?? "No disponible"}</span>
 				</p>
+				{!consentedBefore && (
+					<p role="note" className="mb-4 rounded-xl bg-sky-100 p-3 text-sm text-sky-900">
+						Cliente nuevo
+						{registeredAt ? ` — registrado ${formatAgo(registeredAt)}` : ""}. Es la primera vez que
+						pide acceso. Apruébalo solo si acabas de añadir este conector tú.
+					</p>
+				)}
 				{!known && (
 					<p role="alert" className="mb-4 rounded-xl bg-amber-100 p-3 text-sm text-amber-900">
 						Este cliente no está en la lista de dominios conocidos. Comprueba su identidad antes de

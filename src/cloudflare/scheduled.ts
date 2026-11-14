@@ -5,6 +5,7 @@ import {
 	listStaleSendingOutboundSends,
 	updateOutboundSendStatus,
 } from "../db/d1";
+import { sweepStaleOAuthClients } from "../lib/oauth-client-hygiene";
 import { backupManifestR2Key } from "../lib/r2-keys";
 import { reconcileTelegramWebhook } from "../telegram/registration";
 import { sweepTelegramBridge } from "../telegram/sweep";
@@ -90,6 +91,11 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 	// Expired Telegram confirm buttons: harmless but unbounded if never swept.
 	const expiredTelegramActions = await deleteExpiredTelegramActions(env.INDEX_DB);
 
+	// Open DCR leaves never-consented client rows behind; drop those older than 24 h.
+	const sweptOAuthClients = await sweepStaleOAuthClients(env.INDEX_DB, controller.scheduledTime).catch(
+		() => 0,
+	);
+
 	// Releases a quiet-hours digest and prunes the bridge's ephemeral tables. The
 	// digest also flushes on the next inbound mail, so this is what covers the
 	// morning that happens to be quiet -- the case a mail-triggered flush cannot.
@@ -124,6 +130,7 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 			reconciledSendCount,
 			reconciledTransactional,
 			expiredTelegramActions,
+			sweptOAuthClients,
 			telegramSweep,
 			telegramWebhook: webhook.status,
 		}),
