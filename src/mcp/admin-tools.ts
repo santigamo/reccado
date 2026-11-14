@@ -3,7 +3,8 @@ import { z } from "zod";
 import { getApproval, insertOpsEvent } from "../db/d1";
 import { requestControlPlaneChange } from "../lib/control-plane-intents";
 import { notifyIntentCreated } from "../telegram/notify";
-import { mcpToolError } from "./errors";
+import { notifyAutoApplied } from "../telegram/auto-applied";
+import { mcpToolError, mcpToolResultJson } from "./errors";
 import { intentResponse, resolveIntentRetry, type IntentFlow } from "./intent-flow";
 import { assertScope } from "./scopes";
 import type { McpSendAuth } from "./types";
@@ -155,9 +156,9 @@ async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: Inte
 		return intentResponse(env, retry ? flow : undefined, retry ? ctx : undefined, { intentId: existing, expiresAt: row.expires_at, origin, message, transform });
 	}
 	const { kind, payload } = resolve();
-	let created: { id: string; expiresAt: string };
+	let created: Awaited<ReturnType<typeof requestControlPlaneChange>>;
 	try {
-		created = await requestControlPlaneChange(env, auth, kind, payload, { oauthClientId: auth.oauthClientId, tokenSub: auth.tokenSub, tokenJti: auth.tokenJti });
+		created = await requestControlPlaneChange(env, auth, kind, payload, { oauthClientId: auth.oauthClientId, tokenSub: auth.tokenSub, tokenJti: auth.tokenJti, scopes: auth.scopes });
 	} catch (error) {
 		if (error instanceof Error && error.message === "invalid_intent_kind") throw new ToolFailure("tool_unavailable");
 		const code = (error as { code?: unknown }).code;
@@ -165,8 +166,14 @@ async function runIntent(env: Env, auth: McpSendAuth, origin: string, flow: Inte
 		throw error;
 	}
 	audit.intentId = created.id;
+	if (created.applied) {
+		// Delegated client under a policy: applied without approval; the owner is told and can undo.
+		await notifyAutoApplied(env, { intentId: created.id, kind, applied: created.applied }).catch(() => undefined);
+		const failed = created.applied.items.some((item) => item.status === "failed");
+		return mcpToolResultJson(transform({ status: failed ? "failed" : "applied", intentId: created.id, result: { items: created.applied.items } }));
+	}
 	await notifyIntentCreated(env, created.id).catch(() => undefined);
-	return intentResponse(env, flow, ctx, { intentId: created.id, expiresAt: created.expiresAt, origin, message, transform });
+	return intentResponse(env, flow, ctx, { intentId: created.id, expiresAt: created.expiresAt, origin, message, transform, ...(created.autoApplyRefused ? { autoApplyRefused: created.autoApplyRefused } : {}) });
 }
 
 function register(server: McpServer, env: Env, auth: McpSendAuth, origin: string, flow: IntentFlow | undefined, tool: string, description: string, kinds: string[], opSchema: z.ZodType, resolve: (params: Record<string, unknown>) => Resolved) {
