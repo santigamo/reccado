@@ -2,6 +2,7 @@ import { parseAdmin, readAdminResponse, type AdminProxyResult } from "./errors";
 import type { AuthContext } from "../../api/auth";
 import {
 	createTransactionalApiKeySchema,
+	updateKeyTemplatesSchema,
 	updateTransactionalApiKeySchema,
 } from "../../api/schemas";
 import { getMailbox, upsertApiKeyProjection } from "../../db/d1";
@@ -119,5 +120,62 @@ export async function rotateKey(env: Env, actor: AuthContext, input: KeyInput) {
 	);
 	if (data?.previousKeyProjection) await project(env, data.previousKeyProjection);
 	if (data?.key) await project(env, data.key);
+	return response;
+}
+
+export type KeyTemplatesInput = KeyInput & { add?: string[]; remove?: string[]; set?: string[] };
+
+/**
+ * Computes the next allowlist from a key's current one. Exactly one of `set` or
+ * `add`/`remove` must be given; add/remove are relative to what is stored now.
+ */
+export function nextAllowlist(
+	current: readonly string[] | null | undefined,
+	input: { add?: string[]; remove?: string[]; set?: string[] },
+): string[] {
+	const hasDelta = input.add !== undefined || input.remove !== undefined;
+	if ((input.set !== undefined) === hasDelta) {
+		throw new AdminError(
+			"Provide either set, or add/remove",
+			"invalid_template_allowlist_input",
+			400,
+		);
+	}
+	if (input.set) return [...new Set(input.set.map((id) => id.trim()))];
+	const removed = new Set((input.remove ?? []).map((id) => id.trim()));
+	const next = (current ?? []).filter((id) => !removed.has(id));
+	for (const raw of input.add ?? []) {
+		const id = raw.trim();
+		if (!next.includes(id)) next.push(id);
+	}
+	return next;
+}
+
+/** Edits a key's template allowlist in place: same key id, same secret. */
+export async function updateKeyTemplates(env: Env, actor: AuthContext, input: KeyTemplatesInput) {
+	await requireMailboxOwner(env, actor, input.mailboxId);
+	parseAdmin(updateKeyTemplatesSchema, {
+		add: input.add,
+		remove: input.remove,
+		set: input.set,
+	});
+	const ownerStub = await stub(env, input.mailboxId);
+	const listed = await read<{ keys?: TransactionalApiKeyProjection[] }>(
+		await ownerStub.fetch("https://mailbox-do/transactional/api-keys", { method: "GET" }),
+	);
+	const existing = listed.data?.keys?.find((k) => k.keyId === input.keyId);
+	if (!existing) throw new AdminError("Key not found", "key_not_found", 404);
+	const next = nextAllowlist(existing.templateAllowlist, input);
+	const { data, response } = await read<{ key?: { projection?: TransactionalApiKeyProjection } }>(
+		await ownerStub.fetch(
+			`https://mailbox-do/transactional/api-keys/${encodeURIComponent(input.keyId)}/templates`,
+			{
+				method: "PUT",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ templateAllowlist: next }),
+			},
+		),
+	);
+	if (data?.key?.projection) await project(env, data.key.projection);
 	return response;
 }

@@ -1,9 +1,10 @@
 import { z } from "zod";
 import type { AuthContext } from "../../api/auth";
-import { createTransactionalApiKeySchema } from "../../api/schemas";
+import { createTransactionalApiKeySchema, updateKeyTemplatesSchema } from "../../api/schemas";
 import { requireMailboxOwner } from "../admin/access";
 import { AdminError } from "../admin/errors";
-import { createKey, listKeys, revokeKey, rotateKey } from "../admin/api-keys";
+import { createKey, listKeys, nextAllowlist, revokeKey, rotateKey, updateKeyTemplates } from "../admin/api-keys";
+import { listTemplates } from "../admin/templates";
 import type { IntentField, IntentWarning } from "../approvals";
 import { registerControlPlaneKind, show, strict, type Operation } from "../control-plane-registry";
 import { KEY_SCOPES, type TransactionalApiKeyProjection } from "../transactional-keys";
@@ -31,6 +32,16 @@ const createSchema = z
 const keySchema = z.object({ mailboxId, keyId }).strict();
 const scopesSchema = z
 	.object({ mailboxId, keyId, scopes, templateAllowlist: z.array(z.string().min(1).max(128)).max(100).optional() })
+	.strict();
+
+const templatesSchema = z
+	.object({
+		mailboxId,
+		keyId,
+		add: z.array(z.string().min(1).max(128)).max(100).optional(),
+		remove: z.array(z.string().min(1).max(128)).max(100).optional(),
+		set: z.array(z.string().min(1).max(128)).max(100).optional(),
+	})
 	.strict();
 
 async function activeKey(env: Env, auth: AuthContext, payload: Operation) {
@@ -223,6 +234,74 @@ registerControlPlaneKind("api_key_scopes", {
 			throw error;
 		}
 		return created;
+	},
+	redact: redactSecret,
+});
+
+/**
+ * Edits a key's template allowlist in place. No new secret is issued: the key id and secret
+ * stay the same, so the integration needs no change.
+ */
+registerControlPlaneKind("api_key_templates", {
+	covers: ["mailboxId", "keyId", "add", "remove", "set"],
+	validate: (value) => {
+		const row = strict(templatesSchema, value);
+		strict(updateKeyTemplatesSchema, { add: row.add, remove: row.remove, set: row.set });
+		return row;
+	},
+	render: async (env, auth, payload) => {
+		const key = await activeKey(env, auth, payload);
+		const input = payload as { add?: string[]; remove?: string[]; set?: string[] };
+		const before = key.templateAllowlist ?? [];
+		const after = nextAllowlist(before, input);
+		const added = after.filter((id) => !before.includes(id));
+		const removed = before.filter((id) => !after.includes(id));
+		const listed = await listTemplates(env, auth, { mailboxId: String(payload.mailboxId) });
+		const existing = new Set(
+			(
+				(listed.value as { templates?: Array<{ templateId?: string; id?: string; status?: string; archivedAt?: string | null }> } | null)
+					?.templates ?? []
+			)
+				.filter((t) => t.status === undefined || t.status === "active")
+				.filter((t) => !t.archivedAt)
+				.map((t) => String(t.templateId ?? t.id)),
+		);
+		const warnings: IntentWarning[] = added
+			.filter((id) => !existing.has(id))
+			.map((id) => ({
+				code: "template_missing",
+				message: `la plantilla ${id} no existe todavía`,
+			}));
+		if (key.scopes.includes("transactional:send") && after.length === 0)
+			warnings.push({
+				code: "send_without_templates",
+				message: "Una clave con permiso de envío necesita al menos una plantilla.",
+			});
+		const mark = (id: string) => (added.includes(id) ? `+${id}` : id);
+		return {
+			title: "Cambiar plantillas permitidas de clave API",
+			fields: [
+				...keyFields(key).filter((f) => f.label !== "Plantillas permitidas"),
+				{
+					label: "Plantillas permitidas",
+					value: `${show(before.join(", "))} → ${show(after.map(mark).join(", "))}`,
+				},
+				{ label: "Añadidas", value: show(added.join(", ")) },
+				{ label: "Quitadas", value: show(removed.join(", ")) },
+			],
+			warnings,
+		};
+	},
+	execute: async (env, auth, payload) => {
+		const input = payload as { add?: string[]; remove?: string[]; set?: string[] };
+		const result = await updateKeyTemplates(env, auth, {
+			mailboxId: String(payload.mailboxId),
+			keyId: String(payload.keyId),
+			add: input.add,
+			remove: input.remove,
+			set: input.set,
+		});
+		return redactSecret(result).stored;
 	},
 	redact: redactSecret,
 });

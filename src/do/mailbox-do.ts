@@ -1560,6 +1560,36 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				return Response.json({ error: code }, { status });
 			}
 		}
+		if (
+			url.pathname.match(/^\/transactional\/api-keys\/[^/]+\/templates$/) &&
+			request.method === "PUT"
+		) {
+			const keyId = url.pathname.split("/")[3];
+			if (!keyId) return Response.json({ error: "key_not_found" }, { status: 404 });
+			const body = (await request.json()) as { templateAllowlist?: unknown };
+			if (!Array.isArray(body.templateAllowlist)) {
+				return Response.json({ error: "invalid_template_allowlist" }, { status: 400 });
+			}
+			const { updateApiKeyTemplateAllowlist } = await import("./transactional-key-ops");
+			try {
+				const result = updateApiKeyTemplateAllowlist(
+					this.ctx.storage.sql,
+					keyId,
+					body.templateAllowlist as string[],
+				);
+				if (!result) return Response.json({ error: "key_not_found" }, { status: 404 });
+				return Response.json({ key: result });
+			} catch (error) {
+				const code = error instanceof Error ? error.message : "update_failed";
+				const status =
+					code === "key_not_active" ||
+					code === "invalid_template_allowlist" ||
+					code === "send_scope_requires_template_allowlist"
+						? 400
+						: 500;
+				return Response.json({ error: code }, { status });
+			}
+		}
 		if (url.pathname === "/transactional/api-keys" && request.method === "GET") {
 			const mailboxId = this.ctx.id.name ?? "unknown";
 			const { listApiKeys } = await import("./transactional-key-ops");
