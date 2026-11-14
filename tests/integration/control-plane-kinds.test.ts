@@ -4,6 +4,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { handleAuthRequest } from "#/api/better-auth";
 import { insertMailbox } from "#/db/d1";
 import { addSuppression } from "#/do/mailbox-suppressions";
+import { listApiKeyEvents, updateApiKeyTemplateAllowlist } from "#/do/transactional-key-ops";
+import { config as mcpConfig } from "../../src/mcp/admin-reads";
 import {
 	approveIntent,
 	getIntentStatus,
@@ -441,6 +443,135 @@ describe("api keys", () => {
 		await expect(
 			request("api_key_revoke", { mailboxId: "mbx_kinds_foreign", keyId: "k" }),
 		).rejects.toMatchObject({ code: "forbidden" });
+	});
+});
+
+describe("api key template allowlist (in place)", () => {
+	const MBX = "mbx_kinds_tpl";
+	const keyApi = (path = "") => `https://mailbox-do/transactional/api-keys${path}`;
+	type KeyRow = { keyId: string; status: string; templateAllowlist: string[] | null };
+	const keys = async () =>
+		(
+			(await (await mailboxStub(env, MBX).fetch(keyApi())).json()) as { keys: KeyRow[] }
+		).keys;
+	const send = async (secret: string, template: string, idem: string) => {
+		const response = await mailboxStub(env, MBX).fetch("https://mailbox-do/transactional/send", {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				authorization: `Bearer ${secret}`,
+				"idempotency-key": idem,
+			},
+			body: JSON.stringify({ template, to: "someone@example.net" }),
+		});
+		return { status: response.status, json: (await response.json()) as Record<string, unknown> };
+	};
+	let secret = "";
+	let keyId = "";
+
+	it("setup: a sending key allowed to use only 'welcome'", async () => {
+		await newMailbox(MBX, "t@kinds-tpl.example");
+		const created = await applied("api_key_create", {
+			mailboxId: MBX,
+			body: {
+				environment: "live",
+				sender: "t@kinds-tpl.example",
+				scopes: ["transactional:send", "transactional:templates:use"],
+				templateAllowlist: ["welcome"],
+				recipientPolicy: "someone@example.net",
+			},
+		});
+		secret = created.result.reveal?.[0]?.value ?? "";
+		expect(secret).toMatch(/^rck_live_/);
+		keyId = (await keys()).find((k) => k.status === "active")!.keyId;
+		const denied = await send(secret, "reset", "tpl-before");
+		expect(denied.json.error).toBe("template_not_allowed");
+	});
+	it("renders old → new with a warning for a template that does not exist, no key_replaced", async () => {
+		const intent = await request("api_key_templates", { mailboxId: MBX, keyId, add: ["reset"] });
+		const v = await view(intent);
+		const row = v.fields.find((f) => f.label === "Plantillas permitidas")!;
+		expect(row.value).toBe("welcome → welcome, +reset");
+		expect(v.fields.find((f) => f.label === "Añadidas")?.value).toBe("reset");
+		const codes = v.warnings.map((w) => w.code);
+		expect(codes).toContain("template_missing");
+		expect(v.warnings.map((w) => w.message).join("|")).toContain("la plantilla reset no existe todavía");
+		expect(codes).not.toContain("key_replaced");
+	});
+	it("applies in place: same key id and secret, allowlist, event and nothing revealed", async () => {
+		const tpl = await mailboxStub(env, MBX).fetch("https://mailbox-do/transactional/templates", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ id: "reset", subject: "Reset" }),
+		});
+		expect(tpl.status).toBe(201);
+		const { result } = await applied("api_key_templates", { mailboxId: MBX, keyId, add: ["reset", "welcome"] });
+		expect(result.reveal).toBeUndefined();
+		expect(JSON.stringify(result.result)).not.toContain(secret);
+		const active = (await keys()).filter((k) => k.status === "active");
+		expect(active).toHaveLength(1);
+		expect(active[0]).toMatchObject({ keyId, templateAllowlist: ["welcome", "reset"] });
+		const events = await runInDurableObject(mailboxStub(env, MBX), async (_i, state) =>
+			listApiKeyEvents(state.storage.sql, keyId),
+		);
+		expect(events.at(-1)).toMatchObject({
+			eventType: "template_allowlist_updated",
+			metadata: { from: ["welcome"], to: ["welcome", "reset"] },
+		});
+		const projected = await db
+			.prepare("SELECT template_allowlist_json FROM transactional_api_keys WHERE key_id = ?")
+			.bind(keyId)
+			.first<{ template_allowlist_json: string }>();
+		expect(JSON.parse(projected!.template_allowlist_json)).toEqual(["welcome", "reset"]);
+		// The OLD secret still authenticates and the template is now allowed.
+		const after = await send(secret, "reset", "tpl-after");
+		expect(after.json.error).not.toBe("template_not_allowed");
+		expect(after.status).not.toBe(401);
+	});
+	it("remove and set semantics", async () => {
+		await applied("api_key_templates", { mailboxId: MBX, keyId, remove: ["welcome"] });
+		expect((await keys()).find((k) => k.keyId === keyId)?.templateAllowlist).toEqual(["reset"]);
+		await applied("api_key_templates", { mailboxId: MBX, keyId, set: ["a", "b", "a"] });
+		expect((await keys()).find((k) => k.keyId === keyId)?.templateAllowlist).toEqual(["a", "b"]);
+		await applied("api_key_templates", { mailboxId: MBX, keyId, add: ["c"], remove: ["a"] });
+		expect((await keys()).find((k) => k.keyId === keyId)?.templateAllowlist).toEqual(["b", "c"]);
+	});
+	it("refuses set mixed with add/remove, empty list on a send key, unknown fields and foreign mailboxes", async () => {
+		await expect(request("api_key_templates", { mailboxId: MBX, keyId, set: ["a"], add: ["b"] })).rejects.toBeTruthy();
+		await expect(request("api_key_templates", { mailboxId: MBX, keyId })).rejects.toBeTruthy();
+		await expect(request("api_key_templates", { mailboxId: MBX, keyId, add: ["a"], extra: 1 })).rejects.toBeTruthy();
+		await expect(
+			request("api_key_templates", { mailboxId: "mbx_kinds_foreign", keyId, add: ["a"] }),
+		).rejects.toMatchObject({ code: "forbidden" });
+		const intent = await request("api_key_templates", { mailboxId: MBX, keyId, set: [] });
+		const result = await approve(intent);
+		expect(result.status).not.toBe("executed");
+		expect((await keys()).find((k) => k.keyId === keyId)?.templateAllowlist).toEqual(["b", "c"]);
+	});
+	it("the DO refuses bad ids, over-long lists, a revoked key and an unknown key", async () => {
+		await runInDurableObject(mailboxStub(env, MBX), async (_i, state) => {
+			const sql = state.storage.sql;
+			expect(() => updateApiKeyTemplateAllowlist(sql, keyId, [""])).toThrow("invalid_template_allowlist");
+			expect(() => updateApiKeyTemplateAllowlist(sql, keyId, ["x".repeat(129)])).toThrow("invalid_template_allowlist");
+			expect(() =>
+				updateApiKeyTemplateAllowlist(sql, keyId, Array.from({ length: 101 }, (_, i) => `t${i}`)),
+			).toThrow("invalid_template_allowlist");
+			expect(() => updateApiKeyTemplateAllowlist(sql, keyId, [])).toThrow(
+				"send_scope_requires_template_allowlist",
+			);
+			expect(updateApiKeyTemplateAllowlist(sql, "key_nope", ["a"])).toBeNull();
+		});
+		await applied("api_key_revoke", { mailboxId: MBX, keyId });
+		await runInDurableObject(mailboxStub(env, MBX), async (_i, state) => {
+			expect(() => updateApiKeyTemplateAllowlist(state.storage.sql, keyId, ["a"])).toThrow("key_not_active");
+		});
+	});
+	it("list_config exposes the allowlist and template ids", async () => {
+		const config = await mcpConfig(env, { ...auth } as never);
+		const detail = (config as { mailboxDetails: Array<{ mailboxId: string; keys: unknown; templates: unknown }> })
+			.mailboxDetails.find((m) => m.mailboxId === MBX)!;
+		expect(JSON.stringify(detail.keys)).toContain("templateAllowlist");
+		expect(JSON.stringify(detail.templates)).toContain('"reset"');
 	});
 });
 

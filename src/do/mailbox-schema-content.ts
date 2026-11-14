@@ -207,7 +207,7 @@ CREATE TABLE IF NOT EXISTS api_key_events (
   id TEXT PRIMARY KEY,
   key_id TEXT NOT NULL,
   event_type TEXT NOT NULL
-    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated')),
+    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated', 'template_allowlist_updated')),
   metadata_json TEXT,
   created_at TEXT NOT NULL
 );

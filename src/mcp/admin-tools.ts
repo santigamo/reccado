@@ -70,7 +70,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 		},
 	},
 	manage_api_key: {
-		description: "Create, rotate, revoke or change the scopes of a transactional API key. The secret is shown only to the human on the approval page (approve it there, not in Telegram) and is never returned here. Needs human approval.",
+		description: "Create, rotate, revoke, change the scopes of (scopes: issues a replacement key) or edit the template allowlist of (templates: in place, no new secret) a transactional API key. A secret, when one is issued, is shown only to the human on the approval page (approve it there, not in Telegram) and is never returned here. Needs human approval unless this client's delegation policy allows the change.",
 		actions: {
 			create: { kind: "api_key_create", schema: obj({ mailboxId, body: body({
 				environment: z.enum(["test", "live"]),
@@ -84,7 +84,8 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 			}) }) },
 			rotate: { kind: "api_key_rotate", schema: obj({ mailboxId, keyId: z.string().min(1) }) },
 			revoke: { kind: "api_key_revoke", schema: obj({ mailboxId, keyId: z.string().min(1) }) },
-			scopes: { kind: "api_key_scopes", schema: obj({ mailboxId, keyId: z.string().min(1), scopes: z.array(z.string()).min(1) }) },
+			scopes: { kind: "api_key_scopes", schema: obj({ mailboxId, keyId: z.string().min(1), scopes: z.array(z.string()).min(1), templateAllowlist: z.array(z.string()).optional() }) },
+			templates: { kind: "api_key_templates", schema: obj({ mailboxId, keyId: z.string().min(1), add: z.array(z.string()).optional(), remove: z.array(z.string()).optional(), set: z.array(z.string()).optional() }) },
 		},
 	},
 };

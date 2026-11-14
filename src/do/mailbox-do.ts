@@ -1233,7 +1233,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	}
 
 	/**
-	 * Widens `api_key_events.event_type` to admit 'sender_name_updated'.
+	 * Widens `api_key_events.event_type` to admit 'sender_name_updated' and 'template_allowlist_updated'.
 	 *
 	 * A CHECK constraint cannot be altered in SQLite, so a mailbox provisioned
 	 * before this event type existed would reject the audit row — and because the
@@ -1249,14 +1249,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		const ddl = this.ctx.storage.sql
 			.exec("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_key_events'")
 			.toArray()[0] as { sql?: string } | undefined;
-		if (!ddl?.sql || ddl.sql.includes("sender_name_updated")) return;
+		if (!ddl?.sql || ddl.sql.includes("template_allowlist_updated")) return;
 
 		this.ctx.storage.sql.exec("ALTER TABLE api_key_events RENAME TO api_key_events_old");
 		this.ctx.storage.sql.exec(`CREATE TABLE api_key_events (
   id TEXT PRIMARY KEY,
   key_id TEXT NOT NULL,
   event_type TEXT NOT NULL
-    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated')),
+    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated', 'template_allowlist_updated')),
   metadata_json TEXT,
   created_at TEXT NOT NULL
 )`);
@@ -1557,6 +1557,36 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				// codes are a value that cannot go in a header. Both are the caller's
 				// mistake, neither is a server fault.
 				const status = code === "key_not_active" || code === "invalid_sender_name" ? 400 : 500;
+				return Response.json({ error: code }, { status });
+			}
+		}
+		if (
+			url.pathname.match(/^\/transactional\/api-keys\/[^/]+\/templates$/) &&
+			request.method === "PUT"
+		) {
+			const keyId = url.pathname.split("/")[3];
+			if (!keyId) return Response.json({ error: "key_not_found" }, { status: 404 });
+			const body = (await request.json()) as { templateAllowlist?: unknown };
+			if (!Array.isArray(body.templateAllowlist)) {
+				return Response.json({ error: "invalid_template_allowlist" }, { status: 400 });
+			}
+			const { updateApiKeyTemplateAllowlist } = await import("./transactional-key-ops");
+			try {
+				const result = updateApiKeyTemplateAllowlist(
+					this.ctx.storage.sql,
+					keyId,
+					body.templateAllowlist as string[],
+				);
+				if (!result) return Response.json({ error: "key_not_found" }, { status: 404 });
+				return Response.json({ key: result });
+			} catch (error) {
+				const code = error instanceof Error ? error.message : "update_failed";
+				const status =
+					code === "key_not_active" ||
+					code === "invalid_template_allowlist" ||
+					code === "send_scope_requires_template_allowlist"
+						? 400
+						: 500;
 				return Response.json({ error: code }, { status });
 			}
 		}

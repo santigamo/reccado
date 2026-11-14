@@ -11,7 +11,9 @@ import {
 	type KeyStatus,
 	normalizeSenderName,
 	nowISO,
+	SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST,
 	SEND_SCOPE_REQUIRES_TEMPLATES_USE,
+	sendScopeHasTemplateAllowlist,
 	sendScopeHasTemplateUse,
 	type TransactionalApiKeyProjection,
 	type TransactionalApiKeyRecord,
@@ -499,6 +501,92 @@ export function updateApiKeySenderName(
 		throw new Error("key_not_found");
 	}
 
+	return {
+		key: updated,
+		auditEvent: { id: eventId },
+		projection: {
+			keyId: updated.keyId,
+			mailboxId: updated.mailboxId,
+			sender: updated.sender,
+			senderName: updated.senderName,
+			displaySuffix: updated.displaySuffix,
+			environment: updated.environment,
+			scopes: updated.scopes,
+			templateAllowlist: updated.templateAllowlist,
+			recipientPolicy: updated.recipientPolicy,
+			status: updated.status,
+			quotaMax: updated.quotaMax,
+			quotaUsed: 0,
+			expiresAt: updated.expiresAt,
+			createdAt: updated.createdAt,
+			updatedAt: updated.updatedAt,
+			revokedAt: updated.revokedAt,
+		},
+	};
+}
+
+export type UpdateApiKeyTemplateAllowlistResult = UpdateApiKeySenderNameResult;
+
+export const MAX_TEMPLATE_ALLOWLIST = 100;
+export const MAX_TEMPLATE_ID_LENGTH = 128;
+
+/**
+ * Replaces a key's template allowlist in place.
+ *
+ * Exists so a product can start sending a new template without rotating its
+ * secret. The secret, hash, scopes and sender are untouched; only the allowlist
+ * and `updated_at` change. Entries are trimmed and deduplicated (first
+ * occurrence wins). A key holding `transactional:send` may never be left with an
+ * empty list — the send path reads that as "nothing may be sent".
+ */
+export function updateApiKeyTemplateAllowlist(
+	sql: SqlStorage,
+	keyId: string,
+	list: string[],
+): UpdateApiKeyTemplateAllowlistResult | null {
+	const existing = getApiKey(sql, keyId);
+	if (!existing) return null;
+	if (existing.status === "revoked") {
+		throw new Error("key_not_active");
+	}
+
+	const normalized: string[] = [];
+	for (const raw of list) {
+		if (typeof raw !== "string") throw new Error("invalid_template_allowlist");
+		const id = raw.trim();
+		if (id.length < 1 || id.length > MAX_TEMPLATE_ID_LENGTH) {
+			throw new Error("invalid_template_allowlist");
+		}
+		if (!normalized.includes(id)) normalized.push(id);
+	}
+	if (normalized.length > MAX_TEMPLATE_ALLOWLIST) {
+		throw new Error("invalid_template_allowlist");
+	}
+	if (!sendScopeHasTemplateAllowlist(existing.scopes, normalized)) {
+		throw new Error(SEND_SCOPE_REQUIRES_TEMPLATE_ALLOWLIST);
+	}
+
+	const now = nowISO();
+	const eventId = crypto.randomUUID();
+	// A key without send scope may legitimately hold an empty list; store it as NULL
+	// like createApiKey does.
+	sql.exec(
+		"UPDATE api_keys SET template_allowlist_json = ?, updated_at = ? WHERE key_id = ?",
+		normalized.length ? JSON.stringify(normalized) : null,
+		now,
+		keyId,
+	);
+	sql.exec(
+		`INSERT INTO api_key_events (id, key_id, event_type, metadata_json, created_at)
+     VALUES (?, ?, 'template_allowlist_updated', ?, ?)`,
+		eventId,
+		keyId,
+		JSON.stringify({ from: existing.templateAllowlist, to: normalized }),
+		now,
+	);
+
+	const updated = getApiKey(sql, keyId);
+	if (!updated) throw new Error("key_not_found");
 	return {
 		key: updated,
 		auditEvent: { id: eventId },

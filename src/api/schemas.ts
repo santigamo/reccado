@@ -178,6 +178,15 @@ export const updateTransactionalApiKeySchema = z.object({
 	senderName: senderNameField.nullable(),
 });
 
+const templateIdList = z.array(z.string().trim().min(1).max(128)).max(100);
+/** Exactly one of `set`, or `add`/`remove` (either or both). */
+export const updateKeyTemplatesSchema = z
+	.object({ add: templateIdList.optional(), remove: templateIdList.optional(), set: templateIdList.optional() })
+	.strict()
+	.refine((b) => (b.set !== undefined) !== (b.add !== undefined || b.remove !== undefined), {
+		message: "Provide either set, or add/remove",
+	});
+
 /**
  * Collection-level template sync. Only the shape, the batch cap and duplicate ids
  * are checked here; the per-template rules (id characters, CR/LF in subject, body
