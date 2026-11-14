@@ -24,7 +24,7 @@ confirmation step.**
 In this codebase that confirmation is the `request-send` → `confirm-send` flow
 (`POST /api/mailboxes/{mailboxId}/drafts/{draftId}/request-send` then
 `.../confirm-send`), each gated by its own idempotency key. Over MCP the `send` tool only creates an
-approval intent; the owner approves it with the Telegram ✅/❌ buttons or at `/approve/:id` with the owner web session, and the DO sends an
+approval intent; the owner approves it only at `/approve/:id` with the owner web session (Telegram sends a notice with the link, no buttons), and the DO sends an
 MCP-origin draft only with that approval's HMAC proof, so an agent cannot reach `confirm-send` by
 itself. The one deliberate exception to per-message confirmation is the transactional REST API,
 where an operator-created, mailbox-bound API key is itself the pre-authorization — see
@@ -252,19 +252,23 @@ The MCP endpoint (`/mcp`) authenticates with Better Auth OAuth tokens plus the o
 `search_messages`, `save_draft`, `cancel_draft`, `update_messages`, `send`, `get_health`, `list_ops`,
 `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`, `manage_template`,
 `manage_api_key` (actions incl. `templates`, an in-place allowlist edit), `remove_suppression`, `restore`, `reconcile_stale` (`src/mcp/*`). Scopes:
-`mail:read`, `mail:draft` (default consent), `mail:send`, `mail:read:sensitive`, `admin`.
+`mail:read`, `mail:draft`, `config:read` (default consent), `mail:send`, `mail:read:sensitive`,
+`mailboxes:write`, `templates:write`, `routing:write`, `domains:write`, `keys:write`,
+`suppressions:write` (no omnibus `admin`; `tools/list` shows only granted tools, a call missing a
+scope gets `insufficient_scope` naming it).
 
 Connect a client the standard way: `claude mcp add --transport http reccado https://<host>/mcp`
 (claude.ai: Settings → Connectors → Add custom connector → URL; Cursor/others: add the URL). The
-client self-registers (open DCR), the owner logs in and picks scopes at consent; for a delegated
-product client tick only `admin` and set the policy (`pnpm operator mcp policy set`, or the web UI at
-`/security` "Aplicaciones conectadas"). `pnpm operator mcp register` is an optional fallback (see
-`docs/OPERATIONS.md`). `send` and every `manage_*`/`restore`/`reconcile_stale` call only create an
-approval intent: the agent gets a `/approve/:id` URL and the owner approves it in Telegram or on that
-page (API-key secrets only on the page). The one exception is a delegated client (`admin`, no mail
-read scope) with an owner-set policy, which auto-applies a few low-risk kinds; sends are never
-auto. An agent must never try to approve, replay or bypass that step, and the owner registry is not
-reachable over MCP. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
+client identifies itself by CIMD (on) or open DCR (fallback), the owner logs in and picks scopes at
+consent (e.g. a product maintenance client: `templates:write` + `keys:write`). Owner revokes apps
+under `/security` "Aplicaciones conectadas". `pnpm operator mcp register` is an optional fallback
+(see `docs/OPERATIONS.md`). Only `send` and the irreversible / exfiltrating kinds (alias or forward
+rule to a destination outside the owner's domains, `api_key_create|rotate|scopes`,
+`suppression_remove`, `domain_add|provision|disable`) create an approval intent: the agent gets a
+`/approve/:id` URL and the owner approves it there with the web session (API-key secrets are shown
+once on that page, never to the agent). Every other write applies directly with its scope, keeps a
+before-snapshot and is undoable with `restore`. One operation per call. An agent must never try to
+approve, replay or bypass that step, and the owner registry is not reachable over MCP. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
 `mailboxes.owner_email` for pre-existing mailboxes so the owner-scoped MCP lookups can serve them.
 
 ## Verification checklist

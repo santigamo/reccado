@@ -36,20 +36,27 @@ informed decision from the user/supervisor.
 ### Outbound sending
 
 - **An agent may read, draft and act on mailbox content, but every outbound send it initiates over
-  MCP requires the owner's approval, bound to the exact payload (`payload_hash`): the ✅/❌ Telegram
-  button (bound chat + operator allowlist only) or `/approve/:id` with the owner web session. The
-  agent can never approve.** Control-plane changes it initiates need the same approval, with one
-  bounded exception: a delegated client (token with `admin` and neither `mail:read` nor
-  `mail:read:sensitive`) with an owner-set policy may auto-apply a hard-coded set of low-risk kinds
-  (`src/lib/mcp-client-policy.ts`); **sends are never auto-applied**, and the owner registry is
-  never reachable over MCP. Secret-revealing kinds (API key create/rotate/scopes) are approvable
-  only on the web page. The `request-send` → `confirm-send` flow with an idempotency key remains the
-  only sending path; there is no shortcut. A draft created over MCP has a sticky `origin='mcp'` and
-  the mailbox DO sends it only with the HMAC approval proof (`mcp-approval.v1`) minted by that
-  approval; web and Telegram confirm refuse it (`approval_required`). Repeated `confirm-send` calls
-  with the same idempotency key must send at most once. This is a security boundary, not a UX preference — see
-  `docs/ARCHITECTURE.md` ("Authentication and Security Model"), `SECURITY.md` ("MCP") and `SKILL.md`
-  ("Hard invariant"). Owner-registry changes are never available over MCP.
+  MCP requires the owner's approval, bound to the exact payload (`payload_hash`), given only on
+  `/approve/:id` with the owner web session (the URL comes back from the tool; it is never
+  pre-authenticated). Telegram sends a notice with that link for critical requests — no ✅/❌ buttons.
+  The agent can never approve.** The same approval gates a short list of irreversible /
+  exfiltrating control-plane kinds, for any token: `api_key_create`, `api_key_rotate`,
+  `api_key_scopes` (they issue a secret), `suppression_remove`, `domain_add`, `domain_provision`,
+  `domain_disable`, and an alias or forward/routing rule whose destination is outside the owner's
+  domains. **Every other control-plane write applies directly with its scope** (templates,
+  `api_key_templates`, `api_key_revoke`, mailbox kinds, internal aliases/rules, `domain_update`,
+  `restore`, `reconcile_stale`, `update_messages`): it keeps an `admin.before_snapshot` + ops event
+  and returns the result to the agent, and `restore` can undo it. There is no omnibus `admin`
+  scope and no delegation policy; direct vs approval is decided per kind
+  (`src/lib/control-plane-kinds/*`), never per client. Secrets are never returned to the agent
+  (shown once on the approval page). The `request-send` → `confirm-send` flow with an idempotency
+  key remains the only sending path; there is no shortcut. A draft created over MCP has a sticky
+  `origin='mcp'` and the mailbox DO sends it only with the HMAC approval proof
+  (`mcp-approval.v1`) minted by that approval; web and Telegram confirm refuse it
+  (`approval_required`). Repeated `confirm-send` calls with the same idempotency key must send at
+  most once. This is a security boundary, not a UX preference — see `docs/ARCHITECTURE.md`
+  ("Authentication and Security Model"), `SECURITY.md` ("MCP") and `SKILL.md` ("Hard invariant").
+  The owner registry is never reachable over MCP.
 
 ### Legal / provenance
 
@@ -126,25 +133,30 @@ actual repo state, fix this section rather than trusting it blindly.
   `unknown` → no auto-retry, redacted logs, non-authoritative D1 projections) is implemented in
   `src/lib/transactional-*`, `src/do/transactional-*`, D1 migrations `0006`/`0007`, and covered by
   `tests/unit/transactional-*.test.ts` + `tests/integration/transactional-*.test.ts`. The
-  MCP endpoint (`/mcp`, Better Auth OAuth + owner registry; plan `docs/plans/mcp-v2.md`) is no longer
-  read/draft-only: `src/mcp/*` registers `list_mailboxes`, `list_threads`, `read_thread`,
-  `read_message`, `search_messages`, `save_draft`, `cancel_draft`, `update_messages`, `send`,
-  `get_health`, `list_ops`, `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`,
-  `manage_template`, `manage_api_key`, `remove_suppression`, `restore` and `reconcile_stale`, gated
-  by scopes (`mail:read`, `mail:draft`, `mail:send`, `mail:read:sensitive`, `admin`). `send` and every
-  control-plane tool only create an *approval* (table `approvals`, frozen payload + `payload_hash`,
-  10 min, single use) that the owner approves with the ✅/❌ Telegram buttons
-  (`src/telegram/intent-cards.ts`) or on `/approve/:id` with the owner web session; passkeys,
-  WebAuthn and passkey step-up were removed on 2026-11-14 (the `0024` passkey table stays, unused).
-  Delegated OAuth clients with a policy (`pnpm operator mcp policy set|show|rm`,
-  `src/api/mcp-policy-routes.ts`) auto-apply template/API-key-allowlist/suppression/restore kinds
-  and notify on Telegram with ↩️ Deshacer (`src/telegram/auto-applied.ts`); `manage_api_key` action
-  `templates` edits a key's allowlist in place. Control-plane kinds live in
-  `src/lib/control-plane-kinds/*`. Better Auth/`@better-auth/mcp` is 1.7.20, with
-  `@better-auth/cimd`; migrations run through `0029`
-  (`0021` Better Auth 1.7.20, `0022` approvals, `0024` passkey (unused), `0025`–`0028`
-  audit/approval metadata, intent payload, pending uniqueness, `0029` `mcp_client_policies` +
-  `approvals.approved_via`/`auto_refused`; `0023` does not exist). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
+  MCP endpoint (`/mcp`, Better Auth OAuth + owner registry; plan `docs/plans/mcp-v2.md`, final
+  permission model in its "2026-11-14 final permission model" section) is no longer read/draft-only:
+  `src/mcp/*` registers `list_mailboxes`, `list_threads`, `read_thread`, `read_message`,
+  `search_messages`, `save_draft`, `cancel_draft`, `update_messages`, `send`, `get_health`,
+  `list_ops`, `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`,
+  `manage_template`, `manage_api_key`, `remove_suppression`, `restore` and `reconcile_stale`
+  (one operation per call, no batches). Scopes are `resource:action` with no `admin`:
+  `mail:read`, `mail:read:sensitive`, `mail:draft`, `mail:send`, `config:read`, `mailboxes:write`,
+  `templates:write`, `routing:write`, `domains:write`, `keys:write`, `suppressions:write`
+  (`src/lib/mcp-scopes.ts`). `tools/list` shows only the tools whose scope was granted; a call
+  missing a scope gets the spec `insufficient_scope` signal naming it. `send` and the critical
+  control-plane kinds only create an *approval* (table `approvals`, frozen payload +
+  `payload_hash`, 10 min, single use) that the owner approves on `/approve/:id` with the owner
+  web session (Telegram carries a notice with the link, no buttons; passkeys/WebAuthn were removed
+  — the `0024` passkey table stays, unused). All other writes apply directly and are undoable via
+  `restore`. Delegation policies (`mcp_client_policies`, `pnpm operator mcp policy`, auto-apply,
+  Telegram undo) were removed in `0030`. Connection is one URL + browser login: OAuth 2.1 + PRM,
+  CIMD on (`MCP_CIMD_ENABLED`, `@better-auth/cimd`) as the preferred client registration, open
+  DCR kept as compatibility fallback; the owner revokes clients under `/security` "Aplicaciones
+  conectadas". Control-plane kinds live in `src/lib/control-plane-kinds/*`. Better
+  Auth/`@better-auth/mcp` is 1.7.20; migrations run through `0030` (`0021` Better Auth 1.7.20,
+  `0022` approvals, `0024` passkey (unused), `0025`–`0028` audit/approval metadata, intent payload,
+  pending uniqueness, `0029` `mcp_client_policies` + `approvals.approved_via`/`auto_refused`,
+  `0030` drops `mcp_client_policies`; `0023` does not exist). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
   Gateway) has not started — do not claim it. Cloudflare Email Sending lifecycle events are
   consumed by the `inbox-mcp-email-events` Queue and hard-bounce/complaint suppressions are
   enforced in the mailbox DO. The per-domain Email Sending event subscription is now created and

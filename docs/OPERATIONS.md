@@ -18,7 +18,7 @@ setup/deploy steps, see the [README Deploy guide](../README.md#deploy-your-own) 
   manual replay.
 - Outbound sending from the UI, Telegram, and the MCP endpoint still requires explicit human
   confirmation through `request-send` then `confirm-send` (for MCP-originated drafts, the owner's
-  Telegram button or web approval at `/approve/:id`); there is no fully automated send path on
+  web approval at `/approve/:id`); there is no fully automated send path on
   those surfaces. The transactional API is the one deliberate exception: an operator-created,
   mailbox-bound API key is an explicit pre-authorization, and sends made with it skip the
   per-message confirm step (see `SECURITY.md`).
@@ -386,17 +386,19 @@ Sending, and Access end-to-end in one call. Readiness is still an operator check
 #### Deploy order for the MCP v2 release
 
 Apply remote D1 migrations **before** `pnpm run deploy:dev`: `0021` (Better Auth 1.7.20 account
-table; login breaks if the new code runs without it), `0022` (approvals), `0024`–`0029` (passkey table (now unused),
+table; login breaks if the new code runs without it), `0022` (approvals), `0024`–`0030` (passkey table (now unused),
 outbound audit, approval metadata, intent payload, pending-intent uniqueness, `0029` delegated-client
-policies + `approvals.approved_via`/`auto_refused`; there is no `0023`). **Apply `0029` before
-deploying:** the new code reads `mcp_client_policies` and writes the new `approvals` columns.
-`pnpm run d1:migrate:dev` applies whatever is pending. Then:
+policies + `approvals.approved_via`/`auto_refused`, `0030` drops `mcp_client_policies`; there is no
+`0023`). **`0029` is already applied on the live dev database; apply `0030` before deploying** (the
+final-model code no longer reads `mcp_client_policies`, and `0030` removes it; the `approvals`
+columns from `0029` stay). `pnpm run d1:migrate:dev` applies whatever is pending. Then:
 
-- Existing MCP tokens lack the new scopes: re-register/re-consent (`pnpm operator mcp register`).
+- Existing MCP tokens carry the retired `admin` scope (or lack the new ones) and match no tool:
+  reconnect and re-consent with the new scopes.
 - Telegram "Send" buttons and pending sends created before `0022` carry no payload hash and fail
   closed — re-draft those replies.
-- Passkeys are gone: approve in Telegram (bridge on, owner in the operator allow-list) or on
-  `/approve/:id`. Enable Telegram two-step verification on the owner account.
+- Passkeys are gone and Telegram ✅/❌ approval is gone: approve only on `/approve/:id` with the
+  owner web session (Telegram sends a notice with the link).
 - `/mcp` only answers on hosts it knows: localhost, the deployment origin, and
   `MCP_ALLOWED_HOSTS` (comma-separated; `env.dev` sets `inbox.imsanti.dev`). A new custom domain
   must be added there.
@@ -694,21 +696,35 @@ Scripts should import `scripts/lib/operator-session.ts`: `requireSession(host)` 
 add the cookie, the `Origin` header the CSRF check requires, and a JSON content-type, and throw
 `OperatorAuthError` (with the login command in its message) on a 401.
 
-## MCP clients, approvals and delegated policies
+## MCP clients, scopes and approvals
 
 **Connecting (standard).** Nothing to run on the server: the user adds `https://<host>/mcp` in
 their client — `claude mcp add --transport http reccado https://<host>/mcp`, claude.ai *Settings →
 Connectors → Add custom connector → URL*, or the URL in Cursor/others. The client discovers
 `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server[/api/auth]`,
-registers itself on `/api/auth/oauth2/register` (open DCR, 10/hour/IP, https or loopback redirect
-URIs only, see `SECURITY.md`), then the browser shows the owner login and the consent screen, where
-the scopes are chosen. For a delegated product client tick only `admin` and set its policy (below, or
-the web UI at `/security` → *Aplicaciones conectadas*). Registrations appear as `mcp.client_registered`
-ops events; the hourly cron deletes never-consented clients after 24 h (`sweptOAuthClients` in the
+identifies itself by Client ID Metadata Document (CIMD, `MCP_CIMD_ENABLED=true` in `wrangler.jsonc`)
+or, as a compatibility fallback, registers on `/api/auth/oauth2/register` (open DCR, 10/hour/IP,
+https or loopback redirect URIs only, see `SECURITY.md`), then the browser shows the owner login and
+the consent screen, where the scopes are chosen. Registrations appear as `mcp.client_registered` ops
+events; the hourly cron deletes never-consented clients after 24 h (`sweptOAuthClients` in the
 `cron.backup_sweep` event); the first consent sends a Telegram "Nueva app conectada" notice.
 
+**Scopes at consent.** `mail:read`, `mail:draft` and `config:read` are pre-ticked. `mail:send`,
+`mail:read:sensitive`, `keys:write`, `routing:write` and `domains:write` start unticked and the
+server drops any that were not explicitly ticked; `mailboxes:write`, `templates:write` and
+`suppressions:write` are offered unticked. Example, a *product maintenance client* (an agent that
+only keeps a product's templates and API keys in shape): tick `templates:write` and `keys:write`
+(plus the pre-ticked `config:read` to list), leave `mail:read` off if it should not read inbound
+mail. It sees only `manage_template`, `manage_api_key`, `restore`, `reconcile_stale` and the
+`config:read` tools; template edits and `api_key_revoke`/`templates` apply directly (undo with
+`restore`), while key create/rotate/scopes return an approval link. A call outside the granted scopes
+returns `insufficient_scope` naming the scope.
+
+**Revoking an app.** The owner opens `/security` → *Aplicaciones conectadas* and presses *Revocar*
+(or runs the CLI below). Access JWTs already issued stay valid until they expire (≤ 3600 s).
+
 **Clients (optional fallback).** With an operator session (previous section), pre-register a client
-instead of relying on self-registration:
+instead of relying on CIMD/self-registration:
 
 ```bash
 pnpm operator mcp register [--name <name>] [--callback-port <port>] [--redirect-uri <uri> ...] --host <host>
@@ -719,62 +735,31 @@ pnpm operator mcp revoke <client_id> --host <host>
 `register` creates a public PKCE client (default: Claude Code, callback port `33418`) and prints the
 exact `claude mcp add --transport http reccado https://<host>/mcp --client-id … --callback-port …`
 command. `clients` lists registered clients. `revoke` deletes a client's access tokens, refresh
-tokens, consent and registration in one D1 batch; an access JWT already issued stays valid until it
-expires (≤ 3600 s). CIMD client ids (URLs) are accepted only when `MCP_CIMD_ENABLED=true`
-(default `false` in `wrangler.jsonc`). Default consent is `mail:read mail:draft`; `mail:send`,
-`mail:read:sensitive` and `admin` are granted on the consent screen only when the client asks.
+tokens, consent and registration in one D1 batch.
 
-**Approvals.** `send` and every control-plane tool (`manage_*`, `remove_suppression`, `restore`,
-`reconcile_stale`) create an intent (frozen payload + `payload_hash`); the agent receives
-`https://<host>/approve/<id>`. The owner approves either with the ✅/❌ buttons on the Telegram card
-(bound to intent id + hash prefix, full hash re-checked; only the bound chat and the operator
-allow-list; check the bridge with `pnpm operator telegram status`) or on `/approve/:id` signed in as
-the owner (Origin check, payload hash posted back). `api_key_create`, rotate and scopes reveal a
-secret and are approvable **only on the web page**, which shows it once. Intents expire after 10
-minutes, are single use, and are kept as status rows for 30 days. An `intent_stale` result means the
-draft changed after the request: ask for a new send. A batch (≤ 20 operations) runs in order and
-stops at the first failure; per-item results are `executed`, the failure code, or `not_run`. There
-is no passkey step; turn on Telegram two-step verification, since control of that chat or of the
-web session is what approves.
+**Approvals (irreversible / exfiltrating only).** `send`, aliases or forward/routing rules whose
+destination is outside the owner's domains, `api_key_create`, `api_key_rotate`, `api_key_scopes`,
+`suppression_remove`, `domain_add`, `domain_provision` and `domain_disable` create an intent (frozen
+payload + `payload_hash`); the agent receives `https://<host>/approve/<id>`. The owner approves
+**only** on that page signed in as the owner (Origin check, payload hash posted back); Telegram
+sends a notice with the link, with no buttons (check the bridge with `pnpm operator telegram
+status`). API-key secrets are shown once on the page and never reach the agent. Intents expire after
+10 minutes, are single use, and are kept as status rows for 30 days. An `intent_stale` result means
+the draft changed after the request: ask for a new send. Operations are one per call; there are no
+batches. There is no passkey step: approval is as strong as the owner web session.
 
-**Delegated policies.** An OAuth client whose token has `admin` and neither `mail:read` nor
-`mail:read:sensitive` can auto-apply low-risk changes under a policy (operator session required):
-
-```bash
-pnpm operator mcp policy set --client <client_id> --mailbox <mailbox_id> [--mailbox <id> ...] \
-  --kinds template_upsert,template_archive,api_key_templates,api_key_revoke,suppression_remove,restore \
-  --link-domains example.com,docs.example.com [--allow-variable-links] [--max-per-hour 20] --host <host>
-pnpm operator mcp policy show [--client <client_id>] --host <host>
-pnpm operator mcp policy rm --client <client_id> --host <host>
-```
-
-`set` replaces the client's existing policy. `--kinds` can only narrow the hard-coded ceiling
-(the six kinds above); `--link-domains` is the allow-list every template link must match;
-`--allow-variable-links` additionally accepts a variable as a whole `href`; `--max-per-hour`
-defaults to 20. Example, a product support mailbox whose agent only maintains templates and may
-revoke keys:
-
-```bash
-pnpm operator mcp policy set --client cli_abc123 --mailbox mbx_9f2c... \
-  --kinds template_upsert,template_archive,api_key_revoke --link-domains example.com --max-per-hour 10
-```
-
-A change outside the policy (other kind or mailbox, link not on the allow-list, over the hourly
-limit, a token that can read mail) is not applied: it becomes a normal approval carrying
-`autoApplyRefused` with the reason. Auto-applied changes write `admin.before_snapshot` and an
-`admin.auto_applied` ops event, and send a Telegram notice with ↩️ Deshacer (a `restore`). Sends are
-never auto-applied. `manage_api_key` action `templates` edits a key's template allow-list in place
-(add/remove/set; same key id and secret); `scopes` still issues a replacement key.
-
-**Restore and reconcile.** Deletes over MCP are soft (`disabled`/`revoked`) and record an
-`admin.before_snapshot` in `ops_events`. `restore` (itself approval-gated) takes that ops event id
-and re-enables the mailbox, domain, alias, routing rule or template; each snapshot is restorable
-once (it writes `restored:<snapshotId>`), and archived templates are not restorable (create them
-again). `reconcile_stale` runs the transactional stale-request reconciliation after approval; its
-count is the approximate D1 projection and it never resends. If the worker dies in the middle of an
-approved batch, the intent is left approved without a final report and is not retried: read
-`result_json` / `ops_events`, finish or undo the remaining items by hand. `api_key_scopes` issues a
-replacement key and revokes the old one.
+**Direct changes, restore and reconcile.** Every other write — templates, `api_key_templates`
+(a key's allow-list, edited in place), `api_key_revoke`, mailbox kinds, internal aliases/rules,
+`domain_update`, `restore`, `reconcile_stale`, `update_messages` — applies immediately with its scope
+and returns `{status:"applied", result, snapshotIds}`; no Telegram notice. Deletes are soft
+(`disabled`/`revoked`) and record an `admin.before_snapshot` in `ops_events`. `restore` takes that ops
+event id and re-enables the mailbox, domain, alias, routing rule or template (restoring a forward to
+an external destination needs approval); it requires the write scope of the snapshot's resource;
+each snapshot is restorable once (it writes `restored:<snapshotId>`), and archived templates are not
+restorable (create them again). `reconcile_stale` runs the transactional stale-request reconciliation;
+its count is the approximate D1 projection and it never resends. If the worker dies in the middle of
+an approved intent, it is left approved without a final report and is not retried: read
+`result_json` / `ops_events`. `api_key_scopes` issues a replacement key and revokes the old one.
 
 ## Onboarding a product
 

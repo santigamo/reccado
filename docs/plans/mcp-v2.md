@@ -410,6 +410,43 @@ clients and edits delegation policies; `pnpm operator mcp register|policy` remai
 Open: custom-scheme redirects (e.g. Cursor `cursor://`) are refused until an allow-list is decided.
 Deployed to reccado-dev version `c1f2159f` (99 files / 1346 tests green).
 
+## 2026-11-14 final permission model
+
+Owner decision after two independent reviews of MCP industry practice. It **supersedes** the two
+earlier same-day sections ("passkey → Telegram, delegated auto-apply" — Telegram buttons and
+delegation policies — and the `admin` scope / tier model in §2.3–§2.5, P4/P5); those sections are
+kept as history.
+
+- **Connection:** one URL + browser login; OAuth 2.1 + PRM. CIMD preferred (spec 2025-11-25 SHOULD;
+  2026-07-28 deprecates DCR) and now **on** (`MCP_CIMD_ENABLED=true`); open DCR stays as compatibility
+  fallback.
+- **Scopes** `resource:action`, no omnibus `admin` (spec security best practices: anti-pattern):
+  `mail:read`, `mail:read:sensitive`, `mail:draft`, `mail:send`, `config:read` (health, ops,
+  list_config), `mailboxes:write`, `templates:write`, `routing:write`, `domains:write`, `keys:write`,
+  `suppressions:write`. `tools/list` shows only granted tools (GitHub/Sentry pattern); a call missing
+  a scope gets `insufficient_scope` naming the exact scope. `restore` is visible with any write
+  scope and checks the snapshot's resource scope.
+- **Approval only for irreversible / exfiltration actions, for any token** (Stripe "human
+  confirmation" pattern): `send`; alias or forward/routing rule to a destination outside the owner's
+  domains; `api_key_create`, `api_key_rotate`, `api_key_scopes`; `suppression_remove`; `domain_add`,
+  `domain_provision`, `domain_disable`. Approved **only** on `/approve/:id` with the owner web
+  session (URL from the tool / URL-mode elicitation, never pre-authenticated). Telegram sends a
+  notice with the link for these only: no ✅/❌ buttons, no notices for direct changes.
+- **Everything else applies directly** with its scope: templates, `api_key_templates`,
+  `api_key_revoke`, mailbox kinds, internal aliases/rules, `domain_update`, `restore`, `reconcile`,
+  `update_messages`. Direct changes keep `before_snapshot` + ops events (so `restore` undoes them)
+  and return the result to the agent.
+- **Removed:** delegation policies entirely (table via migration `0030`, routes, CLI, UI editor,
+  auto-apply path, template link checker, Telegram auto-applied/undo) and batches (one item per call).
+- **Kept:** frozen payload + hash for approvals, single use, 10 min; secrets never returned to the
+  agent (shown once on the approval page); sticky `origin='mcp'` + `mcp-approval.v1` proof in the DO;
+  owner registry never over MCP; auth-mail isolation.
+- **Residual risks (accepted, single owner):** a prompt-injected agent holding `templates:write` can
+  change template text directly (reversible via `restore`); approval relies on the owner web session
+  (no passkey). See `SECURITY.md` ("MCP").
+- **Sources:** MCP spec 2025-11-25 authorization + security best practices; Stripe MCP human
+  confirmation; Simon Willison's lethal trifecta; OWASP LLM01.
+
 ## Decision log
 
 | Date | Decision | Why |
@@ -425,3 +462,4 @@ Deployed to reccado-dev version `c1f2159f` (99 files / 1346 tests green).
 | 2026-11-11 | CIMD on a Workers-native fetch transport (https only, no IP literals / local names / own zone, no redirects, size+timeout limits), **no** `global_fetch_strictly_public`, gated by `MCP_CIMD_ENABLED` (default false) until verified live | `@better-auth/cimd` demands exact-once DNS + address pinning, which Workers fetch cannot provide; Workers egress has no private network behind it and refuses raw-IP fetches. Deliberate, documented deviation; pre-registration remains the default path |
 | 2026-11-11 | Supersedes transactional-api.md "keys never exposed via MCP" (from P5) | Owner requested key admin over MCP; secret never reaches the agent |
 | 2026-11-14 | Passkey removed; Telegram button + web-session approval; delegated clients may auto-apply bounded low-risk kinds (never sends) | Owner decision; mail-reading tokens are the injection boundary |
+| 2026-11-14 | Final permission model: fine-grained `resource:action` scopes (no `admin`), filtered `tools/list`, `insufficient_scope`; approval only on `/approve/:id` (web session) for send + irreversible/exfiltrating kinds; all other writes direct + `restore`; delegation policies, Telegram buttons and batches removed; CIMD on | Spec best practices (omnibus scope anti-pattern), Stripe-style confirmation for a short irreversible list, lethal-trifecta reasoning; supersedes the earlier same-day Telegram/delegation row |

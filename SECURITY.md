@@ -122,10 +122,10 @@ Outbound mail from the **UI, Telegram, and the MCP endpoint** always goes throug
 surfaces that sends mail from a single unconfirmed call. This is treated as a hard invariant; see
 `AGENTS.md` and `docs/ARCHITECTURE.md`. For anything an agent initiates over MCP the invariant is
 stronger: **an agent may read, draft and act on mailbox content, but every outbound send it
-initiates requires the owner's approval, bound to the exact payload (Telegram ✅/❌ button or owner
-web session on a server-rendered page), and so does every control-plane change except the bounded
-auto-apply path of delegated clients that cannot read mail** (see
-[MCP](#mcp-agents-scopes-and-approvals)).
+initiates requires the owner's approval, bound to the exact payload (`payload_hash`) and given only
+on a server-rendered page with the owner web session**, and so does a short list of irreversible /
+exfiltrating control-plane changes; every other control-plane write applies directly with its
+narrow scope and is undoable (see [MCP](#mcp-agents-scopes-and-approvals)).
 
 The **transactional API** is the one deliberate exception: an operator explicitly creates a
 mailbox-bound API key (an explicit, human-created pre-authorization), and sends made with that key
@@ -134,76 +134,86 @@ of the pre-authorized credential is what permits the send. Test-environment keys
 (`environment=test`) are rejected in the production send path, and the key can only send to its own
 mailbox with its bound sender, template allowlist, recipient policy, and quota. This does not weaken
 the UI/Telegram/MCP confirmation gate. API-key administration is reachable over MCP
-(`manage_api_key`, tier 2, approval required, never auto-applied except `templates`/`revoke` for a delegated client) but the secret never reaches the agent.
+(`manage_api_key`, scope `keys:write`: create / rotate / scopes need owner approval on the web page; `revoke` and `templates` apply directly) but the secret never reaches the agent.
 
 ### MCP: agents, scopes and approvals
 
 `/mcp` is a stateless MCP server (spec 2026-07-28, with a legacy 2025-era path) authenticated by
-Better Auth OAuth tokens; the owner gate still applies after the token. The design and its
-decision log are in `docs/plans/mcp-v2.md`.
+Better Auth OAuth 2.1 tokens (protected-resource metadata, PKCE); the owner gate still applies
+after the token. The design and its decision log are in `docs/plans/mcp-v2.md` ("2026-11-14 final
+permission model").
 
-- **Scopes**, checked inside each tool handler (missing scope → an `insufficient_scope: <scope>`
-  tool error; clients do not automatically re-prompt consent, so re-authorize to widen scopes):
+**Model in one paragraph.** Connection is one URL plus a browser login. Authority is split into
+narrow `resource:action` scopes the owner ticks at consent; `tools/list` only shows tools the token
+can call. Server-side human approval is reserved for the few actions that are irreversible or
+exfiltrate data. Everything else applies directly, with a before-snapshot so `restore` can undo it.
+
+**Rationale and sources.**
+- *Narrow scopes, no omnibus `admin`.* The MCP authorization spec (2025-11-25) and its security
+  best practices call a catch-all scope an anti-pattern (a leaked or over-granted token gets
+  everything) and define the `insufficient_scope` challenge for a call that needs more. We follow
+  both: a call missing a scope gets HTTP 403 `insufficient_scope` naming the exact scope, and
+  `tools/list` is filtered (the GitHub / Sentry MCP pattern).
+- *Human confirmation only where it matters.* Stripe's MCP server keeps human confirmation for a
+  short list of irreversible actions rather than every write; approving everything trains the owner
+  to click through. We require it for sends, secret issuance, suppression removal, domain changes
+  and external forwarding.
+- *Why mail is the dangerous input.* Simon Willison's "lethal trifecta" (access to private data +
+  exposure to untrusted content + a way to exfiltrate) and OWASP LLM01 (prompt injection) describe
+  an agent that reads inbound mail and can also send or forward. The approval list is exactly the
+  set of exfiltration / irreversible actions; mail-reading scopes are separate and opt-in.
+
+- **Scopes** (`src/lib/mcp-scopes.ts`):
 
   | Scope | Grants | Default consent |
   |---|---|---|
   | `mail:read` | list / search / read (sensitive content redacted) | yes |
-  | `mail:draft` | create / update / cancel drafts, tier-1 message actions | yes |
-  | `mail:send` | request a send (still needs approval) | no |
-  | `mail:read:sensitive` | un-redacted OTP / reset / magic-link content, raw MIME and attachments of such mail | no |
-  | `admin` | read the control plane; request tier-2 changes (still need approval) | no |
+  | `mail:read:sensitive` | un-redacted OTP / reset / magic-link content, raw MIME and attachments of such mail | no, explicit tick |
+  | `mail:draft` | create / update / cancel drafts, read/unread, archive, trash | yes |
+  | `mail:send` | request a send (still needs approval) | no, explicit tick |
+  | `config:read` | `get_health`, `list_ops`, `list_config` | yes |
+  | `mailboxes:write` | create / update / disable mailboxes | no |
+  | `templates:write` | upsert / archive templates | no |
+  | `routing:write` | aliases and routing rules | no, explicit tick |
+  | `domains:write` | add / provision / update / disable domains | no, explicit tick |
+  | `keys:write` | API keys; `reconcile_stale` | no, explicit tick |
+  | `suppressions:write` | remove a suppression | no |
 
-  Existing tokens issued before this release lack the new scopes and need re-consent. On the
-  consent page `mail:send`, `mail:read:sensitive` and `admin` start unticked, each with its own
-  risk line, and the server strips any of them that the owner did not explicitly tick.
-- **Tiers.** The line is mailbox content vs control plane. *Tier 1* (no confirmation): mark
-  read/unread, archive, trash (recoverable), draft create/update/cancel. *Tier 2* (owner approval, or the
-  delegated auto-apply below): every outbound send and every control-plane write — mailboxes, domains, aliases,
-  routing rules, templates, API keys, suppression removal, `restore`, `reconcile_stale`. Batch
-  intents (up to 20 operations, one approval) keep onboarding usable. Deletes are soft
-  (`status='disabled'` / `revoked`) with an `admin.before_snapshot` row in `ops_events` as the undo
-  log. **Owner-registry changes (`owner_identities`, bootstrap emails, pairing) are never exposed
-  over MCP**; they stay CLI/web only.
-- **Approvals.** Tier-2 tools only create an intent in the `approvals` table (`origin='mcp'`) and
-  return a URL (`input_required` URL-mode elicitation on 2026 clients; `{status:"pending",
-  intentId, confirmUrl}` on legacy clients, which re-call the tool with `intentId`). The intent
-  stores a frozen payload and `payload_hash`; a send uses the snapshot, never the live draft, and
-  editing the draft afterwards yields `intent_stale`. Intents expire after 10 minutes, are single
-  use, and their status rows are retained 30 days after expiry or consumption. The owner approves
-  in one of two places:
-  - **Telegram.** The bridge posts a card with ✅/❌ buttons whose callback data binds the intent id
-    and a hash prefix; the full `payload_hash` is re-checked on press. Only the bound chat and the
-    operator allow-list can press them. The card is rendered server-side from the validated payload.
-  - **`https://<host>/approve/:id`.** Requires a Better Auth owner session, renders **only
-    server-side content** (no agent-authored text), checks `Origin`, and posts the payload hash back
-    with the decision. Template bodies are shown in full (HTML as escaped source, the list of linked
-    hosts, warnings for external or unsafe links, a diff against the previous version), plus
-    API-key recipient policy and template allow-list and DMARC `rua` targets; a registry safety net
-    appends any payload field a kind did not render.
-
-  Kinds that reveal a secret (`api_key_create`, rotate, `api_key_scopes`) are approvable **only on
-  the web page**, where the secret is shown once; the Telegram card for them just links there. Of
-  the two approvers, the first decision wins (single use). The agent can never approve: it holds
-  neither the Telegram chat nor the web session. Intents record the requesting OAuth client / token
+  The consent page strips any high-risk scope (`mail:send`, `mail:read:sensitive`, `keys:write`,
+  `routing:write`, `domains:write`) the owner did not tick, server-side. A token with the retired
+  `admin` scope no longer matches any tool: re-consent. `restore` is visible with any write scope
+  and requires the write scope of the snapshot's own resource.
+- **Approval required (any token).** `send`; an alias or forward / routing rule whose destination is
+  outside the owner's domains (also when `restore` would bring one back); `api_key_create`,
+  `api_key_rotate`, `api_key_scopes` (they issue a secret); `suppression_remove`; `domain_add`,
+  `domain_provision`, `domain_disable`. The tool creates an intent in `approvals` (`origin='mcp'`)
+  and returns a URL (`input_required` URL-mode elicitation on 2026 clients; `{status:"pending",
+  intentId, confirmUrl}` on legacy clients, which re-call the tool with `intentId`).
+- **Applied directly (with its scope).** Templates, `api_key_templates` (a key's template
+  allow-list), `api_key_revoke`, mailbox kinds, internal aliases and rules, `domain_update`,
+  `restore`, `reconcile_stale`, `update_messages`. Each keeps an `admin.before_snapshot` + ops
+  event, returns `{status:"applied", result, snapshotIds}` to the agent, and is undoable with
+  `restore`. Deletes are soft (`disabled` / `revoked`). One operation per call; there are no batches.
+  **Owner-registry changes (`owner_identities`, bootstrap emails, pairing) are never exposed over
+  MCP**; they stay CLI/web only.
+- **How approval works.** The intent stores a frozen payload and `payload_hash`; a send uses the
+  snapshot, never the live draft, and editing the draft afterwards yields `intent_stale`. Intents
+  expire after 10 minutes, are single use, and their status rows are kept 30 days. The owner
+  approves **only** at `https://<host>/approve/:id`: it requires a Better Auth owner session (never
+  pre-authenticated), renders only server-side content (no agent-authored text), checks `Origin`,
+  and posts the payload hash back with the decision. Template bodies are shown in full (HTML as
+  escaped source, linked hosts, warnings for external or unsafe links, a diff), plus API-key
+  recipient policy, template allow-list and DMARC `rua` targets; a registry safety net appends any
+  payload field a kind did not render. **Telegram only sends a notice with the link for these
+  critical requests, with no ✅/❌ buttons, and sends no notices for direct changes.** The agent can
+  never approve: it holds no web session. Intents record the requesting OAuth client / token
   `sub` / `jti`; only that principal can read an intent's status and only the same owner can
-  approve it. At most 5 live pending MCP intents per token subject, and Telegram notices are
-  coalesced to one per minute. Audit fields (`approval_channel`, `intent_id`, `payload_hash`, OAuth
-  `client_id`, token `sub`/`jti`, `approved_via`) land in `outbound_sends` and `ops_events`.
-- **Delegated clients (bounded auto-apply).** An OAuth client whose token has `admin` and
-  **neither `mail:read` nor `mail:read:sensitive`** — a client that cannot read inbound mail — can
-  be given a per-client policy (`pnpm operator mcp policy set|show|rm`, table
-  `mcp_client_policies`). For the kinds the policy allows, among a hard-coded ceiling
-  (`template_upsert`, `template_archive`, `api_key_templates`, `api_key_revoke`,
-  `suppression_remove`, `restore`; the policy can only narrow it), on the policy's mailboxes, under
-  `max_auto_per_hour`, the change is applied without an approval click. Template changes also need
-  every link to pass the policy's link-domain check; a variable as a whole `href` is refused unless
-  `allow_variable_links` is set. Auto-applied changes write the same `admin.before_snapshot` and
-  an `admin.auto_applied` ops event (`approved_via='auto'`) and send a Telegram notice with ↩️
-  Deshacer (a `restore`). Anything outside the policy falls back to a normal approval with
-  `autoApplyRefused` stating why. **Sends are never auto-applied.** Rationale: the prompt-injection
-  boundary is the mail-reading token. An agent that cannot read inbound mail has no channel through
-  which an attacker's text reaches it, so low-risk, reversible, rate-limited changes can skip the
-  click. A client with `mail:read` always needs approval.
+  approve it. At most 5 live pending MCP intents per token subject; Telegram notices are
+  coalesced to one per minute. Audit fields (`intent_id`, `payload_hash`, OAuth `client_id`, token
+  `sub`/`jti`, `approved_via`) land in `outbound_sends` and `ops_events`.
+- **Secrets never reach the agent.** `api_key_create` / rotate / `api_key_scopes` show the secret
+  once, in the owner's approve response on the approval page; only the redacted result is stored in
+  `result_json` and tool results strip `secret|token|plaintext`.
 - **Sticky draft origin.** A draft saved over MCP is permanently `origin='mcp'`; the web and
   Telegram confirm paths refuse it (`approval_required`, fail closed). The mailbox DO sends it only
   with an HMAC approval proof (`mcp-approval.v1`, 60 s, signed with `BETTER_AUTH_SECRET`) minted by
@@ -228,56 +238,51 @@ decision log are in `docs/plans/mcp-v2.md`.
 - **Host allow-list and framing.** `/mcp` accepts only localhost, the deployment's own origin and
   hosts listed in `MCP_ALLOWED_HOSTS`. Every HTML response carries `frame-ancestors 'none'` and
   `X-Frame-Options: DENY`; `/approve/*` also sends `Referrer-Policy: no-referrer`.
-- **API-key secret reveal.** `manage_api_key` create/rotate shows the secret once, in the owner's
-  approve response on the approval page; only the redacted result is stored in `result_json` and
-  tool results strip `secret|token|plaintext`. The agent never receives it.
-- **Client registration (open DCR).** `POST /api/auth/oauth2/register` accepts RFC 7591 requests
-  **without a session**, so a stock client connects from just the server URL
-  (`claude mcp add --transport http reccado https://<host>/mcp`). This is safe because
-  registering grants nothing: a client gets no code and no token until the owner logs in through
-  the owner registry (e-mail OTP) **and** consents to that client and those scopes, and the
-  high-risk scopes (`mail:send`, `mail:read:sensitive`, `admin`) are never granted without their
-  own tick. Registered clients are public PKCE clients; `client_credentials` is refused for
-  unauthenticated registrations. Hardening: per-IP rate limit of 10 registrations/hour, stored in
-  D1 (Better Auth `rateLimit` custom rule, so it holds across isolates); `redirect_uris` must be
-  `https`, or `http` on a loopback host (`127.0.0.1`, `localhost`, `[::1]`), with no credentials or
-  fragment (so custom schemes such as Cursor's `cursor://` are refused until deliberately
-  allowed); `client_name` has control/bidi characters stripped and is capped at 100 characters;
-  the hourly cron deletes clients with no consent, token or policy older than 24 h; every
-  registration writes an `mcp.client_registered` ops event (client id, name, redirect hosts, a
-  truncated hash of the IP); the first consent of a client raises a Telegram notice. The consent
-  page shows the client name, redirect host and a "Cliente nuevo" note. Residual risk: the table
-  can be spammed up to the rate limit until the sweep; and a convincing client name can still
-  phish a consent click — the owner must check the redirect host. `pnpm operator mcp register`
-  remains as an optional pre-registration fallback. **CIMD** (Client ID Metadata
-  Documents) is a documented deviation: `@better-auth/cimd` wants exact-once DNS and address
-  pinning that Workers `fetch` cannot provide, so it runs on a Workers-native guarded transport
-  (https only, no IP literals / local names / own zone, no redirects, size and timeout limits,
-  no `global_fetch_strictly_public`). It is **off by default** (`MCP_CIMD_ENABLED=false`) until
-  verified live; first-seen `client_id`s are logged to `ops_events` and the consent page shows the
-  client host, name and redirect host.
-- **Revoking a client.** `pnpm operator mcp revoke <client_id>` deletes its access tokens, refresh
-  tokens, consent and registration. Access JWTs already issued stay valid until they expire
-  (≤ 3600 s), so revocation is not instant.
+- **Client registration.** *CIMD preferred:* the client's `client_id` is an https URL to a Client ID
+  Metadata Document (spec 2025-11-25 SHOULD; the 2026-07-28 spec deprecates DCR). It is **on**
+  (`MCP_CIMD_ENABLED=true`) and runs on a Workers-native guarded fetch transport (https only, no IP
+  literals / local names / own zone, no redirects, size and timeout limits), a documented deviation
+  because `@better-auth/cimd` wants DNS/address pinning Workers `fetch` cannot provide. First-seen
+  `client_id`s are logged to `ops_events`. *Open DCR stays as compatibility fallback:*
+  `POST /api/auth/oauth2/register` accepts RFC 7591 requests **without a session**, so a stock
+  client connects from just the server URL
+  (`claude mcp add --transport http reccado https://<host>/mcp`). Registering grants nothing: no code
+  or token until the owner logs in through the owner registry (e-mail OTP) **and** consents to that
+  client and those scopes, and the high-risk scopes are never granted without their own tick.
+  Registered clients are public PKCE clients; `client_credentials` is refused for unauthenticated
+  registrations. Hardening: per-IP limit of 10 registrations/hour in D1 (holds across isolates);
+  `redirect_uris` must be `https`, or `http` on loopback, with no credentials or fragment;
+  `client_name` has control/bidi characters stripped and is capped at 100 characters; the hourly
+  cron deletes clients with no consent or token older than 24 h; every registration writes an
+  `mcp.client_registered` ops event; the first consent of a client raises a Telegram notice. The
+  consent page shows client name, redirect host and a "Cliente nuevo" note.
+  `pnpm operator mcp register` remains as an optional pre-registration fallback.
+- **Revoking a client.** The owner opens `/security` → *Aplicaciones conectadas* and revokes, or
+  runs `pnpm operator mcp revoke <client_id>`: access tokens, refresh tokens, consent and
+  registration are deleted. Access JWTs already issued stay valid until they expire (≤ 3600 s), so
+  revocation is not instant.
 
-Accepted residual risk:
+Accepted residual risk (honest list):
 
+- **A prompt-injected agent holding `templates:write` can change template text directly.** The
+  change is reversible (`restore` from the before-snapshot, each change audited) but not gated by a
+  click, and a template is sent to real recipients by transactional keys. Accepted for a single
+  owner; do not grant `templates:write` to a client you would not trust with that, and prefer
+  keeping it off agents that also hold `mail:read`.
+- **Approval relies on the owner web session.** There is no passkey / WebAuthn step (owner decision):
+  theft of the owner session cookie, or control of the owner's inbox login (e-mail OTP), lets an
+  attacker approve. Keep the owner address's mailbox protected and the device trusted.
 - The model can leak mail it legitimately read (non-sensitive) through other tools or servers.
 - A native client's localhost OAuth redirect can be intercepted by a local process.
-- **Telegram account takeover or theft of the owner web session lets an attacker approve.** The
-  approval is only as strong as those two channels. Enable Telegram two-step verification (2FA /
-  cloud password) on the owner's account and keep the bound chat private.
-- **Delegated auto-apply can change template text.** A delegated client may rewrite a template body
-  on its allowed mailboxes without a click. This is bounded by the link-domain check, the
-  per-hour rate limit, the mailbox scope and the undo button (each change keeps a snapshot), but it
-  is a real, accepted trade-off; do not give a policy to a client that can also read mail.
+- A convincing client name can still phish a consent click; the owner must check the redirect host.
 - Compromise of the owner's device defeats approval.
-- Tier-1 actions (e.g. trash) are unconfirmed, though recoverable.
+- Direct writes (`mail:draft` actions such as trash, `mailboxes:write`, internal routing,
+  `api_key_revoke`, ...) are unconfirmed, though recoverable through soft deletes and `restore`.
 
 Known limits:
 
-- A worker interruption in the middle of an approved batch leaves the intent approved without a
-  final report and is not retried automatically; the operator reconciles it from `result_json` /
+- A worker interruption in the middle of an approved intent leaves it approved without a final
+  report and is not retried automatically; the operator reconciles it from `result_json` /
   `ops_events`.
 - `api_key_scopes` issues a replacement key and revokes the old one (there is no in-place scope
   patch), so the key id and secret change. The template allow-list is the exception:
