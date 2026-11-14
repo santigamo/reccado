@@ -540,7 +540,7 @@ nothing by registering), and opens your browser for the owner login (e-mail OTP)
 screen. **You choose the scopes on the consent screen:** `mail:read` and `mail:draft` are on by
 default; `mail:send`, `mail:read:sensitive` and `admin` each need their own tick. For a *delegated
 product client* (an app that only manages templates/keys for you), tick only `admin` and then set its
-delegation policy — with the CLI today (`pnpm operator mcp policy set …`) or, once shipped, in the web
+delegation policy — with the CLI (`pnpm operator mcp policy set …`) or in the web
 UI at `/security` → *Aplicaciones conectadas*. The first time a new app is consented you also get a
 Telegram notice naming it. `pnpm operator mcp register` remains as an optional fallback that
 pre-registers a client and prints a command with `--client-id`. Cursor's custom-scheme callback
