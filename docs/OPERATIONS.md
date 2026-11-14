@@ -696,7 +696,19 @@ add the cookie, the `Origin` header the CSRF check requires, and a JSON content-
 
 ## MCP clients, approvals and delegated policies
 
-**Clients.** With an operator session (previous section):
+**Connecting (standard).** Nothing to run on the server: the user adds `https://<host>/mcp` in
+their client — `claude mcp add --transport http reccado https://<host>/mcp`, claude.ai *Settings →
+Connectors → Add custom connector → URL*, or the URL in Cursor/others. The client discovers
+`/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server[/api/auth]`,
+registers itself on `/api/auth/oauth2/register` (open DCR, 10/hour/IP, https or loopback redirect
+URIs only, see `SECURITY.md`), then the browser shows the owner login and the consent screen, where
+the scopes are chosen. For a delegated product client tick only `admin` and set its policy (below, or
+the web UI at `/security` → *Aplicaciones conectadas*). Registrations appear as `mcp.client_registered`
+ops events; the hourly cron deletes never-consented clients after 24 h (`sweptOAuthClients` in the
+`cron.backup_sweep` event); the first consent sends a Telegram "Nueva app conectada" notice.
+
+**Clients (optional fallback).** With an operator session (previous section), pre-register a client
+instead of relying on self-registration:
 
 ```bash
 pnpm operator mcp register [--name <name>] [--callback-port <port>] [--redirect-uri <uri> ...] --host <host>

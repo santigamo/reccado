@@ -254,7 +254,11 @@ The MCP endpoint (`/mcp`) authenticates with Better Auth OAuth tokens plus the o
 `manage_api_key` (actions incl. `templates`, an in-place allowlist edit), `remove_suppression`, `restore`, `reconcile_stale` (`src/mcp/*`). Scopes:
 `mail:read`, `mail:draft` (default consent), `mail:send`, `mail:read:sensitive`, `admin`.
 
-Connect a client with `pnpm operator mcp register` (prints the `claude mcp add` command; see
+Connect a client the standard way: `claude mcp add --transport http reccado https://<host>/mcp`
+(claude.ai: Settings → Connectors → Add custom connector → URL; Cursor/others: add the URL). The
+client self-registers (open DCR), the owner logs in and picks scopes at consent; for a delegated
+product client tick only `admin` and set the policy (`pnpm operator mcp policy set`, or the web UI at
+`/security` "Aplicaciones conectadas"). `pnpm operator mcp register` is an optional fallback (see
 `docs/OPERATIONS.md`). `send` and every `manage_*`/`restore`/`reconcile_stale` call only create an
 approval intent: the agent gets a `/approve/:id` URL and the owner approves it in Telegram or on that
 page (API-key secrets only on the page). The one exception is a delegated client (`admin`, no mail

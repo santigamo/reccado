@@ -231,8 +231,25 @@ decision log are in `docs/plans/mcp-v2.md`.
 - **API-key secret reveal.** `manage_api_key` create/rotate shows the secret once, in the owner's
   approve response on the approval page; only the redacted result is stored in `result_json` and
   tool results strip `secret|token|plaintext`. The agent never receives it.
-- **Client registration.** The default path is a pre-registered OAuth client
-  (`pnpm operator mcp register`). Unauthenticated DCR is refused. **CIMD** (Client ID Metadata
+- **Client registration (open DCR).** `POST /api/auth/oauth2/register` accepts RFC 7591 requests
+  **without a session**, so a stock client connects from just the server URL
+  (`claude mcp add --transport http reccado https://<host>/mcp`). This is safe because
+  registering grants nothing: a client gets no code and no token until the owner logs in through
+  the owner registry (e-mail OTP) **and** consents to that client and those scopes, and the
+  high-risk scopes (`mail:send`, `mail:read:sensitive`, `admin`) are never granted without their
+  own tick. Registered clients are public PKCE clients; `client_credentials` is refused for
+  unauthenticated registrations. Hardening: per-IP rate limit of 10 registrations/hour, stored in
+  D1 (Better Auth `rateLimit` custom rule, so it holds across isolates); `redirect_uris` must be
+  `https`, or `http` on a loopback host (`127.0.0.1`, `localhost`, `[::1]`), with no credentials or
+  fragment (so custom schemes such as Cursor's `cursor://` are refused until deliberately
+  allowed); `client_name` has control/bidi characters stripped and is capped at 100 characters;
+  the hourly cron deletes clients with no consent, token or policy older than 24 h; every
+  registration writes an `mcp.client_registered` ops event (client id, name, redirect hosts, a
+  truncated hash of the IP); the first consent of a client raises a Telegram notice. The consent
+  page shows the client name, redirect host and a "Cliente nuevo" note. Residual risk: the table
+  can be spammed up to the rate limit until the sweep; and a convincing client name can still
+  phish a consent click — the owner must check the redirect host. `pnpm operator mcp register`
+  remains as an optional pre-registration fallback. **CIMD** (Client ID Metadata
   Documents) is a documented deviation: `@better-auth/cimd` wants exact-once DNS and address
   pinning that Workers `fetch` cannot provide, so it runs on a Workers-native guarded transport
   (https only, no IP literals / local names / own zone, no redirects, size and timeout limits,
