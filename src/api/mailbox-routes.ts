@@ -27,6 +27,7 @@ import {
 	createDraftSchema,
 	draftAttachmentsFromMessageSchema,
 	messageActionSchema,
+	purgeSchema,
 	searchQuerySchema,
 	threadListQuerySchema,
 	updateDraftSchema,
@@ -371,6 +372,40 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			),
 		);
 		return c.json(result);
+	});
+
+	// Delete forever, only from the Trash: the selected conversations, exact
+	// messages, or the whole Trash of this mailbox. Owner web session only, like
+	// every /api route (an MCP token never reaches /api, and no MCP tool or
+	// control-plane kind exposes this). The mailbox DO deletes the first batch
+	// now and the rest from its alarm; the answer says how far it got, and
+	// GET …/purge/:operationId follows a large "Empty trash" to the end. No Undo:
+	// the client asks for confirmation first.
+	api.post("/api/mailboxes/:mailboxId/purge", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const body = purgeSchema.parse(await c.req.json());
+		const target = body.threadIds
+			? { threadIds: body.threadIds }
+			: body.messageIds
+				? { messageIds: body.messageIds }
+				: // The Trash as the web lists and counts it: automated reports apart.
+					{ emptyTrash: { reports: "exclude" as const } };
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		return stub.fetch("https://mailbox-do/purge", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ mailboxId, target }),
+		});
+	});
+
+	api.get("/api/mailboxes/:mailboxId/purge/:operationId", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		return stub.fetch(`https://mailbox-do/purge/${encodeURIComponent(c.req.param("operationId"))}`);
 	});
 
 	api.get("/api/mailboxes/:mailboxId/search", async (c) => {

@@ -546,7 +546,23 @@ If D1 and the Durable Object disagree, the Durable Object wins. Repair D1 with
 - Backup manifests written by cron or `POST /api/admin/backups/run` are retained in R2 until an
   operator or lifecycle rule deletes them.
 - Mailbox metadata, message rows, search index entries, drafts, and send audit rows remain in the
-  mailbox Durable Object / D1 until explicit deletion logic is implemented and exercised.
+  mailbox Durable Object / D1 until the owner deletes the message forever (below).
+- **Delete forever / Empty trash** is the one deletion path, and only for messages in the Trash
+  (web owner session; not reachable over MCP). Per message it removes the DO rows (message,
+  attachments, headers, labels, search entry; the conversation is recounted or removed), the R2
+  objects it owns (raw MIME, stored HTML body, attachments — never one another message, attachment
+  or draft file still points at), and the D1 rows keyed by it (`message_index`, `telegram_links`,
+  `telegram_retained`). For a sent copy it also empties the draft it was sent from. It deliberately
+  keeps: the DO `ingest_events` row (marked `error_code = 'purged'`, no content) so a re-delivery of
+  the same email stays deleted; D1 `ingest_events` and `outbound_sends` (ids and status, no content;
+  the send audit); the `send:`/`draft_sending:` markers that make confirm-send idempotent; contacts;
+  D1 `approvals` (an agent send's frozen payload, kept as the owner's approval record); and any
+  backup manifests already written. Telegram messages already posted in the chat are not edited.
+  Large operations run in batches of 250 from the mailbox alarm; R2/D1 cleanup is a
+  `purge_message_objects` job in the DO `jobs` table that retries every 5 minutes (24 attempts,
+  then `status = 'failed'` with `last_error`, visible via the DO). Each finished operation writes one
+  `mailbox.messages_purged` ops event with counts only. There is no automatic Trash expiry: Trash
+  is kept until the owner empties it.
 
 ### What is not automated today
 
@@ -555,9 +571,9 @@ If D1 and the Durable Object disagree, the Durable Object wins. Repair D1 with
 - No full mailbox restore command exists.
 - No user-facing export job exists, although the architecture and implementation docs reserve an
   export format/path.
-- No end-user delete workflow guarantees removal of all raw MIME, attachment blobs, D1 rows, and
-  backup artifacts for a mailbox.
-- No documented trash-retention timer or legal-hold model exists.
+- Per-message permanent deletion exists (Delete forever / Empty trash, above), but there is no
+  whole-mailbox erasure workflow, and it does not touch backup manifests already written.
+- No trash-retention timer (auto-empty after N days) or legal-hold model exists.
 
 ### Operator policy you need to decide explicitly
 
@@ -582,7 +598,8 @@ all related R2 prefixes.
 - **Restore:** there is no automated restore path from R2 backup manifests back into Durable
   Objects. Backup manifests are operational evidence and partial recovery material, not a turnkey
   disaster-recovery workflow.
-- **Delete:** mailbox erasure is manual. If you perform it, you must identify and remove the DO
+- **Delete:** single messages are deleted from the web Trash ("Delete forever", "Empty trash").
+  Whole-mailbox erasure is manual. If you perform it, you must identify and remove the DO
   state plus the corresponding D1 rows and R2 prefixes, and you should capture evidence of exactly
   what was deleted.
 

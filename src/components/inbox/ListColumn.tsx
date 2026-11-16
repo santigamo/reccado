@@ -234,6 +234,8 @@ export function ThreadsList({
 		setSelection,
 		searchEverywhere,
 		layout,
+		askDeleteForever,
+		askEmptyTrash,
 	} = useInbox();
 	const { data, loading, error, refetch, loadMore, loadingMore, loadMoreError } = resource;
 	const folderState = folder.kind === "threads" ? folder.state : null;
@@ -244,6 +246,13 @@ export function ThreadsList({
 	const selectedCount = keys.filter((k) => selection.has(k)).length;
 	const selecting = selection.size > 0;
 	const restorable = folderState === "archive" || folderState === "trash";
+	const inTrash = folderState === "trash" && folder.key === "trash";
+	/** The selected conversations, as refs (Delete forever acts on them). */
+	const selectedRefs = () =>
+		[...selection].map((key) => {
+			const at = key.indexOf(":");
+			return { mailboxId: key.slice(0, at), threadId: key.slice(at + 1) };
+		});
 
 	// Come back to where you were: the list's scroll survives opening a
 	// conversation (and the phone layout hiding the list), and the open row
@@ -326,8 +335,15 @@ export function ThreadsList({
 						: key === "I"
 							? "mark_read"
 							: "mark_unread";
-			if (key === "#" && folderState === "trash") return;
-			if (selecting) onSelectionAction(action);
+			// In the Trash, # means "Delete forever", and that always asks first.
+			if (key === "#" && folderState === "trash") {
+				if (!inTrash) return;
+				if (selecting) askDeleteForever(selectedRefs());
+				else {
+					const row = data.items.find((r) => rowKey(r.mailbox_id, r.id) === focusedKey);
+					if (row) askDeleteForever([{ mailboxId: row.mailbox_id, threadId: row.id }]);
+				}
+			} else if (selecting) onSelectionAction(action);
 			else {
 				const row = data.items.find((r) => rowKey(r.mailbox_id, r.id) === focusedKey);
 				if (row) {
@@ -426,6 +442,11 @@ export function ThreadsList({
 								onArchive={() => onAction(row, "archive")}
 								onTrash={() => onAction(row, "trash")}
 								onRestore={() => onAction(row, "restore_inbox")}
+								onDeleteForever={
+									inTrash
+										? () => askDeleteForever([{ mailboxId: row.mailbox_id, threadId: row.id }])
+										: undefined
+								}
 								onToggleRead={() =>
 									onAction(row, isThreadUnread(row) ? "mark_read" : "mark_unread")
 								}
@@ -503,6 +524,16 @@ export function ThreadsList({
 				>
 					<Trash2 />
 				</IconButton>
+			) : inTrash ? (
+				<IconButton
+					title="Delete forever (#)"
+					aria-label="Delete forever"
+					size="sm"
+					className="text-danger hover:text-danger"
+					onClick={() => askDeleteForever(selectedRefs())}
+				>
+					<Trash2 />
+				</IconButton>
 			) : null}
 			<IconButton title="Mark as read" size="sm" onClick={() => onSelectionAction("mark_read")}>
 				<MailOpen />
@@ -565,6 +596,16 @@ export function ThreadsList({
 								icon: <CheckCheck />,
 								onSelect: onMarkAllRead,
 							},
+							...(inTrash && data.items.length > 0
+								? [
+										{
+											key: "empty-trash",
+											label: "Empty trash",
+											icon: <Trash2 />,
+											onSelect: askEmptyTrash,
+										},
+									]
+								: []),
 						]}
 					/>
 					{selected ? (
@@ -580,7 +621,25 @@ export function ThreadsList({
 					) : null}
 				</>
 			}
-			notice={!loading && !error ? <FailedNotice failed={data.failed} onRetry={refetch} /> : null}
+			notice={
+				!loading && !error ? (
+					<>
+						<FailedNotice failed={data.failed} onRetry={refetch} />
+						{inTrash && !query && data.items.length > 0 ? (
+							<InlineNotice
+								className="border-b border-border-card"
+								action={
+									<Button variant="danger" size="sm" onClick={askEmptyTrash}>
+										Empty trash
+									</Button>
+								}
+							>
+								Conversations in Trash stay until you delete them forever.
+							</InlineNotice>
+						) : null}
+					</>
+				) : null
+			}
 		>
 			{body}
 		</ListFrame>

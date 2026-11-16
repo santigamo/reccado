@@ -60,6 +60,11 @@ export type MailboxIngestResult = {
 	 * null for ordinary mail. Absent from older DOs: treat as ordinary.
 	 */
 	automatedKind?: AutomatedKind | null;
+	/**
+	 * Set on `duplicate` when the message this delivery repeats was deleted
+	 * forever by the owner: it stays deleted (do/mailbox-purge.ts).
+	 */
+	purged?: boolean;
 };
 
 /**

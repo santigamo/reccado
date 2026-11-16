@@ -130,6 +130,21 @@ export const bulkActionSchema = z
 		message: "A whole folder can only be marked read",
 	});
 
+/**
+ * Permanent deletion, only ever of messages in the Trash: whole conversations
+ * (their trashed messages), exact messages, or the whole Trash ("Empty trash").
+ */
+export const purgeSchema = z
+	.object({
+		threadIds: z.array(z.string().min(1).max(200)).min(1).max(100).optional(),
+		messageIds: z.array(z.string().min(1).max(200)).min(1).max(1000).optional(),
+		emptyTrash: z.literal(true).optional(),
+	})
+	.refine(
+		(b) => [b.threadIds, b.messageIds, b.emptyTrash].filter((t) => t !== undefined).length === 1,
+		{ message: "Give exactly one of threadIds, messageIds or emptyTrash" },
+	);
+
 export const createDraftSchema = z.object({
 	to: z.array(z.string().email()).min(1),
 	cc: z.array(z.string().email()).optional(),

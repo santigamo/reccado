@@ -11,6 +11,7 @@ import {
 } from "#/components/inbox/inbox-context";
 import { ApprovalsList, DraftsList, ThreadsList } from "#/components/inbox/ListColumn";
 import { MailboxColumn, MailboxRail } from "#/components/inbox/MailboxColumn";
+import { PurgeDialog } from "#/components/inbox/PurgeDialog";
 import { ScopeSwitcher } from "#/components/inbox/ScopeSwitcher";
 import { SearchField } from "#/components/inbox/SearchField";
 import { ShortcutsDialog } from "#/components/inbox/ShortcutsDialog";
@@ -90,7 +91,8 @@ function InboxLayout() {
 	const refresh = useCallback(() => setSyncToken((n) => n + 1), []);
 	const onSocketEvent = useCallback(
 		(event: MailSocketEvent) => {
-			if (event.type === "message.created") refresh();
+			// New mail, or mail deleted forever (another tab, a long "Empty trash").
+			if (event.type === "message.created" || event.type === "messages.purged") refresh();
 		},
 		[refresh],
 	);
@@ -419,7 +421,15 @@ function InboxScreen({
 		[navigate, search],
 	);
 
-	const { move, markRead, markAllRead } = actions;
+	const { move, markRead, markAllRead, purge, emptyTrash } = actions;
+	// The confirmation in front of "Delete forever" / "Empty trash".
+	const [purgeAsk, setPurgeAsk] = useState<
+		{ kind: "threads"; refs: ThreadRef[] } | { kind: "empty" } | null
+	>(null);
+	const askDeleteForever = useCallback((refs: ThreadRef[]) => {
+		if (refs.length > 0) setPurgeAsk({ kind: "threads", refs });
+	}, []);
+	const askEmptyTrash = useCallback(() => setPurgeAsk({ kind: "empty" }), []);
 	/** One action on conversations: read state, or a move that leaves the open one. */
 	const runAction = useCallback(
 		async (refs: ThreadRef[], action: MessageAction) => {
@@ -521,6 +531,8 @@ function InboxScreen({
 		guessThreadRead: readState.guess,
 		moveThreads: move,
 		markThreadsRead: markRead,
+		askDeleteForever,
+		askEmptyTrash,
 		ownAddresses,
 		selection,
 		toggleSelected,
@@ -860,6 +872,51 @@ function InboxScreen({
 				/>
 			) : null}
 			{shortcutsOpen ? <ShortcutsDialog onClose={() => setShortcutsOpen(false)} /> : null}
+			{purgeAsk?.kind === "threads" ? (
+				<PurgeDialog
+					title={
+						purgeAsk.refs.length === 1
+							? "Delete this conversation forever?"
+							: `Delete ${formatCount(purgeAsk.refs.length)} conversations forever?`
+					}
+					description="This can't be undone. The messages in Trash and their attachments are removed for good."
+					confirmLabel="Delete forever"
+					busyLabel="Deleting…"
+					onClose={() => setPurgeAsk(null)}
+					run={async (onProgress) => {
+						const refs = purgeAsk.refs;
+						if (
+							openId &&
+							refs.some((r) => r.mailboxId === openId.mailboxId && r.threadId === openId.threadId)
+						)
+							closeThread();
+						setSelectionState(new Set());
+						await purge(refs, onProgress);
+					}}
+				/>
+			) : purgeAsk?.kind === "empty" ? (
+				<PurgeDialog
+					title={
+						scopeCounts
+							? `Delete ${formatCount(scopeCounts.trash.threads)} ${scopeCounts.trash.threads === 1 ? "conversation" : "conversations"} forever?`
+							: "Empty trash?"
+					}
+					description={`Everything in Trash ${
+						scopeMailbox
+							? `in ${scopeMailbox.primary_address}`
+							: `in all ${formatCount(scopeIds.length)} ${scopeIds.length === 1 ? "mailbox" : "mailboxes"}`
+					} is deleted for good. This can't be undone.`}
+					confirmLabel="Empty trash"
+					busyLabel="Emptying trash…"
+					onClose={() => setPurgeAsk(null)}
+					run={async (onProgress) => {
+						if (openId && folderKey === "trash" && scopeIds.includes(openId.mailboxId))
+							closeThread();
+						setSelectionState(new Set());
+						await emptyTrash(scopeIds, visibleRows, onProgress);
+					}}
+				/>
+			) : null}
 		</InboxContext.Provider>
 	);
 }

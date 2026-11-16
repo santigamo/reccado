@@ -90,6 +90,7 @@ export function ThreadListItem({
 	onArchive,
 	onTrash,
 	onRestore,
+	onDeleteForever,
 	onToggleRead,
 	checked = false,
 	selecting = false,
@@ -110,6 +111,8 @@ export function ThreadListItem({
 	onArchive: () => void;
 	onTrash: () => void;
 	onRestore: () => void;
+	/** In the Trash: "Delete forever" (the caller asks for confirmation). */
+	onDeleteForever?: () => void;
 	onToggleRead: () => void;
 	/** In the selection. */
 	checked?: boolean;
@@ -298,6 +301,15 @@ export function ThreadListItem({
 				)}
 				{state !== "trash" ? (
 					<IconButton title="Delete" size="sm" onClick={onTrash}>
+						<Trash2 />
+					</IconButton>
+				) : onDeleteForever ? (
+					<IconButton
+						title="Delete forever"
+						size="sm"
+						className="text-danger hover:text-danger"
+						onClick={onDeleteForever}
+					>
 						<Trash2 />
 					</IconButton>
 				) : null}

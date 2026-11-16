@@ -340,6 +340,84 @@ export async function markFolderRead(
 	});
 }
 
+/** Where a permanent deletion is (POST/GET …/purge). */
+export type PurgeOperation = {
+	operationId: string;
+	status: "running" | "done";
+	/** Messages queued when it started. */
+	requested: number;
+	/** Messages deleted so far. */
+	deleted: number;
+	remaining: number;
+};
+
+/** Something in the request was not in the Trash: nothing was deleted. */
+export class NotInTrashError extends Error {
+	constructor() {
+		super("not_in_trash");
+	}
+}
+
+async function startPurge(
+	mailboxId: string,
+	target: { threadIds: string[] } | { emptyTrash: true },
+): Promise<PurgeOperation> {
+	const res = await fetch(`${base(mailboxId)}/purge`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(target),
+	});
+	if (res.status === 409) throw new NotInTrashError();
+	return json<PurgeOperation>(res);
+}
+
+/**
+ * Delete forever, and wait until it is done: the server deletes in batches,
+ * the first one inside the request and the rest in the background, so a large
+ * Trash is followed here until its queue is empty. `onProgress` gets the
+ * messages deleted so far and the total queued.
+ */
+async function purgeToEnd(
+	mailboxId: string,
+	target: { threadIds: string[] } | { emptyTrash: true },
+	onProgress?: (deleted: number, total: number) => void,
+): Promise<PurgeOperation> {
+	let op = await startPurge(mailboxId, target);
+	onProgress?.(op.deleted, op.requested);
+	while (op.status !== "done") {
+		await new Promise((resolve) => setTimeout(resolve, 1000));
+		op = await json<PurgeOperation>(
+			await fetch(`${base(mailboxId)}/purge/${encodeURIComponent(op.operationId)}`),
+		);
+		onProgress?.(op.deleted, op.requested);
+	}
+	return op;
+}
+
+/** "Delete forever" for conversations in the Trash (their trashed messages). */
+export async function purgeThreads(
+	mailboxId: string,
+	threadIds: string[],
+	onProgress?: (deleted: number, total: number) => void,
+): Promise<number> {
+	let deleted = 0;
+	for (let i = 0; i < threadIds.length; i += 100) {
+		const op = await purgeToEnd(mailboxId, { threadIds: threadIds.slice(i, i + 100) }, (d, t) =>
+			onProgress?.(deleted + d, deleted + t),
+		);
+		deleted += op.deleted;
+	}
+	return deleted;
+}
+
+/** "Empty trash" for one mailbox. Resolves with the messages deleted. */
+export async function emptyTrash(
+	mailboxId: string,
+	onProgress?: (deleted: number, total: number) => void,
+): Promise<number> {
+	return (await purgeToEnd(mailboxId, { emptyTrash: true }, onProgress)).deleted;
+}
+
 export async function fetchDrafts(mailboxId: string): Promise<Draft[]> {
 	const data = await json<{ drafts: Draft[] }>(await fetch(`${base(mailboxId)}/drafts`));
 	return data.drafts ?? [];

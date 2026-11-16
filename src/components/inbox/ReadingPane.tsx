@@ -258,6 +258,7 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 		guessThreadRead,
 		moveThreads,
 		markThreadsRead,
+		askDeleteForever,
 		ownAddresses,
 		layout,
 	} = inbox;
@@ -416,6 +417,8 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 		else if (!data) return;
 		else if (key === "e") act(isRestorable ? "restore_inbox" : "archive");
 		else if (key === "#" && state !== "trash") act("trash");
+		// Every message is in the Trash: # is "Delete forever", and it asks first.
+		else if (key === "#") askDeleteForever([{ mailboxId, threadId }]);
 		else if (key === "U") markUnread();
 		else if (key === "r" && threadApprovals.length === 0) reply();
 		else if (key === "a" && threadApprovals.length === 0) reply("reply_all");
@@ -463,7 +466,16 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 						<IconButton title="Delete (#)" aria-label="Delete" onClick={() => act("trash")}>
 							<Trash2 />
 						</IconButton>
-					) : null}
+					) : (
+						<IconButton
+							title="Delete forever (#)"
+							aria-label="Delete forever"
+							className="text-danger hover:text-danger"
+							onClick={() => askDeleteForever([{ mailboxId, threadId }])}
+						>
+							<Trash2 />
+						</IconButton>
+					)}
 					<IconButton
 						title="Mark as unread (Shift+U)"
 						aria-label="Mark as unread"

@@ -75,6 +75,13 @@ export type InboxContextValue = {
 		read: boolean,
 		announce?: boolean,
 	) => Promise<boolean>;
+	/**
+	 * "Delete forever" (Trash only): asks for confirmation, then deletes the
+	 * conversations' trashed messages for good. No Undo.
+	 */
+	askDeleteForever: (refs: ThreadRef[]) => void;
+	/** "Empty trash" for the current scope: asks for confirmation first. */
+	askEmptyTrash: () => void;
 	/** Every address of the owner (mailboxes and aliases), lowercased: never a reply-all recipient. */
 	ownAddresses: string[];
 	/** Selected conversations of the list ("<mailboxId>:<threadId>"). */

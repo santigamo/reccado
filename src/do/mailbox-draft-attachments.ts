@@ -14,6 +14,9 @@
  *  - discarded: kept for DRAFT_ATTACHMENT_PURGE_DELAY_MS so "Undo" (restore)
  *    brings the draft back whole; a mailbox job then deletes the uploads of a
  *    draft that is still discarded.
+ *  - original deleted forever (do/mailbox-purge.ts): a forwarded reference
+ *    keeps the original's object alive; when the draft then drops it, the
+ *    object goes too, since nothing else points at it.
  */
 import {
 	MAX_ATTACHMENT_BYTES,
@@ -23,6 +26,7 @@ import {
 	sanitizeAttachmentName,
 } from "../lib/attachment-limits";
 import type { SnapshotAttachment } from "../lib/outbound-attachments";
+import { isR2KeyReferenced } from "./mailbox-purge";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
@@ -382,7 +386,10 @@ export function removeDraftAttachment(
 	if (!row) return { error: "attachment_not_found" };
 	sql.exec("DELETE FROM draft_attachments WHERE id = ?", attachmentId);
 	touch(sql, draftId);
-	return { removed: attachmentId, deleteR2Key: row.source === "upload" ? row.r2_key : null };
+	// A forwarded file belongs to its original message — unless that message was
+	// deleted forever meanwhile and this draft was the last thing pointing at it.
+	const owned = row.source === "upload" || !isR2KeyReferenced(sql, row.r2_key);
+	return { removed: attachmentId, deleteR2Key: owned ? row.r2_key : null };
 }
 
 /**
@@ -417,13 +424,12 @@ export function transferDraftAttachmentsToMessage(
 
 /** Discard: queue the uploads' deletion after the Undo window (only if there are any). */
 export function scheduleDraftAttachmentPurge(sql: SqlStorage, draftId: string): string | null {
-	const uploads = sql
-		.exec(
-			"SELECT 1 FROM draft_attachments WHERE draft_id = ? AND source = 'upload' LIMIT 1",
-			draftId,
-		)
+	// Any file at all: a forwarded one is normally left alone by the job, but not
+	// when its original was deleted forever in the meantime.
+	const files = sql
+		.exec("SELECT 1 FROM draft_attachments WHERE draft_id = ? LIMIT 1", draftId)
 		.toArray().length;
-	if (!uploads) return null;
+	if (!files) return null;
 	const now = new Date();
 	const runAt = new Date(now.getTime() + DRAFT_ATTACHMENT_PURGE_DELAY_MS).toISOString();
 	sql.exec(
@@ -448,13 +454,20 @@ export function purgeDiscardedDraftAttachments(sql: SqlStorage, draftId: string)
 		.exec<{ status: string }>("SELECT status FROM outbound_drafts WHERE id = ?", draftId)
 		.toArray()[0]?.status;
 	if (status !== undefined && status !== "cancelled") return [];
-	const keys = sql
-		.exec<{ r2_key: string }>(
-			"SELECT r2_key FROM draft_attachments WHERE draft_id = ? AND source = 'upload'",
+	const rows = sql
+		.exec<{ r2_key: string; source: string }>(
+			"SELECT r2_key, source FROM draft_attachments WHERE draft_id = ?",
 			draftId,
 		)
-		.toArray()
-		.map((r) => r.r2_key);
+		.toArray();
 	sql.exec("DELETE FROM draft_attachments WHERE draft_id = ?", draftId);
-	return keys;
+	// Uploads are the draft's own. A forwarded file goes only when nothing else
+	// points at it any more (its original was deleted forever).
+	return [
+		...new Set(
+			rows
+				.filter((r) => r.source === "upload" || !isR2KeyReferenced(sql, r.r2_key))
+				.map((r) => r.r2_key),
+		),
+	];
 }

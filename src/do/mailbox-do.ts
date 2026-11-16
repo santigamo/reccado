@@ -49,6 +49,19 @@ import {
 } from "./mailbox-draft-attachments";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
 import {
+	createPurgeTables,
+	getPurgeOperation,
+	hasQueuedPurge,
+	markPurgeReported,
+	PURGE_OBJECTS_JOB,
+	type PurgeObjectsPayload,
+	type PurgeTarget,
+	runPurgeBatch,
+	runPurgeObjectsJob,
+	startPurge,
+	unreportedPurges,
+} from "./mailbox-purge";
+import {
 	createRealtimeBroadcaster,
 	handleWebSocketMessage,
 	sendHello,
@@ -67,7 +80,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 13;
+const MAILBOX_SCHEMA_VERSION = 14;
 
 export type DraftOrigin = "web" | "telegram" | "mcp";
 
@@ -1574,6 +1587,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 13) {
 			createDraftAttachmentsTable(this.ctx.storage.sql);
 		}
+		// v14: permanent deletion ("Delete forever", "Empty trash"): its queue and
+		// operation tables, and the indexes its R2 reference checks are answered
+		// from. Additive; see do/mailbox-purge.ts.
+		if (currentVersion < 14) {
+			createPurgeTables(this.ctx.storage.sql);
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -1937,8 +1956,17 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			return Response.json({ messages: this.exportMessageIndex() });
 		}
 		if (url.pathname === "/alarm" && request.method === "POST") {
-			await this.runPendingJobs();
+			await this.alarm();
 			return Response.json({ ok: true });
+		}
+		if (url.pathname === "/purge" && request.method === "POST") {
+			const body = (await request.json()) as { mailboxId: string; target: PurgeTarget };
+			return this.purge(body.mailboxId, body.target);
+		}
+		if (url.pathname.startsWith("/purge/") && request.method === "GET") {
+			const operation = getPurgeOperation(this.ctx.storage.sql, url.pathname.split("/")[2]);
+			if (!operation) return Response.json({ error: "operation_not_found" }, { status: 404 });
+			return Response.json(operation);
 		}
 		// --- Transactional API key routes ---
 		if (url.pathname === "/transactional/api-keys" && request.method === "POST") {
@@ -2634,10 +2662,76 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 	}
 
-	// Runs the mailbox's pending jobs (today: deleting a discarded draft's uploads
-	// once its Undo window has passed). Armed by cancelDraft and by runPendingJobs.
+	// Runs the mailbox's pending jobs (a discarded draft's uploads once its Undo
+	// window has passed, the R2/D1 cleanup of permanently deleted messages) and
+	// the next batch of a running "Empty trash". Armed by cancelDraft, by
+	// runPendingJobs and by advancePurge.
 	async alarm(): Promise<void> {
 		await this.runPendingJobs();
+		await this.advancePurge();
+	}
+
+	/**
+	 * Start a permanent deletion and run its first batch now; anything left is
+	 * continued by the alarm, one bounded batch per run.
+	 */
+	private async purge(mailboxId: string, target: PurgeTarget): Promise<Response> {
+		const started = startPurge(this.ctx.storage.sql, mailboxId, target);
+		if ("error" in started) return Response.json(started, { status: 409 });
+		await this.advancePurge();
+		return Response.json(getPurgeOperation(this.ctx.storage.sql, started.operationId));
+	}
+
+	/** One batch of the purge queue, its cleanup job, and the ops events of finished operations. */
+	private async advancePurge(): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		if (hasQueuedPurge(sql)) {
+			const batch = runPurgeBatch(sql, (fn) => this.ctx.storage.transactionSync(fn));
+			for (const mailboxId of batch.mailboxIds) {
+				this.getBroadcaster(mailboxId).broadcast({
+					type: "messages.purged",
+					payload: { threadIds: batch.threadIds },
+				});
+			}
+			if (batch.jobId) await this.runPendingJobs(batch.jobId);
+		}
+		await this.reportFinishedPurges();
+		if (hasQueuedPurge(sql)) await this.armAlarm(Date.now());
+	}
+
+	// One ops event per finished operation: counts and mailbox, nothing about
+	// the mail itself. A D1 failure leaves it unreported for the next alarm.
+	private async reportFinishedPurges(): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		const pending = unreportedPurges(sql);
+		if (pending.length === 0) return;
+		const { insertOpsEvent } = await import("../db/d1");
+		for (const op of pending) {
+			try {
+				await insertOpsEvent(this.env.INDEX_DB, {
+					id: crypto.randomUUID(),
+					event_type: "mailbox.messages_purged",
+					severity: "info",
+					subject: op.mailbox_id,
+					payload_json: JSON.stringify({
+						mailboxId: op.mailbox_id,
+						operationId: op.id,
+						scope: op.scope,
+						messages: op.deleted_messages,
+						conversations: op.touched_threads,
+						conversationsRemoved: op.removed_threads,
+					}),
+				});
+				markPurgeReported(sql, op.id);
+			} catch (error) {
+				console.error("mailbox.purge_report_failed", {
+					operationId: op.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				await this.armAlarm(Date.now() + 5 * 60 * 1000);
+				return;
+			}
+		}
 	}
 
 	private getBroadcaster(mailboxId: string) {
@@ -2848,7 +2942,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 
 	private async armAlarm(at: number): Promise<void> {
 		const current = await this.ctx.storage.getAlarm();
-		if (current === null || current > at) await this.ctx.storage.setAlarm(at);
+		// An alarm time already in the past is the one firing right now (or about
+		// to): it must not stop the next wake-up from being set.
+		if (current === null || current > at || current <= Date.now()) {
+			await this.ctx.storage.setAlarm(at);
+		}
 	}
 
 	private async draftAttachmentRoute(request: Request, url: URL): Promise<Response | null> {
@@ -2921,16 +3019,25 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		return exportMessageIndex(this.ctx.storage.sql);
 	}
 
-	// Mailbox-local jobs from the `jobs` table. The only writer so far is a draft
-	// discard (PURGE_DRAFT_ATTACHMENTS_JOB); unknown types are marked done.
-	private async runPendingJobs(): Promise<void> {
+	// Mailbox-local jobs from the `jobs` table: a draft discard
+	// (PURGE_DRAFT_ATTACHMENTS_JOB) and the R2/D1 cleanup of permanently deleted
+	// messages (PURGE_OBJECTS_JOB). Unknown types are marked done. `onlyJobId`
+	// runs that one job now, whatever its next_run_at (a purge batch just queued it).
+	private async runPendingJobs(onlyJobId?: string): Promise<void> {
 		const now = new Date().toISOString();
-		const jobs = this.ctx.storage.sql
-			.exec<{ id: string; type: string; payload_json: string }>(
-				"SELECT id, type, payload_json FROM jobs WHERE status = 'pending' AND next_run_at <= ? LIMIT 5",
-				now,
-			)
-			.toArray();
+		const jobs = onlyJobId
+			? this.ctx.storage.sql
+					.exec<{ id: string; type: string; payload_json: string }>(
+						"SELECT id, type, payload_json FROM jobs WHERE status = 'pending' AND id = ?",
+						onlyJobId,
+					)
+					.toArray()
+			: this.ctx.storage.sql
+					.exec<{ id: string; type: string; payload_json: string }>(
+						"SELECT id, type, payload_json FROM jobs WHERE status = 'pending' AND next_run_at <= ? LIMIT 5",
+						now,
+					)
+					.toArray();
 		for (const job of jobs) {
 			this.ctx.storage.sql.exec(
 				"UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ?",
@@ -2948,9 +3055,15 @@ export class MailboxDurableObject extends DurableObject<Env> {
 					this.ctx.storage.sql
 						.exec<{ attempts: number }>("SELECT attempts FROM jobs WHERE id = ?", job.id)
 						.toArray()[0]?.attempts ?? 1;
-				// A transient R2 error retries hourly, a few times, then stays visible as failed.
-				status = attempts >= 5 ? "failed" : "pending";
-				nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+				// A transient R2 error retries hourly, a few times, then stays visible as
+				// failed. Deleted mail's leftovers retry sooner and for longer: until they
+				// are gone, an object the owner deleted forever still exists.
+				const purge = job.type === PURGE_OBJECTS_JOB;
+				status = attempts >= (purge ? 24 : 5) ? "failed" : "pending";
+				nextRunAt = new Date(Date.now() + (purge ? 5 : 60) * 60 * 1000).toISOString();
+				if (purge) {
+					console.error("mailbox.purge_cleanup_failed", { jobId: job.id, attempts, status });
+				}
 			}
 			this.ctx.storage.sql.exec(
 				"UPDATE jobs SET status = ?, next_run_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
@@ -2967,11 +3080,25 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			)
 			.toArray()[0];
 		if (next) {
-			await this.ctx.storage.setAlarm(new Date(next.next_run_at).getTime());
+			await this.armAlarm(new Date(next.next_run_at).getTime());
 		}
 	}
 
 	private async runJob(id: string, type: string, payloadJson: string): Promise<void> {
+		if (type === PURGE_OBJECTS_JOB) {
+			const sql = this.ctx.storage.sql;
+			await runPurgeObjectsJob(
+				{
+					sql,
+					r2: this.env.MAIL_OBJECTS,
+					db: this.env.INDEX_DB,
+					saveProgress: (payload) =>
+						sql.exec("UPDATE jobs SET payload_json = ? WHERE id = ?", JSON.stringify(payload), id),
+				},
+				JSON.parse(payloadJson) as PurgeObjectsPayload,
+			);
+			return;
+		}
 		if (type === PURGE_DRAFT_ATTACHMENTS_JOB) {
 			const payload = JSON.parse(payloadJson) as { draftId?: string; keys?: string[] };
 			// Rows go first, in one synchronous step with the status check, so a draft

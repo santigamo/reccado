@@ -11,9 +11,12 @@ import { useToast } from "#/components/ui/Toast";
 import type { InboxFolder } from "#/lib/inbox-search";
 import {
 	type ChangedMessage,
+	emptyTrash as emptyMailboxTrash,
 	type MessageAction,
 	markFolderRead,
 	moveThreads,
+	NotInTrashError,
+	purgeThreads,
 	runThreadAction,
 } from "#/lib/mail";
 import { actionToast, undoSteps } from "#/lib/undo";
@@ -270,8 +273,97 @@ export function useThreadActions({
 		[folder, setManyRead, toast],
 	);
 
+	/**
+	 * "Delete forever" for conversations in the Trash. The caller has already
+	 * asked for confirmation; there is no Undo. Rows leave at once; a failure
+	 * brings back whatever is still there and says so.
+	 */
+	const purge = useCallback(
+		async (
+			refs: readonly ThreadRef[],
+			onProgress?: (deleted: number, total: number) => void,
+		): Promise<boolean> => {
+			if (refs.length === 0) return true;
+			const keys = refs.map(keyOf);
+			hide(keys);
+			let done = 0;
+			try {
+				for (const [mailboxId, threadIds] of byMailbox(refs)) {
+					const before = done;
+					done += await purgeThreads(mailboxId, threadIds, (d, t) =>
+						onProgress?.(before + d, before + t),
+					);
+				}
+			} catch (error) {
+				unhide(keys);
+				forgetInflight();
+				refresh();
+				toast.show({
+					tone: "danger",
+					message:
+						error instanceof NotInTrashError
+							? "Only conversations in Trash can be deleted forever. Nothing was deleted."
+							: `Could not delete ${refs.length === 1 ? "the conversation" : `${refs.length} conversations`} forever. Check your connection and try again.`,
+				});
+				return false;
+			}
+			forgetInflight();
+			settle(keys);
+			refresh();
+			toast.show({
+				message:
+					refs.length === 1
+						? "Conversation deleted forever"
+						: `${refs.length} conversations deleted forever`,
+			});
+			return true;
+		},
+		[hide, unhide, settle, refresh, toast],
+	);
+
+	/** "Empty trash" in every mailbox of the scope, one after the other. No Undo. */
+	const emptyTrash = useCallback(
+		async (
+			mailboxIds: readonly string[],
+			rows: readonly UnifiedThreadRow[],
+			onProgress?: (deleted: number, total: number) => void,
+		): Promise<boolean> => {
+			const keys = rows
+				.filter((r) => mailboxIds.includes(r.mailbox_id))
+				.map((r) => keyOf({ mailboxId: r.mailbox_id, threadId: r.id }));
+			hide(keys);
+			let done = 0;
+			let failed = 0;
+			for (const mailboxId of mailboxIds) {
+				const before = done;
+				try {
+					done += await emptyMailboxTrash(mailboxId, (d, t) =>
+						onProgress?.(before + d, before + t),
+					);
+				} catch {
+					failed++;
+				}
+			}
+			forgetInflight();
+			if (failed > 0) unhide(keys);
+			else settle(keys);
+			refresh();
+			toast.show(
+				failed > 0
+					? {
+							tone: "danger",
+							message:
+								"Could not empty the whole trash. What was deleted stays deleted; try again for the rest.",
+						}
+					: { message: "Trash emptied" },
+			);
+			return failed === 0;
+		},
+		[hide, unhide, settle, refresh, toast],
+	);
+
 	const hiddenKeys = useMemo(() => new Set(Object.keys(hidden)), [hidden]);
-	return { hidden: hiddenKeys, move, markRead, markAllRead };
+	return { hidden: hiddenKeys, move, markRead, markAllRead, purge, emptyTrash };
 }
 
 /** The exact messages to flip back, grouped by conversation. */

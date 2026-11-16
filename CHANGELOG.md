@@ -11,6 +11,32 @@ package.
 
 ### Added
 
+- **Delete forever and Empty trash (2026-11-16).** The first permanent deletion in the mail client,
+  and only from the Trash. *Web.* In Trash, "Delete forever" replaces Delete for the selected
+  conversations, a row and the open conversation (`#` too), and an "Empty trash" bar/menu item acts
+  on the scope (one mailbox, or every mailbox). Both ask first, with the count, the scope and "This
+  can't be undone."; no Undo toast; an open conversation that was deleted closes, list and counts
+  refresh, a large Trash shows progress. *API* (owner web session only, Origin-checked; no MCP tool or
+  control-plane kind): `POST /api/mailboxes/:id/purge` with `threadIds` (their trashed messages),
+  `messageIds` (refused with 409 `not_in_trash` unless every one is in the Trash) or `emptyTrash`,
+  and `GET /api/mailboxes/:id/purge/:operationId`. *Mailbox DO* (schema v14, `do/mailbox-purge.ts`):
+  an operation queues its message ids (`purge_queue`, `purge_operations`) and deletes in batches of
+  250 — the first in the request, the rest from the alarm — re-checking `state = 'trash'` each time
+  (a message restored meanwhile stays). Each batch removes, in one transaction, the message, its
+  attachment, header, label and search rows, scrubs the subject/sender from its live-update history,
+  empties the draft a sent copy came from (the send markers stay, so a replayed confirm-send still
+  sends nothing), recounts or removes its conversation, and queues a `purge_message_objects` job
+  for the R2 objects (raw MIME, HTML body, attachments) and the D1 rows (`message_index`,
+  `telegram_links`, `telegram_retained`); the job retries every 5 minutes until done. An R2 object is
+  deleted only when no surviving message, attachment or draft file points at it (forwarded
+  attachments, sent copies re-using upload keys, duplicate deliveries sharing a raw key); new
+  indexes make those checks lookups. The ingest ledger keeps its row, marked `purged`, so a
+  re-delivered copy of a deleted email stays a duplicate (its new raw object is deleted) instead of
+  coming back. One `mailbox.messages_purged` ops event per finished operation (mailbox, scope,
+  counts). A draft that forwarded an attachment of a message deleted forever now deletes that object
+  when it drops the file or is purged after a discard. Not included: automatic emptying of the Trash
+  after N days.
+
 - **Attachments when composing and forwarding (2026-11-16).** *Compose.* A paperclip, drag-and-drop
   onto the dialog and pasted files attach to the draft; chips show name, size, upload progress,
   errors and remove; a running total ("3 files · 4.2 MB of 17 MB"); Send waits while uploads are in

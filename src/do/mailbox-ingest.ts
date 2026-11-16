@@ -13,6 +13,7 @@ import { normalizeMessageId } from "../lib/email-metadata";
 import { normalizeSubject, parseMimeBytes, snippetFromText } from "../lib/mime";
 import { attachmentR2Key, bodyHtmlR2Key, sanitizeFilename } from "../lib/r2-keys";
 import { classifySensitive, type StoredSensitiveKind } from "../lib/sensitive-mail";
+import { isR2KeyReferenced } from "./mailbox-purge";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
@@ -321,8 +322,9 @@ export async function ingestInboundEmail(
 			message_local_id: string | null;
 			raw_sha256: string;
 			status: string;
+			error_code: string | null;
 		}>(
-			"SELECT message_local_id, raw_sha256, status FROM ingest_events WHERE idempotency_key = ?",
+			"SELECT message_local_id, raw_sha256, status, error_code FROM ingest_events WHERE idempotency_key = ?",
 			message.idempotencyKey,
 		)
 		.toArray()[0];
@@ -340,6 +342,30 @@ export async function ingestInboundEmail(
 	}
 
 	if (existing?.message_local_id) {
+		// The owner deleted this email forever (mailbox-purge.ts). A re-delivery of
+		// it (Email Routing retry, DLQ replay, the sender's MTA resending) stays a
+		// duplicate rather than bringing it back, and the copy of the raw bytes the
+		// email handler just wrote goes too — unless something still points at it.
+		if (existing.error_code === "purged") {
+			if (!isR2KeyReferenced(ctx.sql, message.rawR2Key)) {
+				try {
+					await ctx.r2.delete(message.rawR2Key);
+				} catch (error) {
+					console.error("mailbox.purged_redelivery_cleanup_failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			return {
+				status: "duplicate",
+				mailboxId: message.mailboxId,
+				messageCount: messageCount(ctx.sql),
+				idempotencyKey: message.idempotencyKey,
+				messageLocalId: existing.message_local_id,
+				rawR2Key: message.rawR2Key,
+				purged: true,
+			};
+		}
 		return {
 			status: "duplicate",
 			mailboxId: message.mailboxId,
