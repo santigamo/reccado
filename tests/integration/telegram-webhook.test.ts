@@ -470,7 +470,7 @@ describe("telegram webhook", () => {
 		expect(edit?.body.message_id).toBe(5151);
 		expect(String(edit?.body.text)).toContain("· archivado");
 		expect(calls.find((call) => call.method === "answerCallbackQuery")?.body.text).toBe(
-			"Archivado",
+			"Conversación archivada",
 		);
 	});
 

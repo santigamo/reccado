@@ -167,7 +167,8 @@ describe("notify consumer", () => {
 
 		expect(message.ack).toHaveBeenCalledTimes(1);
 		expect(message.retry).not.toHaveBeenCalled();
-		expect(callsFor(db.calls, "telegram_links")).toHaveLength(1);
+		// The link row (the thread-aware card also reads telegram_links first).
+		expect(callsFor(db.calls, "INTO telegram_links")).toHaveLength(1);
 	});
 
 	it("retries with backoff instead of losing the push when Telegram rate-limits", async () => {
@@ -255,7 +256,8 @@ describe("notify consumer", () => {
 
 		expect(message.ack).toHaveBeenCalledTimes(1);
 		expect(message.retry).not.toHaveBeenCalled();
-		expect(callsFor(db.calls, "telegram_links")).toHaveLength(1);
+		// The link row (the thread-aware card also reads telegram_links first).
+		expect(callsFor(db.calls, "INTO telegram_links")).toHaveLength(1);
 	});
 
 	it("edits the card when a state change arrives from another surface", async () => {
