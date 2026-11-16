@@ -10,6 +10,8 @@
 #   - The generic-api-key hit in src/api/mailbox-routes.ts is a false positive on
 #     the `raw_r2_key:` object field name (there is no literal secret on that
 #     line); it also carries an inline `// gitleaks:allow` marker.
+#   - `test-secret-0123456789-0123456789-0123` is the placeholder auth secret the test
+#     suites pass to the Worker under test.
 #
 # Keep this allowlist as narrow as possible so real secrets are still caught.
 
@@ -24,6 +26,9 @@ paths = [
   '''docs/validation/PHASE1_VALIDATION\.md''',
 ]
 regexes = [
+  # The fixed placeholder the test suites use as BETTER_AUTH_SECRET. Not a credential:
+  # it exists only under tests/ and no deployment is ever configured with it.
+  '''test-secret-0123456789-0123456789-0123''',
   # Deleted Cloudflare Access service-token / policy identifiers from the Phase 1 log.
   '''6691b004-f78a-4258-928f-033c94881b48''',
   '''254520d9-ca00-4177-a4c6-cb7307009dd6''',
