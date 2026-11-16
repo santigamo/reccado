@@ -133,7 +133,7 @@ describe("GET /messages/:id/html framing", () => {
 		expect(shown.headers.get("content-security-policy")).toContain(
 			"img-src 'self' data: https: http:",
 		);
-		await shown.text();
+		expect(await shown.text()).toContain('src="https://example.org/remote.png"');
 
 		const html = await response.text();
 		expect(html).toContain('target="_blank"');
@@ -145,7 +145,60 @@ describe("GET /messages/:id/html framing", () => {
 		);
 		// An unresolvable cid: is dropped rather than left as a broken request.
 		expect(html).not.toContain("cid:");
-		expect(html).toContain('src="https://example.org/remote.png"');
+		// With images off the remote source is not even in the markup.
+		expect(html).toContain('data-blocked-src="https://example.org/remote.png"');
+		expect(html).not.toContain(' src="https://example.org/remote.png"');
+	});
+
+	it("never serves a meta refresh, a sender <base> or a referrer override, in either mode", async () => {
+		const mailboxId = "mbx_html_route_refresh";
+		await createMailbox(mailboxId, "html-route-refresh@example.com");
+		const raw = [
+			"From: Rico <rico@example.org>",
+			"To: html-route@example.com",
+			"Subject: Beacon",
+			"Message-ID: <refresh@example.org>",
+			"MIME-Version: 1.0",
+			"Content-Type: text/html; charset=utf-8",
+			"",
+			`<html><head><META HTTP-EQUIV='Refresh' content='0;url=https://t.example/r'><base href="https://t.example/"><meta name=referrer content=unsafe-url><link rel=dns-prefetch href="//t.example"></head><body><p style="background:url(https://t.example/c)">Hi</p></body></html>`,
+			"",
+		].join("\r\n");
+		const messageId = await ingestRaw(mailboxId, raw, "refresh@example.org");
+		for (const query of ["", "?images=1"]) {
+			const response = await fetchWorker(
+				new Request(
+					`http://localhost/api/mailboxes/${mailboxId}/messages/${messageId}/html${query}`,
+				),
+			);
+			expect(response.status).toBe(200);
+			const html = await response.text();
+			expect(html).not.toMatch(/refresh|unsafe-url|<link|<base href/i);
+			expect(html).toContain('<base target="_blank" rel="noopener noreferrer">');
+			if (!query) expect(html).not.toContain("t.example");
+		}
+	});
+
+	it("answers markup the parser refuses with an error the client falls back from", async () => {
+		const mailboxId = "mbx_html_route_unparsable";
+		await createMailbox(mailboxId, "html-route-unparsable@example.com");
+		const raw = [
+			"From: Rico <rico@example.org>",
+			"To: html-route@example.com",
+			"Subject: Frames",
+			"Message-ID: <frameset@example.org>",
+			"MIME-Version: 1.0",
+			"Content-Type: text/html; charset=utf-8",
+			"",
+			"<body><frameset></frameset><style>a{}</style></body>",
+			"",
+		].join("\r\n");
+		const messageId = await ingestRaw(mailboxId, raw, "frameset@example.org");
+		const response = await fetchWorker(
+			new Request(`http://localhost/api/mailboxes/${mailboxId}/messages/${messageId}/html`),
+		);
+		expect(response.status).toBe(422);
+		expect(response.headers.get("content-type")).toContain("application/json");
 	});
 
 	it("every other API response keeps DENY", async () => {
@@ -168,7 +221,9 @@ describe("GET /messages/:id/html framing", () => {
 				path,
 			);
 			expect(response.headers.get("x-frame-options")).toBe("DENY");
-			expect(response.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
+			expect(response.headers.get("content-security-policy")).toBe(
+				"frame-ancestors 'none'; frame-src 'self'",
+			);
 		}
 	});
 });

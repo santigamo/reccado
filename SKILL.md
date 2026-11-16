@@ -24,7 +24,7 @@ confirmation step.**
 In this codebase that confirmation is the `request-send` → `confirm-send` flow
 (`POST /api/mailboxes/{mailboxId}/drafts/{draftId}/request-send` then
 `.../confirm-send`), each gated by its own idempotency key. Over MCP the `send` tool only creates an
-approval intent; the owner approves it only at `/approve/:id` with the owner web session (Telegram sends a notice with the link, no buttons), and the DO sends an
+approval intent; the owner approves it only with the owner web session on this origin — at `/approve/:id` (the link the tool returns) or in the inbox approvals pane, both posting the frozen `payload_hash` to the same endpoint — never from Telegram (it sends a notice with the link, no buttons), and the DO sends an
 MCP-origin draft only with that approval's HMAC proof, so an agent cannot reach `confirm-send` by
 itself. The one deliberate exception to per-message confirmation is the transactional REST API,
 where an operator-created, mailbox-bound API key is itself the pre-authorization — see

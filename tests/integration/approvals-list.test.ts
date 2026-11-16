@@ -358,6 +358,52 @@ describe("GET /api/approvals", () => {
 		expect(JSON.stringify(body)).not.toContain('"jti"');
 	});
 
+	it("reads each pending send's frozen snapshot once, and carries its HTML body", async () => {
+		const box = await mailbox();
+		const intent = await sendIntent(
+			box,
+			{
+				to: ["a@example.net"],
+				subject: "Rich",
+				bodyText: "Hello in bold",
+				bodyHtml: "<p>Hello <strong>in bold</strong></p>",
+			},
+			ownerId,
+		);
+		const plain = await sendIntent(
+			box,
+			{ to: ["b@example.net"], subject: "Plain", bodyText: "Hello" },
+			ownerId,
+		);
+		// Every mailbox DO request the listing makes, by path.
+		const paths: string[] = [];
+		const counting = {
+			...authEnv(),
+			MAILBOX_DO: {
+				getByName: (name: string) => {
+					const stub = env.MAILBOX_DO.getByName(name);
+					return {
+						fetch: (input: RequestInfo | URL, init?: RequestInit) => {
+							paths.push(new URL(typeof input === "string" ? input : String(input)).pathname);
+							return stub.fetch(input, init);
+						},
+					};
+				},
+			},
+		} as unknown as Env;
+		const list = await listApprovals(counting, ownerId);
+		const rich = list.pending.find((item) => item.id === intent.id);
+		expect(rich?.send).toMatchObject({
+			text: "Hello in bold",
+			html: "<p>Hello <strong>in bold</strong></p>",
+		});
+		expect(list.pending.find((item) => item.id === plain.id)?.send?.html).toBeNull();
+		for (const item of [intent, plain]) {
+			const reads = paths.filter((p) => p === `/drafts/${item.draftId}/send-intent`);
+			expect(reads).toHaveLength(1);
+		}
+	});
+
 	it("names the requesting OAuth client when it is registered", async () => {
 		const box = await mailbox();
 		const intent = await sendIntent(

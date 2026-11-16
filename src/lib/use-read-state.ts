@@ -15,6 +15,7 @@ import {
 	type MessageAction,
 	moveThreads,
 	runThreadAction,
+	type ThreadScope,
 } from "./mail";
 import { forgetInflight, type UnifiedThreadRow } from "./use-unified-mail";
 
@@ -63,6 +64,7 @@ export function useReadState({
 	counts,
 	refresh,
 	countsInbox,
+	scope,
 }: {
 	/** Rows of the list on screen, as the server sent them. */
 	rows: UnifiedThreadRow[];
@@ -71,6 +73,8 @@ export function useReadState({
 	refresh: () => void;
 	/** Does a row of this list count toward its mailbox's Inbox unread figure? */
 	countsInbox: (row: UnifiedThreadRow) => boolean;
+	/** The messages of a conversation the list's folder shows (thread-wide writes). */
+	scope: ThreadScope;
 }) {
 	const [guesses, setGuesses] = useState<Record<string, Guess>>({});
 	const rowsRef = useRef(rows);
@@ -128,8 +132,8 @@ export function useReadState({
 
 	/**
 	 * Mark conversations read or unread: the guesses at once, then the writes
-	 * (`messageIds` when known for a single conversation, else every message of
-	 * each conversation, one request per mailbox), then a reload that cannot
+	 * (`messageIds` when known for a single conversation, else the messages of
+	 * each conversation the folder shows, one request per mailbox), then a reload that cannot
 	 * reuse a request from before the write. Resolves to what changed (for Undo);
 	 * rejects after rolling the guesses back when a write fails.
 	 */
@@ -157,7 +161,7 @@ export function useReadState({
 						changed.push(...(await runThreadAction(mailboxId, group.messages, action)));
 					}
 					if (group.threads.length > 0) {
-						changed.push(...(await moveThreads(mailboxId, group.threads, action)));
+						changed.push(...(await moveThreads(mailboxId, group.threads, action, scope)));
 					}
 				}
 				forgetInflight();
@@ -187,7 +191,7 @@ export function useReadState({
 				refresh();
 			}
 		},
-		[guess, refresh],
+		[guess, refresh, scope],
 	);
 
 	/** One conversation; see setManyRead. Never rejects (a failure rolls back). */

@@ -1,23 +1,36 @@
-import { createApiApp } from "./api/hono";
 import { requireAuth } from "./api/auth";
-import * as templates from "./lib/admin/templates";
-import { adminResponse } from "./lib/admin/errors";
+import { createApiApp } from "./api/hono";
 import type { InboundEmailQueueMessage } from "./cloudflare/types";
 import { deriveDevTestMailboxId } from "./db/seed-dev";
+import { adminResponse } from "./lib/admin/errors";
+import * as templates from "./lib/admin/templates";
 import { mailboxStub } from "./lib/mailbox-stub";
 
 /**
- * Anti-framing headers for every server-rendered HTML response (/approve/:id,
- * /security, /consent, /login, ...), so no other origin — including same-site
- * siblings — can frame a page that asks for an approval. The approval page also
- * sends no Referer (its URL carries the intent id).
+ * Headers for every server-rendered HTML response (/approve/:id, /inbox,
+ * /security, /consent, /login, ...):
+ *  - anti-framing (`frame-ancestors 'none'` + X-Frame-Options DENY), so no other
+ *    origin — including same-site siblings — can frame a page that asks for an
+ *    approval;
+ *  - `frame-src 'self'`: the only frames the app has are message bodies from
+ *    this origin, and a frame can then not be navigated anywhere else (a sender's
+ *    meta refresh or link is a navigation the body's own CSP does not govern);
+ *  - no Referer from pages whose URL can carry an approval id: `/approve/:id`,
+ *    and `/inbox`, where a thread-less request opens as `?approval=<id>` (set for
+ *    every /inbox page, since the SPA moves to that URL without a new load).
  */
 export function withHtmlSecurityHeaders(response: Response, pathname: string): Response {
 	if (!response.headers.get("content-type")?.toLowerCase().includes("text/html")) return response;
 	const headers = new Headers(response.headers);
-	headers.set("Content-Security-Policy", mergeFrameAncestors(headers.get("Content-Security-Policy")));
+	headers.set(
+		"Content-Security-Policy",
+		mergeDirectives(headers.get("Content-Security-Policy"), {
+			"frame-ancestors": "frame-ancestors 'none'",
+			"frame-src": "frame-src 'self'",
+		}),
+	);
 	headers.set("X-Frame-Options", "DENY");
-	if (pathname.startsWith("/approve/")) headers.set("Referrer-Policy", "no-referrer");
+	if (carriesApprovalId(pathname)) headers.set("Referrer-Policy", "no-referrer");
 	return new Response(response.body, {
 		status: response.status,
 		statusText: response.statusText,
@@ -26,12 +39,22 @@ export function withHtmlSecurityHeaders(response: Response, pathname: string): R
 	} as ResponseInit);
 }
 
-function mergeFrameAncestors(existing: string | null): string {
+function carriesApprovalId(pathname: string): boolean {
+	return (
+		pathname.startsWith("/approve/") || pathname === "/inbox" || pathname.startsWith("/inbox/")
+	);
+}
+
+/** Replace (or add) the named directives, keeping every other one as it was. */
+function mergeDirectives(existing: string | null, replace: Record<string, string>): string {
+	const names = Object.keys(replace);
 	const directives = (existing ?? "")
 		.split(";")
 		.map((directive) => directive.trim())
-		.filter((directive) => directive && !/^frame-ancestors\b/i.test(directive));
-	directives.push("frame-ancestors 'none'");
+		.filter(
+			(directive) => directive && !names.includes(directive.split(/\s+/)[0]?.toLowerCase() ?? ""),
+		);
+	directives.push(...Object.values(replace));
 	return directives.join("; ");
 }
 

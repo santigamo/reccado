@@ -1,11 +1,12 @@
 /**
  * The owner's approvals queue for the inbox (`GET /api/approvals`).
  *
- * Read-only. Every pending item is rendered through `getIntentView`, the same
- * function the standalone `/approve/:id` page uses, so the queue never shows a
- * field, warning or payload hash the single-item view would not. The extra
- * `send` block is the same frozen snapshot that view renders, structured so the
- * inbox can lay it out (From/To/Subject/body) instead of parsing labels.
+ * Read-only. Every pending item is rendered through the same view the
+ * standalone `/approve/:id` page uses (`getIntentView`), so the queue never
+ * shows a field, warning or payload hash the single-item view would not. The
+ * extra `send` block is the very snapshot that view was rendered from (read
+ * once per item, not again), structured so the inbox can lay it out
+ * (From/To/Subject/body) instead of parsing labels.
  *
  * Approving and denying stay on `POST /api/approvals/:id/approve|deny`; nothing
  * here changes state. Only the owner web session reaches this (see
@@ -13,8 +14,9 @@
  */
 
 import {
+	type FrozenSend,
 	fieldsFromSnapshot,
-	getIntentView,
+	getIntentViewWithSnapshot,
 	type IntentField,
 	type IntentStatusName,
 	type IntentWarning,
@@ -43,6 +45,13 @@ export type ApprovalSendSummary = {
 	subject: string;
 	/** Full plain-text body (pending items only; the single view shows it too). */
 	text: string | null;
+	/**
+	 * The HTML body as frozen, when the agent sent one (pending items only; the
+	 * single view shows it too, as its "HTML" field). Raw agent markup: the
+	 * inbox never renders it, it only hands it to the owner's own draft, which
+	 * the server sanitises like any owner HTML.
+	 */
+	html: string | null;
 	snippet: string;
 	attachments: number;
 };
@@ -128,8 +137,8 @@ export async function listApprovals(
 
 	const pendingItems = await Promise.all(
 		pending.map(async (row) => {
-			const view = await getIntentView(env, row.token, { userId });
-			const send = await sendSummary(env, row, true);
+			const { view, frozen } = await getIntentViewWithSnapshot(env, row.token, { userId });
+			const send = sendSummary(row, frozen, true);
 			return item(row, names, {
 				status: view.status,
 				title: view.title,
@@ -148,7 +157,7 @@ export async function listApprovals(
 				fields: [],
 				warnings: [],
 				payloadHash: null,
-				send: await sendSummary(env, row, false),
+				send: sendSummary(row, await readSnapshot(env, row), false),
 			}),
 		),
 	);
@@ -199,18 +208,23 @@ function decidedStatus(row: Row): IntentStatusName {
 	return "approved";
 }
 
-async function sendSummary(
-	env: Env,
-	row: Row,
-	withBody: boolean,
-): Promise<ApprovalSendSummary | null> {
+/** A decided row's snapshot (pending rows get theirs with the view). */
+async function readSnapshot(env: Env, row: Row): Promise<FrozenSend | null> {
 	if (row.kind !== "send" || !row.mailbox_id || !row.draft_id) return null;
-	const frozen = await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null);
-	if (!frozen) return null;
+	return readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null);
+}
+
+function sendSummary(
+	row: Row,
+	frozen: FrozenSend | null,
+	withBody: boolean,
+): ApprovalSendSummary | null {
+	if (row.kind !== "send" || !row.mailbox_id || !row.draft_id || !frozen) return null;
 	const snapshot = frozen.snapshot;
 	const { from } = fieldsFromSnapshot(snapshot);
 	const identity = (snapshot.identity ?? {}) as Record<string, unknown>;
 	const text = typeof snapshot.text === "string" ? snapshot.text : "";
+	const html = typeof snapshot.html === "string" && snapshot.html ? snapshot.html : null;
 	return {
 		mailboxId: row.mailbox_id,
 		draftId: row.draft_id,
@@ -223,6 +237,7 @@ async function sendSummary(
 		bcc: strings(snapshot.bcc),
 		subject: typeof snapshot.subject === "string" ? snapshot.subject : "",
 		text: withBody ? text : null,
+		html: withBody ? html : null,
 		snippet: text.replace(/\s+/g, " ").trim().slice(0, SNIPPET_CHARS),
 		attachments: Array.isArray(snapshot.attachments) ? snapshot.attachments.length : 0,
 	};

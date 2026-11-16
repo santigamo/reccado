@@ -219,6 +219,68 @@ describe("bulk actions", () => {
 		expect((await bulk(mbx, "restore_inbox", { threadIds: [b.threadId] })).changed).toEqual([]);
 	});
 
+	it("acts on a conversation only through the messages its folder shows", async () => {
+		// A conversation was deleted, then a reply arrived: the old message stays in
+		// Trash, the new one is in Inbox. The same conversation is a row of both.
+		const mbx = "mbx-bulk-scope";
+		const old = await ingest(
+			mbx,
+			mime({ from: "c@example.org", subject: "C", messageId: "c1@example.org" }),
+			"c1@example.org",
+			"2026-11-10T09:00:00.000Z",
+		);
+		await bulk(mbx, "trash", { messageIds: [old.messageLocalId] });
+		const reply = await ingest(
+			mbx,
+			mime({
+				from: "c@example.org",
+				subject: "Re: C",
+				messageId: "c2@example.org",
+				inReplyTo: "c1@example.org",
+			}),
+			"c2@example.org",
+			"2026-11-10T10:00:00.000Z",
+		);
+		expect(reply.threadId).toBe(old.threadId);
+		const states = async () =>
+			Object.fromEntries((await thread(mbx, old.threadId)).map((m) => [m.id, m.state]));
+
+		// From Inbox: archive moves the reply only; the trashed message stays put.
+		const archived = await bulk(mbx, "archive", { threadIds: [old.threadId], scope: "live" });
+		expect(archived.changed.map((c) => c.id)).toEqual([reply.messageLocalId]);
+		expect(await states()).toEqual({
+			[old.messageLocalId]: "trash",
+			[reply.messageLocalId]: "archive",
+		});
+		// No scope given is the same as "live": the Trash is never reached by default.
+		const restored = await bulk(mbx, "restore_inbox", { threadIds: [old.threadId] });
+		expect(restored.changed.map((c) => c.id)).toEqual([reply.messageLocalId]);
+		// Read state from a normal folder leaves the trashed message unread.
+		await bulk(mbx, "mark_read", { threadIds: [old.threadId], scope: "live" });
+		const read = Object.fromEntries(
+			(await thread(mbx, old.threadId)).map((m) => [m.id, m.is_read]),
+		);
+		expect(read).toEqual({ [old.messageLocalId]: 0, [reply.messageLocalId]: 1 });
+
+		// From Trash: restore brings back the trashed message only.
+		const fromTrash = await bulk(mbx, "restore_inbox", {
+			threadIds: [old.threadId],
+			scope: "trash",
+		});
+		expect(fromTrash.changed.map((c) => c.id)).toEqual([old.messageLocalId]);
+		expect(await states()).toEqual({
+			[old.messageLocalId]: "inbox",
+			[reply.messageLocalId]: "inbox",
+		});
+
+		// All mail lists trashed messages too, so it reaches them.
+		await bulk(mbx, "trash", { messageIds: [old.messageLocalId] });
+		const all = await bulk(mbx, "archive", { threadIds: [old.threadId], scope: "all" });
+		expect(all.changed.map((c) => c.id).sort()).toEqual(
+			[old.messageLocalId, reply.messageLocalId].sort(),
+		);
+	});
+
 	it("marks every unread conversation of a folder read, and only that folder", async () => {
 		const mbx = "mbx-mark-all";
 		const ids = await seed(mbx);
@@ -305,6 +367,14 @@ describe("sender names and Reply-To", () => {
 				messageLocalId,
 			);
 		});
+		// A search summary reads it as stored: no backfill.
+		const summarised = await testEnv.MAILBOX_DO.getByName(mbx).fetch(
+			`https://mailbox-do/threads/${threadId}?backfill=0`,
+		);
+		const [asStored] = ((await summarised.json()) as { messages: Msg[] }).messages;
+		expect(asStored?.from_name).toBeNull();
+		expect(asStored?.reply_to_json).toBeNull();
+
 		const [opened] = await thread(mbx, threadId);
 		expect(opened?.from_name).toBe("Rubén García");
 		expect(JSON.parse(String(opened?.reply_to_json))).toEqual(["sales@example.org"]);

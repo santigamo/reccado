@@ -231,10 +231,41 @@ export async function fetchThreads(
 	return data.threads ?? [];
 }
 
-export async function fetchThread(mailboxId: string, threadId: string): Promise<ThreadDetail> {
+/**
+ * One conversation. Opening it also fills older rows' sender names and
+ * Reply-To from their raw headers (once, server side); `backfill: false` reads
+ * it as stored, for callers that only summarise it (search).
+ */
+export async function fetchThread(
+	mailboxId: string,
+	threadId: string,
+	opts: { backfill?: boolean } = {},
+): Promise<ThreadDetail> {
+	const query = opts.backfill === false ? "?backfill=0" : "";
 	return json<ThreadDetail>(
-		await fetch(`${base(mailboxId)}/threads/${encodeURIComponent(threadId)}`),
+		await fetch(`${base(mailboxId)}/threads/${encodeURIComponent(threadId)}${query}`),
 	);
+}
+
+/** Requests a search keeps in flight at once (per mailbox). */
+export const SEARCH_FETCH_CONCURRENCY = 6;
+
+/** `fn` over `items` with at most `limit` running at once; results in input order. */
+export async function mapWithConcurrency<T, R>(
+	items: readonly T[],
+	limit: number,
+	fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const worker = async () => {
+		while (next < items.length) {
+			const index = next++;
+			results[index] = await fn(items[index]!);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+	return results;
 }
 
 export async function fetchMessage(
@@ -263,8 +294,30 @@ export async function runMessageAction(
 /** A message a bulk action changed, as it was before (what Undo restores). */
 export type ChangedMessage = { id: string; thread_id: string; state: string; is_read: number };
 
+/**
+ * Which messages of a conversation a thread action reaches: what the folder it
+ * is taken from shows. Outside the Trash, never the trashed ones; in the
+ * Trash, only those; All mail (and its reports view), every one.
+ */
+export type ThreadScope = "live" | "trash" | "all";
+
+export function folderScope(folder: { state: MessageState | null }): ThreadScope {
+	if (folder.state === "trash") return "trash";
+	if (folder.state === null) return "all";
+	return "live";
+}
+
+/** The messages of an open conversation a thread action from `scope` reaches. */
+export function inScope<T extends { state: string }>(
+	messages: readonly T[],
+	scope: ThreadScope,
+): T[] {
+	if (scope === "all") return [...messages];
+	return messages.filter((m) => (scope === "trash" ? m.state === "trash" : m.state !== "trash"));
+}
+
 export type BulkTarget =
-	| { threadIds: string[] }
+	| { threadIds: string[]; scope: ThreadScope }
 	| { messageIds: string[] }
 	| { folder: { state: Exclude<MessageState, "draft"> | null; reports?: "only" } };
 
@@ -305,17 +358,22 @@ export async function runThreadAction(
 
 /**
  * Move whole conversations (by id) to a folder, or set their read state, in one
- * request per hundred. Returns what changed, for Undo.
+ * request per hundred, touching only the messages `scope` reaches (see
+ * ThreadScope). Returns what changed, for Undo.
  */
 export async function moveThreads(
 	mailboxId: string,
 	threadIds: string[],
 	action: MessageAction,
+	scope: ThreadScope,
 ): Promise<ChangedMessage[]> {
 	const changed: ChangedMessage[] = [];
 	for (let i = 0; i < threadIds.length; i += 100) {
 		changed.push(
-			...(await runBulkAction(mailboxId, action, { threadIds: threadIds.slice(i, i + 100) })),
+			...(await runBulkAction(mailboxId, action, {
+				threadIds: threadIds.slice(i, i + 100),
+				scope,
+			})),
 		);
 	}
 	return changed;
@@ -326,8 +384,9 @@ export async function moveThread(
 	mailboxId: string,
 	threadId: string,
 	action: MessageAction,
+	scope: ThreadScope,
 ): Promise<ChangedMessage[]> {
-	return moveThreads(mailboxId, [threadId], action);
+	return moveThreads(mailboxId, [threadId], action, scope);
 }
 
 /** "Mark all as read" for a folder of one mailbox. */
@@ -666,16 +725,24 @@ export async function searchThreads(
 	opts: { state?: Exclude<MessageState, "draft"> | null; limit?: number; mail?: FolderMail } = {},
 ): Promise<ThreadRow[]> {
 	const messageIds = await searchMessageIds(mailboxId, q, opts.limit ?? 50, opts.mail);
-	const seenThreads = new Set<string>();
-	const rows: ThreadRow[] = [];
-
-	for (const messageId of messageIds) {
-		const message = await fetchMessage(mailboxId, messageId);
+	// The hits, a few at a time; then each conversation once, by its first hit in
+	// this folder. Read as stored: summarising a result is not opening it, so it
+	// never waits on (or triggers) the header backfill.
+	const messages = await mapWithConcurrency(messageIds, SEARCH_FETCH_CONCURRENCY, (id) =>
+		fetchMessage(mailboxId, id),
+	);
+	const firstHit = new Map<string, (typeof messages)[number]>();
+	for (const message of messages) {
 		if (opts.state && message.state !== opts.state) continue;
-		if (seenThreads.has(message.thread_id)) continue;
-		seenThreads.add(message.thread_id);
-
-		const detail = await fetchThread(mailboxId, message.thread_id);
+		if (!firstHit.has(message.thread_id)) firstHit.set(message.thread_id, message);
+	}
+	const hits = [...firstHit.values()];
+	const details = await mapWithConcurrency(hits, SEARCH_FETCH_CONCURRENCY, (message) =>
+		fetchThread(mailboxId, message.thread_id, { backfill: false }),
+	);
+	const rows: ThreadRow[] = [];
+	hits.forEach((message, i) => {
+		const detail = details[i]!;
 		// A detail that came back without messages still has the hit itself.
 		const row = summarizeThread(
 			detail.messages.length > 0 ? detail : { ...detail, messages: [message] },
@@ -683,7 +750,7 @@ export async function searchThreads(
 			opts.mail,
 		);
 		if (row) rows.push(row);
-	}
+	});
 
 	// Newest activity first, like every other list.
 	return rows.sort(byLatestActivity);

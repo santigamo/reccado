@@ -13,7 +13,9 @@ import type { ApiBindings } from "./hono";
  *
  * Write (`POST .../routing`): `{ ok: true }` with 201 (created) or 200 (already
  * routed); every refusal is `{ ok: false, reason, message, remedy }` with a
- * status from REFUSAL_STATUS.
+ * status from REFUSAL_STATUS (a missing or unreadable body is
+ * `invalid_address`). An address whose mailbox has another owner is a 403
+ * `forbidden`, the same authority the MCP `address_route` kind enforces.
  */
 export function registerCloudflareReadRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/cloudflare/zones", async (c) =>
@@ -23,9 +25,12 @@ export function registerCloudflareReadRoutes(api: Hono<ApiBindings>): void {
 		c.json(await domainOverview(c.env, c.get("auth")!, { domain: c.req.param("domain") })),
 	);
 	api.post("/api/cloudflare/domains/:domain/routing", async (c) => {
+		// An empty or non-JSON body names no address: the documented
+		// `invalid_address` refusal, not a generic JSON error.
+		const body: unknown = await c.req.json().catch(() => null);
 		const result = await routeAddress(c.env, c.get("auth")!, {
 			domain: c.req.param("domain"),
-			body: await c.req.json(),
+			body,
 		});
 		if (result.ok) return c.json(result, result.status === "created" ? 201 : 200);
 		return c.json(result, REFUSAL_STATUS[result.reason] as 400);

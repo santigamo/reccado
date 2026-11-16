@@ -858,6 +858,70 @@ describe("Empty trash on a large mailbox", () => {
 	});
 });
 
+describe("conversation tallies", () => {
+	it("count a conversation whose trashed messages span two batches once", async () => {
+		const mailboxId = await newMailbox();
+		const total = PURGE_BATCH_MESSAGES + 10;
+		const thread = "t-one-long-conversation";
+		await sql(mailboxId, (s) => {
+			const at = "2026-01-01T00:00:00.000Z";
+			s.exec(
+				`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
+         VALUES (?, 'long', ?, ?, 0, ?, ?)`,
+				thread,
+				at,
+				total,
+				at,
+				at,
+			);
+			for (let i = 0; i < total; i++) {
+				const id = `long-${i}`;
+				s.exec(
+					`INSERT INTO messages (id, idempotency_key, thread_id, direction, state, from_addr, to_json,
+             subject, received_at, raw_r2_key, raw_sha256, raw_size, parse_status, is_read, created_at, updated_at)
+           VALUES (?, ?, ?, 'inbound', 'trash', 'a@example.net', '[]', 'long', ?, ?, 'x', 1, 'parsed', 1, ?, ?)`,
+					id,
+					`key-${id}`,
+					thread,
+					new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+					`raw/dev/${mailboxId}/long/${id}.eml`,
+					at,
+					at,
+				);
+			}
+		});
+
+		const first = await purge(mailboxId, { threadIds: [thread] });
+		expect(first).toMatchObject({ status: "running", deleted: PURGE_BATCH_MESSAGES });
+		expect(first).toMatchObject({ conversations: 1, conversationsRemoved: 0 });
+		let status = first;
+		for (let i = 0; i < 5 && status.status !== "done"; i++) {
+			await runAlarm(mailboxId);
+			status = (await (await api(mailboxId, `/purge/${first.operationId}`)).json()) as PurgeOp;
+		}
+		expect(status).toMatchObject({
+			status: "done",
+			deleted: total,
+			conversations: 1,
+			conversationsRemoved: 1,
+		});
+		// The per-operation conversation set does not outlive the operation.
+		expect(await count(mailboxId, "SELECT 1 FROM purge_operation_threads")).toBe(0);
+
+		const events = await testEnv.INDEX_DB.prepare(
+			"SELECT payload_json FROM ops_events WHERE event_type = 'mailbox.messages_purged' AND subject = ?",
+		)
+			.bind(mailboxId)
+			.all<{ payload_json: string }>();
+		expect(events.results).toHaveLength(1);
+		expect(JSON.parse(events.results[0]!.payload_json)).toMatchObject({
+			messages: total,
+			conversations: 1,
+			conversationsRemoved: 1,
+		});
+	});
+});
+
 describe("a re-delivered copy of a deleted email", () => {
 	it("stays deleted (and its new raw copy is removed), while new mail still arrives", async () => {
 		const mailboxId = await newMailbox();

@@ -114,6 +114,12 @@ export const bulkActionSchema = z
 	.object({
 		action: z.enum(["mark_read", "mark_unread", "archive", "trash", "restore_inbox"]),
 		threadIds: z.array(z.string().min(1).max(200)).min(1).max(100).optional(),
+		/**
+		 * With threadIds: the messages of each conversation the acting folder shows
+		 * ("live" outside the Trash, "trash" in it, "all" in All mail). Absent is
+		 * "live", so a conversation action never reaches the Trash by default.
+		 */
+		scope: z.enum(["live", "trash", "all"]).optional(),
 		messageIds: z.array(z.string().min(1).max(200)).min(1).max(1000).optional(),
 		folder: z
 			.object({
@@ -128,6 +134,9 @@ export const bulkActionSchema = z
 	)
 	.refine((b) => !b.folder || b.action === "mark_read", {
 		message: "A whole folder can only be marked read",
+	})
+	.refine((b) => b.scope === undefined || b.threadIds !== undefined, {
+		message: "scope only applies to threadIds",
 	});
 
 /**

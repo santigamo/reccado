@@ -234,6 +234,16 @@ package.
 
 ### Changed
 
+- **Faster thread lists and searches on large mailboxes.** A list page no longer counts the messages
+  of every conversation in the mailbox before sorting (about a third of the rows read per
+  conversation); counts are computed for the page's rows. `GET /api/approvals` reads each pending
+  send's frozen snapshot once instead of three times. Search fetches its hits a few at a time and
+  no longer triggers or waits on the sender-name/Reply-To backfill (`GET …/threads/:id?backfill=0`);
+  opening the conversation still runs it.
+- **Approval boundary documented as it is.** The owner approves with the owner web session on
+  `/approve/:id` or in the inbox approvals pane (same endpoint, same payload-hash binding;
+  secret-revealing kinds only on `/approve/:id`). AGENTS.md, SECURITY.md, SKILL.md and
+  docs/ARCHITECTURE.md now say so.
 - `better-auth`/`@better-auth/mcp` 1.7.20 (session JWTs are no longer accepted at `/mcp`);
   `agents` 0.33 and `@modelcontextprotocol/server` 2.4.0. Existing MCP tokens need re-consent for
   the new scopes; Telegram pending sends created before `0022` must be re-drafted.
@@ -278,6 +288,25 @@ read/search/draft endpoint.
 
 ### Security
 
+- **Opening a message with images off makes no request to anyone else (2026-11-16).** A sender's
+  `<meta http-equiv="refresh">` navigated the message body to any URL when the body was opened
+  outside the inbox frame (Chrome's sandbox stopped it inside the frame; other browsers may not),
+  a `<video poster>` was fetched in Chrome despite the body's CSP, and `<meta name="referrer"
+  content="unsafe-url">` made those requests carry the message URL (mailbox and message ids).
+  The served body now drops, in both modes, meta refresh, referrer overrides (`<meta
+  name=referrer>`, `referrerpolicy`, `ping`), the sender's `<base>`, every `<link>` (DNS prefetch,
+  preconnect, prefetch, stylesheets) and script/object/embed/iframe/frame elements; with images
+  off it also moves every remote source aside (`src`, `srcset`, `background`, `poster`, SVG `href`,
+  …) and neutralises remote CSS `url()`, `image-set()` and `@import` in style attributes and
+  blocks (`src/lib/email-html.ts`). Every app page now sends `frame-src 'self'`, so the message
+  frame cannot be navigated off this origin at all, and `/inbox` pages send
+  `Referrer-Policy: no-referrer` like `/approve/:id`, since a thread-less approval opens as
+  `/inbox?folder=approvals&approval=<id>`. A body the HTML parser refuses now answers 422 (the
+  inbox shows the text part) instead of a 500.
+- **"Route it" enforces the same ownership as the agent's `address_route`.** The web endpoint
+  `POST /api/cloudflare/domains/:domain/routing` now refuses (403 `forbidden`) an address whose
+  mailbox, or whose alias's mailbox, has another owner; an empty or non-JSON body answers the
+  documented `400 { ok: false, reason: "invalid_address" }` instead of `{ error: "invalid_json" }`.
 - **The transactional status route verifies the key secret.** `GET
   /v1/.../transactional/messages/:requestId` checked the key id, revocation and scope but never
   the secret, and ignored expiry — and key ids are public (every send response carries one). Send
@@ -296,6 +325,26 @@ read/search/draft endpoint.
   change still hold the full body and should be purged by hand.
 
 ### Fixed
+
+- **Conversation actions leave the other folder's messages alone (2026-11-16).** Archiving, moving
+  to Inbox or marking read/unread a conversation from Inbox, Archive or Sent also moved its trashed
+  messages (a conversation deleted, then a reply arrived: archiving the reply pulled the old
+  messages out of the Trash), and restoring from Trash moved the conversation's live messages too.
+  Thread actions now reach only the messages the folder shows: never the trashed ones outside the
+  Trash, only those in it, everything in All mail (`POST …/bulk-actions` takes `scope` with
+  `threadIds`; absent means outside the Trash). The open conversation's toolbar, Mark unread and
+  mark-read-on-open follow the same rule. MCP `update_messages` acts on explicit message ids only and
+  was not affected.
+- **"Edit as my draft" keeps the HTML body and can no longer leave a duplicate.** The owner's copy
+  of an agent's send now carries its HTML body (sanitised by the server like any owner HTML), and
+  the agent's request is denied *before* the copy is made: a failed deny makes no copy (the request
+  stays waiting), a request already decided elsewhere gets none, and a failed copy after the deny
+  leaves the agent's (now unapprovable) draft in Drafts and says so. The agent's attachments are
+  not copied; the owner is told.
+- **"Delete forever" counts a conversation once.** A conversation whose trashed messages took more
+  than one batch was counted once per batch in the operation status and the
+  `mailbox.messages_purged` event. Conversations are now counted once per operation (mailbox schema
+  v15, `purge_operation_threads`).
 
 - **Sent messages no longer show "(no text content)".** The send path stored the sent copy
   without its body, so the viewer had nothing to render even though the mail went out intact.

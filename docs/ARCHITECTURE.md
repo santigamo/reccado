@@ -185,7 +185,8 @@ provider returned.
 - Public or OSS multi-user MCP should use OAuth 2.1 style scopes per tool.
 - MCP scopes are `resource:action` (`mail:read`, `mail:draft`, `mail:send`, `config:read`, `templates:write`, `keys:write`, …); there is no omnibus `admin`.
 - The agent may read, draft and summarize, but it may not send, nor change the control plane,
-  without the owner's approval (`/approve/:id`, owner web session) bound to the exact payload, for sends and the
+  without the owner's approval (owner web session, on `/approve/:id` or in the inbox approvals pane;
+  secret-revealing kinds on `/approve/:id` only) bound to the exact payload, for sends and the
   irreversible / exfiltrating control-plane kinds; other control-plane writes apply directly with their narrow scope
   and a before-snapshot (`restore` undoes them).
 - Prompt-injection defenses wrap every email-to-agent path.

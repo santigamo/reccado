@@ -515,8 +515,19 @@ function expiredStatus(): IntentStatus {
 	return { status: "expired", send: null, deliveryFeedback: null };
 }
 
-export async function getIntentStatus(env: Env, id: string): Promise<IntentStatus> {
-	const row = await getApproval(env.INDEX_DB, id);
+/**
+ * What a caller already read for this request, so one render does not read the
+ * D1 row or the frozen snapshot (a mailbox DO round trip) twice. `frozen`
+ * undefined means "not read yet"; null means "read, and there is none".
+ */
+type Preloaded = { row: ApprovalRow | null; frozen?: FrozenSend | null };
+
+export async function getIntentStatus(
+	env: Env,
+	id: string,
+	preloaded?: Preloaded,
+): Promise<IntentStatus> {
+	const row = preloaded ? preloaded.row : await getApproval(env.INDEX_DB, id);
 	if (!row) return expiredStatus();
 	if (row.kind !== "send" && controlPlaneKind(row.kind)) {
 		const stored = await controlData(env, id);
@@ -545,7 +556,10 @@ export async function getIntentStatus(env: Env, id: string): Promise<IntentStatu
 	let from: string | null = null;
 	let frozen: FrozenSend | null = null;
 	if (row.kind === "send" && row.mailbox_id && row.draft_id) {
-		frozen = await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null);
+		frozen =
+			preloaded?.frozen !== undefined
+				? preloaded.frozen
+				: await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null);
 		from = frozen ? fieldsFromSnapshot(frozen.snapshot).from : null;
 	}
 	const deliveryFeedback = await feedbackFor(env, from);
@@ -576,6 +590,19 @@ export async function getIntentView(
 	id: string,
 	actor: { userId: string },
 ): Promise<IntentView> {
+	return (await buildView(env, id, actor.userId)).view;
+}
+
+/**
+ * The same view, plus the frozen send snapshot it was rendered from (null for a
+ * control-plane kind or a send whose snapshot is gone), read once. For the
+ * inbox queue, which lays the snapshot out itself.
+ */
+export async function getIntentViewWithSnapshot(
+	env: Env,
+	id: string,
+	actor: { userId: string },
+): Promise<{ view: IntentView; frozen: FrozenSend | null }> {
 	return buildView(env, id, actor.userId);
 }
 
@@ -585,28 +612,36 @@ export async function getIntentView(
  */
 export async function getIntentCard(env: Env, id: string): Promise<IntentView> {
 	const row = await getApproval(env.INDEX_DB, id);
-	return buildView(env, id, row?.token_sub ?? null);
+	return (await buildView(env, id, row?.token_sub ?? null)).view;
 }
 
-async function buildView(env: Env, id: string, userId: string | null): Promise<IntentView> {
+async function buildView(
+	env: Env,
+	id: string,
+	userId: string | null,
+): Promise<{ view: IntentView; frozen: FrozenSend | null }> {
 	const row = await getApproval(env.INDEX_DB, id);
-	const status = await getIntentStatus(env, id);
 	if (!row) {
 		return {
-			id,
-			kind: "send",
-			status: "expired",
-			title: "Solicitud caducada",
-			fields: [],
-			warnings: [],
-			payloadHash: null,
-			expiresAt: null,
+			view: {
+				id,
+				kind: "send",
+				status: "expired",
+				title: "Solicitud caducada",
+				fields: [],
+				warnings: [],
+				payloadHash: null,
+				expiresAt: null,
+			},
+			frozen: null,
 		};
 	}
+	// Read once; the status below is computed from the same row and snapshot.
 	const frozen =
 		row.kind === "send" && row.mailbox_id && row.draft_id
 			? await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null)
 			: null;
+	const status = await getIntentStatus(env, id, { row, frozen });
 	let warnings =
 		row.kind === "send" && frozen
 			? await warningsForSend(env, frozen.snapshot, frozen.seenAddresses)
@@ -653,14 +688,17 @@ async function buildView(env: Env, id: string, userId: string | null): Promise<I
 		}
 	}
 	return {
-		id: row.token,
-		kind: row.kind,
-		status: status.status,
-		title: rendered.title,
-		fields: rendered.fields,
-		warnings,
-		payloadHash: status.status === "pending" ? row.payload_hash : null,
-		expiresAt: row.expires_at,
+		view: {
+			id: row.token,
+			kind: row.kind,
+			status: status.status,
+			title: rendered.title,
+			fields: rendered.fields,
+			warnings,
+			payloadHash: status.status === "pending" ? row.payload_hash : null,
+			expiresAt: row.expires_at,
+		},
+		frozen,
 	};
 }
 

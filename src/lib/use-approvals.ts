@@ -38,6 +38,8 @@ export type ApprovalSend = {
 	bcc: string[];
 	subject: string;
 	text: string | null;
+	/** The frozen HTML body, when the agent sent one (pending only). Never rendered here. */
+	html: string | null;
 	snippet: string;
 	attachments: number;
 };
@@ -272,36 +274,92 @@ export async function denyApproval(approval: PendingApproval): Promise<ApprovalO
 	return outcome;
 }
 
+/** Why "Edit as my draft" stopped, in words the owner can act on. */
+export class TakeOverError extends Error {
+	constructor(
+		readonly code:
+			| "not_a_send"
+			| "no_recipients"
+			| "deny_failed"
+			| "already_decided"
+			| "copy_failed",
+		/** What the owner is told; says what did and did not happen. */
+		readonly ownerMessage: string,
+	) {
+		super(code);
+	}
+}
+
 /**
  * "Edit": the request is frozen and bound to its hash, so it cannot be edited.
- * Instead the owner takes the text over: a NEW draft of their own (origin web)
- * is created with the same recipients, subject and body, then the agent's
- * request is denied and the agent's draft cancelled. Sending the copy is an
- * ordinary owner send from Compose; the agent's draft is never sent.
+ * Instead the owner takes it over: the agent's request is denied, then a NEW
+ * draft of their own (origin web) is created with the same recipients,
+ * subject and body (the HTML body too, sanitised by the server like any owner
+ * HTML; the agent's attachments are not carried over, and the result says
+ * so), then the agent's draft is cancelled. Sending the copy is an ordinary
+ * owner send from Compose; the agent's draft is never sent.
+ *
+ * Deny first, copy second, because of what each order leaves behind when its
+ * second step fails:
+ *  - copy first, deny fails: two drafts, and the agent's request is still
+ *    approvable, so the same mail could be sent twice;
+ *  - deny first, copy fails: nothing can be sent, the agent's draft (with the
+ *    text) is still in Drafts, and the owner is told to start one by hand.
+ * Only the second is harmless. A request someone already decided (sent,
+ * approved elsewhere) gets no copy at all.
  */
 export async function takeOverAsOwnDraft(
 	approval: PendingApproval,
-): Promise<{ draftId: string; mailboxId: string }> {
+): Promise<{ draftId: string; mailboxId: string; attachmentsLeftOut: number }> {
 	const send = approval.send;
-	if (!send || approval.kind !== "send") throw new Error("not_a_send");
-	if (send.to.length === 0) throw new Error("no_recipients");
-	const draftId = await createDraft(send.mailboxId, {
-		to: send.to,
-		cc: send.cc.length ? send.cc : undefined,
-		bcc: send.bcc.length ? send.bcc : undefined,
-		subject: send.subject || "(no subject)",
-		bodyText: send.text ?? "",
-		threadId: send.threadId ?? undefined,
-		...(send.parentMessageId ? { parentMessageId: send.parentMessageId } : {}),
-	} as Parameters<typeof createDraft>[1]);
-	const denied = await denyApproval(approval);
-	// Only once the request is denied: the agent's draft can no longer be approved, so
-	// retire it rather than leave two copies in Drafts. If the request was decided
-	// elsewhere meanwhile, the copy stays as a plain draft and the agent's is untouched.
-	if (denied.status === "denied") {
-		await cancelDraft(send.mailboxId, send.draftId).catch(() => undefined);
+	if (!send || approval.kind !== "send")
+		throw new TakeOverError("not_a_send", "Only a message can be edited as your own draft.");
+	if (send.to.length === 0)
+		throw new TakeOverError("no_recipients", "The request has no recipients to copy.");
+
+	let denied: ApprovalOutcome;
+	try {
+		denied = await denyApproval(approval);
+	} catch {
+		throw new TakeOverError(
+			"deny_failed",
+			"Could not reach the request. Nothing was changed: it is still waiting for you.",
+		);
 	}
-	return { draftId, mailboxId: send.mailboxId };
+	// "expired": nobody can approve it any more either, so a copy is still safe.
+	if (denied.status !== "denied" && denied.status !== "expired") {
+		throw new TakeOverError(
+			denied.alreadyDecided ? "already_decided" : "deny_failed",
+			denied.alreadyDecided
+				? `The request was already ${denied.status} elsewhere, so no copy was made.`
+				: "The request could not be discarded, so no copy was made. It is still waiting for you.",
+		);
+	}
+
+	let draftId: string;
+	try {
+		draftId = await createDraft(send.mailboxId, {
+			to: send.to,
+			cc: send.cc.length ? send.cc : undefined,
+			bcc: send.bcc.length ? send.bcc : undefined,
+			subject: send.subject || "(no subject)",
+			bodyText: send.text ?? "",
+			...(send.html ? { bodyHtml: send.html } : {}),
+			threadId: send.threadId ?? undefined,
+			...(send.parentMessageId ? { parentMessageId: send.parentMessageId } : {}),
+		});
+	} catch {
+		// The agent's draft is left alone: it is no longer approvable, and it is
+		// where the text still is.
+		throw new TakeOverError(
+			"copy_failed",
+			"The agent's request was discarded, but your copy could not be created. Nothing was sent; the agent's text is still in Drafts.",
+		);
+	}
+	// The request is denied and the copy exists: retire the agent's draft rather
+	// than leave two in Drafts. A failure here leaves an unapprovable draft only.
+	await cancelDraft(send.mailboxId, send.draftId).catch(() => undefined);
+	return { draftId, mailboxId: send.mailboxId, attachmentsLeftOut: send.attachments };
 }
 
 // Recent outcomes, so a result stays on screen after the request leaves the

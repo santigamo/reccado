@@ -118,6 +118,7 @@ export function createPurgeTables(sql: SqlStorage): void {
   thread_id TEXT,
   created_at TEXT NOT NULL
 )`);
+	createPurgeThreadsTable(sql);
 	sql.exec("CREATE INDEX IF NOT EXISTS idx_purge_queue_operation ON purge_queue(operation_id)");
 	sql.exec("CREATE INDEX IF NOT EXISTS idx_purge_queue_batch ON purge_queue(batch_id)");
 	// R2 keys a batch may delete, checked against every surviving reference.
@@ -134,6 +135,20 @@ export function createPurgeTables(sql: SqlStorage): void {
        ON messages(body_html_r2_key) WHERE body_html_r2_key IS NOT NULL`,
 	);
 	sql.exec("CREATE INDEX IF NOT EXISTS idx_draft_attachments_r2_key ON draft_attachments(r2_key)");
+}
+
+/**
+ * v15. The conversations an operation has touched so far, once each, so its
+ * tallies count a conversation whose trashed messages span several batches
+ * once (and say whether it is gone). Rows live only while the operation runs.
+ */
+export function createPurgeThreadsTable(sql: SqlStorage): void {
+	sql.exec(`CREATE TABLE IF NOT EXISTS purge_operation_threads (
+  operation_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  removed INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (operation_id, thread_id)
+)`);
 }
 
 /** Does any surviving message, attachment or draft file point at this R2 object? */
@@ -406,24 +421,37 @@ export function runPurgeBatch(
 				batchId,
 			);
 
-			// Per-operation tallies.
+			// Per-operation tallies. Conversations are counted once per operation,
+			// however many batches their messages took.
+			sql.exec(
+				`INSERT OR IGNORE INTO purge_operation_threads (operation_id, thread_id)
+           SELECT DISTINCT operation_id, thread_id FROM purge_queue
+            WHERE batch_id = ? AND thread_id IS NOT NULL`,
+				batchId,
+			);
+			sql.exec(
+				`UPDATE purge_operation_threads SET removed = 1
+          WHERE removed = 0
+            AND thread_id IN (SELECT thread_id FROM purge_queue WHERE batch_id = ?)
+            AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.id = purge_operation_threads.thread_id)`,
+				batchId,
+			);
 			for (const row of sql
-				.exec<{ operation_id: string; messages: number; threads: number; removed: number }>(
-					`SELECT q.operation_id, COUNT(*) AS messages, COUNT(DISTINCT q.thread_id) AS threads,
-                  COUNT(DISTINCT CASE WHEN t.id IS NULL THEN q.thread_id END) AS removed
-             FROM purge_queue q LEFT JOIN threads t ON t.id = q.thread_id
-            WHERE q.batch_id = ? GROUP BY q.operation_id`,
+				.exec<{ operation_id: string; messages: number }>(
+					`SELECT operation_id, COUNT(*) AS messages FROM purge_queue
+            WHERE batch_id = ? GROUP BY operation_id`,
 					batchId,
 				)
 				.toArray()) {
 				sql.exec(
 					`UPDATE purge_operations SET deleted_messages = deleted_messages + ?,
-              touched_threads = touched_threads + ?, removed_threads = removed_threads + ?,
+              touched_threads = (SELECT COUNT(*) FROM purge_operation_threads p
+                                  WHERE p.operation_id = purge_operations.id),
+              removed_threads = (SELECT COALESCE(SUM(removed), 0) FROM purge_operation_threads p
+                                  WHERE p.operation_id = purge_operations.id),
               updated_at = ?
             WHERE id = ?`,
 					row.messages,
-					row.threads,
-					row.removed,
 					now,
 					row.operation_id,
 				);
@@ -480,13 +508,17 @@ export function runPurgeBatch(
 			sql.exec("DELETE FROM purge_queue WHERE batch_id = ?", batchId);
 		}
 
-		// Operations with nothing left queued are finished.
+		// Operations with nothing left queued are finished; their tallies are final.
 		sql.exec(
 			`UPDATE purge_operations SET status = 'done', finished_at = ?, updated_at = ?
         WHERE status = 'running'
           AND NOT EXISTS (SELECT 1 FROM purge_queue q WHERE q.operation_id = purge_operations.id)`,
 			now,
 			now,
+		);
+		sql.exec(
+			`DELETE FROM purge_operation_threads WHERE operation_id IN (
+         SELECT id FROM purge_operations WHERE status = 'done')`,
 		);
 	});
 	return result;

@@ -18,7 +18,8 @@ export type Rendered = {
 export type ApprovalMode = "required" | "direct";
 export type ControlPlaneKind = {
 	/**
-	 * `required`: irreversible / exfiltrating, so it pends until the owner approves on `/approve/:id`.
+	 * `required`: irreversible / exfiltrating, so it pends until the owner approves it (owner web
+	 * session, on `/approve/:id` or in the inbox approvals pane).
 	 * `direct`: applied immediately with the token's scope (before-snapshot + ops event kept).
 	 * A function decides from the (validated) payload.
 	 */

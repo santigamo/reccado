@@ -50,6 +50,7 @@ import {
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
 import {
 	createPurgeTables,
+	createPurgeThreadsTable,
 	getPurgeOperation,
 	hasQueuedPurge,
 	markPurgeReported,
@@ -80,7 +81,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 14;
+const MAILBOX_SCHEMA_VERSION = 15;
 
 export type DraftOrigin = "web" | "telegram" | "mcp";
 
@@ -321,28 +322,37 @@ export function listThreads(
 	before?: ThreadListCursor,
 ): ThreadListRow[] {
 	const visible = (alias: string) => visibleClause(alias, state, reports);
-	const folderFilter = state
-		? `WHERE EXISTS (SELECT 1 FROM messages f WHERE f.thread_id = t.id AND f.state = ?${reportsClause("f", reports)})`
-		: "";
-	const outer: string[] = [];
-	if (unread !== undefined) outer.push(unread ? "unread_count > 0" : "unread_count = 0");
+	// Which conversations, decided per thread with EXISTS probes that stop at the
+	// first match. The counts are not computed here: ordering and paging only need
+	// the representative message, and counting every message of every thread
+	// before ORDER BY/LIMIT made each page cost a pass over the whole mailbox.
+	const where: string[] = [];
+	if (state) {
+		where.push(
+			`EXISTS (SELECT 1 FROM messages f WHERE f.thread_id = t.id AND f.state = ?${reportsClause("f", reports)})`,
+		);
+	}
+	if (unread !== undefined) {
+		where.push(
+			`${unread ? "" : "NOT "}EXISTS (SELECT 1 FROM messages u WHERE u.thread_id = t.id AND u.is_read = 0 AND ${visible("u")})`,
+		);
+	}
 	// Keyset paging on the list order: strictly after the last row of the
 	// previous page, so a page never repeats or skips a conversation.
-	if (before) outer.push("(latest_received_at < ? OR (latest_received_at = ? AND id < ?))");
-	const unreadFilter = outer.length ? `WHERE ${outer.join(" AND ")}` : "";
+	const after = before
+		? "WHERE (latest_received_at < ? OR (latest_received_at = ? AND id < ?))"
+		: "";
 	const rows = sql
 		.exec(
 			`SELECT * FROM (
-         SELECT ${THREAD_LIST_COLUMNS},
-           (SELECT COUNT(*) FROM messages c WHERE c.thread_id = t.id AND ${visible("c")}) AS message_count,
-           (SELECT COUNT(*) FROM messages u WHERE u.thread_id = t.id AND u.is_read = 0 AND ${visible("u")}) AS unread_count
+         SELECT ${THREAD_LIST_COLUMNS}
          FROM threads t
          JOIN messages lm ON lm.id = (
            SELECT m.id FROM messages m WHERE m.thread_id = t.id AND ${visible("m")}
            ORDER BY m.received_at DESC, m.rowid DESC LIMIT 1
          )
-         ${folderFilter}
-       ) ${unreadFilter}
+         ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+       ) ${after}
        ORDER BY latest_received_at DESC, id DESC
        LIMIT ?`,
 			...(state ? [state] : []),
@@ -352,7 +362,8 @@ export function listThreads(
 		.toArray() as Array<Record<string, SqlStorageValue>>;
 	if (rows.length === 0) return [];
 
-	// Participants for the whole page in one indexed read, oldest message first.
+	// The page's visible messages in one indexed read, oldest first: participants,
+	// and the message / unread counts of these rows only.
 	const ids = rows.map((r) => String(r.id));
 	const senders = sql
 		.exec<{ thread_id: string } & ParticipantSource>(
@@ -369,13 +380,16 @@ export function listThreads(
 		list.push(row);
 		byThread.set(row.thread_id, list);
 	}
-	return rows.map((row) => ({
-		...row,
-		id: String(row.id),
-		message_count: Number(row.message_count ?? 0),
-		unread_count: Number(row.unread_count ?? 0),
-		participants: buildParticipants(byThread.get(String(row.id)) ?? []),
-	}));
+	return rows.map((row) => {
+		const messages = byThread.get(String(row.id)) ?? [];
+		return {
+			...row,
+			id: String(row.id),
+			message_count: messages.length,
+			unread_count: messages.filter((m) => Number(m.is_read) === 0).length,
+			participants: buildParticipants(messages),
+		};
+	});
 }
 
 export type FolderCounts = {
@@ -1593,6 +1607,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 14) {
 			createPurgeTables(this.ctx.storage.sql);
 		}
+		// v15: per-operation conversation set, so a purge counts a conversation
+		// whose messages span several batches once. Additive.
+		if (currentVersion < 15) {
+			createPurgeThreadsTable(this.ctx.storage.sql);
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -1794,8 +1813,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (url.pathname.startsWith("/threads/") && request.method === "GET") {
 			const threadId = url.pathname.split("/")[2];
 			// Older rows get their sender name and Reply-To from their own raw
-			// headers, once, the first time their conversation is opened.
-			if (threadId) {
+			// headers, once, the first time their conversation is opened — not when
+			// a search only summarises it (`?backfill=0`).
+			if (threadId && url.searchParams.get("backfill") !== "0") {
 				try {
 					await backfillHeaderFields(this.ctx.storage.sql, this.env.MAIL_OBJECTS, threadId);
 				} catch (error) {

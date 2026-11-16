@@ -33,6 +33,8 @@ import {
 	cancelDraft,
 	type Draft,
 	fetchDrafts,
+	folderScope,
+	inScope,
 	type Mailbox,
 	type Message,
 	type MessageAction,
@@ -245,6 +247,7 @@ function typingInto(target: EventTarget | null): boolean {
 export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadId: string }) {
 	const inbox = useInbox();
 	const {
+		folder,
 		colorOf,
 		mailboxById,
 		threads,
@@ -284,10 +287,13 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 		guessedRef.current = `${mailboxId}:${threadId}`;
 		guessThreadRead(mailboxId, threadId, true);
 	}, [listRowUnread, mailboxId, threadId, guessThreadRead]);
+	// Thread-wide actions reach only what the folder this was opened from shows:
+	// from Inbox, Archive or Sent never the trashed messages; from Trash only those.
+	const scope = folderScope(folder);
 	const markedKeyRef = useRef("");
 	useEffect(() => {
 		if (!data) return;
-		const unread = data.messages.filter((m) => m.is_read === 0);
+		const unread = inScope(data.messages, scope).filter((m) => m.is_read === 0);
 		const key = `${threadId}:${data.messages.map((m) => m.id).join(",")}`;
 		if (markedKeyRef.current === key) return;
 		markedKeyRef.current = key;
@@ -300,7 +306,7 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 			true,
 			unread.map((m) => m.id),
 		);
-	}, [data, mailboxId, threadId, setThreadRead]);
+	}, [data, mailboxId, threadId, setThreadRead, scope]);
 
 	// Messages that were unread when the conversation opened keep their "new"
 	// emphasis while it stays open, though they are already marked read.
@@ -317,7 +323,8 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 
 	const messages = data?.messages ?? [];
 	const latest = messages.at(-1);
-	const state = conversationState(messages);
+	const acting = inScope(messages, scope);
+	const state = conversationState(acting.length > 0 ? acting : messages);
 	const isRestorable = state === "archive" || state === "trash";
 	const threadApprovals = approvalsForThread(approvals, mailboxId, threadId);
 	// Drafts of this conversation, shown under it (Gmail). A draft an approval is
@@ -364,7 +371,7 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 
 	function markUnread() {
 		closeThread();
-		void markThreadsRead([{ mailboxId, threadId, messageIds: messages.map((m) => m.id) }], false);
+		void markThreadsRead([{ mailboxId, threadId, messageIds: acting.map((m) => m.id) }], false);
 	}
 
 	// Who answers: Reply / Reply all target the newest message someone else sent

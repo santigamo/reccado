@@ -83,8 +83,11 @@ export function createApiApp(): Hono<ApiBindings> {
 		headers.set("X-Content-Type-Options", "nosniff");
 		// DENY everywhere, with one exception: a message's HTML body, which the
 		// inbox itself frames (sandboxed) and which declares SAMEORIGIN to match its
-		// CSP frame-ancestors 'self'. Pages that ask for decisions (/approve,
-		// /login, /consent) are not served by this app and keep their own DENY.
+		// CSP frame-ancestors 'self'. Pages that ask for decisions (/approve/:id and
+		// /inbox, whose approvals pane approves too; /login, /consent) are not served
+		// by this app: server.ts withHtmlSecurityHeaders gives them their own DENY,
+		// frame-ancestors 'none' and frame-src 'self' (plus no-referrer on /approve
+		// and /inbox).
 		const framable =
 			MESSAGE_HTML_PATH.test(c.req.path) && headers.get("X-Frame-Options") === "SAMEORIGIN";
 		if (!framable) headers.set("X-Frame-Options", "DENY");

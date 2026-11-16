@@ -31,7 +31,7 @@ import {
 	parseInboxSearch,
 	withoutCompose,
 } from "#/lib/inbox-search";
-import { cancelDraft, FOLDERS, type MessageAction, restoreDraft } from "#/lib/mail";
+import { cancelDraft, FOLDERS, folderScope, type MessageAction, restoreDraft } from "#/lib/mail";
 import { useMailboxColors } from "#/lib/mailbox-color";
 import { useAgentStatus } from "#/lib/use-agent-status";
 import { type PendingApproval, usePendingApprovals } from "#/lib/use-approvals";
@@ -205,6 +205,7 @@ function InboxScreen({
 				folder.key !== "reports" && (folder.key === "inbox" || row.latest_state === "inbox"),
 			[folder.key],
 		),
+		scope: folderScope(folder),
 	});
 	const { applyCounts } = readState;
 	const toast = useToast();

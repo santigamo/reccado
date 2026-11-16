@@ -12,6 +12,7 @@ import type { InboxFolder } from "#/lib/inbox-search";
 import {
 	type ChangedMessage,
 	emptyTrash as emptyMailboxTrash,
+	folderScope,
 	type MessageAction,
 	markFolderRead,
 	moveThreads,
@@ -140,7 +141,10 @@ export function useThreadActions({
 			const changes: Changes = [];
 			try {
 				for (const [mailboxId, threadIds] of byMailbox(refs)) {
-					changes.push({ mailboxId, changed: await moveThreads(mailboxId, threadIds, action) });
+					changes.push({
+						mailboxId,
+						changed: await moveThreads(mailboxId, threadIds, action, folderScope(folder)),
+					});
 				}
 			} catch {
 				unhide(keys);

@@ -4,8 +4,10 @@
  * --address`, sharing its Cloudflare client and rule logic (`../email-routing`).
  *
  * Owner web session, or an MCP agent's `address_route` request once the owner
- * approved it on `/approve/:id` (src/lib/control-plane-kinds/address-route.ts runs
- * this same function; no MCP path reaches it without that approval).
+ * approved it with the owner web session (on `/approve/:id` or the inbox
+ * approvals pane; src/lib/control-plane-kinds/address-route.ts runs this same
+ * function; no MCP path reaches it without that approval). Both paths enforce
+ * the same ownership: an address of a mailbox with another owner is refused.
  *
  * Authority is bounded the same way the DNS gate bounds DMARC writes:
  *   - the zone comes from the `domains` registry, never from the caller;
@@ -27,7 +29,7 @@ import {
 	EmailRoutingApiError,
 	ensureAddressRoute,
 } from "../email-routing";
-import { assertAdminAccess } from "./access";
+import { assertAdminAccess, requireMailboxOwner } from "./access";
 
 const TIMEOUT_MS = 10_000;
 
@@ -140,16 +142,22 @@ export async function routeAddress(
 		);
 
 	const mailboxes = await listMailboxes(env.INDEX_DB);
-	const isMailbox = mailboxes.some(
+	const mailbox = mailboxes.find(
 		(m) => m.status === "active" && m.primary_address.toLowerCase() === address,
 	);
-	const alias = isMailbox ? null : await getAlias(env.INDEX_DB, address);
-	if (!isMailbox && !(alias && alias.status === "active"))
+	const alias = mailbox ? null : await getAlias(env.INDEX_DB, address);
+	if (!mailbox && !(alias && alias.status === "active"))
 		return refuse(
 			"address_unknown",
 			`${address} is not an active mailbox or alias in Reccado.`,
 			"Create the mailbox (or alias) first. Reccado only routes addresses it files.",
 		);
+	// The same authority the agent's `address_route` has: an address of a mailbox
+	// (or an alias of one) that has an owner is routed only by that owner. A
+	// mailbox with no owner yet (pre-0003 rows) stays under the owner web session
+	// alone, as the rest of the UI treats it; MCP refuses those outright.
+	const ownerOf = mailbox ?? mailboxes.find((m) => m.mailbox_id === alias?.mailbox_id);
+	if (ownerOf?.owner_email) await requireMailboxOwner(env, actor, ownerOf.mailbox_id);
 
 	const token = env.CLOUDFLARE_API_TOKEN?.trim();
 	if (!token)

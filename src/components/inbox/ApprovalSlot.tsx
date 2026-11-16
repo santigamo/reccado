@@ -3,6 +3,7 @@ import { type ReactNode, useState } from "react";
 import { BrandMark } from "#/components/shell/AppShell";
 import { Button, buttonClassName } from "#/components/ui/Button";
 import { StatusDot } from "#/components/ui/StatusDot";
+import { useToast } from "#/components/ui/Toast";
 import {
 	approvalTitle,
 	errorText,
@@ -22,6 +23,7 @@ import {
 	denyApproval,
 	dismissOutcome,
 	type PendingApproval,
+	TakeOverError,
 	takeOverAsOwnDraft,
 	useApprovalOutcomes,
 	useNow,
@@ -293,6 +295,7 @@ function OutcomeNotice({ outcome }: { outcome: ApprovalOutcome }) {
  */
 export function ApprovalActionBar({ approval }: { approval: PendingApproval }) {
 	const { refresh, openCompose } = useInbox();
+	const toast = useToast();
 	const [busy, setBusy] = useState<null | "approve" | "deny" | "edit">(null);
 	const [confirm, setConfirm] = useState<null | "deny" | "edit">(null);
 	const [error, setError] = useState<string | null>(null);
@@ -312,13 +315,25 @@ export function ApprovalActionBar({ approval }: { approval: PendingApproval }) {
 			} else {
 				const copy = await takeOverAsOwnDraft(approval);
 				openCompose({ from: copy.mailboxId, draftId: copy.draftId });
+				if (copy.attachmentsLeftOut > 0) {
+					toast.show({
+						message: `The agent's ${copy.attachmentsLeftOut === 1 ? "attachment was" : `${copy.attachmentsLeftOut} attachments were`} not copied. Attach ${copy.attachmentsLeftOut === 1 ? "it" : "them"} again if you need ${copy.attachmentsLeftOut === 1 ? "it" : "them"}.`,
+					});
+				}
 			}
 		} catch (err) {
-			setError(
-				action === "edit"
-					? `Could not open a copy to edit (${err instanceof Error ? err.message : "error"}). Nothing was discarded.`
-					: "Nothing was done: the request could not be reached. Try again.",
-			);
+			if (action === "edit") {
+				// Said in a toast too: once the request is discarded this bar leaves
+				// with it, and the inline message would go unseen.
+				const message =
+					err instanceof TakeOverError
+						? err.ownerMessage
+						: "Could not open a copy to edit. Nothing was changed. Try again.";
+				setError(message);
+				toast.show({ tone: "danger", message });
+			} else {
+				setError("Nothing was done: the request could not be reached. Try again.");
+			}
 		} finally {
 			setBusy(null);
 			setConfirm(null);

@@ -414,6 +414,62 @@ describe("POST /api/cloudflare/domains/:domain/routing", () => {
 		expect(status).toBe(201);
 		expect(body).toMatchObject({ ok: true, status: "created", address: `sales@${zone}` });
 	});
+
+	it("answers an empty or non-JSON body with invalid_address, not a server error", async () => {
+		const { zone } = await setup();
+		const calls = stubCloudflare([]);
+		for (const body of [undefined, "", "not json", "{"]) {
+			const response = await run(
+				new Request(`http://localhost/api/cloudflare/domains/${zone}/routing`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					...(body === undefined ? {} : { body }),
+				}),
+			);
+			expect(response.status).toBe(400);
+			expect(await response.json()).toMatchObject({ ok: false, reason: "invalid_address" });
+		}
+		expect(calls).toEqual([]);
+	});
+
+	it("refuses, like the agent's address_route, an address whose mailbox has another owner", async () => {
+		const { zone } = await setup();
+		const now = new Date().toISOString();
+		const foreign = `mbx_foreign_${n}`;
+		await db
+			.prepare(
+				"INSERT INTO mailboxes (mailbox_id, primary_address, display_name, status, owner_email, created_at, updated_at) VALUES (?, ?, NULL, 'active', ?, ?, ?)",
+			)
+			.bind(foreign, `other@${zone}`, "someone-else@example.org", now, now)
+			.run();
+		await db
+			.prepare(
+				"INSERT INTO aliases (alias_address, mailbox_id, domain_id, status, created_at, updated_at) SELECT ?, ?, id, 'active', ?, ? FROM domains WHERE domain = ?",
+			)
+			.bind(`otheralias@${zone}`, foreign, now, now, zone)
+			.run();
+		const calls = stubCloudflare([
+			catchAllDrop,
+			["GET", "/email/routing/rules?", 200, []],
+			routingOn,
+			["POST", "/email/routing/rules", 200, { id: "r-foreign" }],
+		]);
+		for (const address of [`other@${zone}`, `otheralias@${zone}`]) {
+			const { status, body } = await route(zone, address);
+			expect(status).toBe(403);
+			expect(body).toEqual({ error: "forbidden" });
+		}
+		expect(calls).toEqual([]);
+
+		// A mailbox with no owner yet (pre-ownership rows) stays routable from the
+		// owner's web session, as the rest of the UI treats it.
+		await db
+			.prepare("UPDATE mailboxes SET owner_email = NULL WHERE mailbox_id = ?")
+			.bind(foreign)
+			.run();
+		const { status } = await route(zone, `other@${zone}`);
+		expect(status).toBe(201);
+	});
 });
 
 describe("POST /api/cloudflare/domains/:domain/routing — perimeter", () => {

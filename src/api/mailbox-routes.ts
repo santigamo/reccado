@@ -12,6 +12,7 @@ import {
 } from "../lib/attachment-limits";
 import { isPreviewableImage } from "../lib/attachment-preview";
 import { sha256Hex } from "../lib/crypto";
+import { injectIntoHead, prepareEmailHtml } from "../lib/email-html";
 import { AppError } from "../lib/errors";
 import { sanitizeOwnerHtml } from "../lib/html-sanitize";
 import { mailboxStub } from "../lib/mailbox-stub";
@@ -58,51 +59,10 @@ export function emailHtmlCsp(remoteImages: boolean): string {
 }
 
 // Force links inside the (sandboxed) email frame to open in a new tab rather than
-// replacing the framed document. Injected into the existing <head> when present so
-// it doesn't disturb the email's own base URL (we only set `target`, never `href`).
+// replacing the framed document. The sender's own <base> was removed by
+// prepareEmailHtml; this one only sets `target`, never `href`.
 function injectBaseTarget(html: string): string {
-	const baseTag = '<base target="_blank" rel="noopener noreferrer">';
-	if (/<head[^>]*>/i.test(html)) {
-		return html.replace(/(<head[^>]*>)/i, `$1${baseTag}`);
-	}
-	if (/<html[^>]*>/i.test(html)) {
-		return html.replace(/(<html[^>]*>)/i, `$1<head>${baseTag}</head>`);
-	}
-	return `${baseTag}${html}`;
-}
-
-/**
- * Last touches on a stored email body before it is framed: every link opens a
- * new tab without an opener or a referrer, and cid: images resolve to this
- * message's own attachments. Scripts, forms and remote frames are not touched
- * here — the CSP (default-src 'none', no script-src, form-action 'none') and the
- * iframe sandbox are what block them.
- */
-async function prepareEmailHtml(html: string, cidMap: Map<string, string>): Promise<string> {
-	const rewriter = new HTMLRewriter()
-		.on("a[href], area[href]", {
-			element(el) {
-				el.setAttribute("target", "_blank");
-				el.setAttribute("rel", "noopener noreferrer");
-			},
-		})
-		.on("img[src]", {
-			element(el) {
-				const src = el.getAttribute("src") ?? "";
-				const match = /^cid:(.+)$/i.exec(src.trim());
-				if (!match) return;
-				let cid = match[1]!;
-				try {
-					cid = decodeURIComponent(cid);
-				} catch {
-					// Not percent-encoded after all: use it as written.
-				}
-				const target = cidMap.get(cid.replace(/^<|>$/g, "").trim().toLowerCase());
-				if (target) el.setAttribute("src", target);
-				else el.removeAttribute("src");
-			},
-		});
-	return rewriter.transform(new Response(html)).text();
+	return injectIntoHead(html, '<base target="_blank" rel="noopener noreferrer">');
 }
 
 /**
@@ -186,7 +146,10 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
 		const stub = await requireMailboxStub(c.env, mailboxId);
-		return stub.fetch(`https://mailbox-do/threads/${c.req.param("threadId")}`);
+		// `?backfill=0`: read as stored (search summaries), without the lazy header
+		// backfill that opening a conversation runs.
+		const backfill = c.req.query("backfill") === "0" ? "?backfill=0" : "";
+		return stub.fetch(`https://mailbox-do/threads/${c.req.param("threadId")}${backfill}`);
 	});
 
 	api.get("/api/mailboxes/:mailboxId/messages/:messageId", async (c) => {
@@ -208,9 +171,13 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 	// Sanitized HTML body, meant to be embedded in a sandboxed iframe by the client.
 	// The email HTML is attacker-controlled, so we lock it down at the response edge:
 	// a strict CSP blocks scripts/forms/frames (default-src 'none' + no script-src),
-	// allows only inline styles and remote images so the mail still renders, and a
-	// nosniff header prevents content-type games. A <base target="_blank"> is injected
-	// so links open in a new tab instead of navigating the framed document.
+	// allows only inline styles (and remote images once the reader asks), and a
+	// nosniff header prevents content-type games. prepareEmailHtml (lib/email-html.ts)
+	// removes what the CSP does not govern (meta refresh, referrer overrides, <link>
+	// prefetches, the sender's <base>) and, with images off, every remote source.
+	// A <base target="_blank"> is injected so links open in a new tab instead of
+	// navigating the framed document; the parent page's CSP (`frame-src 'self'`,
+	// server.ts) keeps the frame itself from being navigated off this origin.
 	api.get("/api/mailboxes/:mailboxId/messages/:messageId/html", async (c) => {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
@@ -242,11 +209,20 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 				}
 			}
 		}
-		const html = await prepareEmailHtml(injectBaseTarget(raw), cidMap);
+		const remoteImages = c.req.query("images") === "1";
+		let prepared: string;
+		try {
+			prepared = await prepareEmailHtml(raw, cidMap, remoteImages);
+		} catch {
+			// Markup the streaming parser refuses (e.g. a <frameset> before a
+			// <script>). Nothing unvetted is served: the client shows the text part.
+			return c.json({ error: "html_unrenderable" }, 422);
+		}
+		const html = injectBaseTarget(prepared);
 		return new Response(html, {
 			headers: {
 				"content-type": "text/html; charset=utf-8",
-				"content-security-policy": emailHtmlCsp(c.req.query("images") === "1"),
+				"content-security-policy": emailHtmlCsp(remoteImages),
 				// The one HTML response the app frames itself. The global middleware
 				// leaves this exact value alone for this route only (see api/hono.ts);
 				// every other response keeps DENY. A DENY here conflicts with
@@ -339,7 +315,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		assertMailboxAccess(auth, mailboxId, c.env);
 		const body = bulkActionSchema.parse(await c.req.json());
 		const target = body.threadIds
-			? { threadIds: body.threadIds }
+			? { threadIds: body.threadIds, scope: body.scope ?? ("live" as const) }
 			: body.messageIds
 				? { messageIds: body.messageIds }
 				: {

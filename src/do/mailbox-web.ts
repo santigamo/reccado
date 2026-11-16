@@ -24,8 +24,18 @@ export type BulkAction = (typeof BULK_ACTIONS)[number];
 export const MAX_BULK_THREADS = 100;
 export const MAX_BULK_MESSAGES = 1000;
 
+/**
+ * Which messages of a conversation an action by thread id may touch: the ones
+ * the folder it was taken from shows. A normal folder (Inbox, Archive, Sent)
+ * never touches what is in the Trash, the Trash only touches what is in it,
+ * and All mail (which lists trashed messages too) touches everything.
+ */
+export const THREAD_SCOPES = ["live", "trash", "all"] as const;
+export type ThreadScope = (typeof THREAD_SCOPES)[number];
+
 export type BulkTarget =
-	| { threadIds: string[] }
+	/** Whole conversations, limited to `scope` ("live" when absent). */
+	| { threadIds: string[]; scope?: ThreadScope }
 	| { messageIds: string[] }
 	/**
 	 * Every unread message of a folder ("Mark all as read"), with the same
@@ -74,6 +84,13 @@ function changes(action: BulkAction, row: Row): boolean {
 	return stateAfter(action, row) !== row.state;
 }
 
+/** SQL condition on `m` for the messages a thread scope reaches. */
+export function scopeClause(scope: ThreadScope | undefined): string {
+	if (scope === "all") return "";
+	if (scope === "trash") return " AND m.state = 'trash'";
+	return " AND m.state != 'trash'";
+}
+
 function targetRows(sql: SqlStorage, target: BulkTarget): Row[] {
 	const columns = "m.id, m.thread_id, m.state, m.is_read, m.direction";
 	if ("threadIds" in target) {
@@ -81,7 +98,8 @@ function targetRows(sql: SqlStorage, target: BulkTarget): Row[] {
 		if (ids.length === 0) return [];
 		return sql
 			.exec<Row>(
-				`SELECT ${columns} FROM messages m WHERE m.thread_id IN (${placeholders(ids.length)})`,
+				`SELECT ${columns} FROM messages m
+          WHERE m.thread_id IN (${placeholders(ids.length)})${scopeClause(target.scope)}`,
 				...ids,
 			)
 			.toArray();

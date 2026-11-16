@@ -96,8 +96,10 @@ function findQuote(doc: Document): HTMLElement[] {
 	return total - quoted > 0 ? parts : [];
 }
 
-/** Remote content the CSP held back: images, CSS backgrounds. */
+/** Remote content held back: images, CSS backgrounds (see lib/email-html.ts). */
 function hasRemoteContent(doc: Document): boolean {
+	// The server strips remote sources when images are off and says so.
+	if (doc.querySelector('meta[name="reccado-remote-blocked"]')) return true;
 	for (const img of doc.querySelectorAll("img")) {
 		const src = img.getAttribute("src") ?? img.getAttribute("srcset") ?? "";
 		if (/^\s*(https?:)?\/\//i.test(src)) return true;
