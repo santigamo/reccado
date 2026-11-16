@@ -193,6 +193,17 @@ export async function mcpHandler(
 			// base URL (…/api/auth), matching how tokens are minted; the audience
 			// must be the resource identifier tokens were minted for.
 			resource,
+			// Keys come from the same auth instance, in process. The default is an
+			// HTTP fetch of our own …/api/auth/jwks, and a Worker cannot subrequest
+			// its own route on its custom domain: in production every token failed
+			// with "Jwks failed" (HTTP 500). Better Auth's verifier accepts a
+			// function here (core oauth2/verify: `typeof jwksFetch === "string"
+			// ? fetch : jwksFetch()`); the public option is typed as a URL only.
+			jwksUrl: (async () => {
+				const res = await auth.handler(new Request(new URL("/api/auth/jwks", request.url)));
+				if (!res.ok) throw new Error(`jwks_unavailable_${res.status}`);
+				return res.json();
+			}) as unknown as string,
 		},
 	);
 	return protectedHandler(request);

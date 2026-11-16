@@ -69,12 +69,13 @@ beforeAll(async () => {
 		migrationAuthUpgrade as string,
 		migrationPasskey as string,
 	);
-	const jwks = await (await run(new Request(`${ORIGIN}/api/auth/jwks`))).text();
+	// Production regression: a Worker cannot subrequest its own route on its custom
+	// domain, so an HTTP fetch of our own /jwks fails there. Make it fail here too;
+	// token verification must get the keys in process.
 	const realFetch = globalThis.fetch;
 	vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-		if (url === `${ORIGIN}/api/auth/jwks`)
-			return new Response(jwks, { headers: { "content-type": "application/json" } });
+		if (url.endsWith("/api/auth/jwks")) return new Response(null, { status: 522 });
 		return realFetch(input, init);
 	});
 });
