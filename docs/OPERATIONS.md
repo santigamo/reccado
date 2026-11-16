@@ -771,7 +771,8 @@ tokens, consent and registration in one D1 batch.
 
 **Approvals (irreversible / exfiltrating only).** `send`, aliases or forward/routing rules whose
 destination is outside the owner's domains, `api_key_create`, `api_key_rotate`, `api_key_scopes`,
-`suppression_remove`, `domain_add`, `domain_provision` and `domain_disable` create an intent (frozen
+`suppression_remove`, `domain_add`, `domain_provision`, `domain_disable` and `address_route`
+(`manage_routing` `route_address`: the web "Route it" for one address) create an intent (frozen
 payload + `payload_hash`); the agent receives `https://<host>/approve/<id>`. The owner approves
 **only** on that page signed in as the owner (Origin check, payload hash posted back); Telegram
 sends a notice with the link, with no buttons (check the bridge with `pnpm operator telegram

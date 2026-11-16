@@ -1,11 +1,11 @@
 import { insertOpsEvent, upsertIngestEvent, upsertMessageIndex } from "../db/d1";
+import { mailboxStub } from "../lib/mailbox-stub";
 import type {
 	InboundEmailQueueMessage,
 	InboundNotificationQueueMessage,
 	MailboxIngestResult,
 } from "./types";
 import { inboundEmailQueueMessageSchema } from "./types";
-import { mailboxStub } from "../lib/mailbox-stub";
 
 const MAX_RETRIES = 3;
 
@@ -104,37 +104,19 @@ export async function handleInboundQueue(
 				// mail throttled ingest itself. A failed enqueue still cannot break
 				// ingest: the mail is already stored, and re-delivering it to reindex
 				// would be the more expensive mistake.
-				try {
-					await env.NOTIFY_QUEUE.send({
-						schemaVersion: 1,
-						eventType: "mail.notify.v1",
-						notification: {
-							mailboxId: body.mailboxId,
-							mailboxAddress: body.recipient,
-							messageLocalId: result.messageLocalId,
-							threadId: result.threadId ?? result.messageLocalId,
-							subject: result.subject ?? body.headers.subject,
-							fromAddr: result.fromAddr ?? body.sender,
-							snippet: result.snippet ?? null,
-							hasAttachments: Boolean(result.hasAttachments),
-						},
-					} satisfies InboundNotificationQueueMessage);
-				} catch (error) {
-					console.error("notify.enqueue_failed", {
+				//
+				// Mail the DO classified as automated (a DMARC aggregate report) gets no
+				// notice at all: the inbox hides it and it arrives already read, so a card
+				// would announce mail the operator cannot see. Never enqueued means never
+				// retained either, so the quiet-hours digest cannot bring it back.
+				if (result.automatedKind) {
+					console.log("notify.skipped_automated", {
 						messageId: message.id,
 						mailboxId: body.mailboxId,
-						error: error instanceof Error ? error.message : String(error),
+						automatedKind: result.automatedKind,
 					});
-					await insertOpsEvent(env.INDEX_DB, {
-						id: crypto.randomUUID(),
-						event_type: "notify.enqueue_failed",
-						severity: "warning",
-						subject: result.messageLocalId,
-						payload_json: JSON.stringify({
-							mailboxId: body.mailboxId,
-							error: error instanceof Error ? error.message : String(error),
-						}),
-					}).catch(() => undefined);
+				} else {
+					await enqueueNotification(env, message.id, body, result);
 				}
 			} else if (result.status === "duplicate") {
 				await upsertIngestEvent(env.INDEX_DB, {
@@ -172,5 +154,45 @@ export async function handleInboundQueue(
 			}
 			message.retry({ delaySeconds: 2 });
 		}
+	}
+}
+
+async function enqueueNotification(
+	env: Env,
+	queueMessageId: string,
+	body: InboundEmailQueueMessage,
+	result: MailboxIngestResult,
+): Promise<void> {
+	try {
+		await env.NOTIFY_QUEUE.send({
+			schemaVersion: 1,
+			eventType: "mail.notify.v1",
+			notification: {
+				mailboxId: body.mailboxId,
+				mailboxAddress: body.recipient,
+				messageLocalId: result.messageLocalId,
+				threadId: result.threadId ?? result.messageLocalId,
+				subject: result.subject ?? body.headers.subject,
+				fromAddr: result.fromAddr ?? body.sender,
+				snippet: result.snippet ?? null,
+				hasAttachments: Boolean(result.hasAttachments),
+			},
+		} satisfies InboundNotificationQueueMessage);
+	} catch (error) {
+		console.error("notify.enqueue_failed", {
+			messageId: queueMessageId,
+			mailboxId: body.mailboxId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		await insertOpsEvent(env.INDEX_DB, {
+			id: crypto.randomUUID(),
+			event_type: "notify.enqueue_failed",
+			severity: "warning",
+			subject: result.messageLocalId,
+			payload_json: JSON.stringify({
+				mailboxId: body.mailboxId,
+				error: error instanceof Error ? error.message : String(error),
+			}),
+		}).catch(() => undefined);
 	}
 }

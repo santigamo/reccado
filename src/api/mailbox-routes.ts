@@ -5,11 +5,18 @@ import { adminResponse } from "../lib/admin/errors";
 import * as ops from "../lib/admin/ops";
 import * as suppressions from "../lib/admin/suppressions";
 import * as templates from "../lib/admin/templates";
+import {
+	MAX_ATTACHMENT_BYTES,
+	normalizeAttachmentType,
+	sanitizeAttachmentName,
+} from "../lib/attachment-limits";
 import { isPreviewableImage } from "../lib/attachment-preview";
+import { sha256Hex } from "../lib/crypto";
 import { AppError } from "../lib/errors";
 import { sanitizeOwnerHtml } from "../lib/html-sanitize";
 import { mailboxStub } from "../lib/mailbox-stub";
 import { confirmDraftSend } from "../lib/outbound-send";
+import { draftAttachmentR2Key, sanitizeFilename } from "../lib/r2-keys";
 import { htmlToPlainText } from "../lib/rich-text";
 import { enqueueTelegramCardRefreshForAction } from "../telegram/cards";
 import { assertMailboxAccess } from "./auth";
@@ -18,6 +25,7 @@ import {
 	bulkActionSchema,
 	confirmSendSchema,
 	createDraftSchema,
+	draftAttachmentsFromMessageSchema,
 	messageActionSchema,
 	searchQuerySchema,
 	threadListQuerySchema,
@@ -438,6 +446,12 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			body: JSON.stringify({
 				mailboxAddress: mailbox.primary_address,
 				displayName: mailbox.display_name,
+				// The owner pressing Send again after an edit (body or files) re-freezes
+				// the draft as it is now; without this a stale intent could never be
+				// replaced from the web and every retry answered intent_stale. An agent
+				// draft is unaffected: its send still needs an approval bound to the
+				// new hash.
+				replaceStale: true,
 			}),
 		});
 	});
@@ -455,6 +469,8 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		});
 		return Response.json(result, { status });
 	});
+
+	registerDraftAttachmentRoutes(api);
 
 	// Undo for "Discard draft": your own discarded draft comes back as a draft.
 	api.post("/api/mailboxes/:mailboxId/drafts/:draftId/restore", async (c) => {
@@ -534,6 +550,130 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			mailboxId: c.req.param("mailboxId"),
 		});
 		return result ? c.json(result) : c.json({ error: "reconcile_failed" }, 500);
+	});
+}
+
+/**
+ * Files on a draft. Same gate as the other draft routes (the owner's web
+ * session; MCP never reaches /api). The bytes go straight from the request to
+ * R2 under a draft-scoped key; the mailbox DO only records their metadata and
+ * decides whether the draft may take them (limits, status, never an agent's
+ * draft). A file the DO refuses is deleted again, so no request leaves an
+ * object nobody points at.
+ */
+function registerDraftAttachmentRoutes(api: Hono<ApiBindings>): void {
+	const path = "/api/mailboxes/:mailboxId/drafts/:draftId/attachments";
+
+	// Raw body upload: the file's bytes, its type in Content-Type and its name in
+	// ?filename= (URL-encoded). A raw body keeps the browser's upload progress
+	// simple and lets the size be refused from Content-Length before reading.
+	api.post(path, async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		const draftId = c.req.param("draftId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const declared = Number(c.req.header("content-length") ?? "NaN");
+		if (Number.isFinite(declared) && declared > MAX_ATTACHMENT_BYTES) {
+			return c.json({ error: "attachment_too_large", maxBytes: MAX_ATTACHMENT_BYTES }, 413);
+		}
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		const bytes = new Uint8Array(await c.req.arrayBuffer());
+		if (bytes.byteLength > MAX_ATTACHMENT_BYTES) {
+			return c.json({ error: "attachment_too_large", maxBytes: MAX_ATTACHMENT_BYTES }, 413);
+		}
+		if (bytes.byteLength === 0) return c.json({ error: "attachment_empty" }, 400);
+		const filename = c.req.query("filename") ?? "";
+		const contentType = normalizeAttachmentType(c.req.header("content-type"));
+		const id = crypto.randomUUID();
+		const r2Key = draftAttachmentR2Key({
+			mailboxId,
+			draftId,
+			attachmentId: id,
+			safeFilename: sanitizeFilename(sanitizeAttachmentName(filename)),
+		});
+		const sha256 = await sha256Hex(bytes);
+		await c.env.MAIL_OBJECTS.put(r2Key, bytes, {
+			httpMetadata: { contentType, contentDisposition: "attachment" },
+		});
+		let response: Response;
+		try {
+			response = await stub.fetch(
+				`https://mailbox-do/drafts/${encodeURIComponent(draftId)}/attachments`,
+				{
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						id,
+						filename,
+						contentType,
+						size: bytes.byteLength,
+						sha256,
+						r2Key,
+					}),
+				},
+			);
+		} catch (error) {
+			await c.env.MAIL_OBJECTS.delete(r2Key).catch(() => undefined);
+			throw error;
+		}
+		if (!response.ok) await c.env.MAIL_OBJECTS.delete(r2Key).catch(() => undefined);
+		return response;
+	});
+
+	api.post(`${path}/from-message`, async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const body = draftAttachmentsFromMessageSchema.parse(await c.req.json());
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		return stub.fetch(
+			`https://mailbox-do/drafts/${encodeURIComponent(c.req.param("draftId"))}/attachments/from-message`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+			},
+		);
+	});
+
+	api.delete(`${path}/:attachmentId`, async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		return stub.fetch(
+			`https://mailbox-do/drafts/${encodeURIComponent(c.req.param("draftId"))}/attachments/${encodeURIComponent(c.req.param("attachmentId"))}`,
+			{ method: "DELETE" },
+		);
+	});
+
+	// Download one of the draft's files. Always as a download, never rendered:
+	// whatever the upload claimed to be, it is served nosniff, sandboxed and with
+	// Content-Disposition: attachment — the same headers as a message attachment.
+	api.get(`${path}/:attachmentId`, async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const attachmentId = c.req.param("attachmentId");
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		const meta = await stub.fetch(
+			`https://mailbox-do/drafts/${encodeURIComponent(c.req.param("draftId"))}/attachments/${encodeURIComponent(attachmentId)}`,
+		);
+		if (!meta.ok) return meta;
+		const { attachment } = (await meta.json()) as {
+			attachment: { r2_key: string; filename: string; content_type: string };
+		};
+		const object = await c.env.MAIL_OBJECTS.get(attachment.r2_key);
+		if (!object) return c.json({ error: "attachment_missing" }, 404);
+		return new Response(object.body, {
+			headers: {
+				"content-type": attachment.content_type || "application/octet-stream",
+				"content-disposition": `attachment; filename="${sanitizeAttachmentFilename(attachment.filename, attachmentId)}"`,
+				"x-content-type-options": "nosniff",
+				"content-security-policy": "default-src 'none'; sandbox",
+				"cache-control": "private, no-store",
+			},
+		});
 	});
 }
 

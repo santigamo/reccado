@@ -173,10 +173,9 @@ CREATE TABLE IF NOT EXISTS outbound_drafts (
 -- before migrateDraftIdempotency() can ALTER TABLE ADD COLUMN. The index is
 -- created by migrateDraftIdempotency() instead, AFTER the column is guaranteed.
 
--- Reserved, currently unused: scaffolding for the planned "mailbox-local DO alarm
--- jobs" milestone (see docs/IMPLEMENTATION.md). Nothing inserts rows into this
--- table yet; mailbox-do.ts's runPendingJobs()/alarm() poll it defensively but are
--- effectively no-ops until a feature starts enqueueing jobs here.
+-- Mailbox-local jobs run by the DO alarm (mailbox-do.ts runPendingJobs()). The
+-- one writer so far is a draft discard, which queues the deletion of the draft's
+-- uploaded attachments after the Undo window (do/mailbox-draft-attachments.ts).
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL,

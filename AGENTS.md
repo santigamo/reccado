@@ -42,7 +42,7 @@ informed decision from the user/supervisor.
   The agent can never approve.** The same approval gates a short list of irreversible /
   exfiltrating control-plane kinds, for any token: `api_key_create`, `api_key_rotate`,
   `api_key_scopes` (they issue a secret), `suppression_remove`, `domain_add`, `domain_provision`,
-  `domain_disable`, and an alias or forward/routing rule whose destination is outside the owner's
+  `domain_disable`, `address_route` (creates a Cloudflare Email Routing rule), and an alias or forward/routing rule whose destination is outside the owner's
   domains. **Every other control-plane write applies directly with its scope** (templates,
   `api_key_templates`, `api_key_revoke`, mailbox kinds, internal aliases/rules, `domain_update`,
   `restore`, `reconcile_stale`, `update_messages`): it keeps an `admin.before_snapshot` + ops event

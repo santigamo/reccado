@@ -125,9 +125,25 @@ export type Draft = {
 	status: "draft" | "pending_confirmation" | "sent" | "cancelled";
 	/** Who created it: "mcp" drafts can only be sent through an owner approval. */
 	origin?: "web" | "telegram" | "mcp";
+	/** Files on the draft (GET /drafts/:id). */
+	attachments?: DraftAttachment[];
+	/** How many files (GET /drafts list rows). */
+	attachment_count?: number;
 	created_by: string;
 	created_at: string;
 	updated_at: string;
+};
+
+/** A file on a draft: an upload, or (forward) a reference to a message's file. */
+export type DraftAttachment = {
+	id: string;
+	filename: string;
+	content_type: string;
+	size: number;
+	sha256: string;
+	source: "upload" | "message";
+	source_attachment_id?: string | null;
+	created_at: string;
 };
 
 export type MessageAction = "mark_read" | "mark_unread" | "archive" | "trash" | "restore_inbox";
@@ -378,6 +394,112 @@ export async function cancelDraft(mailboxId: string, draftId: string): Promise<v
 		method: "POST",
 	});
 	if (!res.ok) throw new Error(`Could not discard draft (HTTP ${res.status})`);
+}
+
+/** Why the server refused a file, in words (limits are in lib/attachment-limits.ts). */
+export function attachmentErrorText(code: string | undefined): string {
+	switch (code) {
+		case "attachment_too_large":
+			return "File is too large";
+		case "attachments_too_large":
+			return "Over the total size limit";
+		case "too_many_attachments":
+			return "Too many files";
+		case "attachment_empty":
+			return "File is empty";
+		case "agent_draft_attachments":
+			return "Agent drafts can't take files";
+		case "draft_not_editable":
+			return "The draft can no longer be changed";
+		case "send_in_progress":
+			return "The message is being sent";
+		case "aborted":
+			return "Upload cancelled";
+		default:
+			return "Upload failed";
+	}
+}
+
+export class AttachmentUploadError extends Error {
+	constructor(readonly code: string) {
+		super(attachmentErrorText(code));
+	}
+}
+
+/**
+ * Uploads one file to a draft as a raw body (its type in Content-Type, its name
+ * in ?filename=). XHR rather than fetch for the upload progress events.
+ */
+export function uploadDraftAttachment(
+	mailboxId: string,
+	draftId: string,
+	file: File,
+	opts: { onProgress?: (fraction: number) => void; signal?: AbortSignal } = {},
+): Promise<DraftAttachment> {
+	return new Promise((resolve, reject) => {
+		const xhr = new XMLHttpRequest();
+		const url = `${base(mailboxId)}/drafts/${encodeURIComponent(draftId)}/attachments?filename=${encodeURIComponent(file.name)}`;
+		xhr.open("POST", url);
+		xhr.setRequestHeader("content-type", file.type || "application/octet-stream");
+		xhr.upload.onprogress = (event) => {
+			if (event.lengthComputable) opts.onProgress?.(event.loaded / event.total);
+		};
+		xhr.onload = () => {
+			let body: { attachment?: DraftAttachment; error?: string } = {};
+			try {
+				body = JSON.parse(xhr.responseText) as typeof body;
+			} catch {
+				// Not JSON: reported by status below.
+			}
+			if (xhr.status === 401 && typeof window !== "undefined") window.location.assign("/login");
+			if (xhr.status >= 200 && xhr.status < 300 && body.attachment) resolve(body.attachment);
+			else reject(new AttachmentUploadError(body.error ?? `http_${xhr.status}`));
+		};
+		xhr.onerror = () => reject(new AttachmentUploadError("network"));
+		xhr.onabort = () => reject(new AttachmentUploadError("aborted"));
+		opts.signal?.addEventListener("abort", () => xhr.abort(), { once: true });
+		xhr.send(file);
+	});
+}
+
+export async function deleteDraftAttachment(
+	mailboxId: string,
+	draftId: string,
+	attachmentId: string,
+): Promise<void> {
+	const res = await fetch(
+		`${base(mailboxId)}/drafts/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(attachmentId)}`,
+		{ method: "DELETE" },
+	);
+	// Already gone is what we wanted.
+	if (!res.ok && res.status !== 404)
+		throw new Error(`Could not remove the file (HTTP ${res.status})`);
+}
+
+/** Forward: attach a message's files to the draft by reference (no bytes move). */
+export async function attachMessageFiles(
+	mailboxId: string,
+	draftId: string,
+	messageId: string,
+	attachmentIds: string[],
+): Promise<{
+	added: DraftAttachment[];
+	skipped: Array<{ id: string; filename: string; reason: string }>;
+}> {
+	return json(
+		await fetch(
+			`${base(mailboxId)}/drafts/${encodeURIComponent(draftId)}/attachments/from-message`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ messageId, attachmentIds }),
+			},
+		),
+	);
+}
+
+export function draftAttachmentUrl(mailboxId: string, draftId: string, attachmentId: string) {
+	return `${base(mailboxId)}/drafts/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(attachmentId)}`;
 }
 
 /** Undo a discard: your own discarded draft becomes a draft again. */

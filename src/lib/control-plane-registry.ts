@@ -1,7 +1,7 @@
 import type { z } from "zod";
 import type { AuthContext } from "../api/auth";
-import type { IntentField, IntentWarning } from "./approvals";
 import { AdminError, parseAdmin } from "./admin/errors";
+import type { IntentField, IntentWarning } from "./approvals";
 
 export type Operation = Record<string, unknown>;
 export type Rendered = {
@@ -22,7 +22,9 @@ export type ControlPlaneKind = {
 	 * `direct`: applied immediately with the token's scope (before-snapshot + ops event kept).
 	 * A function decides from the (validated) payload.
 	 */
-	approval: ApprovalMode | ((env: Env, auth: AuthContext, payload: Operation) => Promise<ApprovalMode>);
+	approval:
+		| ApprovalMode
+		| ((env: Env, auth: AuthContext, payload: Operation) => Promise<ApprovalMode>);
 	/** Static payload paths this kind always renders (merged with `Rendered.covers`). */
 	covers?: string[];
 	validate: (payload: unknown) => Operation;
@@ -33,7 +35,38 @@ export type ControlPlaneKind = {
 	 * one-time secrets (`secrets`) that go only into the owner's approve HTTP response.
 	 */
 	redact?: (result: unknown) => { stored: unknown; secrets?: IntentField[] };
+	/**
+	 * Fields describing a decided request's outcome (what was asked and what came of it), for
+	 * the approval page once there is nothing left to approve. Gets the frozen payload and the
+	 * stored execution item; must not throw and must not show secrets.
+	 */
+	describeOutcome?: (payload: Operation, item: ExecutionItem) => IntentField[];
 };
+
+/** One stored execution result, as `approvals.result_json.items[n]` keeps it. */
+export type ExecutionItem = {
+	status: "executed" | "failed" | "not_run";
+	result?: unknown;
+	errorCode?: string;
+	detail?: Record<string, unknown>;
+};
+
+/**
+ * A kind's reasoned refusal: `code` is the stable reason, `detail` (no secrets) is stored with
+ * the failed execution so the approval page and the agent's status poll can say why and what
+ * to do. Thrown from `render` it refuses the request before any approval exists.
+ */
+export class ControlPlaneRefusal extends AdminError {
+	constructor(
+		message: string,
+		code: string,
+		status: number,
+		readonly detail: Record<string, unknown>,
+	) {
+		super(message, code, status);
+		this.name = "ControlPlaneRefusal";
+	}
+}
 
 const registry = new Map<string, ControlPlaneKind>();
 export function registerControlPlaneKind(kind: string, definition: ControlPlaneKind): void {
@@ -41,7 +74,12 @@ export function registerControlPlaneKind(kind: string, definition: ControlPlaneK
 		throw new Error("invalid_intent_kind");
 	registry.set(kind, definition);
 }
-export async function approvalModeFor(kind: ControlPlaneKind, env: Env, auth: AuthContext, payload: Operation): Promise<ApprovalMode> {
+export async function approvalModeFor(
+	kind: ControlPlaneKind,
+	env: Env,
+	auth: AuthContext,
+	payload: Operation,
+): Promise<ApprovalMode> {
 	return typeof kind.approval === "function" ? kind.approval(env, auth, payload) : kind.approval;
 }
 export function controlPlaneKind(kind: string): ControlPlaneKind | undefined {
@@ -84,7 +122,7 @@ export function unrenderedFields(payload: Operation, covers: string[]): IntentFi
 		.filter(([path]) => !isCovered(path, covers))
 		.map(([path, value]) => ({
 			label: `campo: ${path}`,
-			value: typeof value === "string" ? value : JSON.stringify(value) ?? "undefined",
+			value: typeof value === "string" ? value : (JSON.stringify(value) ?? "undefined"),
 			format: "pre" as const,
 		}));
 }

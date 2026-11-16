@@ -13,6 +13,12 @@ import { buildReferences, messageIdHeader, referencesHeader } from "../lib/email
 import { normalizeMessageId } from "../lib/email-metadata";
 import { AmbiguousSendError } from "../lib/errors";
 import { normalizeSubject, snippetFromText } from "../lib/mime";
+import {
+	AttachmentUnavailableError,
+	type LoadedAttachment,
+	loadSnapshotAttachments,
+	providerAttachments,
+} from "../lib/outbound-attachments";
 import { stripQuotedText } from "../lib/quoted-text";
 import { bodyHtmlR2Key } from "../lib/r2-keys";
 import {
@@ -27,6 +33,20 @@ import {
 	type ThreadParticipant,
 } from "../lib/thread-summary";
 import { httpStatusForTransactionalResult } from "../lib/transactional-send";
+import {
+	addMessageAttachments,
+	addUploadedAttachment,
+	createDraftAttachmentsTable,
+	draftAttachmentCounts,
+	getDraftAttachmentRow,
+	listDraftAttachments,
+	PURGE_DRAFT_ATTACHMENTS_JOB,
+	purgeDiscardedDraftAttachments,
+	removeDraftAttachment,
+	scheduleDraftAttachmentPurge,
+	snapshotAttachments,
+	transferDraftAttachmentsToMessage,
+} from "./mailbox-draft-attachments";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
 import {
 	createRealtimeBroadcaster,
@@ -47,7 +67,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 12;
+const MAILBOX_SCHEMA_VERSION = 13;
 
 export type DraftOrigin = "web" | "telegram" | "mcp";
 
@@ -574,14 +594,19 @@ export function applyMessageAction(sql: SqlStorage, messageId: string | undefine
 }
 
 function listDrafts(sql: SqlStorage) {
-	return sql.exec("SELECT * FROM outbound_drafts ORDER BY updated_at DESC").toArray();
+	// The count is what a list row needs (the paperclip); the files come with the draft.
+	const counts = draftAttachmentCounts(sql);
+	return sql
+		.exec("SELECT * FROM outbound_drafts ORDER BY updated_at DESC")
+		.toArray()
+		.map((draft) => ({ ...draft, attachment_count: counts.get(String(draft.id)) ?? 0 }));
 }
 
 function getDraft(sql: SqlStorage, draftId: string | undefined) {
 	if (!draftId) throw new Error("draftId required");
 	const draft = sql.exec("SELECT * FROM outbound_drafts WHERE id = ?", draftId).toArray()[0];
 	if (!draft) throw new Error("draft not found");
-	return draft;
+	return { ...draft, attachments: listDraftAttachments(sql, draftId) };
 }
 
 function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
@@ -791,7 +816,7 @@ type ConfirmSendDraftContext = {
 	 * the send itself (most tests) can leave them out: the sent copy then keeps its
 	 * text body and skips the HTML rendering.
 	 */
-	r2?: Pick<R2Bucket, "put">;
+	r2?: Pick<R2Bucket, "put"> & Partial<Pick<R2Bucket, "get">>;
 	mailboxId?: string;
 	/** Present only when the worker has verified a consumed passkey approval. */
 	approvalProofSecret?: string | null;
@@ -888,7 +913,9 @@ function buildSendSnapshot(sql: SqlStorage, draftId: string, identity: SenderIde
 		html: draft.body_html,
 		inReplyTo,
 		references,
-		attachments: [] as Array<{ r2Key: string; sha256: string }>,
+		// [] for a draft without files: the same JSON (and so the same payload_hash)
+		// every intent froze before attachments existed.
+		attachments: snapshotAttachments(sql, draftId),
 	};
 }
 
@@ -1144,6 +1171,7 @@ export async function confirmSendDraft(
 	}
 
 	let providerMessageId: string | null = null;
+	let loadedAttachments: LoadedAttachment[] = [];
 	try {
 		// Atomic per-draft send gate: only one idempotency key per draft may
 		// proceed to EMAIL.send. A different attempt key targeting the same draft
@@ -1170,6 +1198,33 @@ export async function confirmSendDraft(
 			};
 		}
 
+		// The frozen files, read back now and checked against their frozen sha256:
+		// what leaves is exactly what was confirmed. Nothing has been sent yet, so a
+		// missing or changed object releases both gates and fails cleanly — a retry
+		// with the same key may go again once the draft is fixed.
+		if (snapshot.attachments.length > 0) {
+			try {
+				if (!ctx.r2?.get) throw new AttachmentUnavailableError("attachment_missing");
+				loadedAttachments = await loadSnapshotAttachments(
+					ctx.r2 as Pick<R2Bucket, "get">,
+					snapshot.attachments,
+				);
+			} catch (error) {
+				ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", sentKey);
+				ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", `draft_sending:${draftId}`);
+				if (error instanceof AttachmentUnavailableError) {
+					return {
+						id: draftId,
+						status: draft.status,
+						sent: false,
+						error: error.reason,
+						attachmentId: error.attachmentId ?? null,
+					};
+				}
+				throw error;
+			}
+		}
+
 		const providerResult = await ctx.email.send({
 			// Bare address when the mailbox has no display name — identical to the
 			// behaviour before names existed, so no mailbox changes how it renders
@@ -1186,6 +1241,9 @@ export async function confirmSendDraft(
 			// "" is a draft whose rich body was emptied: a text-only send.
 			html: draft.body_html || undefined,
 			...(Object.keys(outboundHeaders).length > 0 ? { headers: outboundHeaders } : {}),
+			...(loadedAttachments.length > 0
+				? { attachments: providerAttachments(loadedAttachments) }
+				: {}),
 		});
 		providerMessageId = extractProviderMessageId(providerResult);
 	} catch (error) {
@@ -1254,9 +1312,16 @@ export async function confirmSendDraft(
 				subject: draft.subject,
 				text: draft.body_text ?? null,
 				html: draft.body_html ?? null,
+				// Only when there are files, so a send without any keeps its old value.
+				...(snapshot.attachments.length > 0
+					? { attachments: snapshot.attachments.map((a) => a.sha256) }
+					: {}),
 			}),
 		),
 	);
+	// Free the bytes before the bookkeeping; the sent copy keeps only the metadata.
+	loadedAttachments = [];
+	const hasAttachments = snapshot.attachments.length > 0;
 	// The list row previews the reply itself, not the quoted conversation under it.
 	const sentSnippet =
 		snippetFromText(stripQuotedText(draft.body_text ?? ""), null) ||
@@ -1298,7 +1363,7 @@ export async function confirmSendDraft(
           from_addr, from_name, to_json, cc_json, bcc_json, subject, snippet,
           received_at, raw_r2_key, raw_sha256, raw_size, body_text, body_html_r2_key,
           parse_status, has_attachments, is_read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'parsed', 0, 1, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'parsed', ?, 1, ?, ?)`,
 			messageLocalId,
 			sentKey,
 			threadId,
@@ -1318,9 +1383,13 @@ export async function confirmSendDraft(
 			rawSha256,
 			draft.body_text,
 			bodyHtmlR2KeyValue,
+			hasAttachments ? 1 : 0,
 			now,
 			now,
 		);
+		// The sent copy lists the files like any received message (same table,
+		// same download route), on the very objects that were sent.
+		transferDraftAttachmentsToMessage(ctx.sql, draftId, messageLocalId, snapshot.attachments, now);
 	});
 
 	recordRealtimeEvent(ctx.sql, "message.created", {
@@ -1345,6 +1414,7 @@ export async function confirmSendDraft(
 		receivedAt: now,
 		rawR2Key,
 		rawSha256,
+		hasAttachments,
 	};
 }
 
@@ -1498,6 +1568,11 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 12) {
 			const columns = this.columnNames("messages");
 			this.addColumnIfMissing("messages", columns, "reply_to_json", "TEXT");
+		}
+		// v13: files attached to drafts (metadata only; the bytes are in R2). A new
+		// table, so purely additive; see do/mailbox-draft-attachments.ts.
+		if (currentVersion < 13) {
+			createDraftAttachmentsTable(this.ctx.storage.sql);
 		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -1746,6 +1821,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				),
 			);
 		}
+		const attachmentResponse = await this.draftAttachmentRoute(request, url);
+		if (attachmentResponse) return attachmentResponse;
 		if (url.pathname.match(/^\/drafts\/[^/]+\/restore$/) && request.method === "POST") {
 			const result = restoreDraft(this.ctx.storage.sql, url.pathname.split("/")[2]);
 			return Response.json(result, { status: "error" in result ? 409 : 200 });
@@ -1830,11 +1907,16 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const isAmbiguous = result.error === "ambiguous";
 			const status =
 				"error" in result && !isAmbiguous
-					? result.error === "intent_stale" || result.error === "approval_required"
+					? result.error === "intent_stale" ||
+						result.error === "approval_required" ||
+						result.error === "attachment_missing" ||
+						result.error === "attachment_changed"
 						? 409
-						: result.error === "too_many_recipients"
-							? 400
-							: 500
+						: result.error === "attachments_too_large"
+							? 413
+							: result.error === "too_many_recipients"
+								? 400
+								: 500
 					: 200;
 			return Response.json(result, { status });
 		}
@@ -1848,7 +1930,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				body.allowedStatuses.every((s) => typeof s === "string")
 					? (body.allowedStatuses as string[])
 					: undefined;
-			const result = this.cancelDraft(draftId, allowed);
+			const result = await this.cancelDraft(draftId, allowed);
 			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname === "/export-index" && request.method === "GET") {
@@ -2552,8 +2634,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 	}
 
-	// Reserved, currently unused: fires only if something calls storage.setAlarm(),
-	// which today only happens from inside runPendingJobs() itself (see its comment).
+	// Runs the mailbox's pending jobs (today: deleting a discarded draft's uploads
+	// once its Undo window has passed). Armed by cancelDraft and by runPendingJobs.
 	async alarm(): Promise<void> {
 		await this.runPendingJobs();
 	}
@@ -2753,18 +2835,94 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 	}
 
-	private cancelDraft(draftId: string | undefined, allowed?: string[]) {
-		return cancelDraft(this.ctx.storage.sql, draftId, allowed);
+	private async cancelDraft(draftId: string | undefined, allowed?: string[]) {
+		const result = cancelDraft(this.ctx.storage.sql, draftId, allowed);
+		// Uploaded files outlive a discard for the Undo window, then a job deletes
+		// them unless the draft was restored.
+		if (!("error" in result) && draftId) {
+			const runAt = scheduleDraftAttachmentPurge(this.ctx.storage.sql, draftId);
+			if (runAt) await this.armAlarm(new Date(runAt).getTime());
+		}
+		return result;
+	}
+
+	private async armAlarm(at: number): Promise<void> {
+		const current = await this.ctx.storage.getAlarm();
+		if (current === null || current > at) await this.ctx.storage.setAlarm(at);
+	}
+
+	private async draftAttachmentRoute(request: Request, url: URL): Promise<Response | null> {
+		const match = url.pathname.match(/^\/drafts\/([^/]+)\/attachments(?:\/([^/]+))?$/);
+		if (!match) return null;
+		const draftId = match[1]!;
+		const tail = match[2];
+		const sql = this.ctx.storage.sql;
+		const statusOf = (error: string) =>
+			error === "attachment_not_found" || error === "message_not_found"
+				? 404
+				: error === "attachment_too_large" ||
+						error === "attachments_too_large" ||
+						error === "too_many_attachments"
+					? 413
+					: 409;
+		if (!tail && request.method === "GET") {
+			getDraft(sql, draftId);
+			return Response.json({ attachments: listDraftAttachments(sql, draftId) });
+		}
+		if (!tail && request.method === "POST") {
+			const body = (await request.json()) as {
+				id: string;
+				filename: string;
+				contentType: string;
+				size: number;
+				sha256: string;
+				r2Key: string;
+			};
+			const result = addUploadedAttachment(sql, draftId, body);
+			return Response.json(result, {
+				status: "error" in result ? statusOf(result.error) : 201,
+			});
+		}
+		if (tail === "from-message" && request.method === "POST") {
+			const body = (await request.json()) as { messageId: string; attachmentIds?: string[] };
+			const result = addMessageAttachments(sql, draftId, body.messageId, body.attachmentIds);
+			return Response.json(result, {
+				status: "error" in result ? statusOf(result.error) : 200,
+			});
+		}
+		if (tail && request.method === "GET") {
+			const row = getDraftAttachmentRow(sql, draftId, tail);
+			if (!row) return Response.json({ error: "attachment_not_found" }, { status: 404 });
+			return Response.json({ attachment: row });
+		}
+		if (tail && request.method === "DELETE") {
+			const result = removeDraftAttachment(sql, draftId, tail);
+			if ("error" in result) {
+				return Response.json(result, { status: statusOf(result.error) });
+			}
+			if (result.deleteR2Key) {
+				try {
+					await this.env.MAIL_OBJECTS.delete(result.deleteR2Key);
+				} catch (error) {
+					// The row is gone, so the file is off the draft either way; a leftover
+					// object under the draft prefix is logged, not surfaced.
+					console.error("mailbox.draft_attachment_delete_failed", {
+						draftId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			return Response.json({ removed: result.removed });
+		}
+		return null;
 	}
 
 	private exportMessageIndex() {
 		return exportMessageIndex(this.ctx.storage.sql);
 	}
 
-	// Reserved, currently unused: the `jobs` table (see the comment on its CREATE
-	// TABLE in mailbox-schema-content.ts) has no writers yet, so this always finds
-	// zero pending jobs. Kept wired up (and gated by DO alarm) for the planned
-	// mailbox-local job-queue milestone in docs/IMPLEMENTATION.md.
+	// Mailbox-local jobs from the `jobs` table. The only writer so far is a draft
+	// discard (PURGE_DRAFT_ATTACHMENTS_JOB); unknown types are marked done.
 	private async runPendingJobs(): Promise<void> {
 		const now = new Date().toISOString();
 		const jobs = this.ctx.storage.sql
@@ -2779,8 +2937,26 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				now,
 				job.id,
 			);
+			let status: "done" | "pending" | "failed" = "done";
+			let nextRunAt = now;
+			let lastError: string | null = null;
+			try {
+				await this.runJob(job.id, job.type, job.payload_json);
+			} catch (error) {
+				lastError = error instanceof Error ? error.message.slice(0, 200) : String(error);
+				const attempts =
+					this.ctx.storage.sql
+						.exec<{ attempts: number }>("SELECT attempts FROM jobs WHERE id = ?", job.id)
+						.toArray()[0]?.attempts ?? 1;
+				// A transient R2 error retries hourly, a few times, then stays visible as failed.
+				status = attempts >= 5 ? "failed" : "pending";
+				nextRunAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+			}
 			this.ctx.storage.sql.exec(
-				"UPDATE jobs SET status = 'done', updated_at = ? WHERE id = ?",
+				"UPDATE jobs SET status = ?, next_run_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
+				status,
+				nextRunAt,
+				lastError,
 				now,
 				job.id,
 			);
@@ -2792,6 +2968,27 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			.toArray()[0];
 		if (next) {
 			await this.ctx.storage.setAlarm(new Date(next.next_run_at).getTime());
+		}
+	}
+
+	private async runJob(id: string, type: string, payloadJson: string): Promise<void> {
+		if (type === PURGE_DRAFT_ATTACHMENTS_JOB) {
+			const payload = JSON.parse(payloadJson) as { draftId?: string; keys?: string[] };
+			// Rows go first, in one synchronous step with the status check, so a draft
+			// restored meanwhile can never lose its files. The keys are kept on the job
+			// until R2 confirms the delete, so a retry still knows what to remove.
+			const keys =
+				payload.keys ??
+				(payload.draftId
+					? purgeDiscardedDraftAttachments(this.ctx.storage.sql, payload.draftId)
+					: []);
+			if (keys.length === 0) return;
+			this.ctx.storage.sql.exec(
+				"UPDATE jobs SET payload_json = ? WHERE id = ?",
+				JSON.stringify({ ...payload, keys }),
+				id,
+			);
+			await this.env.MAIL_OBJECTS.delete(keys);
 		}
 	}
 

@@ -1,4 +1,4 @@
-import { PenLine, Trash2 } from "lucide-react";
+import { Paperclip, PenLine, Trash2 } from "lucide-react";
 import { IconButton } from "#/components/ui/IconButton";
 import { Pill } from "#/components/ui/Pill";
 import { formatDayTime, formatFullDate } from "#/lib/dates";
@@ -25,6 +25,7 @@ export function ThreadDraftRow({
 		.replace(/\s+/g, " ")
 		.trim();
 	const byAgent = draft.origin === "mcp";
+	const files = draft.attachment_count ?? draft.attachments?.length ?? 0;
 	return (
 		<div className="flex items-start gap-3 border-b border-[#F1F1F1] px-4 py-3.5 sm:px-7">
 			<span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-pill text-text-secondary [&_svg]:size-3.5 sm:size-8">
@@ -36,12 +37,18 @@ export function ThreadDraftRow({
 				className="flex min-w-0 flex-1 flex-col gap-0.5 rounded-control text-left outline-none focus-visible:ring-2 focus-visible:ring-text-muted"
 			>
 				<span className="flex min-w-0 items-center gap-1.5">
-					<span className="text-label font-semibold text-danger">Draft</span>
+					<span className="shrink-0 text-label font-semibold text-danger">Draft</span>
 					<span className="min-w-0 truncate text-label text-text-muted">
 						to {to.join(", ") || "(no recipients)"}
 					</span>
 					{byAgent ? <Pill tone="neutral">Written by the agent</Pill> : null}
 					{draft.status === "pending_confirmation" ? <Pill tone="approval">Sending</Pill> : null}
+					{files > 0 ? (
+						<Paperclip
+							aria-label={files === 1 ? "1 attachment" : `${files} attachments`}
+							className="size-3.5 shrink-0 text-icon"
+						/>
+					) : null}
 					<span className="min-w-2 flex-1" />
 					<time
 						dateTime={draft.updated_at}

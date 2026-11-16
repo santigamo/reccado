@@ -146,6 +146,13 @@ export const createDraftSchema = z.object({
 
 export const updateDraftSchema = createDraftSchema.partial();
 
+/** Forward: attach (some of) a message's files to a draft, by reference. */
+export const draftAttachmentsFromMessageSchema = z.object({
+	messageId: z.string().min(1).max(200),
+	/** Omitted: every file of the message. */
+	attachmentIds: z.array(z.string().min(1).max(200)).max(100).optional(),
+});
+
 export const confirmSendSchema = z.object({
 	idempotencyKey: z.string().min(1),
 });

@@ -1,5 +1,7 @@
-import { ChevronDown, Lock, Maximize2, Minimize2, Send, Trash2, X } from "lucide-react";
+import { ChevronDown, Lock, Maximize2, Minimize2, Paperclip, Send, Trash2, X } from "lucide-react";
 import {
+	type ClipboardEvent,
+	type DragEvent,
 	type KeyboardEvent,
 	type ReactElement,
 	type ReactNode,
@@ -28,6 +30,7 @@ import {
 } from "#/lib/mail";
 import { tint, useMailboxColors } from "#/lib/mailbox-color";
 import { htmlToPlainText, plainTextToEditorHtml } from "#/lib/rich-text";
+import { ComposeAttachmentList, useComposeFiles } from "./ComposeAttachments";
 import { forwardQuoteHtml, replyQuoteHtml, sanitizeComposeHtml } from "./compose-html";
 import { RichTextEditor, type RichTextEditorHandle } from "./RichTextEditor";
 
@@ -79,6 +82,9 @@ function explainReason(reason: string | undefined): string {
 	}
 	if (reason === "too_many_recipients") return "too many recipients.";
 	if (reason === "intent_stale") return "the draft changed while sending. Try again.";
+	if (reason === "attachment_missing" || reason === "attachment_changed")
+		return "an attachment is no longer available. Remove it and attach it again.";
+	if (reason === "attachments_too_large") return "the attachments are over the size limit.";
 	return reason ?? "unknown error";
 }
 
@@ -193,6 +199,9 @@ export function ComposeModal({
 		typeof window === "undefined" ? false : readFullScreen(),
 	);
 	const [saved, setSaved] = useState(false);
+	const files = useComposeFiles(mailboxId);
+	const [dragging, setDragging] = useState(false);
+	const fileInputRef = useRef<HTMLInputElement>(null);
 	const toRef = useRef<HTMLInputElement>(null);
 	const editorRef = useRef<RichTextEditorHandle>(null);
 	const colorOf = useMailboxColors(mailboxes);
@@ -245,6 +254,7 @@ export function ComposeModal({
 				setSavedSnapshot(snapshotOf(loadedTo, loadedCc, loadedBcc, draft.subject ?? "", html));
 				setSaved(true);
 				setAgentDraft(draft.origin === "mcp");
+				files.load(draft.attachments ?? []);
 				setStatus(null);
 			})
 			.catch((err: unknown) => {
@@ -260,7 +270,7 @@ export function ComposeModal({
 		return () => {
 			alive = false;
 		};
-	}, [prefill.draftId, mailboxId, setDraftId]);
+	}, [prefill.draftId, mailboxId, setDraftId, files.load]);
 
 	// Reply / forward: the original goes below the cursor, as Gmail does it. Fetched
 	// here (not passed in the URL) and reduced to the compose allowlist first.
@@ -277,6 +287,11 @@ export function ComposeModal({
 					if (res.ok) html = await res.text();
 				}
 				if (!alive) return;
+				// Forward carries the original's files, checked by default (removable
+				// chips), attached by reference once the draft exists.
+				if (prefill.mode === "forward" && message.attachments?.length) {
+					files.offerForward(quoteId, message.attachments);
+				}
 				const quoted =
 					prefill.mode === "forward"
 						? forwardQuoteHtml(message, html)
@@ -316,12 +331,14 @@ export function ComposeModal({
 		return () => {
 			alive = false;
 		};
-	}, [prefill.quote, prefill.draftId, prefill.mode, prefill.to, mailboxId]);
+	}, [prefill.quote, prefill.draftId, prefill.mode, prefill.to, mailboxId, files.offerForward]);
 
 	const toList = allAddresses(to, toDraft);
 	const ccList = allAddresses(cc, ccDraft);
 	const bccList = allAddresses(bcc, bccDraft);
-	const dirty = snapshotOf(toList, ccList, bccList, subject, bodyHtml) !== savedSnapshot;
+	// Files waiting for a draft count as unsaved: closing must create it first.
+	const dirty =
+		snapshotOf(toList, ccList, bccList, subject, bodyHtml) !== savedSnapshot || files.hasQueued;
 
 	function buildPayload(): DraftPayload {
 		return {
@@ -396,6 +413,54 @@ export function ComposeModal({
 		return () => window.clearTimeout(timer);
 	});
 
+	// Files go up as soon as there is a draft to hold them (a new message gets one
+	// with its first recipient, through autosave).
+	const { hasQueued, flush } = files;
+	useEffect(() => {
+		if (draftId && hasQueued && !agentDraft) void flush(draftId);
+	}, [draftId, hasQueued, agentDraft, flush]);
+
+	function attach(list: readonly File[]) {
+		if (list.length === 0) return;
+		if (agentDraft) {
+			setStatus({ text: "Files can't be added to a draft written by the agent.", error: true });
+			return;
+		}
+		const refused = files.addFiles(list);
+		setStatus(refused ? { text: refused, error: true } : null);
+		// Without a draft yet, save one now (when there is a valid recipient) rather
+		// than after the autosave delay. Next tick: the queued files are in state.
+		if (!draftIdRef.current) window.setTimeout(() => autosaveRef.current(), 0);
+	}
+
+	function onDrop(event: DragEvent<HTMLDivElement>) {
+		if (!event.dataTransfer.types.includes("Files")) return;
+		event.preventDefault();
+		setDragging(false);
+		if (!busy) attach(Array.from(event.dataTransfer.files));
+	}
+
+	// A pasted file (a screenshot) is attached, not pasted into the text.
+	function onPasteCapture(event: ClipboardEvent<HTMLDivElement>) {
+		const pasted = Array.from(event.clipboardData.files);
+		if (pasted.length === 0) return;
+		event.preventDefault();
+		event.stopPropagation();
+		if (!busy) attach(pasted);
+	}
+
+	/** Uploads whatever is pending onto the draft; false (with a reason shown) if a file failed. */
+	async function settleFiles(id: string): Promise<boolean> {
+		const ok = await files.flush(id);
+		if (!ok) {
+			setStatus({
+				text: "Some files could not be attached. Remove them or attach them again.",
+				error: true,
+			});
+		}
+		return ok;
+	}
+
 	function validate(payload: DraftPayload): boolean {
 		setConfirm(null);
 		if (!mailboxId) {
@@ -430,9 +495,10 @@ export function ComposeModal({
 		setBusy(true);
 		setStatus({ text: "Saving…" });
 		try {
-			await ensureDraft(payload);
+			const id = await ensureDraft(payload);
 			markSaved();
 			setStatus(null);
+			await settleFiles(id);
 		} catch (err) {
 			setStatus({
 				text: err instanceof Error ? err.message : "Could not save the draft.",
@@ -467,11 +533,16 @@ export function ComposeModal({
 				return;
 			}
 		}
+		if (files.failed) {
+			setStatus({ text: "Remove the files that could not be attached first.", error: true });
+			return;
+		}
 		setBusy(true);
 		setStatus({ text: "Sending…" });
 		try {
 			const id = await ensureDraft(payload);
 			markSaved();
+			if (!(await settleFiles(id))) return;
 			const result = await sendDraft(mailboxId, id, idempotencyKey);
 			if (result.sent) {
 				setStatus({ text: "Sent." });
@@ -492,6 +563,7 @@ export function ComposeModal({
 	async function discardNow() {
 		setConfirm(null);
 		setBusy(true);
+		files.abortAll();
 		const id = draftIdRef.current;
 		try {
 			// Let an autosave in flight land first, or it could recreate the draft.
@@ -535,6 +607,14 @@ export function ComposeModal({
 	async function requestClose() {
 		if (busy) return;
 		if (!dirty) {
+			const open = draftIdRef.current;
+			if (files.uploading && open) {
+				setBusy(true);
+				setStatus({ text: "Saving…" });
+				const ok = await settleFiles(open);
+				setBusy(false);
+				if (!ok) return;
+			}
 			onClose();
 			return;
 		}
@@ -565,6 +645,12 @@ export function ComposeModal({
 		setStatus({ text: "Saving…" });
 		try {
 			const id = await ensureDraft(payload);
+			// Close only once the files are on the draft: a closed dialog can't show
+			// that one failed.
+			if (!(await settleFiles(id))) {
+				setBusy(false);
+				return;
+			}
 			onSent?.();
 			onClose();
 			onDraftSaved?.({ mailboxId, draftId: id });
@@ -689,8 +775,8 @@ export function ComposeModal({
 					<Button
 						variant="primary"
 						onClick={() => void handleSend()}
-						disabled={busy || !mailboxId}
-						title="Send (⌘/Ctrl + Enter)"
+						disabled={busy || !mailboxId || files.uploading}
+						title={files.uploading ? "Waiting for attachments to upload" : "Send (⌘/Ctrl + Enter)"}
 						className="pr-[18px] pl-3.5"
 					>
 						<Send />
@@ -699,6 +785,26 @@ export function ComposeModal({
 					<Button variant="secondary" onClick={handleSaveDraft} disabled={busy} className="px-3.5">
 						Save draft
 					</Button>
+					<IconButton
+						title={agentDraft ? "Files can't be added to an agent's draft" : "Attach files"}
+						onClick={() => fileInputRef.current?.click()}
+						disabled={busy || agentDraft}
+						className="size-9"
+					>
+						<Paperclip />
+					</IconButton>
+					<input
+						ref={fileInputRef}
+						type="file"
+						multiple
+						hidden
+						tabIndex={-1}
+						aria-hidden="true"
+						onChange={(e) => {
+							attach(Array.from(e.target.files ?? []));
+							e.target.value = "";
+						}}
+					/>
 					<div className="flex min-w-0 flex-1 items-center justify-end gap-2 pr-1.5 text-label text-text-muted max-sm:order-last max-sm:basis-full max-sm:justify-start [&_svg]:size-[15px] [&_svg]:shrink-0">
 						<Lock aria-hidden="true" />
 						<span className="min-w-0">{note}</span>
@@ -714,115 +820,151 @@ export function ComposeModal({
 				</>
 			}
 		>
+			{/* biome-ignore lint/a11y/noStaticElementInteractions: a drop zone; the paperclip button is the accessible way in */}
 			<div
-				className="flex h-12 shrink-0 items-center gap-3 border-t border-l-[3px] border-t-border-card pr-5 pl-[25px] max-sm:pl-[17px]"
-				style={{ backgroundColor: tint(color, 10), borderLeftColor: color.css }}
+				className="relative flex min-h-0 flex-1 flex-col"
+				onDragEnter={(e) => {
+					if (e.dataTransfer.types.includes("Files") && !agentDraft) setDragging(true);
+				}}
+				onDragOver={(e) => {
+					if (e.dataTransfer.types.includes("Files") && !agentDraft) e.preventDefault();
+				}}
+				onDragLeave={(e) => {
+					if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false);
+				}}
+				onDrop={onDrop}
+				onPasteCapture={onPasteCapture}
 			>
-				<span className="w-14 shrink-0 text-label text-text-muted max-sm:w-12">From</span>
-				{locked ? (
-					<span className="flex min-w-0">{chip}</span>
-				) : (
-					<Menu
-						label={`From: ${fromMailbox?.primary_address ?? "pick a mailbox"}`}
-						triggerClassName="flex min-w-0 rounded-panel"
-						trigger={chip}
-						items={mailboxes.map((m) => ({
-							key: m.mailbox_id,
-							label: m.primary_address,
-							icon: (
-								<span
-									aria-hidden="true"
-									className="size-2 rounded-[4px]"
-									style={{ background: colorOf(m.mailbox_id).css }}
-								/>
-							),
-							active: m.mailbox_id === mailboxId,
-							disabled: m.status !== "active" || busy,
-							onSelect: () => setMailboxId(m.mailbox_id),
-						}))}
+				<div
+					className="flex h-12 shrink-0 items-center gap-3 border-t border-l-[3px] border-t-border-card pr-5 pl-[25px] max-sm:pl-[17px]"
+					style={{ backgroundColor: tint(color, 10), borderLeftColor: color.css }}
+				>
+					<span className="w-14 shrink-0 text-label text-text-muted max-sm:w-12">From</span>
+					{locked ? (
+						<span className="flex min-w-0">{chip}</span>
+					) : (
+						<Menu
+							label={`From: ${fromMailbox?.primary_address ?? "pick a mailbox"}`}
+							triggerClassName="flex min-w-0 rounded-panel"
+							trigger={chip}
+							items={mailboxes.map((m) => ({
+								key: m.mailbox_id,
+								label: m.primary_address,
+								icon: (
+									<span
+										aria-hidden="true"
+										className="size-2 rounded-[4px]"
+										style={{ background: colorOf(m.mailbox_id).css }}
+									/>
+								),
+								active: m.mailbox_id === mailboxId,
+								disabled: m.status !== "active" || busy,
+								onSelect: () => setMailboxId(m.mailbox_id),
+							}))}
+						/>
+					)}
+					{fromMailbox?.display_name ? (
+						<span className="min-w-0 flex-1 truncate text-label text-text-muted max-sm:hidden">
+							Sends as {fromMailbox.display_name}
+						</span>
+					) : null}
+				</div>
+
+				<AddressRow
+					label="To"
+					inputRef={toRef}
+					chips={to}
+					onChips={setTo}
+					draft={toDraft}
+					onDraft={setToDraft}
+					disabled={busy}
+					trailing={
+						!showCc || !showBcc ? (
+							<span className="flex shrink-0 gap-2 text-label text-text-muted">
+								{showCc ? null : (
+									<button
+										type="button"
+										className="rounded-[4px] hover:text-text"
+										onClick={() => setShowCc(true)}
+									>
+										Cc
+									</button>
+								)}
+								{showBcc ? null : (
+									<button
+										type="button"
+										className="rounded-[4px] hover:text-text"
+										onClick={() => setShowBcc(true)}
+									>
+										Bcc
+									</button>
+								)}
+							</span>
+						) : null
+					}
+				/>
+				{showCc ? (
+					<AddressRow
+						label="Cc"
+						chips={cc}
+						onChips={setCc}
+						draft={ccDraft}
+						onDraft={setCcDraft}
+						disabled={busy}
+						autoFocus={cc.length === 0}
 					/>
-				)}
-				{fromMailbox?.display_name ? (
-					<span className="min-w-0 flex-1 truncate text-label text-text-muted max-sm:hidden">
-						Sends as {fromMailbox.display_name}
-					</span>
+				) : null}
+				{showBcc ? (
+					<AddressRow
+						label="Bcc"
+						chips={bcc}
+						onChips={setBcc}
+						draft={bccDraft}
+						onDraft={setBccDraft}
+						disabled={busy}
+						autoFocus={bcc.length === 0}
+					/>
+				) : null}
+
+				<label className="flex h-12 shrink-0 items-center gap-3 border-y border-border-card pr-5 pl-7 max-sm:pl-5">
+					<span className="w-14 shrink-0 text-label text-text-muted max-sm:w-12">Subject</span>
+					<input
+						value={subject}
+						onChange={(e) => setSubject(e.target.value)}
+						placeholder="Subject"
+						disabled={busy}
+						className="h-full min-w-0 flex-1 bg-transparent text-body font-medium text-ink outline-none placeholder:font-normal placeholder:text-text-faint"
+					/>
+				</label>
+
+				<RichTextEditor
+					ref={editorRef}
+					aria-label="Message"
+					onChange={setBodyHtml}
+					placeholder="Write your message…"
+					disabled={busy}
+				/>
+				<ComposeAttachmentList
+					items={files.items}
+					mailboxId={mailboxId}
+					draftId={draftId}
+					disabled={busy}
+					onRemove={(key) => {
+						void files.remove(key, draftIdRef.current).then((ok) => {
+							if (!ok) setStatus({ text: "Could not remove the file. Try again.", error: true });
+						});
+					}}
+				/>
+				{dragging ? (
+					<div
+						aria-hidden="true"
+						className="pointer-events-none absolute inset-2 z-10 flex items-center justify-center gap-2 rounded-card border-2 border-dashed border-text-faint bg-panel/90 text-body font-medium text-text-secondary [&_svg]:size-4"
+					>
+						<Paperclip />
+						Drop files to attach
+					</div>
 				) : null}
 			</div>
-
-			<AddressRow
-				label="To"
-				inputRef={toRef}
-				chips={to}
-				onChips={setTo}
-				draft={toDraft}
-				onDraft={setToDraft}
-				disabled={busy}
-				trailing={
-					!showCc || !showBcc ? (
-						<span className="flex shrink-0 gap-2 text-label text-text-muted">
-							{showCc ? null : (
-								<button
-									type="button"
-									className="rounded-[4px] hover:text-text"
-									onClick={() => setShowCc(true)}
-								>
-									Cc
-								</button>
-							)}
-							{showBcc ? null : (
-								<button
-									type="button"
-									className="rounded-[4px] hover:text-text"
-									onClick={() => setShowBcc(true)}
-								>
-									Bcc
-								</button>
-							)}
-						</span>
-					) : null
-				}
-			/>
-			{showCc ? (
-				<AddressRow
-					label="Cc"
-					chips={cc}
-					onChips={setCc}
-					draft={ccDraft}
-					onDraft={setCcDraft}
-					disabled={busy}
-					autoFocus={cc.length === 0}
-				/>
-			) : null}
-			{showBcc ? (
-				<AddressRow
-					label="Bcc"
-					chips={bcc}
-					onChips={setBcc}
-					draft={bccDraft}
-					onDraft={setBccDraft}
-					disabled={busy}
-					autoFocus={bcc.length === 0}
-				/>
-			) : null}
-
-			<label className="flex h-12 shrink-0 items-center gap-3 border-y border-border-card pr-5 pl-7 max-sm:pl-5">
-				<span className="w-14 shrink-0 text-label text-text-muted max-sm:w-12">Subject</span>
-				<input
-					value={subject}
-					onChange={(e) => setSubject(e.target.value)}
-					placeholder="Subject"
-					disabled={busy}
-					className="h-full min-w-0 flex-1 bg-transparent text-body font-medium text-ink outline-none placeholder:font-normal placeholder:text-text-faint"
-				/>
-			</label>
-
-			<RichTextEditor
-				ref={editorRef}
-				aria-label="Message"
-				onChange={setBodyHtml}
-				placeholder="Write your message…"
-				disabled={busy}
-			/>
 		</Dialog>
 	);
 }

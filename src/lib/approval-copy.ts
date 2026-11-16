@@ -66,7 +66,21 @@ const KIND_TITLES: Record<string, string> = {
 	template_archive: "Archive a template",
 	restore: "Restore a previous state",
 	transactional_reconcile: "Reconcile stuck transactional requests",
+	address_route: "Route an address to this Reccado",
 };
+
+/** Server titles that carry a value, translated by pattern. */
+const TITLE_PATTERNS: Array<[RegExp, (m: RegExpMatchArray) => string]> = [
+	[/^Enrutar (\S+) a este Reccado$/, (m) => `Route ${m[1]} to this Reccado`],
+];
+
+function patternTitle(title: string): string | null {
+	for (const [re, to] of TITLE_PATTERNS) {
+		const m = title.match(re);
+		if (m) return to(m);
+	}
+	return null;
+}
 
 const LABELS: Record<string, string> = {
 	De: "From",
@@ -112,6 +126,10 @@ const LABELS: Record<string, string> = {
 	Remitente: "Sender",
 	"Solicitudes atascadas (aprox.)": "Stuck requests (approx.)",
 	"Zona Cloudflare": "Cloudflare zone",
+	"Regla a crear": "Rule to create",
+	Resultado: "Result",
+	"Qué hacer": "What to do",
+	Comando: "Command",
 	Zona: "Zone",
 };
 
@@ -181,6 +199,16 @@ const WARNINGS: Record<string, (w: ApprovalWarning) => string | null> = {
 		return id ? `Template ${id} does not exist yet.` : null;
 	},
 	send_without_templates: () => "A key that can send needs at least one template.",
+	cloudflare_route: (w) => {
+		const m = w.message.match(/\(zona (\S+?)\) que entrega (\S+) a este Worker/);
+		return m
+			? `Creates a Cloudflare Email Routing rule (zone ${m[1]}) that delivers ${m[2]} to this Worker. It never changes or deletes an existing rule or the catch-all: if something already handles the address, nothing changes.`
+			: null;
+	},
+	routing_token_missing: () =>
+		"This Worker has no CLOUDFLARE_API_TOKEN: approving will fail without changing anything.",
+	routing_worker_unknown: () =>
+		"This Worker does not know its own name (WORKER_NAME): approving will fail without changing anything.",
 	external_forward: (w) => {
 		const to = grab(w, /:\s*(\S+)$/);
 		return to ? `Forwards to an outside address: ${to}` : null;
@@ -188,7 +216,12 @@ const WARNINGS: Record<string, (w: ApprovalWarning) => string | null> = {
 };
 
 export function approvalTitle(item: Pick<ApprovalItem, "title" | "kind">): string {
-	return TITLES[item.title] ?? KIND_TITLES[item.kind] ?? (item.title || item.kind);
+	return (
+		TITLES[item.title] ??
+		patternTitle(item.title) ??
+		KIND_TITLES[item.kind] ??
+		(item.title || item.kind)
+	);
 }
 
 export function fieldLabel(label: string): string {
@@ -207,7 +240,7 @@ export function warningText(warning: ApprovalWarning): string {
 
 /** English for a server (Spanish) request title; an unknown title passes through. */
 export function translateTitle(title: string): string {
-	return TITLES[title] ?? title;
+	return TITLES[title] ?? patternTitle(title) ?? title;
 }
 
 /** Who asked: the OAuth client's name when known. */

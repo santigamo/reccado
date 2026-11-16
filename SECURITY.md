@@ -186,7 +186,9 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
 - **Approval required (any token).** `send`; an alias or forward / routing rule whose destination is
   outside the owner's domains (also when `restore` would bring one back); `api_key_create`,
   `api_key_rotate`, `api_key_scopes` (they issue a secret); `suppression_remove`; `domain_add`,
-  `domain_provision`, `domain_disable`. The tool creates an intent in `approvals` (`origin='mcp'`)
+  `domain_provision`, `domain_disable`; `address_route` (`manage_routing` `route_address`: one
+  Cloudflare Email Routing rule delivering an existing address to this Worker, via the same
+  `routeAddress` as the web "Route it"; no MCP path calls Cloudflare before approval). The tool creates an intent in `approvals` (`origin='mcp'`)
   and returns a URL (`input_required` URL-mode elicitation on 2026 clients; `{status:"pending",
   intentId, confirmUrl}` on legacy clients, which re-call the tool with `intentId`).
 - **Applied directly (with its scope).** Templates, `api_key_templates` (a key's template

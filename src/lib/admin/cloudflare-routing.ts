@@ -3,10 +3,9 @@
  * Worker serving this request. The web counterpart of `pnpm setup:routing
  * --address`, sharing its Cloudflare client and rule logic (`../email-routing`).
  *
- * Owner web session only. It is not a control-plane kind and the MCP tools do
- * not reach it: whether an agent may change Cloudflare routing (and under which
- * approval) is a decision that has not been made, so the agent path stays as it
- * was.
+ * Owner web session, or an MCP agent's `address_route` request once the owner
+ * approved it on `/approve/:id` (src/lib/control-plane-kinds/address-route.ts runs
+ * this same function; no MCP path reaches it without that approval).
  *
  * Authority is bounded the same way the DNS gate bounds DMARC writes:
  *   - the zone comes from the `domains` registry, never from the caller;

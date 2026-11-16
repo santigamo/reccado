@@ -11,6 +11,31 @@ package.
 
 ### Added
 
+- **Attachments when composing and forwarding (2026-11-16).** *Compose.* A paperclip, drag-and-drop
+  onto the dialog and pasted files attach to the draft; chips show name, size, upload progress,
+  errors and remove; a running total ("3 files · 4.2 MB of 17 MB"); Send waits while uploads are in
+  flight; a draft row in a conversation shows a paperclip. *Limits* (`src/lib/attachment-limits.ts`):
+  17 MiB per file and in total, 20 files — Cloudflare Email Sending caps the whole message at 25 MiB
+  after base64. *Storage.* Bytes go from the request straight to R2 under
+  `drafts/<env>/<mailbox>/<draft>/<attachment>-<name>`; the mailbox DO keeps metadata only in a new
+  `draft_attachments` table (schema v13). Owner-session routes: `POST|GET|DELETE
+  /api/mailboxes/:id/drafts/:draftId/attachments[/:attachmentId]` (raw body, `?filename=`) and
+  `POST …/attachments/from-message`. Names are sanitised (no path, no control characters, NFC,
+  bounded), types reduced to `type/subtype`; downloads are always `attachment`, nosniff, sandboxed.
+  Agent (`mcp`) drafts never take files. *Send.* The frozen send intent lists the files (id, name,
+  type, size, sha256, R2 key, in order), so `payload_hash` covers them and adding or removing one
+  makes an armed intent stale; a draft without files freezes `attachments: []` exactly as before, so
+  existing hashes and approvals are unchanged. Confirm-send reads the files back from R2, checks each
+  sha256 and hands them to Email Sending, which composes the multipart/mixed message; a missing or
+  changed file sends nothing and frees the attempt. The sent copy lists the files in the ordinary
+  `attachments` table on the same R2 objects (download works like received mail) and the D1 index
+  gets `has_attachments`. The web request-send now replaces a stale intent, so Send works again after
+  an edit. *Forward.* The original's files are offered checked and removable, attached by reference to
+  its R2 objects (no bytes through the browser); inline images go as regular files and the dialog
+  says so. *Lifecycle.* Removing a file deletes its upload; sending hands the objects to the sent
+  copy; discarding keeps them for 24 h so Undo restores the draft whole, then a mailbox alarm job
+  deletes the uploads of a draft still discarded (forwarded originals are never deleted).
+
 - **Mail-client conventions in the web inbox (2026-11-16).** *Who.* Your own messages say
   "me" / the mailbox display name instead of the mailbox local part; mail stored before names
   were kept gets its sender name (and Reply-To) from its own raw headers in R2 the first time
@@ -159,6 +184,22 @@ package.
   (`MCP_CIMD_ENABLED`, default off) on a Workers-native guarded transport.
 - D1 migrations `0021` (Better Auth 1.7.20), `0022`, `0024`–`0028`; **apply them remotely before
   deploying** (see `docs/OPERATIONS.md`).
+- **No Telegram notice for DMARC aggregate reports (2026-11-16).** The mailbox DO returns its
+  classification in the ingest result (`MailboxIngestResult.automatedKind`, additive); the inbound
+  consumer stores and indexes the report as before but enqueues no `NOTIFY_QUEUE` message for it,
+  so it is never retained for the quiet-hours digest either. Muted senders, ordinary mail and a
+  person writing about DMARC are unchanged (`tests/integration/dmarc-notify.test.ts`).
+- **Agents can ask to route an address, behind owner approval (2026-11-16).** New approval-gated
+  control-plane kind `address_route`, exposed as `manage_routing` `route_address`
+  (`{domain, address}`, scope `routing:write`). Over MCP it only creates an approval (no
+  Cloudflare call); on the owner's approval it runs the same `routeAddress` as the web "Route it"
+  (one literal `to:<address> -> <this Worker>` rule, never overwrites a rule or touches the
+  catch-all). Unknown address / unregistered or inactive domain / another owner's mailbox are
+  refused at request time (`refused: <reason>`); Cloudflare-side refusals (conflict, routing
+  disabled, token missing or without permission, timeout, API error) end as a failed execution
+  whose `result.items[0].detail` carries `reason`, `message`, `remedy` (and `cli` / `conflict`).
+  The approval page shows "Route <address> to this Reccado" with the zone and the rule to create,
+  and, once decided, the outcome. No migration.
 
 ### Removed
 

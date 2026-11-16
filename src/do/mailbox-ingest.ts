@@ -629,6 +629,7 @@ export async function ingestInboundEmail(
 			rfcMessageId: message.messageId,
 			parseStatus,
 			realtimeSeq: seq,
+			automatedKind,
 		};
 	} catch (error) {
 		if (isUniqueConstraintViolation(error)) {

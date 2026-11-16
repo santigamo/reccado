@@ -40,6 +40,23 @@ export function attachmentR2Key(input: {
 	return `attachments/${env}/${input.mailboxId}/${input.messageLocalId}/${input.attachmentSha256}-${input.safeFilename}`;
 }
 
+/**
+ * A file the owner attached to a draft. Scoped to the draft (not to a message:
+ * there is none yet) and to a random attachment id, so two uploads of the same
+ * name never collide and a filename can never reach outside its prefix. When the
+ * draft is sent the sent copy's attachment row takes this object over as is.
+ */
+export function draftAttachmentR2Key(input: {
+	env?: string;
+	mailboxId: string;
+	draftId: string;
+	attachmentId: string;
+	safeFilename: string;
+}): string {
+	const env = input.env ?? "dev";
+	return `drafts/${env}/${input.mailboxId}/${input.draftId}/${input.attachmentId}-${input.safeFilename}`;
+}
+
 export function exportR2Key(input: {
 	env?: string;
 	mailboxId: string;

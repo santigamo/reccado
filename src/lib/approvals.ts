@@ -31,7 +31,7 @@ import {
 	hashPayload,
 	ownerForUser,
 } from "./control-plane-intents";
-import { renderWithSafetyNet } from "./control-plane-registry";
+import { ControlPlaneRefusal, renderWithSafetyNet } from "./control-plane-registry";
 import { hmacSha256 } from "./crypto";
 import { domainFromAddress } from "./email-headers";
 import { getSendingFeedbackStatus } from "./feedback-liveness";
@@ -76,6 +76,8 @@ export type IntentStatus = {
 			status: "executed" | "failed" | "not_run";
 			result?: unknown;
 			errorCode?: string;
+			/** A kind's reasoned refusal (`ControlPlaneRefusal.detail`): why, and what to do. */
+			detail?: Record<string, unknown>;
 		}>;
 	} | null;
 };
@@ -631,6 +633,24 @@ async function buildView(env: Env, id: string, userId: string | null): Promise<I
 		} catch {
 			status.status = "stale";
 		}
+	} else if (
+		definition?.describeOutcome &&
+		status.result?.items[0] &&
+		userId &&
+		(!row.token_sub || row.token_sub === userId)
+	) {
+		// Decided: the kind may tell the owner who could approve it what was asked and what came of it.
+		try {
+			const data = await controlData(env, id);
+			const payload = JSON.parse(data?.payload_json ?? "null") as Record<string, unknown>;
+			if (payload && typeof payload === "object")
+				rendered = {
+					...rendered,
+					fields: definition.describeOutcome(payload, status.result.items[0]),
+				};
+		} catch {
+			// Nothing to add: the status card still says what happened.
+		}
 	}
 	return {
 		id: row.token,
@@ -784,6 +804,7 @@ async function dispatchControl(
 		results.push({
 			status: "failed",
 			errorCode: error instanceof AdminError ? error.code : "execution_failed",
+			...(error instanceof ControlPlaneRefusal ? { detail: error.detail } : {}),
 		});
 	}
 	await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?")
