@@ -127,10 +127,12 @@ jobs:
         # "no leaks found in partial scan", failing every PR (the exit-code wrapper is
         # buggy). The CLI scans the working tree against .gitleaks.toml and exits non-zero
         # only on a real finding — deterministic, and no GitHub API / PR permissions needed.
+        # --verbose prints each finding (rule, file, line; the value stays redacted) so a red
+        # run says what to fix.
         env:
           GITLEAKS_VERSION: "8.24.3"
         run: |
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             | tar -xz -C /usr/local/bin gitleaks
           gitleaks version
-          gitleaks dir . --config .gitleaks.toml --redact --no-banner
+          gitleaks dir . --config .gitleaks.toml --redact --no-banner --verbose
