@@ -502,12 +502,20 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 		const subject = messages[0]?.subject ?? "(no subject)";
 		const isNew = (m: Message | undefined) =>
 			Boolean(m && (m.is_read === 0 || newOnOpen?.has(m.id)));
-		const openAt = (i: number) => i === messages.length - 1 || isNew(messages[i]);
-		// Gmail folds a run of read, older messages in the middle of a long thread
-		// into one "N older messages" bar; the first one stays as a line on top.
-		const firstOpen = messages.findIndex((_, i) => openAt(i));
-		const foldEnd = firstOpen < 0 ? messages.length - 1 : firstOpen;
-		const fold = !unfolded && foldEnd - 1 > FOLD_AFTER;
+		// Newest first: the latest message sits right under the subject, older
+		// ones follow below it, as the owner reads a conversation top-down.
+		const view = [...messages].reverse();
+		const openAt = (i: number) => i === 0 || isNew(view[i]);
+		// A long run of read, older messages folds into one "N older messages"
+		// bar; the line right after the open ones and the very first message stay.
+		let lastOpen = 0;
+		view.forEach((_, i) => {
+			if (openAt(i)) lastOpen = i;
+		});
+		const foldFrom = lastOpen + 2;
+		const foldTo = view.length - 2;
+		const hidden = foldTo - foldFrom + 1;
+		const fold = !unfolded && hidden >= FOLD_AFTER;
 		content = (
 			<div ref={scrollRef} className="app-scroll min-h-0 flex-1 overflow-y-auto">
 				<header
@@ -527,10 +535,24 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 						</span>
 					</div>
 				</header>
-				{messages.map((message, i) => {
-					if (fold && i > 0 && i < foldEnd - 1) {
-						if (i !== 1) return null;
-						const hidden = foldEnd - 2;
+				{threadDrafts.map((draft) => (
+					<ThreadDraftRow
+						key={draft.id}
+						draft={draft}
+						onOpen={() => openCompose({ from: mailboxId, draftId: draft.id })}
+						onDiscard={async () => {
+							await cancelDraft(mailboxId, draft.id).catch(() => undefined);
+							draftsRes.refetch();
+							refresh();
+						}}
+					/>
+				))}
+				<div className="px-5 py-5 empty:hidden">
+					<ApprovalCardSlot mailboxId={mailboxId} threadId={threadId} approvals={threadApprovals} />
+				</div>
+				{view.map((message, i) => {
+					if (fold && i >= foldFrom && i <= foldTo) {
+						if (i !== foldFrom) return null;
 						return (
 							<button
 								key="fold"
@@ -548,7 +570,7 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 						);
 					}
 					return (
-						<div key={message.id} ref={i === messages.length - 1 ? newestRef : undefined}>
+						<div key={message.id} ref={i === 0 ? newestRef : undefined}>
 							<MessageItem
 								message={message}
 								mailboxId={mailboxId}
@@ -558,21 +580,6 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 						</div>
 					);
 				})}
-				{threadDrafts.map((draft) => (
-					<ThreadDraftRow
-						key={draft.id}
-						draft={draft}
-						onOpen={() => openCompose({ from: mailboxId, draftId: draft.id })}
-						onDiscard={async () => {
-							await cancelDraft(mailboxId, draft.id).catch(() => undefined);
-							draftsRes.refetch();
-							refresh();
-						}}
-					/>
-				))}
-				<div className="px-5 py-5 empty:hidden">
-					<ApprovalCardSlot mailboxId={mailboxId} threadId={threadId} approvals={threadApprovals} />
-				</div>
 			</div>
 		);
 	}

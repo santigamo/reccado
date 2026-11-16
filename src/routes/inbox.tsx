@@ -393,9 +393,15 @@ function InboxScreen({
 			subtitle = `${formatCount(n)} ${n === 1 ? "result" : "results"}`;
 		}
 	} else if (folder.kind === "threads" && folderCounts) {
-		// "14,171 emails": every message in the folder, not the conversations loaded.
-		const n = folderCounts.messages;
-		subtitle = `${formatCount(n)} ${n === 1 ? "email" : "emails"}`;
+		// What still needs reading, not the size of the folder. Sent mail has no
+		// unread state, so it counts conversations instead.
+		if (folderKey === "sent") {
+			const n = folderCounts.threads;
+			subtitle = `${formatCount(n)} ${n === 1 ? "conversation" : "conversations"}`;
+		} else {
+			const n = folderCounts.unread;
+			subtitle = n > 0 ? `${formatCount(n)} unread` : "All read";
+		}
 	} else if (folder.kind === "drafts" && scopeCounts) {
 		const n = scopeCounts.drafts;
 		subtitle = `${formatCount(n)} ${n === 1 ? "draft" : "drafts"}`;
