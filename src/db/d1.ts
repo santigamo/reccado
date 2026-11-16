@@ -584,7 +584,6 @@ export async function upsertIngestEvent(
          mailbox_id = excluded.mailbox_id,
          message_local_id = excluded.message_local_id,
          raw_r2_key = excluded.raw_r2_key,
-         template_allowlist_json = excluded.template_allowlist_json,
          status = excluded.status,
          error_code = excluded.error_code,
          updated_at = excluded.updated_at`,
