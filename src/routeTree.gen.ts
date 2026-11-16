@@ -11,17 +11,26 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SecurityRouteImport } from './routes/security'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as InboxRouteImport } from './routes/inbox'
 import { Route as DomainsRouteImport } from './routes/domains'
 import { Route as ConsentRouteImport } from './routes/consent'
 import { Route as AboutRouteImport } from './routes/about'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as SettingsIndexRouteImport } from './routes/settings/index'
 import { Route as MailboxesIndexRouteImport } from './routes/mailboxes/index'
+import { Route as InboxIndexRouteImport } from './routes/inbox/index'
+import { Route as SettingsSuppressionsRouteImport } from './routes/settings/suppressions'
+import { Route as SettingsKeysRouteImport } from './routes/settings/keys'
+import { Route as SettingsDomainsRouteImport } from './routes/settings/domains'
+import { Route as SettingsAgentAccessRouteImport } from './routes/settings/agent-access'
+import { Route as SettingsAccountRouteImport } from './routes/settings/account'
 import { Route as MailboxesMailboxIdRouteImport } from './routes/mailboxes/$mailboxId'
 import { Route as ApproveIdRouteImport } from './routes/approve/$id'
 import { Route as MailboxesMailboxIdIndexRouteImport } from './routes/mailboxes/$mailboxId/index'
 import { Route as MailboxesMailboxIdKeysRouteImport } from './routes/mailboxes/$mailboxId/keys'
 import { Route as MailboxesMailboxIdComposeRouteImport } from './routes/mailboxes/$mailboxId/compose'
 import { Route as MailboxesMailboxIdThreadIdRouteImport } from './routes/mailboxes/$mailboxId/$threadId'
+import { Route as InboxMailboxIdThreadIdRouteImport } from './routes/inbox/$mailboxId.$threadId'
 
 const SecurityRoute = SecurityRouteImport.update({
   id: '/security',
@@ -31,6 +40,11 @@ const SecurityRoute = SecurityRouteImport.update({
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const InboxRoute = InboxRouteImport.update({
+  id: '/inbox',
+  path: '/inbox',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DomainsRoute = DomainsRouteImport.update({
@@ -53,9 +67,44 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SettingsIndexRoute = SettingsIndexRouteImport.update({
+  id: '/settings/',
+  path: '/settings/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const MailboxesIndexRoute = MailboxesIndexRouteImport.update({
   id: '/mailboxes/',
   path: '/mailboxes/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const InboxIndexRoute = InboxIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => InboxRoute,
+} as any)
+const SettingsSuppressionsRoute = SettingsSuppressionsRouteImport.update({
+  id: '/settings/suppressions',
+  path: '/settings/suppressions',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsKeysRoute = SettingsKeysRouteImport.update({
+  id: '/settings/keys',
+  path: '/settings/keys',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsDomainsRoute = SettingsDomainsRouteImport.update({
+  id: '/settings/domains',
+  path: '/settings/domains',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsAgentAccessRoute = SettingsAgentAccessRouteImport.update({
+  id: '/settings/agent-access',
+  path: '/settings/agent-access',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsAccountRoute = SettingsAccountRouteImport.update({
+  id: '/settings/account',
+  path: '/settings/account',
   getParentRoute: () => rootRouteImport,
 } as any)
 const MailboxesMailboxIdRoute = MailboxesMailboxIdRouteImport.update({
@@ -90,17 +139,31 @@ const MailboxesMailboxIdThreadIdRoute =
     path: '/$threadId',
     getParentRoute: () => MailboxesMailboxIdRoute,
   } as any)
+const InboxMailboxIdThreadIdRoute = InboxMailboxIdThreadIdRouteImport.update({
+  id: '/$mailboxId/$threadId',
+  path: '/$mailboxId/$threadId',
+  getParentRoute: () => InboxRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/about': typeof AboutRoute
   '/consent': typeof ConsentRoute
   '/domains': typeof DomainsRoute
+  '/inbox': typeof InboxRouteWithChildren
   '/login': typeof LoginRoute
   '/security': typeof SecurityRoute
   '/approve/$id': typeof ApproveIdRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdRouteWithChildren
+  '/settings/account': typeof SettingsAccountRoute
+  '/settings/agent-access': typeof SettingsAgentAccessRoute
+  '/settings/domains': typeof SettingsDomainsRoute
+  '/settings/keys': typeof SettingsKeysRoute
+  '/settings/suppressions': typeof SettingsSuppressionsRoute
+  '/inbox/': typeof InboxIndexRoute
   '/mailboxes/': typeof MailboxesIndexRoute
+  '/settings/': typeof SettingsIndexRoute
+  '/inbox/$mailboxId/$threadId': typeof InboxMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
   '/mailboxes/$mailboxId/keys': typeof MailboxesMailboxIdKeysRoute
@@ -114,7 +177,15 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/security': typeof SecurityRoute
   '/approve/$id': typeof ApproveIdRoute
+  '/settings/account': typeof SettingsAccountRoute
+  '/settings/agent-access': typeof SettingsAgentAccessRoute
+  '/settings/domains': typeof SettingsDomainsRoute
+  '/settings/keys': typeof SettingsKeysRoute
+  '/settings/suppressions': typeof SettingsSuppressionsRoute
+  '/inbox': typeof InboxIndexRoute
   '/mailboxes': typeof MailboxesIndexRoute
+  '/settings': typeof SettingsIndexRoute
+  '/inbox/$mailboxId/$threadId': typeof InboxMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
   '/mailboxes/$mailboxId/keys': typeof MailboxesMailboxIdKeysRoute
@@ -126,11 +197,20 @@ export interface FileRoutesById {
   '/about': typeof AboutRoute
   '/consent': typeof ConsentRoute
   '/domains': typeof DomainsRoute
+  '/inbox': typeof InboxRouteWithChildren
   '/login': typeof LoginRoute
   '/security': typeof SecurityRoute
   '/approve/$id': typeof ApproveIdRoute
   '/mailboxes/$mailboxId': typeof MailboxesMailboxIdRouteWithChildren
+  '/settings/account': typeof SettingsAccountRoute
+  '/settings/agent-access': typeof SettingsAgentAccessRoute
+  '/settings/domains': typeof SettingsDomainsRoute
+  '/settings/keys': typeof SettingsKeysRoute
+  '/settings/suppressions': typeof SettingsSuppressionsRoute
+  '/inbox/': typeof InboxIndexRoute
   '/mailboxes/': typeof MailboxesIndexRoute
+  '/settings/': typeof SettingsIndexRoute
+  '/inbox/$mailboxId/$threadId': typeof InboxMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/$threadId': typeof MailboxesMailboxIdThreadIdRoute
   '/mailboxes/$mailboxId/compose': typeof MailboxesMailboxIdComposeRoute
   '/mailboxes/$mailboxId/keys': typeof MailboxesMailboxIdKeysRoute
@@ -143,11 +223,20 @@ export interface FileRouteTypes {
     | '/about'
     | '/consent'
     | '/domains'
+    | '/inbox'
     | '/login'
     | '/security'
     | '/approve/$id'
     | '/mailboxes/$mailboxId'
+    | '/settings/account'
+    | '/settings/agent-access'
+    | '/settings/domains'
+    | '/settings/keys'
+    | '/settings/suppressions'
+    | '/inbox/'
     | '/mailboxes/'
+    | '/settings/'
+    | '/inbox/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
     | '/mailboxes/$mailboxId/keys'
@@ -161,7 +250,15 @@ export interface FileRouteTypes {
     | '/login'
     | '/security'
     | '/approve/$id'
+    | '/settings/account'
+    | '/settings/agent-access'
+    | '/settings/domains'
+    | '/settings/keys'
+    | '/settings/suppressions'
+    | '/inbox'
     | '/mailboxes'
+    | '/settings'
+    | '/inbox/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
     | '/mailboxes/$mailboxId/keys'
@@ -172,11 +269,20 @@ export interface FileRouteTypes {
     | '/about'
     | '/consent'
     | '/domains'
+    | '/inbox'
     | '/login'
     | '/security'
     | '/approve/$id'
     | '/mailboxes/$mailboxId'
+    | '/settings/account'
+    | '/settings/agent-access'
+    | '/settings/domains'
+    | '/settings/keys'
+    | '/settings/suppressions'
+    | '/inbox/'
     | '/mailboxes/'
+    | '/settings/'
+    | '/inbox/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/$threadId'
     | '/mailboxes/$mailboxId/compose'
     | '/mailboxes/$mailboxId/keys'
@@ -188,11 +294,18 @@ export interface RootRouteChildren {
   AboutRoute: typeof AboutRoute
   ConsentRoute: typeof ConsentRoute
   DomainsRoute: typeof DomainsRoute
+  InboxRoute: typeof InboxRouteWithChildren
   LoginRoute: typeof LoginRoute
   SecurityRoute: typeof SecurityRoute
   ApproveIdRoute: typeof ApproveIdRoute
   MailboxesMailboxIdRoute: typeof MailboxesMailboxIdRouteWithChildren
+  SettingsAccountRoute: typeof SettingsAccountRoute
+  SettingsAgentAccessRoute: typeof SettingsAgentAccessRoute
+  SettingsDomainsRoute: typeof SettingsDomainsRoute
+  SettingsKeysRoute: typeof SettingsKeysRoute
+  SettingsSuppressionsRoute: typeof SettingsSuppressionsRoute
   MailboxesIndexRoute: typeof MailboxesIndexRoute
+  SettingsIndexRoute: typeof SettingsIndexRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -209,6 +322,13 @@ declare module '@tanstack/react-router' {
       path: '/login'
       fullPath: '/login'
       preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/inbox': {
+      id: '/inbox'
+      path: '/inbox'
+      fullPath: '/inbox'
+      preLoaderRoute: typeof InboxRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/domains': {
@@ -239,11 +359,60 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/settings/': {
+      id: '/settings/'
+      path: '/settings'
+      fullPath: '/settings/'
+      preLoaderRoute: typeof SettingsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/mailboxes/': {
       id: '/mailboxes/'
       path: '/mailboxes'
       fullPath: '/mailboxes/'
       preLoaderRoute: typeof MailboxesIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/inbox/': {
+      id: '/inbox/'
+      path: '/'
+      fullPath: '/inbox/'
+      preLoaderRoute: typeof InboxIndexRouteImport
+      parentRoute: typeof InboxRoute
+    }
+    '/settings/suppressions': {
+      id: '/settings/suppressions'
+      path: '/settings/suppressions'
+      fullPath: '/settings/suppressions'
+      preLoaderRoute: typeof SettingsSuppressionsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/keys': {
+      id: '/settings/keys'
+      path: '/settings/keys'
+      fullPath: '/settings/keys'
+      preLoaderRoute: typeof SettingsKeysRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/domains': {
+      id: '/settings/domains'
+      path: '/settings/domains'
+      fullPath: '/settings/domains'
+      preLoaderRoute: typeof SettingsDomainsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/agent-access': {
+      id: '/settings/agent-access'
+      path: '/settings/agent-access'
+      fullPath: '/settings/agent-access'
+      preLoaderRoute: typeof SettingsAgentAccessRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/settings/account': {
+      id: '/settings/account'
+      path: '/settings/account'
+      fullPath: '/settings/account'
+      preLoaderRoute: typeof SettingsAccountRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/mailboxes/$mailboxId': {
@@ -288,8 +457,27 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof MailboxesMailboxIdThreadIdRouteImport
       parentRoute: typeof MailboxesMailboxIdRoute
     }
+    '/inbox/$mailboxId/$threadId': {
+      id: '/inbox/$mailboxId/$threadId'
+      path: '/$mailboxId/$threadId'
+      fullPath: '/inbox/$mailboxId/$threadId'
+      preLoaderRoute: typeof InboxMailboxIdThreadIdRouteImport
+      parentRoute: typeof InboxRoute
+    }
   }
 }
+
+interface InboxRouteChildren {
+  InboxIndexRoute: typeof InboxIndexRoute
+  InboxMailboxIdThreadIdRoute: typeof InboxMailboxIdThreadIdRoute
+}
+
+const InboxRouteChildren: InboxRouteChildren = {
+  InboxIndexRoute: InboxIndexRoute,
+  InboxMailboxIdThreadIdRoute: InboxMailboxIdThreadIdRoute,
+}
+
+const InboxRouteWithChildren = InboxRoute._addFileChildren(InboxRouteChildren)
 
 interface MailboxesMailboxIdRouteChildren {
   MailboxesMailboxIdThreadIdRoute: typeof MailboxesMailboxIdThreadIdRoute
@@ -313,11 +501,18 @@ const rootRouteChildren: RootRouteChildren = {
   AboutRoute: AboutRoute,
   ConsentRoute: ConsentRoute,
   DomainsRoute: DomainsRoute,
+  InboxRoute: InboxRouteWithChildren,
   LoginRoute: LoginRoute,
   SecurityRoute: SecurityRoute,
   ApproveIdRoute: ApproveIdRoute,
   MailboxesMailboxIdRoute: MailboxesMailboxIdRouteWithChildren,
+  SettingsAccountRoute: SettingsAccountRoute,
+  SettingsAgentAccessRoute: SettingsAgentAccessRoute,
+  SettingsDomainsRoute: SettingsDomainsRoute,
+  SettingsKeysRoute: SettingsKeysRoute,
+  SettingsSuppressionsRoute: SettingsSuppressionsRoute,
   MailboxesIndexRoute: MailboxesIndexRoute,
+  SettingsIndexRoute: SettingsIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

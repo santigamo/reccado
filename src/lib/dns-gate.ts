@@ -164,9 +164,7 @@ async function resolveRegisteredZone(
 		.all<RegisteredDomain>();
 	const candidates = (rows.results ?? [])
 		.map((row) => ({ ...row, domain: canonicalizeHost(row.domain) }))
-		.filter(
-			(row) => sendingDomain === row.domain || sendingDomain.endsWith(`.${row.domain}`),
-		)
+		.filter((row) => sendingDomain === row.domain || sendingDomain.endsWith(`.${row.domain}`))
 		.sort((a, b) => b.domain.length - a.domain.length);
 
 	const match = candidates[0];
@@ -217,6 +215,40 @@ async function cloudflareRequest<T>(
 }
 
 /**
+ * Read (never write) the DMARC policy record currently published for one
+ * sending domain, for the settings UI. Lives here because this file is the only
+ * one allowed to address the DNS record API; the name is composed the same way
+ * as for writes and the zone is resolved from the registry, so a read can't be
+ * aimed at a record or zone the write path would refuse.
+ *
+ * Returns the normalized `v=DMARC1…` content, or null when none is published.
+ */
+export async function readDmarcRecord(
+	env: DnsGateEnv,
+	db: D1Database,
+	sendingDomainInput: string,
+): Promise<string | null> {
+	const token = env.CLOUDFLARE_API_TOKEN?.trim();
+	if (!token) {
+		throw new DnsGateRefusal("dns-gate: CLOUDFLARE_API_TOKEN is not set, so DNS cannot be read.");
+	}
+	const sendingDomain = canonicalizeHost(sendingDomainInput);
+	assertHostShape(sendingDomain);
+	const zone = await resolveRegisteredZone(db, sendingDomain);
+	const name = `_dmarc.${sendingDomain}`;
+	const existing = await cloudflareRequest<DnsRecord[]>(
+		token,
+		"GET",
+		`/zones/${zone.zone_id}/dns_records?type=TXT&name=${encodeURIComponent(name)}&per_page=100`,
+	);
+	return (
+		existing
+			.map((record) => normalizeTxtContent(record.content))
+			.find((content) => content.toLowerCase().startsWith("v=dmarc1")) ?? null
+	);
+}
+
+/**
  * Publish (or correct) the DMARC policy for one sending domain.
  *
  * Idempotent, and an upsert rather than a create on purpose: enabling Cloudflare
@@ -254,7 +286,9 @@ export async function ensureDmarcRecord(
 		);
 	}
 	if (!name.startsWith("_dmarc.")) {
-		throw new DnsGateRefusal(`dns-gate: refusing to write "${name}", which is not a _dmarc record.`);
+		throw new DnsGateRefusal(
+			`dns-gate: refusing to write "${name}", which is not a _dmarc record.`,
+		);
 	}
 	if (name !== `_dmarc.${zone.domain}` && !name.endsWith(`.${zone.domain}`)) {
 		throw new DnsGateRefusal(

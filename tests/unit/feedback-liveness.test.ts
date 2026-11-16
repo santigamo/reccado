@@ -11,7 +11,9 @@ const HOUR = 60 * 60 * 1000;
 const NOW = Date.parse("2026-09-01T12:00:00.000Z");
 const iso = (msAgo: number) => new Date(NOW - msAgo).toISOString();
 
-function observation(overrides: Partial<SenderFeedbackObservation> = {}): SenderFeedbackObservation {
+function observation(
+	overrides: Partial<SenderFeedbackObservation> = {},
+): SenderFeedbackObservation {
 	return {
 		domain: "send.example.com",
 		dispatched: 0,

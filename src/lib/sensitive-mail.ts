@@ -48,11 +48,15 @@ function urlParts(value: string): URL | null {
 function hasSecretParam(url: URL): boolean {
 	const pairs = [
 		...url.searchParams.entries(),
-		...new URLSearchParams(url.hash.replace(/^#/, "").replace(/^\//, "").replace(/^[^=]*\?/, "")).entries(),
+		...new URLSearchParams(
+			url.hash
+				.replace(/^#/, "")
+				.replace(/^\//, "")
+				.replace(/^[^=]*\?/, ""),
+		).entries(),
 	];
 	return pairs.some(
-		([name, val]) =>
-			SECRET_PARAM.test(name) || (LONG_VALUE_PARAM.test(name) && val.length >= 16),
+		([name, val]) => SECRET_PARAM.test(name) || (LONG_VALUE_PARAM.test(name) && val.length >= 16),
 	);
 }
 
@@ -63,7 +67,10 @@ function longestSegment(url: URL): number {
 /** Does this URL look like it carries a credential? */
 function isSecretUrl(value: string, minSegment = 24): boolean {
 	const url = urlParts(value);
-	if (!url) return /[?&#](?:t|token|code|key|sig|otp|reset|auth|login|magic|session|verify)(?:=|%3d)/i.test(value);
+	if (!url)
+		return /[?&#](?:t|token|code|key|sig|otp|reset|auth|login|magic|session|verify)(?:=|%3d)/i.test(
+			value,
+		);
 	return hasSecretParam(url) || longestSegment(url) >= minSegment;
 }
 

@@ -32,13 +32,17 @@ export const INTENT_NOTIFY_COALESCE_MS = 60_000;
  * direct (non-critical) changes never reach this function.
  */
 export async function notifyIntentCreated(env: Env, intentId: string): Promise<void> {
-	const principal = await env.INDEX_DB.prepare("SELECT token_sub, created_at FROM approvals WHERE token = ?")
+	const principal = await env.INDEX_DB.prepare(
+		"SELECT token_sub, created_at FROM approvals WHERE token = ?",
+	)
 		.bind(intentId)
 		.first<{ token_sub: string | null; created_at: string }>()
 		.catch(() => null);
 	let coalesced = false;
 	if (principal?.token_sub) {
-		const since = new Date(Date.parse(principal.created_at) - INTENT_NOTIFY_COALESCE_MS).toISOString();
+		const since = new Date(
+			Date.parse(principal.created_at) - INTENT_NOTIFY_COALESCE_MS,
+		).toISOString();
 		const earlier = await env.INDEX_DB.prepare(
 			"SELECT 1 AS hit FROM approvals WHERE token_sub = ? AND token <> ? AND created_at > ? AND created_at <= ? LIMIT 1",
 		)

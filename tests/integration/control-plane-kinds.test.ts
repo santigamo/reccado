@@ -2,10 +2,10 @@ import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { handleAuthRequest } from "#/api/better-auth";
+import { renderApprovalPage } from "#/components/approval-page";
 import { insertMailbox } from "#/db/d1";
 import { addSuppression } from "#/do/mailbox-suppressions";
 import { listApiKeyEvents, updateApiKeyTemplateAllowlist } from "#/do/transactional-key-ops";
-import { config as mcpConfig } from "../../src/mcp/admin-reads";
 import {
 	approveIntent,
 	getIntentStatus,
@@ -13,7 +13,6 @@ import {
 	registerControlPlaneKind,
 	requestControlPlaneChange,
 } from "#/lib/approvals";
-import { renderApprovalPage } from "#/components/approval-page";
 import { controlPlaneKind } from "#/lib/control-plane-intents";
 import { renderWithSafetyNet } from "#/lib/control-plane-registry";
 import { mailboxStub } from "#/lib/mailbox-stub";
@@ -37,6 +36,7 @@ import migrationAudit from "../../migrations/d1/0025_outbound_audit.sql?raw";
 import migrationApprovalMeta from "../../migrations/d1/0026_approval_metadata.sql?raw";
 import migrationIntentPayload from "../../migrations/d1/0027_intent_payload.sql?raw";
 import migrationPendingUnique from "../../migrations/d1/0028_approval_pending_unique.sql?raw";
+import { config as mcpConfig } from "../../src/mcp/admin-reads";
 import { applyMigrations } from "../helpers/migrations";
 
 const db = env.INDEX_DB;
@@ -68,7 +68,9 @@ beforeAll(async () => {
 		migrationPendingUnique,
 	);
 	await db
-		.prepare("INSERT INTO runtime_config (key, value, updated_at) VALUES ('deployment.origin', ?, ?)")
+		.prepare(
+			"INSERT INTO runtime_config (key, value, updated_at) VALUES ('deployment.origin', ?, ?)",
+		)
 		.bind(ORIGIN, new Date().toISOString())
 		.run();
 });
@@ -123,7 +125,6 @@ async function registerOwner(email: string): Promise<{ userId: string; jar: Jar 
 	return { userId: user?.id ?? "", jar };
 }
 
-
 type Owner = Awaited<ReturnType<typeof registerOwner>>;
 const EMAIL = "kinds-owner@example.com";
 let owner: Owner;
@@ -137,21 +138,40 @@ beforeAll(async () => {
 async function request(kind: string, payload: unknown) {
 	const intent = await requestControlPlaneChange(env, auth, kind, payload);
 	// A direct change that failed reports its AdminError code; surface it the way a refused request does.
-	if (intent.applied?.status === "failed") throw Object.assign(new Error(intent.applied.errorCode), { code: intent.applied.errorCode });
+	if (intent.applied?.status === "failed")
+		throw Object.assign(new Error(intent.applied.errorCode), { code: intent.applied.errorCode });
 	return intent;
 }
 /** What the owner would be shown for a kind's payload (direct kinds never pend, so render it directly). */
 async function preview(kind: string, payload: unknown) {
 	const definition = controlPlaneKind(kind)!;
 	const rendered = await renderWithSafetyNet(definition, env, auth, definition.validate(payload));
-	return { id: "preview", kind, status: "pending" as const, ...rendered, payloadHash: "h", expiresAt: null };
+	return {
+		id: "preview",
+		kind,
+		status: "pending" as const,
+		...rendered,
+		payloadHash: "h",
+		expiresAt: null,
+	};
 }
-async function approve(intent: { id: string; payloadHash: string; applied?: { status: string; result?: unknown; errorCode?: string } }) {
+async function approve(intent: {
+	id: string;
+	payloadHash: string;
+	applied?: { status: string; result?: unknown; errorCode?: string };
+}) {
 	// Direct kinds already ran at request time; shape their outcome like an approved intent.
 	if (intent.applied)
 		return {
 			status: intent.applied.status === "applied" ? ("executed" as const) : ("failed" as const),
-			result: { items: [{ status: intent.applied.status === "applied" ? "executed" : "failed", result: intent.applied.result }] },
+			result: {
+				items: [
+					{
+						status: intent.applied.status === "applied" ? "executed" : "failed",
+						result: intent.applied.result,
+					},
+				],
+			},
 			reveal: undefined as Array<{ value: string }> | undefined,
 		};
 	return approveIntent(env, {
@@ -189,7 +209,10 @@ async function snapshotId(subject: string): Promise<string> {
 	return row!.id;
 }
 const domainRow = (name: string) =>
-	db.prepare("SELECT * FROM domains WHERE domain = ?").bind(name).first<{ id: string; status: string }>();
+	db
+		.prepare("SELECT * FROM domains WHERE domain = ?")
+		.bind(name)
+		.first<{ id: string; status: string }>();
 
 describe("domains", () => {
 	it("changes nothing before approval, then registers", async () => {
@@ -202,7 +225,9 @@ describe("domains", () => {
 		await expect(request("domain_add", { domain: "x", zoneId: "z" })).rejects.toMatchObject({
 			code: "validation_error",
 		});
-		await expect(request("domain_add", { domain: "ok.example", zoneId: "z", extra: 1 })).rejects.toBeTruthy();
+		await expect(
+			request("domain_add", { domain: "ok.example", zoneId: "z", extra: 1 }),
+		).rejects.toBeTruthy();
 		await expect(
 			requestControlPlaneChange(env, { ...auth, email: "stranger@example.com" }, "domain_add", {
 				domain: "ok.example",
@@ -241,9 +266,19 @@ describe("routing", () => {
 		await applied("alias_add", payload);
 		await expect(request("alias_add", payload)).rejects.toMatchObject({ code: "alias_exists" });
 		await applied("alias_remove", { aliasAddress: payload.aliasAddress });
-		expect(await db.prepare("SELECT 1 FROM aliases WHERE alias_address = ?").bind(payload.aliasAddress).first()).toBeNull();
+		expect(
+			await db
+				.prepare("SELECT 1 FROM aliases WHERE alias_address = ?")
+				.bind(payload.aliasAddress)
+				.first(),
+		).toBeNull();
 		await applied("restore", { opsEventId: await snapshotId(payload.aliasAddress) });
-		expect(await db.prepare("SELECT 1 FROM aliases WHERE alias_address = ?").bind(payload.aliasAddress).first()).not.toBeNull();
+		expect(
+			await db
+				.prepare("SELECT 1 FROM aliases WHERE alias_address = ?")
+				.bind(payload.aliasAddress)
+				.first(),
+		).not.toBeNull();
 	});
 	it("refuses aliases to another owner's mailbox", async () => {
 		await insertMailbox(db, {
@@ -271,7 +306,9 @@ describe("routing", () => {
 			"Reenvío a una dirección externa: ext@elsewhere.test",
 		);
 		expect(rendered.warnings).toHaveLength(1);
-		expect(await db.prepare("SELECT 1 FROM routing_rules WHERE pattern = 'fwd@kinds-r.example'").first()).toBeNull();
+		expect(
+			await db.prepare("SELECT 1 FROM routing_rules WHERE pattern = 'fwd@kinds-r.example'").first(),
+		).toBeNull();
 		await approve(intent);
 		const rule = await db
 			.prepare("SELECT id FROM routing_rules WHERE pattern = 'fwd@kinds-r.example'")
@@ -279,7 +316,9 @@ describe("routing", () => {
 		expect(rule).not.toBeNull();
 		await applied("routing_rule_upsert", { ruleId: rule!.id, priority: 9 });
 		await applied("routing_rule_remove", { ruleId: rule!.id });
-		expect(await db.prepare("SELECT 1 FROM routing_rules WHERE id = ?").bind(rule!.id).first()).toBeNull();
+		expect(
+			await db.prepare("SELECT 1 FROM routing_rules WHERE id = ?").bind(rule!.id).first(),
+		).toBeNull();
 		await applied("restore", { opsEventId: await snapshotId(rule!.id) });
 		expect(
 			await db.prepare("SELECT priority FROM routing_rules WHERE id = ?").bind(rule!.id).first(),
@@ -296,7 +335,10 @@ describe("templates", () => {
 	it("upserts with a diff summary, archives, and refuses non-owners", async () => {
 		await newMailbox("mbx_kinds_t", "t@kinds-t.example");
 		const base = { mailboxId: "mbx_kinds_t", templateId: "welcome" };
-		const tpl = (subject: string, body_text?: string) => ({ ...base, body: { subject, body_text } });
+		const tpl = (subject: string, body_text?: string) => ({
+			...base,
+			body: { subject, body_text },
+		});
 		await applied("template_upsert", tpl("Hola", "uno"));
 		const rendered = await preview("template_upsert", tpl("Hola 2", "uno dos"));
 		const text = JSON.stringify(rendered.fields);
@@ -308,9 +350,9 @@ describe("templates", () => {
 		await expect(
 			request("template_archive", { mailboxId: "mbx_kinds_foreign", templateId: "welcome" }),
 		).rejects.toMatchObject({ code: "forbidden" });
-		await expect(
-			request("template_upsert", tpl("bad\nsubject")),
-		).rejects.toMatchObject({ code: "validation_error" });
+		await expect(request("template_upsert", tpl("bad\nsubject"))).rejects.toMatchObject({
+			code: "validation_error",
+		});
 	});
 });
 
@@ -319,13 +361,17 @@ describe("approval page fidelity", () => {
 		await newMailbox("mbx_kinds_f", "f@kinds-f.example");
 		await applied("domain_add", { domain: "kinds-f.example", zoneId: "zf" });
 		const base = { mailboxId: "mbx_kinds_f", templateId: "promo" };
-		await applied("template_upsert", { ...base, body: { subject: "Hi", body_text: "old line\nkeep" } });
+		await applied("template_upsert", {
+			...base,
+			body: { subject: "Hi", body_text: "old line\nkeep" },
+		});
 		const v = await preview("template_upsert", {
 			...base,
 			body: {
 				subject: "Hi 2",
 				body_text: "Pay now at https://evil.example/pay.\nkeep",
-				body_html: '<p onclick="x()">Go <a href="https://kinds-f.example/ok">ok</a> <a href="https://phish.example/x?a=1&b=2">pay</a></p><script>alert(1)</script>',
+				body_html:
+					'<p onclick="x()">Go <a href="https://kinds-f.example/ok">ok</a> <a href="https://phish.example/x?a=1&b=2">pay</a></p><script>alert(1)</script>',
 			},
 		});
 		const html = renderApprovalPage({ ...v, fields: v.fields, warnings: v.warnings });
@@ -341,7 +387,9 @@ describe("approval page fidelity", () => {
 		const warnings = v.warnings.map((w) => w.message).join("|");
 		expect(warnings).toContain("evil.example");
 		expect(warnings).toContain("phish.example");
-		expect(warnings).not.toContain("dominio que no es uno de tus dominios de envío: kinds-f.example");
+		expect(warnings).not.toContain(
+			"dominio que no es uno de tus dominios de envío: kinds-f.example",
+		);
 	});
 	it("api key and domain provision pages show every approved field", async () => {
 		await newMailbox("mbx_kinds_g", "g@kinds-g.example");
@@ -398,7 +446,7 @@ describe("approval page fidelity", () => {
 		expect(rows["campo: nested.deep"]).toBe("[1,2]");
 		expect(rows["campo: nested.other"]).toBe("true");
 		expect(rows["campo: shown"]).toBeUndefined();
-		expect(renderApprovalPage(v)).toContain("campo: hidden");
+		expect(renderApprovalPage(v)).toContain("Field: hidden");
 	});
 });
 
@@ -419,7 +467,10 @@ describe("api keys", () => {
 		expect(secret).toMatch(/^rck_test_/);
 		expect(JSON.stringify(result.result)).not.toContain(secret);
 		expect(JSON.stringify(await getIntentStatus(env, intent.id))).not.toContain(secret);
-		const stored = await db.prepare("SELECT * FROM approvals WHERE token = ?").bind(intent.id).first();
+		const stored = await db
+			.prepare("SELECT * FROM approvals WHERE token = ?")
+			.bind(intent.id)
+			.first();
 		expect(JSON.stringify(stored)).not.toContain(secret);
 		const events = await db.prepare("SELECT * FROM ops_events").all();
 		expect(JSON.stringify(events.results)).not.toContain(secret);
@@ -430,12 +481,17 @@ describe("api keys", () => {
 	it("rotates, changes scopes and revokes", async () => {
 		const list = async () =>
 			(
-				(await (await mailboxStub(env, "mbx_kinds_k").fetch("https://mailbox-do/transactional/api-keys")).json()) as {
+				(await (
+					await mailboxStub(env, "mbx_kinds_k").fetch("https://mailbox-do/transactional/api-keys")
+				).json()) as {
 					keys: Array<{ keyId: string; status: string; scopes: string[] }>;
 				}
 			).keys;
 		const first = (await list()).find((k) => k.status === "active")!;
-		const rotated = await applied("api_key_rotate", { mailboxId: "mbx_kinds_k", keyId: first.keyId });
+		const rotated = await applied("api_key_rotate", {
+			mailboxId: "mbx_kinds_k",
+			keyId: first.keyId,
+		});
 		expect(rotated.result.reveal?.[0]?.value).toMatch(/^rck_test_/);
 		const second = (await list()).find((k) => k.status === "active")!;
 		expect(second.keyId).not.toBe(first.keyId);
@@ -447,7 +503,10 @@ describe("api keys", () => {
 		expect(scoped.result.reveal).toHaveLength(1);
 		const third = (await list()).find((k) => k.status === "active")!;
 		expect(third.keyId).not.toBe(second.keyId);
-		const revoked = await applied("api_key_revoke", { mailboxId: "mbx_kinds_k", keyId: third.keyId });
+		const revoked = await applied("api_key_revoke", {
+			mailboxId: "mbx_kinds_k",
+			keyId: third.keyId,
+		});
 		expect(revoked.result.reveal).toBeUndefined();
 		expect((await list()).filter((k) => k.status === "active")).toHaveLength(0);
 	});
@@ -466,9 +525,7 @@ describe("api key template allowlist (in place)", () => {
 	const keyApi = (path = "") => `https://mailbox-do/transactional/api-keys${path}`;
 	type KeyRow = { keyId: string; status: string; templateAllowlist: string[] | null };
 	const keys = async () =>
-		(
-			(await (await mailboxStub(env, MBX).fetch(keyApi())).json()) as { keys: KeyRow[] }
-		).keys;
+		((await (await mailboxStub(env, MBX).fetch(keyApi())).json()) as { keys: KeyRow[] }).keys;
 	const send = async (secret: string, template: string, idem: string) => {
 		const response = await mailboxStub(env, MBX).fetch("https://mailbox-do/transactional/send", {
 			method: "POST",
@@ -509,7 +566,9 @@ describe("api key template allowlist (in place)", () => {
 		expect(v.fields.find((f) => f.label === "Añadidas")?.value).toBe("reset");
 		const codes = v.warnings.map((w) => w.code);
 		expect(codes).toContain("template_missing");
-		expect(v.warnings.map((w) => w.message).join("|")).toContain("la plantilla reset no existe todavía");
+		expect(v.warnings.map((w) => w.message).join("|")).toContain(
+			"la plantilla reset no existe todavía",
+		);
 		expect(codes).not.toContain("key_replaced");
 	});
 	it("applies in place: same key id and secret, allowlist, event and nothing revealed", async () => {
@@ -519,7 +578,11 @@ describe("api key template allowlist (in place)", () => {
 			body: JSON.stringify({ id: "reset", subject: "Reset" }),
 		});
 		expect(tpl.status).toBe(201);
-		const { result } = await applied("api_key_templates", { mailboxId: MBX, keyId, add: ["reset", "welcome"] });
+		const { result } = await applied("api_key_templates", {
+			mailboxId: MBX,
+			keyId,
+			add: ["reset", "welcome"],
+		});
 		expect(result.reveal).toBeUndefined();
 		expect(JSON.stringify(result.result)).not.toContain(secret);
 		const active = (await keys()).filter((k) => k.status === "active");
@@ -551,22 +614,36 @@ describe("api key template allowlist (in place)", () => {
 		expect((await keys()).find((k) => k.keyId === keyId)?.templateAllowlist).toEqual(["b", "c"]);
 	});
 	it("refuses set mixed with add/remove, empty list on a send key, unknown fields and foreign mailboxes", async () => {
-		await expect(request("api_key_templates", { mailboxId: MBX, keyId, set: ["a"], add: ["b"] })).rejects.toBeTruthy();
+		await expect(
+			request("api_key_templates", { mailboxId: MBX, keyId, set: ["a"], add: ["b"] }),
+		).rejects.toBeTruthy();
 		await expect(request("api_key_templates", { mailboxId: MBX, keyId })).rejects.toBeTruthy();
-		await expect(request("api_key_templates", { mailboxId: MBX, keyId, add: ["a"], extra: 1 })).rejects.toBeTruthy();
+		await expect(
+			request("api_key_templates", { mailboxId: MBX, keyId, add: ["a"], extra: 1 }),
+		).rejects.toBeTruthy();
 		await expect(
 			request("api_key_templates", { mailboxId: "mbx_kinds_foreign", keyId, add: ["a"] }),
 		).rejects.toMatchObject({ code: "forbidden" });
-		await expect(request("api_key_templates", { mailboxId: MBX, keyId, set: [] })).rejects.toBeTruthy();
+		await expect(
+			request("api_key_templates", { mailboxId: MBX, keyId, set: [] }),
+		).rejects.toBeTruthy();
 		expect((await keys()).find((k) => k.keyId === keyId)?.templateAllowlist).toEqual(["b", "c"]);
 	});
 	it("the DO refuses bad ids, over-long lists, a revoked key and an unknown key", async () => {
 		await runInDurableObject(mailboxStub(env, MBX), async (_i, state) => {
 			const sql = state.storage.sql;
-			expect(() => updateApiKeyTemplateAllowlist(sql, keyId, [""])).toThrow("invalid_template_allowlist");
-			expect(() => updateApiKeyTemplateAllowlist(sql, keyId, ["x".repeat(129)])).toThrow("invalid_template_allowlist");
+			expect(() => updateApiKeyTemplateAllowlist(sql, keyId, [""])).toThrow(
+				"invalid_template_allowlist",
+			);
+			expect(() => updateApiKeyTemplateAllowlist(sql, keyId, ["x".repeat(129)])).toThrow(
+				"invalid_template_allowlist",
+			);
 			expect(() =>
-				updateApiKeyTemplateAllowlist(sql, keyId, Array.from({ length: 101 }, (_, i) => `t${i}`)),
+				updateApiKeyTemplateAllowlist(
+					sql,
+					keyId,
+					Array.from({ length: 101 }, (_, i) => `t${i}`),
+				),
 			).toThrow("invalid_template_allowlist");
 			expect(() => updateApiKeyTemplateAllowlist(sql, keyId, [])).toThrow(
 				"send_scope_requires_template_allowlist",
@@ -575,13 +652,16 @@ describe("api key template allowlist (in place)", () => {
 		});
 		await applied("api_key_revoke", { mailboxId: MBX, keyId });
 		await runInDurableObject(mailboxStub(env, MBX), async (_i, state) => {
-			expect(() => updateApiKeyTemplateAllowlist(state.storage.sql, keyId, ["a"])).toThrow("key_not_active");
+			expect(() => updateApiKeyTemplateAllowlist(state.storage.sql, keyId, ["a"])).toThrow(
+				"key_not_active",
+			);
 		});
 	});
 	it("list_config exposes the allowlist and template ids", async () => {
 		const config = await mcpConfig(env, { ...auth } as never);
-		const detail = (config as { mailboxDetails: Array<{ mailboxId: string; keys: unknown; templates: unknown }> })
-			.mailboxDetails.find((m) => m.mailboxId === MBX)!;
+		const detail = (
+			config as { mailboxDetails: Array<{ mailboxId: string; keys: unknown; templates: unknown }> }
+		).mailboxDetails.find((m) => m.mailboxId === MBX)!;
 		expect(JSON.stringify(detail.keys)).toContain("templateAllowlist");
 		expect(JSON.stringify(detail.templates)).toContain('"reset"');
 	});
@@ -601,7 +681,11 @@ describe("suppressions and reconcile", () => {
 		expect(rendered.warnings[0]?.message).toContain("rebotó o se quejó");
 		const count = async () =>
 			(
-				(await (await mailboxStub(env, "mbx_kinds_s").fetch("https://mailbox-do/transactional/suppressions")).json()) as {
+				(await (
+					await mailboxStub(env, "mbx_kinds_s").fetch(
+						"https://mailbox-do/transactional/suppressions",
+					)
+				).json()) as {
 					suppressions: unknown[];
 				}
 			).suppressions.length;
@@ -609,7 +693,10 @@ describe("suppressions and reconcile", () => {
 		await approve(intent);
 		expect(await count()).toBe(0);
 		await expect(
-			request("suppression_remove", { mailboxId: "mbx_kinds_s", body: { email: "bounced@example.net" } }),
+			request("suppression_remove", {
+				mailboxId: "mbx_kinds_s",
+				body: { email: "bounced@example.net" },
+			}),
 		).rejects.toMatchObject({ code: "suppression_not_found" });
 		await expect(
 			request("suppression_remove", { mailboxId: "mbx_kinds_s", body: { email: "not-an-email" } }),
@@ -626,12 +713,14 @@ describe("suppressions and reconcile", () => {
 		const rendered = await preview("transactional_reconcile", { mailboxId: "mbx_kinds_s" });
 		expect(JSON.stringify(rendered.fields)).toContain('"1"');
 		expect(rendered.warnings[0]?.message).toContain("No se reenvía");
-		const before = await db.prepare("SELECT COUNT(*) AS n FROM outbound_sends").first<{ n: number }>();
+		const before = await db
+			.prepare("SELECT COUNT(*) AS n FROM outbound_sends")
+			.first<{ n: number }>();
 		const done = await request("transactional_reconcile", { mailboxId: "mbx_kinds_s" });
 		expect(done.applied?.status).toBe("applied");
-		expect((await db.prepare("SELECT COUNT(*) AS n FROM outbound_sends").first<{ n: number }>())?.n).toBe(
-			before?.n,
-		);
+		expect(
+			(await db.prepare("SELECT COUNT(*) AS n FROM outbound_sends").first<{ n: number }>())?.n,
+		).toBe(before?.n);
 		await expect(
 			request("transactional_reconcile", { mailboxId: "mbx_kinds_foreign" }),
 		).rejects.toMatchObject({ code: "forbidden" });
@@ -640,10 +729,21 @@ describe("suppressions and reconcile", () => {
 		await newMailbox("mbx_kinds_x", "x@kinds-x.example");
 		await applied("mailbox_disable", { mailboxId: "mbx_kinds_x" });
 		const snap = await snapshotId("mbx_kinds_x");
-		await db.prepare("UPDATE mailboxes SET owner_email = 'someone-else@example.com' WHERE mailbox_id = 'mbx_kinds_x'").run();
-		await expect(request("restore", { opsEventId: snap })).rejects.toMatchObject({ code: "forbidden" });
-		await db.prepare("UPDATE mailboxes SET owner_email = ? WHERE mailbox_id = 'mbx_kinds_x'").bind(EMAIL).run();
+		await db
+			.prepare(
+				"UPDATE mailboxes SET owner_email = 'someone-else@example.com' WHERE mailbox_id = 'mbx_kinds_x'",
+			)
+			.run();
+		await expect(request("restore", { opsEventId: snap })).rejects.toMatchObject({
+			code: "forbidden",
+		});
+		await db
+			.prepare("UPDATE mailboxes SET owner_email = ? WHERE mailbox_id = 'mbx_kinds_x'")
+			.bind(EMAIL)
+			.run();
 		await applied("restore", { opsEventId: snap });
-		expect((await db.prepare("SELECT status FROM mailboxes WHERE mailbox_id = 'mbx_kinds_x'").first())).toEqual({ status: "active" });
+		expect(
+			await db.prepare("SELECT status FROM mailboxes WHERE mailbox_id = 'mbx_kinds_x'").first(),
+		).toEqual({ status: "active" });
 	});
 });

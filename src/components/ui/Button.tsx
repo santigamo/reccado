@@ -1,42 +1,51 @@
 import type { ButtonHTMLAttributes } from "react";
 import { cn } from "#/lib/cn";
 
-type Variant = "primary" | "secondary" | "ghost" | "danger";
-type Size = "sm" | "md";
+export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
+export type ButtonSize = "sm" | "md";
 
-const VARIANTS: Record<Variant, string> = {
+const VARIANTS: Record<ButtonVariant, string> = {
+	// Navy pill — Compose, "Approve & send", "Create mailbox".
 	primary:
-		"bg-[var(--app-accent)] text-[var(--app-on-accent)] hover:bg-[var(--app-accent-hover)] border border-transparent",
-	secondary:
-		"bg-[var(--app-surface)] text-[var(--app-text)] border border-[var(--app-border-strong)] hover:bg-[var(--app-hover)]",
-	ghost:
-		"bg-transparent text-[var(--app-text-soft)] border border-transparent hover:bg-[var(--app-hover)]",
+		"bg-brand text-white shadow-primary hover:bg-brand-hover disabled:bg-disabled disabled:shadow-none",
+	// White outline pill — "Edit".
+	secondary: "border border-[#DCDCDC] bg-panel text-text hover:bg-row-selected",
+	// Text-only — "Cancel", "Discard".
+	ghost: "text-text-secondary hover:bg-hover hover:text-text",
 	danger:
-		"bg-transparent text-[var(--app-danger)] border border-transparent hover:bg-[color-mix(in_oklab,var(--app-danger)_12%,transparent)]",
+		"border border-[color-mix(in_srgb,var(--color-danger)_35%,transparent)] bg-panel text-danger hover:bg-[color-mix(in_srgb,var(--color-danger)_8%,white)]",
 };
 
-const SIZES: Record<Size, string> = {
-	sm: "h-8 px-3 text-[13px] gap-1.5 rounded-md",
-	md: "h-10 px-5 text-sm gap-2 rounded-full",
+const SIZES: Record<ButtonSize, string> = {
+	sm: "h-8 gap-1.5 px-3 text-label",
+	// 44px tall on touch screens (primary actions need a full touch target).
+	md: "h-9 gap-2 px-4 text-body pointer-coarse:h-11",
 };
 
+/** Class string for anything that should look like a Button (e.g. a router `<Link>`). */
+export function buttonClassName(
+	variant: ButtonVariant = "secondary",
+	size: ButtonSize = "md",
+	className?: string,
+): string {
+	return cn(
+		"relative inline-flex shrink-0 select-none items-center justify-center whitespace-nowrap rounded-pill font-medium tracking-[-0.01em] no-underline transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100 [&_svg]:size-4 [&_svg]:shrink-0",
+		VARIANTS[variant],
+		SIZES[size],
+		className,
+	);
+}
+
+/**
+ * Pill button. `primary` navy, `secondary` white outline, `ghost` text-only,
+ * `danger` outlined red. Icons go in `children` (lucide icons are sized 16px).
+ */
 export function Button({
 	variant = "secondary",
 	size = "md",
 	className,
 	type = "button",
 	...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: Variant; size?: Size }) {
-	return (
-		<button
-			type={type}
-			className={cn(
-				"inline-flex select-none items-center justify-center font-medium transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100",
-				VARIANTS[variant],
-				SIZES[size],
-				className,
-			)}
-			{...props}
-		/>
-	);
+}: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: ButtonVariant; size?: ButtonSize }) {
+	return <button type={type} className={buttonClassName(variant, size, className)} {...props} />;
 }

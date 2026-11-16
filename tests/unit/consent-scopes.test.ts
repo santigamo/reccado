@@ -15,7 +15,10 @@ async function constrain(body: Record<string, unknown>): Promise<{ scope?: strin
 
 describe("consent scope narrowing", () => {
 	it("does not grant high-risk scopes when the body names no scope", async () => {
-		const out = await constrain({ accept: true, oauth_query: `client_id=x&scope=${encodeURIComponent(ALL)}` });
+		const out = await constrain({
+			accept: true,
+			oauth_query: `client_id=x&scope=${encodeURIComponent(ALL)}`,
+		});
 		expect(out.scope).toBe("mail:read mail:draft config:read templates:write");
 	});
 

@@ -92,9 +92,10 @@ export async function handleScheduled(controller: ScheduledController, env: Env)
 	const expiredTelegramActions = await deleteExpiredTelegramActions(env.INDEX_DB);
 
 	// Open DCR leaves never-consented client rows behind; drop those older than 24 h.
-	const sweptOAuthClients = await sweepStaleOAuthClients(env.INDEX_DB, controller.scheduledTime).catch(
-		() => 0,
-	);
+	const sweptOAuthClients = await sweepStaleOAuthClients(
+		env.INDEX_DB,
+		controller.scheduledTime,
+	).catch(() => 0);
 
 	// Releases a quiet-hours digest and prunes the bridge's ephemeral tables. The
 	// digest also flushes on the next inbound mail, so this is what covers the

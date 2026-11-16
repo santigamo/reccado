@@ -1,12 +1,22 @@
 import { requireMcpAuth } from "@better-auth/mcp";
 import { McpServer, type McpRequestContext } from "@modelcontextprotocol/server";
 import { createMcpHandler } from "agents/mcp/server";
-import { createAuth, AuthConfigError, getDeploymentOriginForAuth, resolveMcpResource } from "../api/better-auth";
+import {
+	createAuth,
+	AuthConfigError,
+	getDeploymentOriginForAuth,
+	resolveMcpResource,
+} from "../api/better-auth";
 import { recordDeploymentOrigin } from "../db/runtime-config";
 import { requireMcpOwner, resolveOwnerEmails } from "./auth-import";
 import { registerTools } from "./tools";
 import { registerResources } from "./resources";
-import { insufficientScope, neededScopeFor, scopesFromClaims, toolPermitted } from "../lib/mcp-scopes";
+import {
+	insufficientScope,
+	neededScopeFor,
+	scopesFromClaims,
+	toolPermitted,
+} from "../lib/mcp-scopes";
 import type { McpSendAuth as McpAuthContext } from "./types";
 import { makeIntentCodec } from "./intent-flow";
 
@@ -23,7 +33,10 @@ type McpAccessTokenClaims = {
 };
 
 /** The scope a JSON-RPC `tools/call` needs but the token lacks, or null when the call is fine / not a tool call. */
-export async function missingScopeForToolCall(request: Request, granted: ReadonlySet<string>): Promise<string | null> {
+export async function missingScopeForToolCall(
+	request: Request,
+	granted: ReadonlySet<string>,
+): Promise<string | null> {
 	if (request.method !== "POST") return null;
 	let body: unknown;
 	try {
@@ -51,7 +64,10 @@ export function isLegacyMcpRequest(context: McpRequestContext): boolean {
  * tokens are bound to), operator-listed `MCP_ALLOWED_HOSTS`, and the request's own
  * `*.workers.dev` hostname. Everything else is refused by the SDK's Host check.
  */
-export async function resolveAllowedHostnames(env: Env, requestHostname: string): Promise<string[]> {
+export async function resolveAllowedHostnames(
+	env: Env,
+	requestHostname: string,
+): Promise<string[]> {
 	const hosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
 	const origin = await getDeploymentOriginForAuth(env.INDEX_DB).catch(() => null);
 	if (origin) {
@@ -80,12 +96,21 @@ async function runMcpServer(
 	const secret = env.BETTER_AUTH_SECRET?.trim();
 	const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 	if (!secret && !local) return Response.json({ error: "auth_unavailable" }, { status: 503 });
-	const codec = await makeIntentCodec(secret || `local:${env.PHASE0_DEBUG_TOKEN ?? ""}`, `${auth.userId}\0${auth.oauthClientId ?? ""}`);
+	const codec = await makeIntentCodec(
+		secret || `local:${env.PHASE0_DEBUG_TOKEN ?? ""}`,
+		`${auth.userId}\0${auth.oauthClientId ?? ""}`,
+	);
 	const allowedHostnames = await resolveAllowedHostnames(env, hostname);
 	const handler = createMcpHandler(
 		(requestContext) => {
-			const server = new McpServer({ name: "reccado", version: "1.0.0" }, { requestState: { verify: codec.verify } });
-			registerTools(server, env, auth, new URL(request.url).origin, { era: requestContext.era, codec });
+			const server = new McpServer(
+				{ name: "reccado", version: "1.0.0" },
+				{ requestState: { verify: codec.verify } },
+			);
+			registerTools(server, env, auth, new URL(request.url).origin, {
+				era: requestContext.era,
+				codec,
+			});
 			registerResources(server, env, auth);
 			return server;
 		},
@@ -184,7 +209,11 @@ export async function mcpHandler(
 			// tools/list, or an old `admin` token) gets the spec insufficient_scope
 			// challenge naming the exact scope, instead of "unknown tool".
 			const blocked = await missingScopeForToolCall(req, ownerAuth.scopes);
-			if (blocked) return insufficientScope(blocked, `${new URL(resource).origin}/.well-known/oauth-protected-resource/mcp`);
+			if (blocked)
+				return insufficientScope(
+					blocked,
+					`${new URL(resource).origin}/.well-known/oauth-protected-resource/mcp`,
+				);
 
 			return runMcpServer(req, env, ctx, ownerAuth);
 		},

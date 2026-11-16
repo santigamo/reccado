@@ -15,29 +15,30 @@
  */
 
 import {
+	type ApprovalRow,
 	consumeApproval,
 	getApproval,
 	getOutboundSendByIntentId,
 	insertApprovalIntent,
 	insertOpsEvent,
 	listDomains,
-	type ApprovalRow,
 	type OutboundSendRow,
 } from "../db/d1";
-import { hmacSha256 } from "./crypto";
-import { domainFromAddress } from "./email-headers";
-import { getSendingFeedbackStatus } from "./feedback-liveness";
-import { mailboxStub } from "./mailbox-stub";
-import { confirmDraftSend } from "./outbound-send";
-import { classifySensitive } from "./sensitive-mail";
+import { AdminError } from "./admin/errors";
 import {
 	canonicalJson,
 	controlPlaneKind,
 	hashPayload,
 	ownerForUser,
 } from "./control-plane-intents";
-import { renderWithSafetyNet } from "./control-plane-registry";
-import { AdminError } from "./admin/errors";
+import { ControlPlaneRefusal, renderWithSafetyNet } from "./control-plane-registry";
+import { hmacSha256 } from "./crypto";
+import { domainFromAddress } from "./email-headers";
+import { getSendingFeedbackStatus } from "./feedback-liveness";
+import { mailboxStub } from "./mailbox-stub";
+import { confirmDraftSend } from "./outbound-send";
+import { classifySensitive } from "./sensitive-mail";
+
 export { registerControlPlaneKind, requestControlPlaneChange } from "./control-plane-intents";
 
 const MCP_TTL_MS = 10 * 60 * 1000;
@@ -59,7 +60,8 @@ export type IntentStatusName =
  */
 export type IntentFieldFormat = "text" | "pre" | "list";
 export type IntentField = { label: string; value: string; format?: IntentFieldFormat };
-export type IntentWarning = { code: string; message: string };
+/** `address` names the recipient a per-recipient warning is about (send warnings only). */
+export type IntentWarning = { code: string; message: string; address?: string };
 
 export type IntentStatus = {
 	status: IntentStatusName;
@@ -74,6 +76,8 @@ export type IntentStatus = {
 			status: "executed" | "failed" | "not_run";
 			result?: unknown;
 			errorCode?: string;
+			/** A kind's reasoned refusal (`ControlPlaneRefusal.detail`): why, and what to do. */
+			detail?: Record<string, unknown>;
 		}>;
 	} | null;
 };
@@ -99,7 +103,7 @@ export type McpApprovalProof = {
 	sig: string;
 };
 
-type FrozenSend = {
+export type FrozenSend = {
 	payloadHash: string;
 	stale: boolean;
 	snapshot: Record<string, unknown>;
@@ -255,23 +259,61 @@ export async function createIntent(
 /** Atomically share the one live MCP send approval for a draft. */
 export async function getOrCreatePendingIntent(
 	env: Env,
-	input: { kind: "send"; origin: "mcp"; mailboxId: string; draftId: string; payloadHash: string;
-		oauthClientId?: string | null; tokenSub?: string | null; tokenJti?: string | null },
+	input: {
+		kind: "send";
+		origin: "mcp";
+		mailboxId: string;
+		draftId: string;
+		payloadHash: string;
+		oauthClientId?: string | null;
+		tokenSub?: string | null;
+		tokenJti?: string | null;
+	},
 ): Promise<{ intent: { id: string; expiresAt: string; payloadHash: string }; created: boolean }> {
-	if (!input.mailboxId || !input.draftId || !/^[a-f0-9]{64}$/.test(input.payloadHash)) throw new Error("invalid_intent_target");
+	if (!input.mailboxId || !input.draftId || !/^[a-f0-9]{64}$/.test(input.payloadHash))
+		throw new Error("invalid_intent_target");
 	const now = new Date().toISOString();
 	const id = randomId();
 	const expiresAt = new Date(Date.now() + MCP_TTL_MS).toISOString();
-	await env.INDEX_DB.prepare(`UPDATE approvals SET consumed_at = ? WHERE kind = 'send' AND origin = 'mcp' AND mailbox_id = ? AND draft_id = ? AND consumed_at IS NULL AND decision IS NULL AND expires_at <= ?`)
-		.bind(now, input.mailboxId, input.draftId, now).run();
-	const inserted = await env.INDEX_DB.prepare(`INSERT INTO approvals (token, kind, origin, mailbox_id, draft_id, payload_hash, created_at, expires_at, oauth_client_id, token_sub, token_jti) VALUES (?, 'send', 'mcp', ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`)
-		.bind(id, input.mailboxId, input.draftId, input.payloadHash, now, expiresAt, bounded(input.oauthClientId, 2048), bounded(input.tokenSub, 512), bounded(input.tokenJti, 512)).run();
-	const row = await env.INDEX_DB.prepare(`SELECT token, expires_at, payload_hash FROM approvals WHERE kind = 'send' AND origin = 'mcp' AND mailbox_id = ? AND draft_id = ? AND consumed_at IS NULL AND decision IS NULL`)
-		.bind(input.mailboxId, input.draftId).first<{ token: string; expires_at: string; payload_hash: string }>();
+	await env.INDEX_DB.prepare(
+		`UPDATE approvals SET consumed_at = ? WHERE kind = 'send' AND origin = 'mcp' AND mailbox_id = ? AND draft_id = ? AND consumed_at IS NULL AND decision IS NULL AND expires_at <= ?`,
+	)
+		.bind(now, input.mailboxId, input.draftId, now)
+		.run();
+	const inserted = await env.INDEX_DB.prepare(
+		`INSERT INTO approvals (token, kind, origin, mailbox_id, draft_id, payload_hash, created_at, expires_at, oauth_client_id, token_sub, token_jti) VALUES (?, 'send', 'mcp', ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+	)
+		.bind(
+			id,
+			input.mailboxId,
+			input.draftId,
+			input.payloadHash,
+			now,
+			expiresAt,
+			bounded(input.oauthClientId, 2048),
+			bounded(input.tokenSub, 512),
+			bounded(input.tokenJti, 512),
+		)
+		.run();
+	const row = await env.INDEX_DB.prepare(
+		`SELECT token, expires_at, payload_hash FROM approvals WHERE kind = 'send' AND origin = 'mcp' AND mailbox_id = ? AND draft_id = ? AND consumed_at IS NULL AND decision IS NULL`,
+	)
+		.bind(input.mailboxId, input.draftId)
+		.first<{ token: string; expires_at: string; payload_hash: string }>();
 	if (!row) throw new Error("intent_unavailable");
 	const created = (inserted.meta?.changes ?? 0) === 1;
-	if (created) await recordEvent(env, id, "approval.created", { kind: input.kind, origin: input.origin, mailboxId: input.mailboxId, draftId: input.draftId, payloadHash: input.payloadHash });
-	return { intent: { id: row.token, expiresAt: row.expires_at, payloadHash: row.payload_hash }, created };
+	if (created)
+		await recordEvent(env, id, "approval.created", {
+			kind: input.kind,
+			origin: input.origin,
+			mailboxId: input.mailboxId,
+			draftId: input.draftId,
+			payloadHash: input.payloadHash,
+		});
+	return {
+		intent: { id: row.token, expiresAt: row.expires_at, payloadHash: row.payload_hash },
+		created,
+	};
 }
 
 async function recordEvent(
@@ -313,7 +355,7 @@ async function feedbackFor(
 	}
 }
 
-async function readFrozen(
+export async function readFrozen(
 	env: Env,
 	mailboxId: string,
 	draftId: string,
@@ -419,12 +461,14 @@ async function warningsForSend(
 			warnings.push({
 				code: "external_recipient",
 				message: `El destinatario ${address} está fuera de tus dominios.`,
+				address,
 			});
 		}
 		if (address && !seen.has(address)) {
 			warnings.push({
 				code: "never_seen_recipient",
 				message: `Nunca has intercambiado correo con ${address} en este buzón.`,
+				address,
 			});
 		}
 	}
@@ -471,8 +515,19 @@ function expiredStatus(): IntentStatus {
 	return { status: "expired", send: null, deliveryFeedback: null };
 }
 
-export async function getIntentStatus(env: Env, id: string): Promise<IntentStatus> {
-	const row = await getApproval(env.INDEX_DB, id);
+/**
+ * What a caller already read for this request, so one render does not read the
+ * D1 row or the frozen snapshot (a mailbox DO round trip) twice. `frozen`
+ * undefined means "not read yet"; null means "read, and there is none".
+ */
+type Preloaded = { row: ApprovalRow | null; frozen?: FrozenSend | null };
+
+export async function getIntentStatus(
+	env: Env,
+	id: string,
+	preloaded?: Preloaded,
+): Promise<IntentStatus> {
+	const row = preloaded ? preloaded.row : await getApproval(env.INDEX_DB, id);
 	if (!row) return expiredStatus();
 	if (row.kind !== "send" && controlPlaneKind(row.kind)) {
 		const stored = await controlData(env, id);
@@ -501,7 +556,10 @@ export async function getIntentStatus(env: Env, id: string): Promise<IntentStatu
 	let from: string | null = null;
 	let frozen: FrozenSend | null = null;
 	if (row.kind === "send" && row.mailbox_id && row.draft_id) {
-		frozen = await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null);
+		frozen =
+			preloaded?.frozen !== undefined
+				? preloaded.frozen
+				: await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null);
 		from = frozen ? fieldsFromSnapshot(frozen.snapshot).from : null;
 	}
 	const deliveryFeedback = await feedbackFor(env, from);
@@ -532,6 +590,19 @@ export async function getIntentView(
 	id: string,
 	actor: { userId: string },
 ): Promise<IntentView> {
+	return (await buildView(env, id, actor.userId)).view;
+}
+
+/**
+ * The same view, plus the frozen send snapshot it was rendered from (null for a
+ * control-plane kind or a send whose snapshot is gone), read once. For the
+ * inbox queue, which lays the snapshot out itself.
+ */
+export async function getIntentViewWithSnapshot(
+	env: Env,
+	id: string,
+	actor: { userId: string },
+): Promise<{ view: IntentView; frozen: FrozenSend | null }> {
 	return buildView(env, id, actor.userId);
 }
 
@@ -541,28 +612,36 @@ export async function getIntentView(
  */
 export async function getIntentCard(env: Env, id: string): Promise<IntentView> {
 	const row = await getApproval(env.INDEX_DB, id);
-	return buildView(env, id, row?.token_sub ?? null);
+	return (await buildView(env, id, row?.token_sub ?? null)).view;
 }
 
-async function buildView(env: Env, id: string, userId: string | null): Promise<IntentView> {
+async function buildView(
+	env: Env,
+	id: string,
+	userId: string | null,
+): Promise<{ view: IntentView; frozen: FrozenSend | null }> {
 	const row = await getApproval(env.INDEX_DB, id);
-	const status = await getIntentStatus(env, id);
 	if (!row) {
 		return {
-			id,
-			kind: "send",
-			status: "expired",
-			title: "Solicitud caducada",
-			fields: [],
-			warnings: [],
-			payloadHash: null,
-			expiresAt: null,
+			view: {
+				id,
+				kind: "send",
+				status: "expired",
+				title: "Solicitud caducada",
+				fields: [],
+				warnings: [],
+				payloadHash: null,
+				expiresAt: null,
+			},
+			frozen: null,
 		};
 	}
+	// Read once; the status below is computed from the same row and snapshot.
 	const frozen =
 		row.kind === "send" && row.mailbox_id && row.draft_id
 			? await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null)
 			: null;
+	const status = await getIntentStatus(env, id, { row, frozen });
 	let warnings =
 		row.kind === "send" && frozen
 			? await warningsForSend(env, frozen.snapshot, frozen.seenAddresses)
@@ -578,22 +657,48 @@ async function buildView(env: Env, id: string, userId: string | null): Promise<I
 			const data = await controlData(env, id);
 			const actorAuth = await ownerForUser(env, userId);
 			const payload: unknown = JSON.parse(data?.payload_json ?? "null");
-			const part = await renderWithSafetyNet(definition, env, actorAuth, definition.validate(payload));
+			const part = await renderWithSafetyNet(
+				definition,
+				env,
+				actorAuth,
+				definition.validate(payload),
+			);
 			rendered = { title: part.title, fields: part.fields };
 			warnings = part.warnings;
 		} catch {
 			status.status = "stale";
 		}
+	} else if (
+		definition?.describeOutcome &&
+		status.result?.items[0] &&
+		userId &&
+		(!row.token_sub || row.token_sub === userId)
+	) {
+		// Decided: the kind may tell the owner who could approve it what was asked and what came of it.
+		try {
+			const data = await controlData(env, id);
+			const payload = JSON.parse(data?.payload_json ?? "null") as Record<string, unknown>;
+			if (payload && typeof payload === "object")
+				rendered = {
+					...rendered,
+					fields: definition.describeOutcome(payload, status.result.items[0]),
+				};
+		} catch {
+			// Nothing to add: the status card still says what happened.
+		}
 	}
 	return {
-		id: row.token,
-		kind: row.kind,
-		status: status.status,
-		title: rendered.title,
-		fields: rendered.fields,
-		warnings,
-		payloadHash: status.status === "pending" ? row.payload_hash : null,
-		expiresAt: row.expires_at,
+		view: {
+			id: row.token,
+			kind: row.kind,
+			status: status.status,
+			title: rendered.title,
+			fields: rendered.fields,
+			warnings,
+			payloadHash: status.status === "pending" ? row.payload_hash : null,
+			expiresAt: row.expires_at,
+		},
+		frozen,
 	};
 }
 
@@ -617,7 +722,7 @@ export async function approveIntent(
 	},
 ): Promise<IntentStatus & { error?: string; reveal?: IntentField[]; resolved?: boolean }> {
 	const row = await getApproval(env.INDEX_DB, input.id);
-	if (!row || !row.payload_hash || (row.kind === "send" && (!row.mailbox_id || !row.draft_id))) {
+	if (!row?.payload_hash || (row.kind === "send" && (!row.mailbox_id || !row.draft_id))) {
 		return { ...expiredStatus(), error: "expired" };
 	}
 	if (row.consumed_at || row.decision) {
@@ -669,7 +774,10 @@ export async function approveIntent(
 		tokenJti: row.token_jti ?? null,
 	});
 	if (row.kind === "send") return dispatchSend(env, row);
-	return dispatchControl(env, row, actorUserId!, { channel: input.channel, approver: input.approver });
+	return dispatchControl(env, row, actorUserId!, {
+		channel: input.channel,
+		approver: input.approver,
+	});
 }
 
 async function controlData(
@@ -734,6 +842,7 @@ async function dispatchControl(
 		results.push({
 			status: "failed",
 			errorCode: error instanceof AdminError ? error.code : "execution_failed",
+			...(error instanceof ControlPlaneRefusal ? { detail: error.detail } : {}),
 		});
 	}
 	await env.INDEX_DB.prepare("UPDATE approvals SET result_json = ? WHERE token = ?")

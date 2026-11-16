@@ -1,17 +1,27 @@
-import { createFileRoute } from "@tanstack/react-router";
-import type { ReactElement } from "react";
+import { createFileRoute, useLocation } from "@tanstack/react-router";
+import type { ReactElement, ReactNode } from "react";
 import { useState } from "react";
+import { ChevronDownIcon } from "#/components/auth/icons";
+import {
+	ApprovalStrip,
+	AuthPage,
+	Brand,
+	Card,
+	CardHeader,
+	Checkbox,
+	CodeInput,
+	Field,
+	InlineError,
+	PrimaryButton,
+	SecondaryButton,
+	SelfHostedNote,
+	TextButton,
+	TextInput,
+} from "#/components/auth/primitives";
 
 export const Route = createFileRoute("/login")({ component: LoginPage });
 
 type Step = "credentials" | "totp" | "otp-code";
-
-const FIELD_CLASS =
-	"mt-1 w-full rounded-xl border border-[rgba(50,143,151,0.3)] bg-transparent px-3 py-2 text-sm text-[var(--sea-ink)] outline-none focus:border-[rgba(79,184,178,0.6)]";
-const PRIMARY_BUTTON_CLASS =
-	"w-full rounded-full border border-[rgba(50,143,151,0.3)] bg-[rgba(79,184,178,0.14)] px-5 py-2.5 text-sm font-semibold text-[var(--lagoon-deep)] transition hover:bg-[rgba(79,184,178,0.24)] disabled:opacity-50";
-const SECONDARY_BUTTON_CLASS =
-	"w-full rounded-full border border-[rgba(50,143,151,0.3)] px-5 py-2.5 text-sm font-semibold text-[var(--lagoon-deep)] transition hover:bg-[rgba(79,184,178,0.14)] disabled:opacity-50";
 
 async function postJson(url: string, body: Record<string, unknown>): Promise<Response> {
 	return fetch(url, {
@@ -26,8 +36,8 @@ const NETWORK_ERROR = "The request never reached the server. Check your connecti
 /** Same-origin path only. A protocol-relative or backslash next is ignored. */
 function destination(): string {
 	const next = new URLSearchParams(window.location.search).get("next");
-	if (next && next.startsWith("/") && !next.startsWith("//") && !next.includes("\\")) return next;
-	return "/mailboxes";
+	if (next?.startsWith("/") && !next.startsWith("//") && !next.includes("\\")) return next;
+	return "/inbox";
 }
 
 /**
@@ -61,10 +71,16 @@ function LoginPage(): ReactElement {
 	const [otp, setOtp] = useState("");
 	const [otpError, setOtpError] = useState<string | null>(null);
 	const [otpBusy, setOtpBusy] = useState(false);
+	const [otpResent, setOtpResent] = useState(false);
 
 	const [pairingCode, setPairingCode] = useState("");
 	const [pairingError, setPairingError] = useState<string | null>(null);
 	const [pairingBusy, setPairingBusy] = useState(false);
+
+	// Display only: the strip says where the sign-in leads. The redirect itself
+	// still goes through destination(), which validates `next` at click time.
+	const search = useLocation({ select: (location) => location.search }) as Record<string, unknown>;
+	const forApproval = typeof search.next === "string" && search.next.startsWith("/approve/");
 
 	// Full navigation so the new session cookie is part of the next load.
 	//
@@ -73,6 +89,13 @@ function LoginPage(): ReactElement {
 	// in and stopping at / therefore left the origin pointing at whatever
 	// hostname was used last -- which is what MCP tokens get bound to.
 	const enter = () => window.location.assign(destination());
+
+	function back(): void {
+		setStep("credentials");
+		setError(null);
+		setOtpError(null);
+		setOtpResent(false);
+	}
 
 	async function signInWithPassword(event: React.FormEvent): Promise<void> {
 		event.preventDefault();
@@ -124,6 +147,7 @@ function LoginPage(): ReactElement {
 	async function requestOtp(): Promise<void> {
 		setOtpBusy(true);
 		setOtpError(null);
+		setOtpResent(false);
 		try {
 			const response = await postJson("/api/auth/email-otp/send-verification-otp", {
 				email,
@@ -133,6 +157,7 @@ function LoginPage(): ReactElement {
 				setOtpError(`Could not send a code (HTTP ${response.status}).`);
 				return;
 			}
+			if (step === "otp-code") setOtpResent(true);
 			setStep("otp-code");
 		} catch {
 			setOtpError(NETWORK_ERROR);
@@ -145,6 +170,7 @@ function LoginPage(): ReactElement {
 		event.preventDefault();
 		setOtpBusy(true);
 		setOtpError(null);
+		setOtpResent(false);
 		try {
 			const response = await postJson("/api/auth/sign-in/email-otp", { email, otp });
 			if (!response.ok) {
@@ -189,149 +215,219 @@ function LoginPage(): ReactElement {
 		}
 	}
 
+	const strip = forApproval ? (
+		<ApprovalStrip>Sign in to review an approval request</ApprovalStrip>
+	) : null;
+
+	let body: ReactNode;
+	if (step === "totp") {
+		body = (
+			<>
+				<CardHeader
+					title="Enter your authenticator code"
+					subtitle="The 6-digit code your authenticator app shows for Reccado."
+				/>
+				<form onSubmit={verifyTotp} className="flex flex-col gap-4 px-7 pb-6 pt-[22px]">
+					<Field
+						label="Authenticator code"
+						htmlFor="login-totp"
+						error={error ? <InlineError id="login-totp-error">{error}</InlineError> : null}
+					>
+						<CodeInput
+							id="login-totp"
+							required
+							autoFocus
+							value={totp}
+							onChange={(event) => setTotp(event.target.value)}
+							aria-invalid={error ? true : undefined}
+							aria-describedby={error ? "login-totp-error" : undefined}
+						/>
+					</Field>
+					<Checkbox checked={trustDevice} onChange={setTrustDevice}>
+						Trust this browser for 30 days
+					</Checkbox>
+					<div className="flex flex-col gap-1.5">
+						<PrimaryButton type="submit" disabled={busy} aria-busy={busy}>
+							{busy ? "Verifying…" : "Verify"}
+						</PrimaryButton>
+						<TextButton onClick={back} className="self-center">
+							Back
+						</TextButton>
+					</div>
+				</form>
+			</>
+		);
+	} else if (step === "otp-code") {
+		body = (
+			<>
+				<CardHeader
+					title="Check your email"
+					subtitle={
+						<>
+							We sent a 6-digit code to{" "}
+							<span className="font-medium text-text">{email || "your address"}</span>. It expires
+							in 5 minutes.
+						</>
+					}
+				/>
+				<form onSubmit={signInWithOtp} className="flex flex-col gap-4 px-7 pb-6 pt-[22px]">
+					<Field
+						label="Emailed code"
+						htmlFor="login-otp"
+						error={
+							otpError ? (
+								<InlineError id="login-otp-error">{otpError}</InlineError>
+							) : otpResent ? (
+								<p role="status" className="text-[13px] leading-[18px] text-text-muted">
+									A new code is on its way. Earlier codes no longer work.
+								</p>
+							) : null
+						}
+					>
+						<CodeInput
+							id="login-otp"
+							required
+							autoFocus
+							value={otp}
+							onChange={(event) => setOtp(event.target.value)}
+							aria-invalid={otpError ? true : undefined}
+							aria-describedby={otpError ? "login-otp-error" : undefined}
+						/>
+					</Field>
+					<div className="flex flex-col gap-1.5">
+						<PrimaryButton type="submit" disabled={otpBusy} aria-busy={otpBusy}>
+							{otpBusy ? "Working…" : "Sign in"}
+						</PrimaryButton>
+						<div className="flex items-center justify-between">
+							<TextButton onClick={back}>Back</TextButton>
+							<TextButton
+								underline
+								disabled={otpBusy || !email}
+								onClick={() => {
+									setOtp("");
+									void requestOtp();
+								}}
+							>
+								Send a new code
+							</TextButton>
+						</div>
+					</div>
+				</form>
+			</>
+		);
+	} else {
+		body = (
+			<>
+				<CardHeader
+					title="Sign in"
+					subtitle={forApproval ? "You'll go straight to the request once you're in." : undefined}
+				/>
+				<form onSubmit={signInWithPassword} className="flex flex-col gap-4 px-7 pb-6 pt-[22px]">
+					<Field label="Email" htmlFor="login-email">
+						<TextInput
+							id="login-email"
+							type="email"
+							autoComplete="username"
+							required
+							value={email}
+							onChange={(event) => setEmail(event.target.value)}
+							placeholder="you@example.com"
+						/>
+					</Field>
+					<Field
+						label="Password"
+						htmlFor="login-password"
+						error={error ? <InlineError id="login-password-error">{error}</InlineError> : null}
+					>
+						<TextInput
+							id="login-password"
+							type="password"
+							autoComplete="current-password"
+							required
+							value={password}
+							onChange={(event) => setPassword(event.target.value)}
+							aria-invalid={error ? true : undefined}
+							aria-describedby={error ? "login-password-error" : undefined}
+						/>
+					</Field>
+					<PrimaryButton type="submit" disabled={busy} aria-busy={busy}>
+						{busy ? "Signing in…" : "Sign in"}
+					</PrimaryButton>
+				</form>
+			</>
+		);
+	}
+
 	return (
-		<main className="page-wrap px-4 pb-8 pt-14">
-			<section className="island-shell rise-in mx-auto max-w-md rounded-[2rem] px-6 py-10">
-				<p className="island-kicker mb-3">Reccado</p>
-				<h1 className="mb-5 text-2xl font-bold tracking-tight text-[var(--sea-ink)]">Sign in</h1>
-
-				{step === "totp" ? (
-					<form onSubmit={verifyTotp} className="space-y-4">
-						<label className="block text-sm text-[var(--sea-ink-soft)]">
-							Authenticator code
-							<input
-								inputMode="numeric"
-								pattern="[0-9]*"
-								autoComplete="one-time-code"
-								required
-								value={totp}
-								onChange={(event) => setTotp(event.target.value)}
-								className={`${FIELD_CLASS} tracking-[0.3em]`}
-								placeholder="000000"
-							/>
-						</label>
-						<label className="flex items-center gap-2 text-sm text-[var(--sea-ink-soft)]">
-							<input
-								type="checkbox"
-								checked={trustDevice}
-								onChange={(event) => setTrustDevice(event.target.checked)}
-							/>
-							Trust this browser for 30 days
-						</label>
-						<button type="submit" disabled={busy} className={PRIMARY_BUTTON_CLASS}>
-							Verify
-						</button>
-						<button
-							type="button"
-							onClick={() => setStep("credentials")}
-							className="text-xs text-[var(--sea-ink-soft)] underline"
-						>
-							Back
-						</button>
-					</form>
-				) : step === "otp-code" ? (
-					<form onSubmit={signInWithOtp} className="space-y-4">
-						<label className="block text-sm text-[var(--sea-ink-soft)]">
-							Emailed code (expires in 5 minutes)
-							<input
-								inputMode="numeric"
-								pattern="[0-9]*"
-								autoComplete="one-time-code"
-								required
-								value={otp}
-								onChange={(event) => setOtp(event.target.value)}
-								className={`${FIELD_CLASS} tracking-[0.3em]`}
-								placeholder="000000"
-							/>
-						</label>
-						<button type="submit" disabled={otpBusy} className={PRIMARY_BUTTON_CLASS}>
-							Sign in
-						</button>
-						<button
-							type="button"
-							onClick={() => setStep("credentials")}
-							className="text-xs text-[var(--sea-ink-soft)] underline"
-						>
-							Back
-						</button>
-						{otpError && <p className="text-sm text-red-500">{otpError}</p>}
-					</form>
-				) : (
-					<form onSubmit={signInWithPassword} className="space-y-4">
-						<label className="block text-sm text-[var(--sea-ink-soft)]">
-							Email
-							<input
-								type="email"
-								autoComplete="username"
-								required
-								value={email}
-								onChange={(event) => setEmail(event.target.value)}
-								className={FIELD_CLASS}
-								placeholder="you@example.com"
-							/>
-						</label>
-						<label className="block text-sm text-[var(--sea-ink-soft)]">
-							Password
-							<input
-								type="password"
-								autoComplete="current-password"
-								required
-								value={password}
-								onChange={(event) => setPassword(event.target.value)}
-								className={FIELD_CLASS}
-							/>
-						</label>
-						<button type="submit" disabled={busy} className={PRIMARY_BUTTON_CLASS}>
-							Sign in
-						</button>
-					</form>
-				)}
-				{error && <p className="mt-3 text-sm text-red-500">{error}</p>}
-
-				<div className="my-6 border-t border-[rgba(50,143,151,0.2)]" />
-
-				<details>
-					<summary className="cursor-pointer text-sm text-[var(--sea-ink-soft)]">
-						No password yet, or lost your authenticator?
-					</summary>
-					<div className="mt-4 space-y-6">
-						<div className="space-y-3">
-							<p className="text-sm text-[var(--sea-ink-soft)]">
+		<AuthPage>
+			<Brand />
+			<Card className="max-w-[420px]" aria-label="Sign in to Reccado">
+				{strip}
+				{body}
+				{step !== "otp-code" && (
+					<details className="group border-t border-border-card bg-content">
+						<summary className="flex cursor-pointer list-none items-center gap-2.5 px-7 py-4 text-[13px] leading-[18px] text-text-secondary outline-none group-open:pb-0 group-open:font-medium group-open:text-text focus-visible:bg-row-selected [&::-webkit-details-marker]:hidden">
+							<span className="grow">
+								{step === "totp"
+									? "Lost your authenticator?"
+									: "No password yet, or lost your authenticator?"}
+							</span>
+							<ChevronDownIcon className="transition-transform group-open:rotate-180" />
+						</summary>
+						<div className="flex flex-col gap-3 px-7 pb-[18px] pt-3">
+							<p className="text-[13px] leading-[19px] text-text-muted">
 								Sign in with a code emailed to the address above. It only ever goes to an address
 								this deployment already recognises.
 							</p>
-							<button
-								type="button"
-								onClick={requestOtp}
-								disabled={otpBusy || !email}
-								className={SECONDARY_BUTTON_CLASS}
-							>
-								Email me a code
-							</button>
-							{otpError && step !== "otp-code" && (
-								<p className="text-sm text-red-500">{otpError}</p>
+							<SecondaryButton onClick={requestOtp} disabled={otpBusy || !email}>
+								{otpBusy ? "Sending…" : "Email me a code"}
+							</SecondaryButton>
+							{!email && (
+								<p className="text-[12px] leading-4 text-text-muted">
+									Enter your email above first.
+								</p>
 							)}
+							{otpError && <InlineError>{otpError}</InlineError>}
 						</div>
-
-						<form onSubmit={pairWithCode} className="space-y-3">
-							<label className="block text-sm text-[var(--sea-ink-soft)]">
-								Recovery code (minted with <code>wrangler d1 execute</code>)
-								<input
+						<form
+							onSubmit={pairWithCode}
+							className="flex flex-col gap-2.5 border-t border-border px-7 pb-[22px] pt-[18px]"
+						>
+							<Field
+								label="Recovery code"
+								htmlFor="login-pairing"
+								hint={
+									<>
+										minted with <code className="font-mono">wrangler d1 execute</code>
+									</>
+								}
+								error={
+									pairingError ? (
+										<InlineError id="login-pairing-error">{pairingError}</InlineError>
+									) : null
+								}
+							>
+								<TextInput
+									id="login-pairing"
 									required
 									value={pairingCode}
 									onChange={(event) => setPairingCode(event.target.value)}
-									className={`${FIELD_CLASS} font-mono`}
-									placeholder="paste the code"
+									placeholder="Paste the code"
+									autoComplete="off"
+									spellCheck={false}
+									className="font-mono text-[14px] font-normal"
+									aria-invalid={pairingError ? true : undefined}
+									aria-describedby={pairingError ? "login-pairing-error" : undefined}
 								/>
-							</label>
-							<button type="submit" disabled={pairingBusy} className={SECONDARY_BUTTON_CLASS}>
-								Pair and sign in
-							</button>
-							{pairingError && <p className="text-sm text-red-500">{pairingError}</p>}
+							</Field>
+							<SecondaryButton type="submit" disabled={pairingBusy} aria-busy={pairingBusy}>
+								{pairingBusy ? "Pairing…" : "Pair and sign in"}
+							</SecondaryButton>
 						</form>
-					</div>
-				</details>
-			</section>
-		</main>
+					</details>
+				)}
+			</Card>
+			<SelfHostedNote />
+		</AuthPage>
 	);
 }

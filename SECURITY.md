@@ -186,7 +186,9 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
 - **Approval required (any token).** `send`; an alias or forward / routing rule whose destination is
   outside the owner's domains (also when `restore` would bring one back); `api_key_create`,
   `api_key_rotate`, `api_key_scopes` (they issue a secret); `suppression_remove`; `domain_add`,
-  `domain_provision`, `domain_disable`. The tool creates an intent in `approvals` (`origin='mcp'`)
+  `domain_provision`, `domain_disable`; `address_route` (`manage_routing` `route_address`: one
+  Cloudflare Email Routing rule delivering an existing address to this Worker, via the same
+  `routeAddress` as the web "Route it"; no MCP path calls Cloudflare before approval). The tool creates an intent in `approvals` (`origin='mcp'`)
   and returns a URL (`input_required` URL-mode elicitation on 2026 clients; `{status:"pending",
   intentId, confirmUrl}` on legacy clients, which re-call the tool with `intentId`).
 - **Applied directly (with its scope).** Templates, `api_key_templates` (a key's template
@@ -199,9 +201,15 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
 - **How approval works.** The intent stores a frozen payload and `payload_hash`; a send uses the
   snapshot, never the live draft, and editing the draft afterwards yields `intent_stale`. Intents
   expire after 10 minutes, are single use, and their status rows are kept 30 days. The owner
-  approves **only** at `https://<host>/approve/:id`: it requires a Better Auth owner session (never
-  pre-authenticated), renders only server-side content (no agent-authored text), checks `Origin`,
-  and posts the payload hash back with the decision. Template bodies are shown in full (HTML as
+  approves **only** with a Better Auth owner web session on this origin, through
+  `POST /api/approvals/:id/approve`, from one of two pages: `https://<host>/approve/:id` (the URL
+  the tool returns to the agent; never pre-authenticated) or the inbox approvals pane (`/inbox`,
+  the reading pane, fed by `GET /api/approvals`, which renders each item through the same
+  server-side view as `/approve/:id`). Either way the endpoint re-reads the session with the cookie
+  cache off, requires a same-origin `Origin` (a missing one is refused), and takes the payload
+  hash the owner was shown; a hash that no longer matches is `stale`. Kinds that reveal a secret
+  (`api_key_create` / rotate / `api_key_scopes`) are approved only on `/approve/:id`; the inbox
+  links there. Never from Telegram, never by an agent. Template bodies are shown in full (HTML as
   escaped source, linked hosts, warnings for external or unsafe links, a diff), plus API-key
   recipient policy, template allow-list and DMARC `rua` targets; a registry safety net appends any
   payload field a kind did not render. **Telegram only sends a notice with the link for these
@@ -236,8 +244,10 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
   `mail:read:sensitive` for raw access (fail closed). Agents can update or cancel only drafts
   they created (`origin='mcp'`).
 - **Host allow-list and framing.** `/mcp` accepts only localhost, the deployment's own origin and
-  hosts listed in `MCP_ALLOWED_HOSTS`. Every HTML response carries `frame-ancestors 'none'` and
-  `X-Frame-Options: DENY`; `/approve/*` also sends `Referrer-Policy: no-referrer`.
+  hosts listed in `MCP_ALLOWED_HOSTS`. Every HTML response carries `frame-ancestors 'none'`,
+  `frame-src 'self'` and `X-Frame-Options: DENY`; `/approve/*` and `/inbox*` (whose URL can carry
+  `?approval=<id>`) also send `Referrer-Policy: no-referrer`. The one framable response is a
+  message's HTML body (`SAMEORIGIN`, framed sandboxed by the inbox itself).
 - **Client registration.** *CIMD preferred:* the client's `client_id` is an https URL to a Client ID
   Metadata Document (spec 2025-11-25 SHOULD; the 2026-07-28 spec deprecates DCR). It is **on**
   (`MCP_CIMD_ENABLED=true`) and runs on a Workers-native guarded fetch transport (https only, no IP
@@ -257,7 +267,7 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
   `mcp.client_registered` ops event; the first consent of a client raises a Telegram notice. The
   consent page shows client name, redirect host and a "Cliente nuevo" note.
   `pnpm operator mcp register` remains as an optional pre-registration fallback.
-- **Revoking a client.** The owner opens `/security` → *Aplicaciones conectadas* and revokes, or
+- **Revoking a client.** The owner opens `/settings/agent-access` → *Connected agents* and revokes, or
   runs `pnpm operator mcp revoke <client_id>`: access tokens, refresh tokens, consent and
   registration are deleted. Access JWTs already issued stay valid until they expire (≤ 3600 s), so
   revocation is not instant.

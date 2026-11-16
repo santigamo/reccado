@@ -45,7 +45,10 @@ const provisionSchema = z
 	})
 	.strict();
 const updateSchema = z
-	.object({ domain: domainName, body: z.object({ status: z.enum(["pending", "active", "disabled"]) }).strict() })
+	.object({
+		domain: domainName,
+		body: z.object({ status: z.enum(["pending", "active", "disabled"]) }).strict(),
+	})
 	.strict();
 const disableSchema = z.object({ domain: domainName }).strict();
 
@@ -107,7 +110,10 @@ registerControlPlaneKind("domain_provision", {
 		assertAdminAccess(env, auth, "");
 		const body = payload.body as z.infer<typeof provisionSchema>["body"];
 		const zone = String(payload.domain);
-		if (body.mailbox?.ownerEmail && body.mailbox.ownerEmail.toLowerCase() !== auth.email.toLowerCase())
+		if (
+			body.mailbox?.ownerEmail &&
+			body.mailbox.ownerEmail.toLowerCase() !== auth.email.toLowerCase()
+		)
 			throw new AdminError("Forbidden", "forbidden", 403, false);
 		const sending = `${(body.subdomain ?? "send").toLowerCase()}.${zone}`;
 		const warnings = [
@@ -122,7 +128,11 @@ registerControlPlaneKind("domain_provision", {
 				message: `DMARC en modo ${body.dmarc.policy}: afecta al correo que ya está circulando.`,
 			});
 		const ruaDomain = body.dmarc.rua?.split("@")[1]?.toLowerCase();
-		if (ruaDomain && ruaDomain !== zone.toLowerCase() && !ruaDomain.endsWith(`.${zone.toLowerCase()}`))
+		if (
+			ruaDomain &&
+			ruaDomain !== zone.toLowerCase() &&
+			!ruaDomain.endsWith(`.${zone.toLowerCase()}`)
+		)
 			warnings.push({
 				code: "dmarc_external_rua",
 				message: `Los informes DMARC agregados se enviarán a una dirección externa: ${body.dmarc.rua}`,
@@ -149,7 +159,10 @@ registerControlPlaneKind("domain_provision", {
 	},
 	execute: async (env, auth, payload) => {
 		const body = payload.body as z.infer<typeof provisionSchema>["body"];
-		if (body.mailbox?.ownerEmail && body.mailbox.ownerEmail.toLowerCase() !== auth.email.toLowerCase())
+		if (
+			body.mailbox?.ownerEmail &&
+			body.mailbox.ownerEmail.toLowerCase() !== auth.email.toLowerCase()
+		)
 			throw new AdminError("Forbidden", "forbidden", 403, false);
 		return provisionDomain(env, auth, { domain: String(payload.domain), body: payload.body });
 	},
@@ -168,7 +181,10 @@ registerControlPlaneKind("domain_update", {
 				{ label: "Dominio", value: before.domain },
 				{ label: "Estado", value: `${before.status} → ${show(next)}` },
 			],
-			warnings: next === "active" || next === before.status ? [] : await disableWarnings(env, before.domain),
+			warnings:
+				next === "active" || next === before.status
+					? []
+					: await disableWarnings(env, before.domain),
 		};
 	},
 	execute: async (env, auth, payload) => {

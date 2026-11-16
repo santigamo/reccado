@@ -3,7 +3,14 @@ import type { AuthContext } from "../../api/auth";
 import { createTransactionalApiKeySchema, updateKeyTemplatesSchema } from "../../api/schemas";
 import { requireMailboxOwner } from "../admin/access";
 import { AdminError } from "../admin/errors";
-import { createKey, listKeys, nextAllowlist, revokeKey, rotateKey, updateKeyTemplates } from "../admin/api-keys";
+import {
+	createKey,
+	listKeys,
+	nextAllowlist,
+	revokeKey,
+	rotateKey,
+	updateKeyTemplates,
+} from "../admin/api-keys";
 import { listTemplates } from "../admin/templates";
 import type { IntentField, IntentWarning } from "../approvals";
 import { registerControlPlaneKind, show, strict, type Operation } from "../control-plane-registry";
@@ -31,7 +38,12 @@ const createSchema = z
 	.strict();
 const keySchema = z.object({ mailboxId, keyId }).strict();
 const scopesSchema = z
-	.object({ mailboxId, keyId, scopes, templateAllowlist: z.array(z.string().min(1).max(128)).max(100).optional() })
+	.object({
+		mailboxId,
+		keyId,
+		scopes,
+		templateAllowlist: z.array(z.string().min(1).max(128)).max(100).optional(),
+	})
 	.strict();
 
 const templatesSchema = z
@@ -64,7 +76,12 @@ function wildcardDomainRules(policy: string): string[] {
 function policyWarnings(policy: string | null | undefined, sends: boolean): IntentWarning[] {
 	if (!sends) return [];
 	if (!policy?.trim())
-		return [{ code: "no_recipient_policy", message: "Sin política de destinatarios: puede enviar a cualquiera." }];
+		return [
+			{
+				code: "no_recipient_policy",
+				message: "Sin política de destinatarios: puede enviar a cualquiera.",
+			},
+		];
 	if (wildcardDomainRules(policy).length)
 		return [
 			{
@@ -86,7 +103,9 @@ const keyFields = (k: TransactionalApiKeyProjection): IntentField[] => [
 /** Splits the plaintext key out of a service response; nothing else of it is kept. */
 function redactSecret(result: unknown): { stored: unknown; secrets?: IntentField[] } {
 	const value = (result as { value?: Record<string, unknown> } | null)?.value ?? {};
-	const projection = (value.projection ?? value.key) as Partial<TransactionalApiKeyProjection> | undefined;
+	const projection = (value.projection ?? value.key) as
+		| Partial<TransactionalApiKeyProjection>
+		| undefined;
 	const stored = {
 		keyId: projection?.keyId ?? null,
 		displaySuffix: projection?.displaySuffix ?? null,
@@ -95,7 +114,10 @@ function redactSecret(result: unknown): { stored: unknown; secrets?: IntentField
 		secretIssued: typeof value.plaintextKey === "string",
 	};
 	return typeof value.plaintextKey === "string"
-		? { stored, secrets: [{ label: "Clave API (solo se muestra una vez)", value: value.plaintextKey }] }
+		? {
+				stored,
+				secrets: [{ label: "Clave API (solo se muestra una vez)", value: value.plaintextKey }],
+			}
 		: { stored };
 }
 
@@ -112,8 +134,13 @@ registerControlPlaneKind("api_key_create", {
 		const body = payload.body as z.infer<typeof createSchema>["body"];
 		const warnings: IntentWarning[] = [];
 		if (body.environment === "live")
-			warnings.push({ code: "live_key", message: "Clave de producción: podrá enviar correo real." });
-		warnings.push(...policyWarnings(body.recipientPolicy, body.scopes.includes("transactional:send")));
+			warnings.push({
+				code: "live_key",
+				message: "Clave de producción: podrá enviar correo real.",
+			});
+		warnings.push(
+			...policyWarnings(body.recipientPolicy, body.scopes.includes("transactional:send")),
+		);
 		return {
 			title: "Crear clave API",
 			fields: [
@@ -155,7 +182,10 @@ registerControlPlaneKind("api_key_rotate", {
 	},
 	execute: async (env, auth, payload) => {
 		await activeKey(env, auth, payload);
-		return rotateKey(env, auth, { mailboxId: String(payload.mailboxId), keyId: String(payload.keyId) });
+		return rotateKey(env, auth, {
+			mailboxId: String(payload.mailboxId),
+			keyId: String(payload.keyId),
+		});
 	},
 	redact: redactSecret,
 });
@@ -169,7 +199,12 @@ registerControlPlaneKind("api_key_revoke", {
 		return {
 			title: "Revocar clave API",
 			fields: keyFields(key),
-			warnings: [{ code: "key_revoked", message: "Las integraciones que usen esta clave dejarán de funcionar." }],
+			warnings: [
+				{
+					code: "key_revoked",
+					message: "Las integraciones que usen esta clave dejarán de funcionar.",
+				},
+			],
 		};
 	},
 	execute: async (env, auth, payload) => {
@@ -197,7 +232,9 @@ registerControlPlaneKind("api_key_scopes", {
 		return {
 			title: "Cambiar permisos de clave API",
 			fields: [
-				...keyFields(key).filter((f) => f.label !== "Permisos" && f.label !== "Plantillas permitidas"),
+				...keyFields(key).filter(
+					(f) => f.label !== "Permisos" && f.label !== "Plantillas permitidas",
+				),
 				{ label: "Permisos", value: `${key.scopes.join(", ")} → ${next.join(", ")}` },
 				{
 					label: "Plantillas permitidas",
@@ -210,7 +247,8 @@ registerControlPlaneKind("api_key_scopes", {
 				...policyWarnings(key.recipientPolicy, next.includes("transactional:send")),
 				{
 					code: "key_replaced",
-					message: "Se emite una clave nueva con estos permisos y la actual se revoca. Tendrás que actualizar la integración.",
+					message:
+						"Se emite una clave nueva con estos permisos y la actual se revoca. Tendrás que actualizar la integración.",
 				},
 			],
 		};
@@ -223,7 +261,8 @@ registerControlPlaneKind("api_key_scopes", {
 			sender: key.sender,
 			senderName: key.senderName,
 			scopes: payload.scopes,
-			templateAllowlist: (payload.templateAllowlist as string[] | undefined) ?? key.templateAllowlist ?? undefined,
+			templateAllowlist:
+				(payload.templateAllowlist as string[] | undefined) ?? key.templateAllowlist ?? undefined,
 			recipientPolicy: key.recipientPolicy ?? undefined,
 			quotaMax: key.quotaMax ?? undefined,
 			expiresAt: key.expiresAt ?? undefined,
@@ -264,8 +303,16 @@ registerControlPlaneKind("api_key_templates", {
 		const listed = await listTemplates(env, auth, { mailboxId: String(payload.mailboxId) });
 		const existing = new Set(
 			(
-				(listed.value as { templates?: Array<{ templateId?: string; id?: string; status?: string; archivedAt?: string | null }> } | null)
-					?.templates ?? []
+				(
+					listed.value as {
+						templates?: Array<{
+							templateId?: string;
+							id?: string;
+							status?: string;
+							archivedAt?: string | null;
+						}>;
+					} | null
+				)?.templates ?? []
 			)
 				.filter((t) => t.status === undefined || t.status === "active")
 				.filter((t) => !t.archivedAt)

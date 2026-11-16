@@ -12,7 +12,7 @@ export function renderClientConnectedNotice(input: {
 	return (
 		`<b>Nueva app conectada:</b> ${telegramEscape(input.clientName)} (${telegramEscape(hosts)}) ` +
 		`con permisos <code>${telegramEscape(scopes)}</code>\n` +
-		`Si no la reconoces, revócala en /security → Aplicaciones conectadas.`
+		`Si no la reconoces, revócala en /settings/agent-access → Connected agents.`
 	);
 }
 

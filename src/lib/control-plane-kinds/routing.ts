@@ -72,11 +72,10 @@ export async function externalAddresses(env: Env, addresses: string[]): Promise<
 }
 
 async function externalForwards(env: Env, addresses: string[]) {
-	return (await externalAddresses(env, addresses))
-		.map((address) => ({
-			code: "external_forward",
-			message: `Reenvío a una dirección externa: ${address}`,
-		}));
+	return (await externalAddresses(env, addresses)).map((address) => ({
+		code: "external_forward",
+		message: `Reenvío a una dirección externa: ${address}`,
+	}));
 }
 
 /** A forward rule needs owner approval iff its effective destination list leaves the owner's domains. */
@@ -86,10 +85,16 @@ async function ruleApproval(env: Env, _auth: AuthContext, payload: Operation) {
 	const action = p.action ?? before?.action;
 	if (action !== "forward") return "direct" as const;
 	const forward = p.forwardTo ?? (before ? (JSON.parse(before.forward_to_json) as string[]) : []);
-	return (await externalAddresses(env, forward)).length ? ("required" as const) : ("direct" as const);
+	return (await externalAddresses(env, forward)).length
+		? ("required" as const)
+		: ("direct" as const);
 }
 
-async function checkRuleOwnership(env: Env, auth: AuthContext, ids: Array<string | null | undefined>) {
+async function checkRuleOwnership(
+	env: Env,
+	auth: AuthContext,
+	ids: Array<string | null | undefined>,
+) {
 	assertAdminAccess(env, auth, "");
 	for (const id of ids) if (id) await ownedMailbox(env, auth, id);
 }
@@ -174,7 +179,12 @@ registerControlPlaneKind("alias_remove", {
 			],
 			warnings:
 				alias.alias_address === mailbox.primary_address
-					? [{ code: "primary_alias", message: "Es la dirección principal del buzón: dejará de recibir correo." }]
+					? [
+							{
+								code: "primary_alias",
+								message: "Es la dirección principal del buzón: dejará de recibir correo.",
+							},
+						]
 					: [{ code: "alias_removed", message: "El correo a este alias dejará de entregarse." }],
 		};
 	},
@@ -187,7 +197,17 @@ registerControlPlaneKind("alias_remove", {
 
 registerControlPlaneKind("routing_rule_upsert", {
 	approval: ruleApproval,
-	covers: ["ruleId", "domainId", "pattern", "priority", "action", "mailboxId", "forwardTo", "rejectReason", "enabled"],
+	covers: [
+		"ruleId",
+		"domainId",
+		"pattern",
+		"priority",
+		"action",
+		"mailboxId",
+		"forwardTo",
+		"rejectReason",
+		"enabled",
+	],
 	validate: (value) => strict(ruleUpsertSchema, value),
 	render: renderRule,
 	execute: async (env, auth, payload) => {
@@ -221,7 +241,12 @@ registerControlPlaneKind("routing_rule_remove", {
 				{ label: "Patrón", value: rule.pattern },
 				{ label: "Acción", value: rule.action },
 			],
-			warnings: [{ code: "rule_removed", message: "El correo que coincidía con esta regla se enrutará de otra forma." }],
+			warnings: [
+				{
+					code: "rule_removed",
+					message: "El correo que coincidía con esta regla se enrutará de otra forma.",
+				},
+			],
 		};
 	},
 	execute: async (env, auth, payload) => {

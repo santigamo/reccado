@@ -156,10 +156,7 @@ export function createCloudflareClient(token: string): CloudflareClient {
 		});
 		const json = (await response.json()) as ApiResponse<T>;
 		if (response.status === 403 || json.errors?.some((error) => error.code === 9109)) {
-			throw new PermissionError(
-				`Cloudflare refused ${method} ${path} on authority grounds.`,
-				path,
-			);
+			throw new PermissionError(`Cloudflare refused ${method} ${path} on authority grounds.`, path);
 		}
 		if (!response.ok || !json.success) {
 			const details = json.errors?.map((error) => `${error.code}: ${error.message}`).join("; ");
@@ -181,7 +178,8 @@ export function createCloudflareClient(token: string): CloudflareClient {
 		createSendingSubdomain: async (zoneId, name) => {
 			await call("POST", `/zones/${zoneId}/email/sending/subdomains`, { name });
 		},
-		getRoutingStatus: (zoneId) => call<{ enabled: boolean }>("GET", `/zones/${zoneId}/email/routing`),
+		getRoutingStatus: (zoneId) =>
+			call<{ enabled: boolean }>("GET", `/zones/${zoneId}/email/routing`),
 		enableRouting: async (zoneId) => {
 			await call("POST", `/zones/${zoneId}/email/routing/enable`, {});
 		},
@@ -331,18 +329,18 @@ async function stepFeedbackSubscription(
 		const subscriptions = await cf.listSubscriptions(accountId);
 		const mine = subscriptions.filter(
 			(sub) =>
-				sub.source?.type === "email.sending" &&
-				sub.source?.domain?.toLowerCase() === sendingDomain,
+				sub.source?.type === "email.sending" && sub.source?.domain?.toLowerCase() === sendingDomain,
 		);
 		// Coverage is the union across usable subscriptions: splitting the event
 		// types across two of them is a legitimate configuration.
-		const usable = mine.filter(
-			(sub) => sub.enabled && sub.destination?.queue_id === queueId,
-		);
+		const usable = mine.filter((sub) => sub.enabled && sub.destination?.queue_id === queueId);
 		const covered = new Set(usable.flatMap((sub) => sub.events ?? []));
 		const missing = FEEDBACK_EVENT_TYPES.filter((type) => !covered.has(type));
 		if (usable.length > 0 && missing.length === 0) {
-			return { state: "already", detail: `Feedback for ${sendingDomain} reaches queue ${queueId}.` };
+			return {
+				state: "already",
+				detail: `Feedback for ${sendingDomain} reaches queue ${queueId}.`,
+			};
 		}
 		if (usable.length > 0) {
 			// Partial coverage. Adding a second, complete subscription would work, but
@@ -440,9 +438,7 @@ export async function provisionSendingDomain(
 	if (sendingDomain !== zone && !sendingDomain.endsWith(`.${zone}`)) {
 		// Not a step failure: the request itself is incoherent, and running any of it
 		// would put records in a zone the caller did not name.
-		throw new Error(
-			`provision: sending domain "${sendingDomain}" is not inside zone "${zone}".`,
-		);
+		throw new Error(`provision: sending domain "${sendingDomain}" is not inside zone "${zone}".`);
 	}
 
 	const token = env.CLOUDFLARE_API_TOKEN?.trim();
@@ -477,7 +473,10 @@ export async function provisionSendingDomain(
 
 	// 2. Enabling sending is what makes Cloudflare write DKIM/SPF/MX — and its own
 	//    p=reject DMARC, which step 3 then replaces with the ramp.
-	const sending = push("email_sending", await stepEmailSending(cf, domainRow.zone_id, sendingDomain));
+	const sending = push(
+		"email_sending",
+		await stepEmailSending(cf, domainRow.zone_id, sendingDomain),
+	);
 
 	// 3. DMARC. Ordered after sending on purpose; running it first would have the
 	//    provider overwrite the ramp moments later.

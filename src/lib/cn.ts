@@ -1,5 +1,21 @@
 import { type ClassValue, clsx } from "clsx";
-import { twMerge } from "tailwind-merge";
+import { extendTailwindMerge } from "tailwind-merge";
+
+/**
+ * tailwind-merge only knows Tailwind's default theme. Teach it the custom
+ * tokens from styles.css so `text-body` is merged as a font size (not a colour
+ * that would knock out `text-white`), `rounded-card` as a radius, and so on.
+ */
+const twMerge = extendTailwindMerge({
+	extend: {
+		theme: {
+			text: ["meta", "label", "body", "sender", "title"],
+			radius: ["control", "card", "panel", "shell", "pill"],
+			shadow: ["card", "primary", "dialog", "popover", "sticky"],
+			font: ["brand"],
+		},
+	},
+});
 
 /**
  * Merge conditional class names, with later Tailwind utilities winning over

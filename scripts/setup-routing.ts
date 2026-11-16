@@ -6,6 +6,9 @@
  * The irreducible part (MX/SPF/DKIM DNS + verification) is surfaced via `email routing dns get`,
  * not hidden.
  *
+ * The Cloudflare REST calls and the catch-all rule shape come from `src/lib/email-routing.ts`,
+ * the same module the Worker's "Route it" endpoint uses (POST /api/cloudflare/domains/:domain/routing).
+ *
  * SAFETY: dry-run by default. Prints the exact commands and changes nothing. Pass `--apply`
  * to run them against the zone in the Cloudflare account your `wrangler` is logged into.
  *
@@ -17,33 +20,19 @@
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import {
+	catchAllRoutesToWorker,
+	catchAllRuleBody,
+	createEmailRoutingApi,
+	type EmailRoutingRule,
+	type ZoneResult,
+} from "../src/lib/email-routing";
 import { canonicalPrimaryAddress } from "../src/lib/mailbox-id";
 import { literalRoutingRuleArgs } from "./lib/routing";
 
 type WranglerConfig = {
 	name?: string;
 	env?: Record<string, { name?: string }>;
-};
-
-type CloudflareEnvelope<T> = {
-	success?: boolean;
-	errors?: Array<{ code?: number; message?: string }>;
-	messages?: Array<{ code?: number; message?: string }>;
-	result?: T;
-};
-
-type ZoneResult = {
-	id?: string;
-	name?: string;
-	account?: { id?: string; name?: string };
-};
-
-type CatchAllRule = {
-	enabled?: boolean;
-	name?: string;
-	actions?: Array<{ type?: string; value?: string[] }>;
-	matchers?: Array<{ type?: string }>;
-	source?: string;
 };
 
 function parseArgs(argv: string[]): Record<string, string> {
@@ -119,45 +108,6 @@ function wranglerCapture(argv: string[]): string {
 	});
 }
 
-function formatApiErrors(payload: {
-	errors?: Array<{ code?: number; message?: string }>;
-	messages?: Array<{ code?: number; message?: string }>;
-}): string {
-	const items = [...(payload.errors ?? []), ...(payload.messages ?? [])]
-		.map((item) => {
-			const code = item.code ? ` [${item.code}]` : "";
-			return `${item.message ?? "unknown Cloudflare API error"}${code}`;
-		})
-		.filter(Boolean);
-	return items.length > 0 ? items.join("; ") : "unknown Cloudflare API error";
-}
-
-async function cfApi<T>(token: string, path: string, init?: RequestInit): Promise<T> {
-	const response = await fetch(`https://api.cloudflare.com/client/v4${path}`, {
-		...init,
-		headers: {
-			Authorization: `Bearer ${token}`,
-			"Content-Type": "application/json",
-			...(init?.headers ?? {}),
-		},
-	});
-	const payload = (await response.json()) as CloudflareEnvelope<T>;
-	if (!response.ok || payload.success !== true || payload.result === undefined) {
-		throw new Error(formatApiErrors(payload));
-	}
-	return payload.result;
-}
-
-function matchersAreCatchAll(matchers: CatchAllRule["matchers"]): boolean {
-	return (matchers ?? []).some((matcher) => matcher.type === "all");
-}
-
-function actionsTargetWorker(actions: CatchAllRule["actions"], workerName: string): boolean {
-	return (actions ?? []).some(
-		(action) => action.type === "worker" && (action.value ?? []).includes(workerName),
-	);
-}
-
 function parseWranglerAccountInfo(output: string): { id?: string; name?: string } | null {
 	try {
 		const payload = JSON.parse(output) as {
@@ -204,13 +154,10 @@ async function ensureCatchAllRule(workerName: string): Promise<void> {
 		process.exit(1);
 	}
 
+	const api = createEmailRoutingApi(token);
 	let zone: ZoneResult;
 	try {
-		const zones = await cfApi<ZoneResult[]>(
-			token,
-			`/zones?name=${encodeURIComponent(resolvedDomain)}&status=active&match=all`,
-		);
-		const exact = zones.filter((item) => item.name?.toLowerCase() === resolvedDomain);
+		const exact = await api.findZones(resolvedDomain);
 		if (exact.length !== 1 || !exact[0]?.id) {
 			console.error(
 				`setup:routing: could not resolve zone "${resolvedDomain}" from the Cloudflare API.\n` +
@@ -232,9 +179,10 @@ async function ensureCatchAllRule(workerName: string): Promise<void> {
 	console.log(`  Cloudflare account: ${accountLabel}`);
 	console.log(`  Zone: ${resolvedDomain} (${zone.id})`);
 
-	let current: CatchAllRule | undefined;
+	const zoneId = zone.id as string;
+	let current: EmailRoutingRule | undefined;
 	try {
-		current = await cfApi<CatchAllRule>(token, `/zones/${zone.id}/email/routing/rules/catch_all`);
+		current = await api.getCatchAll(zoneId);
 	} catch (error) {
 		console.error(
 			`setup:routing: failed to read the current catch-all rule for ${resolvedDomain}: ${
@@ -244,27 +192,14 @@ async function ensureCatchAllRule(workerName: string): Promise<void> {
 		process.exit(1);
 	}
 
-	if (
-		current.enabled === true &&
-		matchersAreCatchAll(current.matchers) &&
-		actionsTargetWorker(current.actions, workerName)
-	) {
+	if (catchAllRoutesToWorker(current, workerName)) {
 		console.log("  (catch-all already routes to this Worker — skipping)");
 		return;
 	}
 
-	const payload = {
-		enabled: true,
-		name: `Catch-all -> ${workerName}`,
-		matchers: [{ type: "all" }],
-		actions: [{ type: "worker", value: [workerName] }],
-	};
 	console.log("  Applying Cloudflare API update for catch-all routing");
 	try {
-		await cfApi<CatchAllRule>(token, `/zones/${zone.id}/email/routing/rules/catch_all`, {
-			method: "PUT",
-			body: JSON.stringify(payload),
-		});
+		await api.putCatchAll(zoneId, catchAllRuleBody(workerName));
 	} catch (error) {
 		console.error(
 			`setup:routing: failed to update the catch-all rule for ${resolvedDomain}: ${
@@ -306,16 +241,7 @@ console.log(
 runIdempotent("Enable Email Routing on the zone", ["email", "routing", "enable", resolvedDomain]);
 
 if (catchAll) {
-	const payload = JSON.stringify(
-		{
-			enabled: true,
-			name: `Catch-all -> ${worker}`,
-			matchers: [{ type: "all" }],
-			actions: [{ type: "worker", value: [worker] }],
-		},
-		null,
-		2,
-	);
+	const payload = JSON.stringify(catchAllRuleBody(worker), null, 2);
 	console.log(
 		`\n▸ Configure catch-all *@${resolvedDomain} -> Worker via Cloudflare API\n` +
 			"  Wrangler currently rejects catch-all worker rules client-side, so this path uses the\n" +

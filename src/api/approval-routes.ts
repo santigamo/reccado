@@ -12,6 +12,15 @@ import type { ApiBindings } from "./hono";
  * cannot approve by omitting the header.
  */
 export function registerApprovalRoutes(api: Hono<ApiBindings>): void {
+	// The inbox queue: pending (oldest first) and decided in the last 24 h. Read-only,
+	// owner session only; it exposes nothing the single-item view below does not.
+	api.get("/api/approvals", async (c) => {
+		const auth = await owner(c.req.raw, c.env);
+		if (auth instanceof Response) return auth;
+		const { listApprovals } = await import("../lib/approvals-list");
+		return json(await listApprovals(c.env, auth.userId), 200);
+	});
+
 	api.get("/api/approvals/:id", async (c) => {
 		const auth = await owner(c.req.raw, c.env);
 		if (auth instanceof Response) return auth;
@@ -59,7 +68,10 @@ function json(body: unknown, status: number): Response {
 	return Response.json(body, { status, headers: { "cache-control": "no-store" } });
 }
 
-async function owner(request: Request, env: Env): Promise<Awaited<ReturnType<typeof requireAuth>> | Response> {
+async function owner(
+	request: Request,
+	env: Env,
+): Promise<Awaited<ReturnType<typeof requireAuth>> | Response> {
 	try {
 		return await requireAuth(request, env, { disableCookieCache: true });
 	} catch (error) {

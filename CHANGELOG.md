@@ -11,6 +11,160 @@ package.
 
 ### Added
 
+- **Delete forever and Empty trash (2026-11-16).** The first permanent deletion in the mail client,
+  and only from the Trash. *Web.* In Trash, "Delete forever" replaces Delete for the selected
+  conversations, a row and the open conversation (`#` too), and an "Empty trash" bar/menu item acts
+  on the scope (one mailbox, or every mailbox). Both ask first, with the count, the scope and "This
+  can't be undone."; no Undo toast; an open conversation that was deleted closes, list and counts
+  refresh, a large Trash shows progress. *API* (owner web session only, Origin-checked; no MCP tool or
+  control-plane kind): `POST /api/mailboxes/:id/purge` with `threadIds` (their trashed messages),
+  `messageIds` (refused with 409 `not_in_trash` unless every one is in the Trash) or `emptyTrash`,
+  and `GET /api/mailboxes/:id/purge/:operationId`. *Mailbox DO* (schema v14, `do/mailbox-purge.ts`):
+  an operation queues its message ids (`purge_queue`, `purge_operations`) and deletes in batches of
+  250 — the first in the request, the rest from the alarm — re-checking `state = 'trash'` each time
+  (a message restored meanwhile stays). Each batch removes, in one transaction, the message, its
+  attachment, header, label and search rows, scrubs the subject/sender from its live-update history,
+  empties the draft a sent copy came from (the send markers stay, so a replayed confirm-send still
+  sends nothing), recounts or removes its conversation, and queues a `purge_message_objects` job
+  for the R2 objects (raw MIME, HTML body, attachments) and the D1 rows (`message_index`,
+  `telegram_links`, `telegram_retained`); the job retries every 5 minutes until done. An R2 object is
+  deleted only when no surviving message, attachment or draft file points at it (forwarded
+  attachments, sent copies re-using upload keys, duplicate deliveries sharing a raw key); new
+  indexes make those checks lookups. The ingest ledger keeps its row, marked `purged`, so a
+  re-delivered copy of a deleted email stays a duplicate (its new raw object is deleted) instead of
+  coming back. One `mailbox.messages_purged` ops event per finished operation (mailbox, scope,
+  counts). A draft that forwarded an attachment of a message deleted forever now deletes that object
+  when it drops the file or is purged after a discard. Not included: automatic emptying of the Trash
+  after N days.
+
+- **Attachments when composing and forwarding (2026-11-16).** *Compose.* A paperclip, drag-and-drop
+  onto the dialog and pasted files attach to the draft; chips show name, size, upload progress,
+  errors and remove; a running total ("3 files · 4.2 MB of 17 MB"); Send waits while uploads are in
+  flight; a draft row in a conversation shows a paperclip. *Limits* (`src/lib/attachment-limits.ts`):
+  17 MiB per file and in total, 20 files — Cloudflare Email Sending caps the whole message at 25 MiB
+  after base64. *Storage.* Bytes go from the request straight to R2 under
+  `drafts/<env>/<mailbox>/<draft>/<attachment>-<name>`; the mailbox DO keeps metadata only in a new
+  `draft_attachments` table (schema v13). Owner-session routes: `POST|GET|DELETE
+  /api/mailboxes/:id/drafts/:draftId/attachments[/:attachmentId]` (raw body, `?filename=`) and
+  `POST …/attachments/from-message`. Names are sanitised (no path, no control characters, NFC,
+  bounded), types reduced to `type/subtype`; downloads are always `attachment`, nosniff, sandboxed.
+  Agent (`mcp`) drafts never take files. *Send.* The frozen send intent lists the files (id, name,
+  type, size, sha256, R2 key, in order), so `payload_hash` covers them and adding or removing one
+  makes an armed intent stale; a draft without files freezes `attachments: []` exactly as before, so
+  existing hashes and approvals are unchanged. Confirm-send reads the files back from R2, checks each
+  sha256 and hands them to Email Sending, which composes the multipart/mixed message; a missing or
+  changed file sends nothing and frees the attempt. The sent copy lists the files in the ordinary
+  `attachments` table on the same R2 objects (download works like received mail) and the D1 index
+  gets `has_attachments`. The web request-send now replaces a stale intent, so Send works again after
+  an edit. *Forward.* The original's files are offered checked and removable, attached by reference to
+  its R2 objects (no bytes through the browser); inline images go as regular files and the dialog
+  says so. *Lifecycle.* Removing a file deletes its upload; sending hands the objects to the sent
+  copy; discarding keeps them for 24 h so Undo restores the draft whole, then a mailbox alarm job
+  deletes the uploads of a draft still discarded (forwarded originals are never deleted).
+
+- **Mail-client conventions in the web inbox (2026-11-16).** *Who.* Your own messages say
+  "me" / the mailbox display name instead of the mailbox local part; mail stored before names
+  were kept gets its sender name (and Reply-To) from its own raw headers in R2 the first time
+  its conversation is opened — inbound rows of that thread only, newest 20, first 64 KB of each,
+  sanitised with `display-name.ts`, written once (`src/do/mailbox-web.ts`). *Reply.* Reply
+  answers the newest inbound message's Reply-To (else its sender); Reply all (button, menu, `a`)
+  adds its other To/Cc minus every mailbox address and alias; one `Re:` / `Fwd:`, never doubled;
+  Reply / Reply all / Forward / Mark as unread per message from its menu (`src/lib/reply.ts`).
+  *Lists.* Row checkboxes (hover, or tap the avatar), select all in view, shift-click ranges, a
+  selection bar with archive / delete / move to inbox / read / unread; an "Unread" filter
+  (`?unread=true`) and "Mark all as read" for the folder in scope; "load older" + infinite scroll
+  that pages each mailbox by keyset cursor and merges them without ever placing older mail above
+  newer unloaded mail (`src/lib/thread-paging.ts`); scroll position kept when coming back from a
+  conversation, the open row kept in view; selecting text in a row no longer opens it;
+  full timestamp on hover. *Undo.* Archive, delete, move to inbox, mark unread, mark all read
+  and discarding your own draft show a toast with Undo that replays exactly the messages that
+  changed; failed actions roll back and say so. *Browser.* "(3) Inbox — Reccado" tab title and an
+  unread dot on the favicon. *Search.* Empty results say where it searched and offer "Search all
+  mail in every mailbox"; `/` focuses search. *Compose.* Invalid addresses are named before
+  sending; empty subject/body asks first; ⌘/Ctrl+Enter sends; Esc/close keeps your changes as a
+  draft (or asks when there is no recipient to save one for); discarding an unsaved message asks;
+  "Message sent · View message" toast; a full-screen toggle (remembered for the session; phones
+  are always full screen). *Reading.* Remote images are blocked by default (`img-src 'self'
+  data:`) with "Show images" / "Always from <sender>" (this browser), quoted history in HTML
+  replies folded behind "···", a details expander (From, Reply-To, To, Cc, date, subject), and
+  Print. *Layout.* The mailbox column folds into a rail of mailbox dots (`[`), the list folds while
+  a conversation is open (`]`), "Read wider" folds both; remembered per browser. *Keyboard.* `a`,
+  `c`, `/`, `x`, `?` (shortcuts sheet), Shift+I / Shift+U, list j/k/e/# when no conversation is
+  open. Backend: mailbox DO schema v12 adds nullable `messages.reply_to_json` (stored at ingest);
+  `GET …/threads` takes `cursor` and `unread=true`; new `POST /api/mailboxes/:id/bulk-actions`
+  (threads, messages, or a folder's unread → reports what each message was) and
+  `POST …/drafts/:id/restore` (your own discarded drafts only, never an agent's);
+  `…/messages/:id/html?images=1` opts into remote content.
+
+- **DMARC aggregate reports kept out of the web inbox; read state you can see (2026-11-16).**
+  *Reports.* Inbound mail is classified at ingest (`src/lib/automated-mail.ts`) as
+  `automated_kind = 'dmarc_report'` only on structural signals: the RFC 7489 subject
+  (`Report Domain: … Submitter: … Report-ID: …`, any case/spacing) or that subject without the
+  Report-ID plus a report file, or only `receiver!domain!begin!end[!id].{xml,xml.gz,gz,zip}`
+  attachments with a report-ish subject from an automated mailbox; never a reply/forward
+  (In-Reply-To, References, `Re:`/`Fwd:`…), never a parse failure. Reports are stored like any mail
+  but arrive read, do not un-archive a conversation, and the web's `/threads`, `/search` and
+  `/counts` leave them out (a conversation of only reports disappears; a person's conversation
+  holding one stays). They are listed under More → "DMARC reports" (`?folder=reports`,
+  `reports=only`), with no badge. MCP talks to the DO without the filter and still sees them;
+  Telegram notices are unchanged. Mailbox DO schema v11: nullable `messages.automated_kind`,
+  partial covering indexes `idx_messages_web_counts` / `idx_messages_reports`, and a backfill of
+  stored mail from subject/headers/attachment metadata (no R2 read) that also marks found reports
+  read. *Read state.* Unread rows are white with an 8px navy dot in a fixed slot and semibold ink
+  sender/subject/time; read rows sit on a quiet grey (`--color-row-read`) in regular weight and
+  secondary/muted text; the open row is a blue-grey with a wider mailbox stripe; collapsed messages
+  in a thread and the mailbox column follow the same language. Opening a conversation and mark
+  read/unread update rows and unread figures at once, and the guess holds until a reload that
+  started after the write has landed (no flicker back). The dropdown menu is now anchored to the
+  viewport, so "More" is no longer clipped by the scrolling toolbar.
+
+- **Gmail-style mail client: conversation order, rich text, threads (2026-11-16).**
+  *Order.* Every folder lists conversations by their newest message outside the trash (Trash: the
+  newest trashed one), your own replies included, so replying moves a thread to the top; ties break
+  on thread id, so merged multi-mailbox lists and search results are stable. `threads.last_message_at`
+  only moves forward (a late or replayed older mail no longer pulls a thread down). An open
+  conversation lands on its newest message: older read messages are one-line rows and a run of them
+  folds into "N older messages". *Reading.* Message HTML is served with `X-Frame-Options:
+  SAMEORIGIN` (matching its CSP `frame-ancestors 'self'`) instead of the global `DENY` that
+  conflicted with it; every other response, and `/approve`, `/login`, `/consent`, keep `DENY` /
+  `frame-ancestors 'none'`. Links in mail get `target=_blank rel="noopener noreferrer"`, `cid:`
+  inline images resolve to the message's own attachments, and a frame that cannot load falls back to
+  the text part. Plain-text mail keeps line breaks, wraps long lines, links URLs/addresses (React
+  nodes, never HTML) and folds a trailing quoted reply behind "···". *Writing.* Compose is a
+  dependency-free rich text editor (bold, italic, underline, links, lists, quote, clear formatting;
+  ⌘B/I/U/K, ⌘⇧7/8/9, ⌘\\), with sanitised paste, autosave into one draft, replies that quote the
+  original under an attribution line and set `parentMessageId`, and forwards with the original
+  header block. `POST/PATCH /api/mailboxes/:id/drafts` now sanitise `bodyHtml` server-side
+  (`src/lib/html-sanitize.ts`, HTMLRewriter allowlist: no scripts, handlers, images, iframes,
+  external styles, `url()`/`javascript:`; max 1 MB) and derive `bodyText` from the clean HTML, so
+  the multipart/alternative parts agree and the approval `payload_hash` covers the clean markup.
+  Text-only drafts, Telegram and MCP drafts are unchanged. *Threads.* Thread rows (`GET
+  /threads`, MCP `list_threads`) gain additive `participants` (senders oldest first, owner as
+  `me`), `latest_to_json` and `latest_recipient_names_json`; `message_count` and `unread_count` are
+  now computed per folder view (non-trash / trash) from the messages — `unread_count` was a counter
+  that only went up — and `?unread=` filters on it. Rows read "Rico, me · 2"; outbound-only rows
+  say "To: <recipients>" from the real recipients instead of the mailbox's own address; a
+  conversation is bold while any message is unread. Archive / restore of a conversation keep your
+  sent messages in Sent (outbound messages are never moved to Inbox/Archive), and a new inbound
+  reply moves the conversation's archived messages back to the inbox. Reply drafts show inline at
+  the bottom of their thread, and Reply resumes an existing draft instead of starting a second one.
+  Keyboard: `j`/`k` next/previous, `e` archive, `#` trash, `r` reply, `f` forward, `Esc`/`u` back.
+  No schema or D1 migration; deploy is code-only.
+- **Sender display names and real folder counts (2026-11-16).** Mailbox DO schema **v10**
+  (automatic on first DO start, additive): nullable `messages.from_name` and
+  `messages.recipient_names_json`, filled at ingest from the parsed From/To/Cc headers through one
+  sanitiser (`src/lib/display-name.ts`: control/bidi/zero-width/tag characters stripped, 80 code
+  points max, a name that is the address or names a *different* address is dropped). Sent copies
+  store the From phrase they went out with. No backfill: older rows keep the address-derived name.
+  Exposed additively as `latest_from_name` on thread rows, `from_name`/`recipient_names_json` on
+  message rows, and `from_name`/`latest_from_name` on MCP `list_threads`, `search_messages`,
+  `read_message`/`read_thread`; the FTS sender column includes the name. The web UI shows the name
+  and always keeps the real address visible (header line, `title`). New owner-session endpoint
+  `GET /api/mailboxes/:mailboxId/counts` → `{ mailbox_id, counts: { inbox|sent|archive|trash|all:
+  { threads, unread, messages }, drafts } }`, computed by the DO from the new covering index
+  `idx_messages_folder_counts (state, thread_id, is_read)`; the inbox header, folder badges, mailbox
+  unread counts and "1 of N" use it instead of counting loaded rows (no more "+" lower bounds).
+  No D1 migration.
 - **Standard MCP connection (2026-11-14).** `claude mcp add --transport http reccado https://<host>/mcp`
   (and claude.ai custom connectors, Cursor, …) now works with no operator step: unauthenticated
   RFC 7591 client registration is open on `/api/auth/oauth2/register`, hardened by a D1-backed
@@ -56,6 +210,22 @@ package.
   (`MCP_CIMD_ENABLED`, default off) on a Workers-native guarded transport.
 - D1 migrations `0021` (Better Auth 1.7.20), `0022`, `0024`–`0028`; **apply them remotely before
   deploying** (see `docs/OPERATIONS.md`).
+- **No Telegram notice for DMARC aggregate reports (2026-11-16).** The mailbox DO returns its
+  classification in the ingest result (`MailboxIngestResult.automatedKind`, additive); the inbound
+  consumer stores and indexes the report as before but enqueues no `NOTIFY_QUEUE` message for it,
+  so it is never retained for the quiet-hours digest either. Muted senders, ordinary mail and a
+  person writing about DMARC are unchanged (`tests/integration/dmarc-notify.test.ts`).
+- **Agents can ask to route an address, behind owner approval (2026-11-16).** New approval-gated
+  control-plane kind `address_route`, exposed as `manage_routing` `route_address`
+  (`{domain, address}`, scope `routing:write`). Over MCP it only creates an approval (no
+  Cloudflare call); on the owner's approval it runs the same `routeAddress` as the web "Route it"
+  (one literal `to:<address> -> <this Worker>` rule, never overwrites a rule or touches the
+  catch-all). Unknown address / unregistered or inactive domain / another owner's mailbox are
+  refused at request time (`refused: <reason>`); Cloudflare-side refusals (conflict, routing
+  disabled, token missing or without permission, timeout, API error) end as a failed execution
+  whose `result.items[0].detail` carries `reason`, `message`, `remedy` (and `cli` / `conflict`).
+  The approval page shows "Route <address> to this Reccado" with the zone and the rule to create,
+  and, once decided, the outcome. No migration.
 
 ### Removed
 
@@ -64,6 +234,16 @@ package.
 
 ### Changed
 
+- **Faster thread lists and searches on large mailboxes.** A list page no longer counts the messages
+  of every conversation in the mailbox before sorting (about a third of the rows read per
+  conversation); counts are computed for the page's rows. `GET /api/approvals` reads each pending
+  send's frozen snapshot once instead of three times. Search fetches its hits a few at a time and
+  no longer triggers or waits on the sender-name/Reply-To backfill (`GET …/threads/:id?backfill=0`);
+  opening the conversation still runs it.
+- **Approval boundary documented as it is.** The owner approves with the owner web session on
+  `/approve/:id` or in the inbox approvals pane (same endpoint, same payload-hash binding;
+  secret-revealing kinds only on `/approve/:id`). AGENTS.md, SECURITY.md, SKILL.md and
+  docs/ARCHITECTURE.md now say so.
 - `better-auth`/`@better-auth/mcp` 1.7.20 (session JWTs are no longer accepted at `/mcp`);
   `agents` 0.33 and `@modelcontextprotocol/server` 2.4.0. Existing MCP tokens need re-consent for
   the new scopes; Telegram pending sends created before `0022` must be re-drafted.
@@ -108,6 +288,25 @@ read/search/draft endpoint.
 
 ### Security
 
+- **Opening a message with images off makes no request to anyone else (2026-11-16).** A sender's
+  `<meta http-equiv="refresh">` navigated the message body to any URL when the body was opened
+  outside the inbox frame (Chrome's sandbox stopped it inside the frame; other browsers may not),
+  a `<video poster>` was fetched in Chrome despite the body's CSP, and `<meta name="referrer"
+  content="unsafe-url">` made those requests carry the message URL (mailbox and message ids).
+  The served body now drops, in both modes, meta refresh, referrer overrides (`<meta
+  name=referrer>`, `referrerpolicy`, `ping`), the sender's `<base>`, every `<link>` (DNS prefetch,
+  preconnect, prefetch, stylesheets) and script/object/embed/iframe/frame elements; with images
+  off it also moves every remote source aside (`src`, `srcset`, `background`, `poster`, SVG `href`,
+  …) and neutralises remote CSS `url()`, `image-set()` and `@import` in style attributes and
+  blocks (`src/lib/email-html.ts`). Every app page now sends `frame-src 'self'`, so the message
+  frame cannot be navigated off this origin at all, and `/inbox` pages send
+  `Referrer-Policy: no-referrer` like `/approve/:id`, since a thread-less approval opens as
+  `/inbox?folder=approvals&approval=<id>`. A body the HTML parser refuses now answers 422 (the
+  inbox shows the text part) instead of a 500.
+- **"Route it" enforces the same ownership as the agent's `address_route`.** The web endpoint
+  `POST /api/cloudflare/domains/:domain/routing` now refuses (403 `forbidden`) an address whose
+  mailbox, or whose alias's mailbox, has another owner; an empty or non-JSON body answers the
+  documented `400 { ok: false, reason: "invalid_address" }` instead of `{ error: "invalid_json" }`.
 - **The transactional status route verifies the key secret.** `GET
   /v1/.../transactional/messages/:requestId` checked the key id, revocation and scope but never
   the secret, and ignored expiry — and key ids are public (every send response carries one). Send
@@ -126,6 +325,26 @@ read/search/draft endpoint.
   change still hold the full body and should be purged by hand.
 
 ### Fixed
+
+- **Conversation actions leave the other folder's messages alone (2026-11-16).** Archiving, moving
+  to Inbox or marking read/unread a conversation from Inbox, Archive or Sent also moved its trashed
+  messages (a conversation deleted, then a reply arrived: archiving the reply pulled the old
+  messages out of the Trash), and restoring from Trash moved the conversation's live messages too.
+  Thread actions now reach only the messages the folder shows: never the trashed ones outside the
+  Trash, only those in it, everything in All mail (`POST …/bulk-actions` takes `scope` with
+  `threadIds`; absent means outside the Trash). The open conversation's toolbar, Mark unread and
+  mark-read-on-open follow the same rule. MCP `update_messages` acts on explicit message ids only and
+  was not affected.
+- **"Edit as my draft" keeps the HTML body and can no longer leave a duplicate.** The owner's copy
+  of an agent's send now carries its HTML body (sanitised by the server like any owner HTML), and
+  the agent's request is denied *before* the copy is made: a failed deny makes no copy (the request
+  stays waiting), a request already decided elsewhere gets none, and a failed copy after the deny
+  leaves the agent's (now unapprovable) draft in Drafts and says so. The agent's attachments are
+  not copied; the owner is told.
+- **"Delete forever" counts a conversation once.** A conversation whose trashed messages took more
+  than one batch was counted once per batch in the operation status and the
+  `mailbox.messages_purged` event. Conversations are now counted once per operation (mailbox schema
+  v15, `purge_operation_threads`).
 
 - **Sent messages no longer show "(no text content)".** The send path stored the sent copy
   without its body, so the viewer had nothing to render even though the mail went out intact.

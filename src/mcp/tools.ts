@@ -3,14 +3,14 @@ import { z } from "zod";
 import type { AuthContext } from "../api/auth";
 import { insertOpsEvent } from "../db/d1";
 import { AdminError } from "../lib/admin/errors";
-import { McpMailboxFacade } from "./mailbox-facade";
-import { mcpToolError, mcpToolResultJson } from "./errors";
-import { assertScope, McpScopeError, scopeFilteredServer, type McpAuthContext } from "./scopes";
+import { TOOL_SCOPES } from "../lib/mcp-scopes";
 import * as adminReads from "./admin-reads";
 import { registerAdminTools } from "./admin-tools";
-import { registerSendTool } from "./send-tool";
-import { TOOL_SCOPES } from "../lib/mcp-scopes";
+import { mcpToolError, mcpToolResultJson } from "./errors";
 import type { IntentFlow } from "./intent-flow";
+import { McpMailboxFacade } from "./mailbox-facade";
+import { assertScope, type McpAuthContext, McpScopeError, scopeFilteredServer } from "./scopes";
+import { registerSendTool } from "./send-tool";
 
 type RateLimitMap = Map<string, number>;
 
@@ -64,7 +64,8 @@ function checkRateLimit(auth: AuthContext, toolName: string): boolean {
 	rateLimitStore.set(key, current + 1);
 	// Buckets are per minute; anything from an earlier minute can never be read again.
 	const suffix = `:${Math.floor(Date.now() / 60_000)}`;
-	for (const stale of rateLimitStore.keys()) if (!stale.endsWith(suffix)) rateLimitStore.delete(stale);
+	for (const stale of rateLimitStore.keys())
+		if (!stale.endsWith(suffix)) rateLimitStore.delete(stale);
 	return true;
 }
 
@@ -235,6 +236,7 @@ export function registerTools(
 						unread_count: z.number(),
 						latest_subject: z.string().nullable(),
 						latest_from: z.string().nullable(),
+						latest_from_name: z.string().nullable(),
 						latest_snippet: z.string().nullable(),
 						latest_received_at: z.string(),
 						latest_has_attachments: z.number(),
@@ -303,6 +305,7 @@ export function registerTools(
 						mailbox_id: z.string().optional(),
 						subject: z.string().nullable(),
 						from_addr: z.string(),
+						from_name: z.string().nullable(),
 						snippet: z.string().nullable(),
 						received_at: z.string(),
 					}),
@@ -365,6 +368,7 @@ export function registerTools(
 					thread_id: z.string(),
 					direction: z.enum(["inbound", "outbound"]),
 					from_addr: z.string(),
+					from_name: z.string().nullable(),
 					to: z.array(z.string()),
 					cc: z.array(z.string()),
 					subject: z.string().nullable(),
@@ -500,7 +504,12 @@ export function registerTools(
 					duplicate: z.boolean(),
 				}),
 			}),
-			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: false,
+				idempotentHint: true,
+				openWorldHint: false,
+			},
 		},
 		async (params) => {
 			const start = Date.now();
@@ -553,7 +562,12 @@ export function registerTools(
 			description: "Cancel a draft. This never sends email.",
 			inputSchema: z.object({ mailboxId: z.string().min(1), draftId: z.string().min(1) }),
 			outputSchema: z.object({ draft_id: z.string(), status: z.string() }),
-			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: false,
+				idempotentHint: false,
+				openWorldHint: false,
+			},
 		},
 		async (params) =>
 			runTool("cancel_draft", "mail:draft", params.mailboxId, () =>
@@ -572,7 +586,12 @@ export function registerTools(
 				action: z.enum(["mark_read", "mark_unread", "archive", "restore_inbox", "trash"]),
 			}),
 			outputSchema: z.object({ message_ids: z.array(z.string()), action: z.string() }),
-			annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: false,
+				idempotentHint: true,
+				openWorldHint: false,
+			},
 		},
 		async (params) =>
 			runTool("update_messages", "mail:draft", params.mailboxId, () =>
@@ -588,7 +607,8 @@ export function registerTools(
 			outputSchema: z.record(z.string(), z.unknown()),
 			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
 		},
-		async () => runTool("get_health", "config:read", null, () => adminReads.health(env, auth, origin)),
+		async () =>
+			runTool("get_health", "config:read", null, () => adminReads.health(env, auth, origin)),
 	);
 	server.registerTool(
 		"list_ops",

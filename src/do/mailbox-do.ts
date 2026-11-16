@@ -1,12 +1,25 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflare/types";
-import { approvalProofSecret, verifyMcpApprovalProof, type McpApprovalProof } from "../lib/approvals";
+import {
+	approvalProofSecret,
+	type McpApprovalProof,
+	verifyMcpApprovalProof,
+} from "../lib/approvals";
+import { classifyAutomatedMail } from "../lib/automated-mail";
 import { sha256Hex } from "../lib/crypto";
+import { sanitizeDisplayName } from "../lib/display-name";
 import { buildReferences, messageIdHeader, referencesHeader } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
 import { AmbiguousSendError } from "../lib/errors";
-import { normalizeSubject } from "../lib/mime";
+import { normalizeSubject, snippetFromText } from "../lib/mime";
+import {
+	AttachmentUnavailableError,
+	type LoadedAttachment,
+	loadSnapshotAttachments,
+	providerAttachments,
+} from "../lib/outbound-attachments";
+import { stripQuotedText } from "../lib/quoted-text";
 import { bodyHtmlR2Key } from "../lib/r2-keys";
 import {
 	resolveDeliveredAlias,
@@ -14,8 +27,41 @@ import {
 	type SenderEnv,
 	type SenderIdentity,
 } from "../lib/sender-identity";
+import {
+	buildParticipants,
+	type ParticipantSource,
+	type ThreadParticipant,
+} from "../lib/thread-summary";
 import { httpStatusForTransactionalResult } from "../lib/transactional-send";
+import {
+	addMessageAttachments,
+	addUploadedAttachment,
+	createDraftAttachmentsTable,
+	draftAttachmentCounts,
+	getDraftAttachmentRow,
+	listDraftAttachments,
+	PURGE_DRAFT_ATTACHMENTS_JOB,
+	purgeDiscardedDraftAttachments,
+	removeDraftAttachment,
+	scheduleDraftAttachmentPurge,
+	snapshotAttachments,
+	transferDraftAttachmentsToMessage,
+} from "./mailbox-draft-attachments";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
+import {
+	createPurgeTables,
+	createPurgeThreadsTable,
+	getPurgeOperation,
+	hasQueuedPurge,
+	markPurgeReported,
+	PURGE_OBJECTS_JOB,
+	type PurgeObjectsPayload,
+	type PurgeTarget,
+	runPurgeBatch,
+	runPurgeObjectsJob,
+	startPurge,
+	unreportedPurges,
+} from "./mailbox-purge";
 import {
 	createRealtimeBroadcaster,
 	handleWebSocketMessage,
@@ -23,12 +69,19 @@ import {
 	type WebSocketAttachment,
 } from "./mailbox-realtime";
 import { MAILBOX_SCHEMA_SQL } from "./mailbox-schema";
+import {
+	applyBulkAction,
+	type BulkAction,
+	type BulkTarget,
+	backfillHeaderFields,
+	restoreDraft,
+} from "./mailbox-web";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 9;
+const MAILBOX_SCHEMA_VERSION = 15;
 
 export type DraftOrigin = "web" | "telegram" | "mcp";
 
@@ -178,16 +231,19 @@ export function isThreadListState(value: string | null | undefined): value is Th
 }
 
 // Columns the Gmail-style thread list needs: enough to render a full row
-// (sender, subject, snippet, time, attachment/unread affordances) without a
-// second round-trip per thread. `latest_*` describe the representative message
-// of the thread — overall newest for the unfiltered ("All mail") view, or the
-// newest message *in the requested folder* when a state filter is applied, so a
-// Sent/Archive/Trash row previews the right message.
+// (participants, subject, snippet, time, attachment/unread affordances) without
+// a second round-trip per thread. `latest_*` describe the representative message
+// of the conversation: its newest message among the ones the folder shows (every
+// message but trashed ones, or only trashed ones in Trash), so a reply you just
+// sent is what the Inbox row previews, and what it is sorted by.
 const THREAD_LIST_COLUMNS = `
-  t.id, t.subject_norm, t.last_message_at, t.message_count, t.unread_count,
+  t.id, t.subject_norm, t.last_message_at,
   t.created_at, t.updated_at,
   lm.subject AS latest_subject,
   lm.from_addr AS latest_from,
+  lm.from_name AS latest_from_name,
+  lm.to_json AS latest_to_json,
+  lm.recipient_names_json AS latest_recipient_names_json,
   lm.snippet AS latest_snippet,
   lm.received_at AS latest_received_at,
   lm.has_attachments AS latest_has_attachments,
@@ -195,42 +251,299 @@ const THREAD_LIST_COLUMNS = `
   lm.direction AS latest_direction,
   lm.state AS latest_state`;
 
-function listThreads(sql: SqlStorage, limit: number, state?: ThreadListState, unread?: boolean) {
-	const unreadClause =
-		unread === undefined ? "" : unread ? "WHERE t.unread_count > 0" : "WHERE t.unread_count = 0";
+/**
+ * Which messages of a conversation a folder shows. Gmail's model: a conversation
+ * is in a folder when any of its messages is, and it is then shown — and sorted —
+ * by its newest message outside the trash. Trash shows the trashed messages only.
+ * "All mail" (no state) shows everything.
+ */
+function visibleClause(
+	alias: string,
+	state: ThreadListState | undefined,
+	reports?: ReportsFilter,
+): string {
+	const folder =
+		state === "trash" ? `${alias}.state = 'trash'` : state ? `${alias}.state != 'trash'` : "1 = 1";
+	return `${folder}${reportsClause(alias, reports)}`;
+}
+
+/**
+ * Automated mail (DMARC aggregate reports, src/lib/automated-mail.ts) in a list
+ * or a search. Absent: everything, as MCP has always seen it. `exclude`: the
+ * web's normal folders, where a report is neither listed nor counted, and a
+ * conversation made only of reports disappears while a person's conversation
+ * that happens to hold one stays. `only`: the web's "DMARC reports" view.
+ */
+export type ReportsFilter = "exclude" | "only";
+
+export function parseReportsFilter(value: string | null | undefined): ReportsFilter | undefined {
+	return value === "exclude" || value === "only" ? value : undefined;
+}
+
+function reportsClause(alias: string, reports: ReportsFilter | undefined): string {
+	if (reports === "exclude") return ` AND ${alias}.automated_kind IS NULL`;
+	if (reports === "only") return ` AND ${alias}.automated_kind IS NOT NULL`;
+	return "";
+}
+
+/** Where a page of the thread list ends: its last row's sort key. */
+export type ThreadListCursor = { receivedAt: string; id: string };
+
+/** `<latest_received_at>|<thread id>`, as the client sends back from the last row. */
+export function parseThreadListCursor(
+	value: string | null | undefined,
+): ThreadListCursor | undefined {
+	if (!value) return undefined;
+	const at = value.lastIndexOf("|");
+	if (at <= 0 || at === value.length - 1) return undefined;
+	return { receivedAt: value.slice(0, at), id: value.slice(at + 1) };
+}
+
+export type ThreadListRow = Record<string, unknown> & {
+	id: string;
+	message_count: number;
+	unread_count: number;
+	participants: ThreadParticipant[];
+};
+
+/**
+ * Exported for tests. Newest activity first in every folder: the order key is the
+ * representative message's received_at (ISO-8601 UTC everywhere, so string order
+ * is time order), with the thread id as a tie-breaker so the order is total and a
+ * merged multi-mailbox list stays stable across refreshes. Within a thread, ties
+ * on received_at (same-millisecond writes) fall back to insertion order.
+ */
+export function listThreads(
+	sql: SqlStorage,
+	limit: number,
+	state?: ThreadListState,
+	unread?: boolean,
+	reports?: ReportsFilter,
+	before?: ThreadListCursor,
+): ThreadListRow[] {
+	const visible = (alias: string) => visibleClause(alias, state, reports);
+	// Which conversations, decided per thread with EXISTS probes that stop at the
+	// first match. The counts are not computed here: ordering and paging only need
+	// the representative message, and counting every message of every thread
+	// before ORDER BY/LIMIT made each page cost a pass over the whole mailbox.
+	const where: string[] = [];
 	if (state) {
-		// The JOIN's correlated subquery only resolves for threads that actually
-		// have a message in this state, so it doubles as the folder filter — a
-		// thread with no message in `state` is dropped. Order by the folder
-		// message's time so the folder view sorts by folder activity.
-		return sql
-			.exec(
-				`SELECT ${THREAD_LIST_COLUMNS}
-          FROM threads t
-          JOIN messages lm ON lm.id = (
-            SELECT m.id FROM messages m
-            WHERE m.thread_id = t.id AND m.state = ?
-            ORDER BY m.received_at DESC LIMIT 1
-          )
-          ${unreadClause} ORDER BY lm.received_at DESC
-          LIMIT ?`,
-				state,
-				limit,
-			)
-			.toArray();
+		where.push(
+			`EXISTS (SELECT 1 FROM messages f WHERE f.thread_id = t.id AND f.state = ?${reportsClause("f", reports)})`,
+		);
 	}
-	return sql
+	if (unread !== undefined) {
+		where.push(
+			`${unread ? "" : "NOT "}EXISTS (SELECT 1 FROM messages u WHERE u.thread_id = t.id AND u.is_read = 0 AND ${visible("u")})`,
+		);
+	}
+	// Keyset paging on the list order: strictly after the last row of the
+	// previous page, so a page never repeats or skips a conversation.
+	const after = before
+		? "WHERE (latest_received_at < ? OR (latest_received_at = ? AND id < ?))"
+		: "";
+	const rows = sql
 		.exec(
-			`SELECT ${THREAD_LIST_COLUMNS}
-        FROM threads t
-        JOIN messages lm ON lm.id = (
-          SELECT m.id FROM messages m WHERE m.thread_id = t.id ORDER BY m.received_at DESC LIMIT 1
-        )
-        ${unreadClause} ORDER BY t.last_message_at DESC
-        LIMIT ?`,
+			`SELECT * FROM (
+         SELECT ${THREAD_LIST_COLUMNS}
+         FROM threads t
+         JOIN messages lm ON lm.id = (
+           SELECT m.id FROM messages m WHERE m.thread_id = t.id AND ${visible("m")}
+           ORDER BY m.received_at DESC, m.rowid DESC LIMIT 1
+         )
+         ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+       ) ${after}
+       ORDER BY latest_received_at DESC, id DESC
+       LIMIT ?`,
+			...(state ? [state] : []),
+			...(before ? [before.receivedAt, before.receivedAt, before.id] : []),
 			limit,
 		)
+		.toArray() as Array<Record<string, SqlStorageValue>>;
+	if (rows.length === 0) return [];
+
+	// The page's visible messages in one indexed read, oldest first: participants,
+	// and the message / unread counts of these rows only.
+	const ids = rows.map((r) => String(r.id));
+	const senders = sql
+		.exec<{ thread_id: string } & ParticipantSource>(
+			`SELECT m.thread_id, m.direction, m.from_addr, m.from_name, m.is_read
+         FROM messages m
+        WHERE m.thread_id IN (${ids.map(() => "?").join(",")}) AND ${visible("m")}
+        ORDER BY m.received_at ASC, m.rowid ASC`,
+			...ids,
+		)
 		.toArray();
+	const byThread = new Map<string, ParticipantSource[]>();
+	for (const row of senders) {
+		const list = byThread.get(row.thread_id) ?? [];
+		list.push(row);
+		byThread.set(row.thread_id, list);
+	}
+	return rows.map((row) => {
+		const messages = byThread.get(String(row.id)) ?? [];
+		return {
+			...row,
+			id: String(row.id),
+			message_count: messages.length,
+			unread_count: messages.filter((m) => Number(m.is_read) === 0).length,
+			participants: buildParticipants(messages),
+		};
+	});
+}
+
+export type FolderCounts = {
+	/** Conversations with at least one message in this folder (the list's rows). */
+	threads: number;
+	/** Of those, conversations with at least one unread message in this folder. */
+	unread: number;
+	/** Messages in this folder. */
+	messages: number;
+};
+
+export type MailboxCounts = Record<ThreadListState | "all", FolderCounts> & {
+	/** Open drafts: still editable or awaiting confirmation. */
+	drafts: number;
+	/**
+	 * Automated reports (every state), kept out of every other figure here. Read
+	 * on arrival, so `unread` is normally 0; the web shows no badge for it.
+	 */
+	reports: FolderCounts;
+};
+
+/**
+ * Real per-folder totals for the web UI, from the mailbox's own tables. One
+ * statement answered entirely from idx_messages_web_counts (state, thread_id,
+ * is_read, …) WHERE automated_kind IS NULL, so it reads that partial index, never
+ * the message rows, and automated reports never reach a folder figure; the
+ * "all" branch scans the same index. The reports' own figure comes from
+ * idx_messages_reports. Unread is counted from messages.is_read, which every
+ * action maintains — threads.unread_count only ever goes up and is not used here.
+ */
+export function folderCounts(sql: SqlStorage): MailboxCounts {
+	const empty = (): FolderCounts => ({ threads: 0, unread: 0, messages: 0 });
+	const counts: MailboxCounts = {
+		inbox: empty(),
+		sent: empty(),
+		archive: empty(),
+		trash: empty(),
+		all: empty(),
+		drafts: 0,
+		reports: empty(),
+	};
+	const rows = sql
+		.exec<{ folder: string; threads: number; unread: number; messages: number }>(
+			`SELECT state AS folder, COUNT(DISTINCT thread_id) AS threads,
+              COUNT(DISTINCT CASE WHEN is_read = 0 THEN thread_id END) AS unread,
+              COUNT(*) AS messages
+         FROM messages WHERE automated_kind IS NULL GROUP BY state
+       UNION ALL
+       SELECT 'all', COUNT(DISTINCT thread_id),
+              COUNT(DISTINCT CASE WHEN is_read = 0 THEN thread_id END),
+              COUNT(*)
+         FROM messages WHERE automated_kind IS NULL
+       UNION ALL
+       SELECT 'reports', COUNT(DISTINCT thread_id),
+              COUNT(DISTINCT CASE WHEN is_read = 0 THEN thread_id END),
+              COUNT(*)
+         FROM messages WHERE automated_kind IS NOT NULL`,
+		)
+		.toArray();
+	for (const row of rows) {
+		if (row.folder === "all" || row.folder === "reports" || isThreadListState(row.folder)) {
+			counts[row.folder] = { threads: row.threads, unread: row.unread, messages: row.messages };
+		}
+	}
+	counts.drafts =
+		sql
+			.exec<{ n: number }>(
+				"SELECT COUNT(*) AS n FROM outbound_drafts WHERE status IN ('draft', 'pending_confirmation')",
+			)
+			.toArray()[0]?.n ?? 0;
+	return counts;
+}
+
+/**
+ * The indexes behind the web counts and the reports view. Partial, so the
+ * reports index holds only reports. Each carries automated_kind as its last
+ * column although its WHERE already fixes it: SQLite only treats an index as
+ * covering when every column the query names is in it. Created by the v11 migration, not
+ * MAILBOX_SCHEMA_SQL, which runs before any migration on every cold start and
+ * would fail on a mailbox that does not have the column yet.
+ */
+export function createAutomatedMailIndexes(sql: SqlStorage): void {
+	sql.exec(
+		`CREATE INDEX IF NOT EXISTS idx_messages_web_counts
+       ON messages(state, thread_id, is_read, automated_kind) WHERE automated_kind IS NULL`,
+	);
+	sql.exec(
+		`CREATE INDEX IF NOT EXISTS idx_messages_reports
+       ON messages(thread_id, id, is_read, automated_kind) WHERE automated_kind IS NOT NULL`,
+	);
+}
+
+/**
+ * Classifies the mail a mailbox already holds, from what is stored: subject,
+ * sender, In-Reply-To/References and attachment file names and types. No R2
+ * read. Only parsed inbound mail is a candidate (a parse failure is never
+ * classified), and only rows with an attachment or "report" in the subject are
+ * looked at. A report found is marked read too, like one arriving now. Returns
+ * how many rows it classified. Safe to run again: it only touches NULL rows.
+ */
+export function backfillAutomatedKind(sql: SqlStorage): number {
+	const candidates = `m.direction = 'inbound' AND m.parse_status = 'parsed'
+     AND m.automated_kind IS NULL AND (m.has_attachments = 1 OR m.subject LIKE '%report%')`;
+	const rows = sql
+		.exec<{
+			id: string;
+			from_addr: string;
+			subject: string | null;
+			in_reply_to: string | null;
+			references_json: string | null;
+		}>(
+			`SELECT m.id, m.from_addr, m.subject, m.in_reply_to, m.references_json
+         FROM messages m WHERE ${candidates}`,
+		)
+		.toArray();
+	if (rows.length === 0) return 0;
+	const files = new Map<string, Array<{ filename: string | null; contentType: string | null }>>();
+	for (const a of sql
+		.exec<{ message_id: string; filename: string | null; content_type: string | null }>(
+			`SELECT a.message_id, a.filename, a.content_type
+         FROM attachments a JOIN messages m ON m.id = a.message_id WHERE ${candidates}`,
+		)
+		.toArray()) {
+		const list = files.get(a.message_id) ?? [];
+		list.push({ filename: a.filename, contentType: a.content_type });
+		files.set(a.message_id, list);
+	}
+	const now = new Date().toISOString();
+	let classified = 0;
+	for (const row of rows) {
+		let references: string[] = [];
+		try {
+			const parsed = JSON.parse(row.references_json ?? "[]") as unknown;
+			if (Array.isArray(parsed)) references = parsed.map(String);
+		} catch {
+			// Unreadable references: treat as none; In-Reply-To and the subject still gate.
+		}
+		const kind = classifyAutomatedMail({
+			from: row.from_addr,
+			subject: row.subject,
+			inReplyTo: row.in_reply_to,
+			references,
+			attachments: files.get(row.id) ?? [],
+		});
+		if (!kind) continue;
+		sql.exec(
+			"UPDATE messages SET automated_kind = ?, is_read = 1, updated_at = ? WHERE id = ?",
+			kind,
+			now,
+			row.id,
+		);
+		classified++;
+	}
+	return classified;
 }
 
 function getThread(sql: SqlStorage, threadId: string | undefined) {
@@ -282,32 +595,45 @@ function getBodyHtmlR2Key(sql: SqlStorage, messageId: string | undefined): strin
 	return row?.body_html_r2_key ?? null;
 }
 
-function applyMessageAction(sql: SqlStorage, messageId: string | undefined, action: string) {
+export function applyMessageAction(sql: SqlStorage, messageId: string | undefined, action: string) {
 	if (!messageId) throw new Error("messageId required");
 	const now = new Date().toISOString();
 	if (action === "mark_read") {
 		sql.exec("UPDATE messages SET is_read = 1, updated_at = ? WHERE id = ?", now, messageId);
 	} else if (action === "mark_unread") {
 		sql.exec("UPDATE messages SET is_read = 0, updated_at = ? WHERE id = ?", now, messageId);
-	} else if (action === "archive") {
-		sql.exec("UPDATE messages SET state = 'archive', updated_at = ? WHERE id = ?", now, messageId);
+	} else if (action === "archive" || action === "restore_inbox") {
+		// Folder moves act on a conversation, and a conversation holds your own
+		// replies too. Those are never "in the inbox" or "archived": they stay in
+		// Sent, so archiving a thread doesn't empty Sent and restoring it doesn't
+		// drop your replies into the Inbox as if someone had written them.
+		sql.exec(
+			`UPDATE messages SET state = CASE WHEN direction = 'outbound' THEN 'sent' ELSE ? END,
+         updated_at = ? WHERE id = ?`,
+			action === "archive" ? "archive" : "inbox",
+			now,
+			messageId,
+		);
 	} else if (action === "trash") {
 		sql.exec("UPDATE messages SET state = 'trash', updated_at = ? WHERE id = ?", now, messageId);
-	} else if (action === "restore_inbox") {
-		sql.exec("UPDATE messages SET state = 'inbox', updated_at = ? WHERE id = ?", now, messageId);
 	}
 	return { ok: true, messageId, action };
 }
 
 function listDrafts(sql: SqlStorage) {
-	return sql.exec("SELECT * FROM outbound_drafts ORDER BY updated_at DESC").toArray();
+	// The count is what a list row needs (the paperclip); the files come with the draft.
+	const counts = draftAttachmentCounts(sql);
+	return sql
+		.exec("SELECT * FROM outbound_drafts ORDER BY updated_at DESC")
+		.toArray()
+		.map((draft) => ({ ...draft, attachment_count: counts.get(String(draft.id)) ?? 0 }));
 }
 
 function getDraft(sql: SqlStorage, draftId: string | undefined) {
 	if (!draftId) throw new Error("draftId required");
 	const draft = sql.exec("SELECT * FROM outbound_drafts WHERE id = ?", draftId).toArray()[0];
 	if (!draft) throw new Error("draft not found");
-	return draft;
+	return { ...draft, attachments: listDraftAttachments(sql, draftId) };
 }
 
 function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
@@ -517,7 +843,7 @@ type ConfirmSendDraftContext = {
 	 * the send itself (most tests) can leave them out: the sent copy then keeps its
 	 * text body and skips the HTML rendering.
 	 */
-	r2?: Pick<R2Bucket, "put">;
+	r2?: Pick<R2Bucket, "put"> & Partial<Pick<R2Bucket, "get">>;
 	mailboxId?: string;
 	/** Present only when the worker has verified a consumed passkey approval. */
 	approvalProofSecret?: string | null;
@@ -614,7 +940,9 @@ function buildSendSnapshot(sql: SqlStorage, draftId: string, identity: SenderIde
 		html: draft.body_html,
 		inReplyTo,
 		references,
-		attachments: [] as Array<{ r2Key: string; sha256: string }>,
+		// [] for a draft without files: the same JSON (and so the same payload_hash)
+		// every intent froze before attachments existed.
+		attachments: snapshotAttachments(sql, draftId),
 	};
 }
 
@@ -870,6 +1198,7 @@ export async function confirmSendDraft(
 	}
 
 	let providerMessageId: string | null = null;
+	let loadedAttachments: LoadedAttachment[] = [];
 	try {
 		// Atomic per-draft send gate: only one idempotency key per draft may
 		// proceed to EMAIL.send. A different attempt key targeting the same draft
@@ -896,6 +1225,33 @@ export async function confirmSendDraft(
 			};
 		}
 
+		// The frozen files, read back now and checked against their frozen sha256:
+		// what leaves is exactly what was confirmed. Nothing has been sent yet, so a
+		// missing or changed object releases both gates and fails cleanly — a retry
+		// with the same key may go again once the draft is fixed.
+		if (snapshot.attachments.length > 0) {
+			try {
+				if (!ctx.r2?.get) throw new AttachmentUnavailableError("attachment_missing");
+				loadedAttachments = await loadSnapshotAttachments(
+					ctx.r2 as Pick<R2Bucket, "get">,
+					snapshot.attachments,
+				);
+			} catch (error) {
+				ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", sentKey);
+				ctx.sql.exec("DELETE FROM mailbox_meta WHERE key = ?", `draft_sending:${draftId}`);
+				if (error instanceof AttachmentUnavailableError) {
+					return {
+						id: draftId,
+						status: draft.status,
+						sent: false,
+						error: error.reason,
+						attachmentId: error.attachmentId ?? null,
+					};
+				}
+				throw error;
+			}
+		}
+
 		const providerResult = await ctx.email.send({
 			// Bare address when the mailbox has no display name — identical to the
 			// behaviour before names existed, so no mailbox changes how it renders
@@ -909,8 +1265,12 @@ export async function confirmSendDraft(
 			replyTo: snapshot.identity.replyTo ?? undefined,
 			subject: draft.subject,
 			text: draft.body_text ?? undefined,
-			html: draft.body_html ?? undefined,
+			// "" is a draft whose rich body was emptied: a text-only send.
+			html: draft.body_html || undefined,
 			...(Object.keys(outboundHeaders).length > 0 ? { headers: outboundHeaders } : {}),
+			...(loadedAttachments.length > 0
+				? { attachments: providerAttachments(loadedAttachments) }
+				: {}),
 		});
 		providerMessageId = extractProviderMessageId(providerResult);
 	} catch (error) {
@@ -979,9 +1339,21 @@ export async function confirmSendDraft(
 				subject: draft.subject,
 				text: draft.body_text ?? null,
 				html: draft.body_html ?? null,
+				// Only when there are files, so a send without any keeps its old value.
+				...(snapshot.attachments.length > 0
+					? { attachments: snapshot.attachments.map((a) => a.sha256) }
+					: {}),
 			}),
 		),
 	);
+	// Free the bytes before the bookkeeping; the sent copy keeps only the metadata.
+	loadedAttachments = [];
+	const hasAttachments = snapshot.attachments.length > 0;
+	// The list row previews the reply itself, not the quoted conversation under it.
+	const sentSnippet =
+		snippetFromText(stripQuotedText(draft.body_text ?? ""), null) ||
+		snippetFromText(draft.body_text, draft.body_html) ||
+		draft.subject.slice(0, 200);
 	ctx.transactionSync(() => {
 		ctx.sql.exec(
 			"UPDATE mailbox_meta SET value = ?, updated_at = ? WHERE key = ?",
@@ -1003,7 +1375,7 @@ export async function confirmSendDraft(
 			`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
          VALUES (?, ?, ?, 1, 0, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           last_message_at = excluded.last_message_at,
+           last_message_at = MAX(last_message_at, excluded.last_message_at),
            message_count = message_count + 1,
            updated_at = excluded.updated_at`,
 			threadId,
@@ -1015,10 +1387,10 @@ export async function confirmSendDraft(
 		ctx.sql.exec(
 			`INSERT INTO messages
          (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
-          from_addr, to_json, cc_json, bcc_json, subject, snippet,
+          from_addr, from_name, to_json, cc_json, bcc_json, subject, snippet,
           received_at, raw_r2_key, raw_sha256, raw_size, body_text, body_html_r2_key,
           parse_status, has_attachments, is_read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'parsed', 0, 1, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'parsed', ?, 1, ?, ?)`,
 			messageLocalId,
 			sentKey,
 			threadId,
@@ -1026,19 +1398,25 @@ export async function confirmSendDraft(
 			inReplyTo,
 			JSON.stringify(references),
 			fromAddress,
+			// The phrase the From header actually carried, through the same sanitiser.
+			sanitizeDisplayName(snapshot.identity.fromName, fromAddress),
 			draft.to_json,
 			draft.cc_json,
 			draft.bcc_json,
 			draft.subject,
-			(draft.body_text ?? draft.subject).slice(0, 200),
+			sentSnippet,
 			now,
 			rawR2Key,
 			rawSha256,
 			draft.body_text,
 			bodyHtmlR2KeyValue,
+			hasAttachments ? 1 : 0,
 			now,
 			now,
 		);
+		// The sent copy lists the files like any received message (same table,
+		// same download route), on the very objects that were sent.
+		transferDraftAttachmentsToMessage(ctx.sql, draftId, messageLocalId, snapshot.attachments, now);
 	});
 
 	recordRealtimeEvent(ctx.sql, "message.created", {
@@ -1059,10 +1437,11 @@ export async function confirmSendDraft(
 		subject: draft.subject,
 		fromAddr: fromAddress,
 		toJson: draft.to_json,
-		snippet: (draft.body_text ?? draft.subject).slice(0, 200),
+		snippet: sentSnippet,
 		receivedAt: now,
 		rawR2Key,
 		rawSha256,
+		hasAttachments,
 	};
 }
 
@@ -1179,6 +1558,59 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 9) {
 			const columns = this.columnNames("outbound_drafts");
 			this.addColumnIfMissing("outbound_drafts", columns, "origin", "TEXT NOT NULL DEFAULT 'web'");
+		}
+		// v10: sender/recipient display names (nullable, no backfill: a row without
+		// one renders the address-derived name it always did), and the covering
+		// index the per-folder counts are answered from.
+		if (currentVersion < 10) {
+			const columns = this.columnNames("messages");
+			this.addColumnIfMissing("messages", columns, "from_name", "TEXT");
+			this.addColumnIfMissing("messages", columns, "recipient_names_json", "TEXT");
+			this.ctx.storage.sql.exec(
+				"CREATE INDEX IF NOT EXISTS idx_messages_folder_counts ON messages(state, thread_id, is_read)",
+			);
+		}
+		// v11: automated mail (DMARC aggregate reports) the web keeps out of its
+		// folders and counts. An additive nullable column, the two partial indexes
+		// the web counts and the reports view are answered from, and a backfill of
+		// the mail already stored, classified from its stored subject, headers and
+		// attachment metadata (no R2 read).
+		if (currentVersion < 11) {
+			const columns = this.columnNames("messages");
+			this.addColumnIfMissing("messages", columns, "automated_kind", "TEXT");
+			createAutomatedMailIndexes(this.ctx.storage.sql);
+			try {
+				backfillAutomatedKind(this.ctx.storage.sql);
+			} catch (error) {
+				// A failed backfill only leaves old reports visible; it must not stop
+				// the mailbox from booting.
+				console.error("mailbox.automated_backfill_failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+		// v12: Reply-To, kept so Reply answers where the sender asked. Nullable and
+		// not backfilled here: a NULL row is filled from its raw headers in R2 the
+		// first time its thread is opened (backfillHeaderFields, bounded per open).
+		if (currentVersion < 12) {
+			const columns = this.columnNames("messages");
+			this.addColumnIfMissing("messages", columns, "reply_to_json", "TEXT");
+		}
+		// v13: files attached to drafts (metadata only; the bytes are in R2). A new
+		// table, so purely additive; see do/mailbox-draft-attachments.ts.
+		if (currentVersion < 13) {
+			createDraftAttachmentsTable(this.ctx.storage.sql);
+		}
+		// v14: permanent deletion ("Delete forever", "Empty trash"): its queue and
+		// operation tables, and the indexes its R2 reference checks are answered
+		// from. Additive; see do/mailbox-purge.ts.
+		if (currentVersion < 14) {
+			createPurgeTables(this.ctx.storage.sql);
+		}
+		// v15: per-operation conversation set, so a purge counts a conversation
+		// whose messages span several batches once. Additive.
+		if (currentVersion < 15) {
+			createPurgeThreadsTable(this.ctx.storage.sql);
 		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -1358,6 +1790,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			return Response.json({
 				results: searchMessages(this.ctx.storage.sql, q, limit, {
 					includeSensitive: url.searchParams.get("sensitive") === "1",
+					reports: parseReportsFilter(url.searchParams.get("reports")),
 				}),
 			});
 		}
@@ -1369,11 +1802,28 @@ export class MailboxDurableObject extends DurableObject<Env> {
 					Number(url.searchParams.get("limit") ?? "25"),
 					state,
 					url.searchParams.has("unread") ? url.searchParams.get("unread") === "true" : undefined,
+					parseReportsFilter(url.searchParams.get("reports")),
+					parseThreadListCursor(url.searchParams.get("before")),
 				),
 			});
 		}
+		if (url.pathname === "/counts" && request.method === "GET") {
+			return Response.json({ counts: folderCounts(this.ctx.storage.sql) });
+		}
 		if (url.pathname.startsWith("/threads/") && request.method === "GET") {
 			const threadId = url.pathname.split("/")[2];
+			// Older rows get their sender name and Reply-To from their own raw
+			// headers, once, the first time their conversation is opened — not when
+			// a search only summarises it (`?backfill=0`).
+			if (threadId && url.searchParams.get("backfill") !== "0") {
+				try {
+					await backfillHeaderFields(this.ctx.storage.sql, this.env.MAIL_OBJECTS, threadId);
+				} catch (error) {
+					console.error("mailbox.header_backfill_failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
 			// getThread already returns { thread, messages }; return it flat so the
 			// client reads data.messages / data.thread directly (not data.thread.messages).
 			return Response.json(this.getThread(threadId));
@@ -1396,6 +1846,25 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const messageId = url.pathname.split("/")[2];
 			const body = (await request.json()) as { action: string };
 			return Response.json(this.applyMessageAction(messageId, body.action));
+		}
+		if (url.pathname === "/bulk-actions" && request.method === "POST") {
+			const body = (await request.json()) as { action: BulkAction; target: BulkTarget };
+			const sql = this.ctx.storage.sql;
+			return Response.json(
+				applyBulkAction(
+					sql,
+					(fn) => this.ctx.storage.transactionSync(fn),
+					(messageId, action) => applyMessageAction(sql, messageId, action),
+					body.action,
+					body.target,
+				),
+			);
+		}
+		const attachmentResponse = await this.draftAttachmentRoute(request, url);
+		if (attachmentResponse) return attachmentResponse;
+		if (url.pathname.match(/^\/drafts\/[^/]+\/restore$/) && request.method === "POST") {
+			const result = restoreDraft(this.ctx.storage.sql, url.pathname.split("/")[2]);
+			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname === "/drafts" && request.method === "GET") {
 			return Response.json({ drafts: this.listDrafts() });
@@ -1477,11 +1946,16 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const isAmbiguous = result.error === "ambiguous";
 			const status =
 				"error" in result && !isAmbiguous
-					? result.error === "intent_stale" || result.error === "approval_required"
+					? result.error === "intent_stale" ||
+						result.error === "approval_required" ||
+						result.error === "attachment_missing" ||
+						result.error === "attachment_changed"
 						? 409
-						: result.error === "too_many_recipients"
-							? 400
-							: 500
+						: result.error === "attachments_too_large"
+							? 413
+							: result.error === "too_many_recipients"
+								? 400
+								: 500
 					: 200;
 			return Response.json(result, { status });
 		}
@@ -1495,15 +1969,24 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				body.allowedStatuses.every((s) => typeof s === "string")
 					? (body.allowedStatuses as string[])
 					: undefined;
-			const result = this.cancelDraft(draftId, allowed);
+			const result = await this.cancelDraft(draftId, allowed);
 			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname === "/export-index" && request.method === "GET") {
 			return Response.json({ messages: this.exportMessageIndex() });
 		}
 		if (url.pathname === "/alarm" && request.method === "POST") {
-			await this.runPendingJobs();
+			await this.alarm();
 			return Response.json({ ok: true });
+		}
+		if (url.pathname === "/purge" && request.method === "POST") {
+			const body = (await request.json()) as { mailboxId: string; target: PurgeTarget };
+			return this.purge(body.mailboxId, body.target);
+		}
+		if (url.pathname.startsWith("/purge/") && request.method === "GET") {
+			const operation = getPurgeOperation(this.ctx.storage.sql, url.pathname.split("/")[2]);
+			if (!operation) return Response.json({ error: "operation_not_found" }, { status: 404 });
+			return Response.json(operation);
 		}
 		// --- Transactional API key routes ---
 		if (url.pathname === "/transactional/api-keys" && request.method === "POST") {
@@ -2199,10 +2682,76 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 	}
 
-	// Reserved, currently unused: fires only if something calls storage.setAlarm(),
-	// which today only happens from inside runPendingJobs() itself (see its comment).
+	// Runs the mailbox's pending jobs (a discarded draft's uploads once its Undo
+	// window has passed, the R2/D1 cleanup of permanently deleted messages) and
+	// the next batch of a running "Empty trash". Armed by cancelDraft, by
+	// runPendingJobs and by advancePurge.
 	async alarm(): Promise<void> {
 		await this.runPendingJobs();
+		await this.advancePurge();
+	}
+
+	/**
+	 * Start a permanent deletion and run its first batch now; anything left is
+	 * continued by the alarm, one bounded batch per run.
+	 */
+	private async purge(mailboxId: string, target: PurgeTarget): Promise<Response> {
+		const started = startPurge(this.ctx.storage.sql, mailboxId, target);
+		if ("error" in started) return Response.json(started, { status: 409 });
+		await this.advancePurge();
+		return Response.json(getPurgeOperation(this.ctx.storage.sql, started.operationId));
+	}
+
+	/** One batch of the purge queue, its cleanup job, and the ops events of finished operations. */
+	private async advancePurge(): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		if (hasQueuedPurge(sql)) {
+			const batch = runPurgeBatch(sql, (fn) => this.ctx.storage.transactionSync(fn));
+			for (const mailboxId of batch.mailboxIds) {
+				this.getBroadcaster(mailboxId).broadcast({
+					type: "messages.purged",
+					payload: { threadIds: batch.threadIds },
+				});
+			}
+			if (batch.jobId) await this.runPendingJobs(batch.jobId);
+		}
+		await this.reportFinishedPurges();
+		if (hasQueuedPurge(sql)) await this.armAlarm(Date.now());
+	}
+
+	// One ops event per finished operation: counts and mailbox, nothing about
+	// the mail itself. A D1 failure leaves it unreported for the next alarm.
+	private async reportFinishedPurges(): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		const pending = unreportedPurges(sql);
+		if (pending.length === 0) return;
+		const { insertOpsEvent } = await import("../db/d1");
+		for (const op of pending) {
+			try {
+				await insertOpsEvent(this.env.INDEX_DB, {
+					id: crypto.randomUUID(),
+					event_type: "mailbox.messages_purged",
+					severity: "info",
+					subject: op.mailbox_id,
+					payload_json: JSON.stringify({
+						mailboxId: op.mailbox_id,
+						operationId: op.id,
+						scope: op.scope,
+						messages: op.deleted_messages,
+						conversations: op.touched_threads,
+						conversationsRemoved: op.removed_threads,
+					}),
+				});
+				markPurgeReported(sql, op.id);
+			} catch (error) {
+				console.error("mailbox.purge_report_failed", {
+					operationId: op.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				await this.armAlarm(Date.now() + 5 * 60 * 1000);
+				return;
+			}
+		}
 	}
 
 	private getBroadcaster(mailboxId: string) {
@@ -2242,8 +2791,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		return result;
 	}
 
-	private listThreads(limit: number, state?: ThreadListState, unread?: boolean) {
-		return listThreads(this.ctx.storage.sql, limit, state, unread);
+	private listThreads(
+		limit: number,
+		state?: ThreadListState,
+		unread?: boolean,
+		reports?: ReportsFilter,
+		before?: ThreadListCursor,
+	) {
+		return listThreads(this.ctx.storage.sql, limit, state, unread, reports, before);
 	}
 
 	private getThread(threadId: string | undefined) {
@@ -2394,34 +2949,147 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		);
 	}
 
-	private cancelDraft(draftId: string | undefined, allowed?: string[]) {
-		return cancelDraft(this.ctx.storage.sql, draftId, allowed);
+	private async cancelDraft(draftId: string | undefined, allowed?: string[]) {
+		const result = cancelDraft(this.ctx.storage.sql, draftId, allowed);
+		// Uploaded files outlive a discard for the Undo window, then a job deletes
+		// them unless the draft was restored.
+		if (!("error" in result) && draftId) {
+			const runAt = scheduleDraftAttachmentPurge(this.ctx.storage.sql, draftId);
+			if (runAt) await this.armAlarm(new Date(runAt).getTime());
+		}
+		return result;
+	}
+
+	private async armAlarm(at: number): Promise<void> {
+		const current = await this.ctx.storage.getAlarm();
+		// An alarm time already in the past is the one firing right now (or about
+		// to): it must not stop the next wake-up from being set.
+		if (current === null || current > at || current <= Date.now()) {
+			await this.ctx.storage.setAlarm(at);
+		}
+	}
+
+	private async draftAttachmentRoute(request: Request, url: URL): Promise<Response | null> {
+		const match = url.pathname.match(/^\/drafts\/([^/]+)\/attachments(?:\/([^/]+))?$/);
+		if (!match) return null;
+		const draftId = match[1]!;
+		const tail = match[2];
+		const sql = this.ctx.storage.sql;
+		const statusOf = (error: string) =>
+			error === "attachment_not_found" || error === "message_not_found"
+				? 404
+				: error === "attachment_too_large" ||
+						error === "attachments_too_large" ||
+						error === "too_many_attachments"
+					? 413
+					: 409;
+		if (!tail && request.method === "GET") {
+			getDraft(sql, draftId);
+			return Response.json({ attachments: listDraftAttachments(sql, draftId) });
+		}
+		if (!tail && request.method === "POST") {
+			const body = (await request.json()) as {
+				id: string;
+				filename: string;
+				contentType: string;
+				size: number;
+				sha256: string;
+				r2Key: string;
+			};
+			const result = addUploadedAttachment(sql, draftId, body);
+			return Response.json(result, {
+				status: "error" in result ? statusOf(result.error) : 201,
+			});
+		}
+		if (tail === "from-message" && request.method === "POST") {
+			const body = (await request.json()) as { messageId: string; attachmentIds?: string[] };
+			const result = addMessageAttachments(sql, draftId, body.messageId, body.attachmentIds);
+			return Response.json(result, {
+				status: "error" in result ? statusOf(result.error) : 200,
+			});
+		}
+		if (tail && request.method === "GET") {
+			const row = getDraftAttachmentRow(sql, draftId, tail);
+			if (!row) return Response.json({ error: "attachment_not_found" }, { status: 404 });
+			return Response.json({ attachment: row });
+		}
+		if (tail && request.method === "DELETE") {
+			const result = removeDraftAttachment(sql, draftId, tail);
+			if ("error" in result) {
+				return Response.json(result, { status: statusOf(result.error) });
+			}
+			if (result.deleteR2Key) {
+				try {
+					await this.env.MAIL_OBJECTS.delete(result.deleteR2Key);
+				} catch (error) {
+					// The row is gone, so the file is off the draft either way; a leftover
+					// object under the draft prefix is logged, not surfaced.
+					console.error("mailbox.draft_attachment_delete_failed", {
+						draftId,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			return Response.json({ removed: result.removed });
+		}
+		return null;
 	}
 
 	private exportMessageIndex() {
 		return exportMessageIndex(this.ctx.storage.sql);
 	}
 
-	// Reserved, currently unused: the `jobs` table (see the comment on its CREATE
-	// TABLE in mailbox-schema-content.ts) has no writers yet, so this always finds
-	// zero pending jobs. Kept wired up (and gated by DO alarm) for the planned
-	// mailbox-local job-queue milestone in docs/IMPLEMENTATION.md.
-	private async runPendingJobs(): Promise<void> {
+	// Mailbox-local jobs from the `jobs` table: a draft discard
+	// (PURGE_DRAFT_ATTACHMENTS_JOB) and the R2/D1 cleanup of permanently deleted
+	// messages (PURGE_OBJECTS_JOB). Unknown types are marked done. `onlyJobId`
+	// runs that one job now, whatever its next_run_at (a purge batch just queued it).
+	private async runPendingJobs(onlyJobId?: string): Promise<void> {
 		const now = new Date().toISOString();
-		const jobs = this.ctx.storage.sql
-			.exec<{ id: string; type: string; payload_json: string }>(
-				"SELECT id, type, payload_json FROM jobs WHERE status = 'pending' AND next_run_at <= ? LIMIT 5",
-				now,
-			)
-			.toArray();
+		const jobs = onlyJobId
+			? this.ctx.storage.sql
+					.exec<{ id: string; type: string; payload_json: string }>(
+						"SELECT id, type, payload_json FROM jobs WHERE status = 'pending' AND id = ?",
+						onlyJobId,
+					)
+					.toArray()
+			: this.ctx.storage.sql
+					.exec<{ id: string; type: string; payload_json: string }>(
+						"SELECT id, type, payload_json FROM jobs WHERE status = 'pending' AND next_run_at <= ? LIMIT 5",
+						now,
+					)
+					.toArray();
 		for (const job of jobs) {
 			this.ctx.storage.sql.exec(
 				"UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ?",
 				now,
 				job.id,
 			);
+			let status: "done" | "pending" | "failed" = "done";
+			let nextRunAt = now;
+			let lastError: string | null = null;
+			try {
+				await this.runJob(job.id, job.type, job.payload_json);
+			} catch (error) {
+				lastError = error instanceof Error ? error.message.slice(0, 200) : String(error);
+				const attempts =
+					this.ctx.storage.sql
+						.exec<{ attempts: number }>("SELECT attempts FROM jobs WHERE id = ?", job.id)
+						.toArray()[0]?.attempts ?? 1;
+				// A transient R2 error retries hourly, a few times, then stays visible as
+				// failed. Deleted mail's leftovers retry sooner and for longer: until they
+				// are gone, an object the owner deleted forever still exists.
+				const purge = job.type === PURGE_OBJECTS_JOB;
+				status = attempts >= (purge ? 24 : 5) ? "failed" : "pending";
+				nextRunAt = new Date(Date.now() + (purge ? 5 : 60) * 60 * 1000).toISOString();
+				if (purge) {
+					console.error("mailbox.purge_cleanup_failed", { jobId: job.id, attempts, status });
+				}
+			}
 			this.ctx.storage.sql.exec(
-				"UPDATE jobs SET status = 'done', updated_at = ? WHERE id = ?",
+				"UPDATE jobs SET status = ?, next_run_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
+				status,
+				nextRunAt,
+				lastError,
 				now,
 				job.id,
 			);
@@ -2432,7 +3100,42 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			)
 			.toArray()[0];
 		if (next) {
-			await this.ctx.storage.setAlarm(new Date(next.next_run_at).getTime());
+			await this.armAlarm(new Date(next.next_run_at).getTime());
+		}
+	}
+
+	private async runJob(id: string, type: string, payloadJson: string): Promise<void> {
+		if (type === PURGE_OBJECTS_JOB) {
+			const sql = this.ctx.storage.sql;
+			await runPurgeObjectsJob(
+				{
+					sql,
+					r2: this.env.MAIL_OBJECTS,
+					db: this.env.INDEX_DB,
+					saveProgress: (payload) =>
+						sql.exec("UPDATE jobs SET payload_json = ? WHERE id = ?", JSON.stringify(payload), id),
+				},
+				JSON.parse(payloadJson) as PurgeObjectsPayload,
+			);
+			return;
+		}
+		if (type === PURGE_DRAFT_ATTACHMENTS_JOB) {
+			const payload = JSON.parse(payloadJson) as { draftId?: string; keys?: string[] };
+			// Rows go first, in one synchronous step with the status check, so a draft
+			// restored meanwhile can never lose its files. The keys are kept on the job
+			// until R2 confirms the delete, so a retry still knows what to remove.
+			const keys =
+				payload.keys ??
+				(payload.draftId
+					? purgeDiscardedDraftAttachments(this.ctx.storage.sql, payload.draftId)
+					: []);
+			if (keys.length === 0) return;
+			this.ctx.storage.sql.exec(
+				"UPDATE jobs SET payload_json = ? WHERE id = ?",
+				JSON.stringify({ ...payload, keys }),
+				id,
+			);
+			await this.env.MAIL_OBJECTS.delete(keys);
 		}
 	}
 

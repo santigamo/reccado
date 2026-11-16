@@ -105,13 +105,63 @@ export const messageActionSchema = z.object({
 	action: z.enum(["mark_read", "mark_unread", "archive", "trash", "restore_inbox"]),
 });
 
+/**
+ * One action on many messages of a mailbox: whole conversations (bulk archive,
+ * delete, read state), exact messages (undo), or every unread message of a
+ * folder (mark all as read; read state only). Exactly one target.
+ */
+export const bulkActionSchema = z
+	.object({
+		action: z.enum(["mark_read", "mark_unread", "archive", "trash", "restore_inbox"]),
+		threadIds: z.array(z.string().min(1).max(200)).min(1).max(100).optional(),
+		/**
+		 * With threadIds: the messages of each conversation the acting folder shows
+		 * ("live" outside the Trash, "trash" in it, "all" in All mail). Absent is
+		 * "live", so a conversation action never reaches the Trash by default.
+		 */
+		scope: z.enum(["live", "trash", "all"]).optional(),
+		messageIds: z.array(z.string().min(1).max(200)).min(1).max(1000).optional(),
+		folder: z
+			.object({
+				state: z.enum(["inbox", "archive", "trash", "sent"]).nullable(),
+				reports: z.enum(["only"]).optional(),
+			})
+			.optional(),
+	})
+	.refine(
+		(b) => [b.threadIds, b.messageIds, b.folder].filter((t) => t !== undefined).length === 1,
+		{ message: "Give exactly one of threadIds, messageIds or folder" },
+	)
+	.refine((b) => !b.folder || b.action === "mark_read", {
+		message: "A whole folder can only be marked read",
+	})
+	.refine((b) => b.scope === undefined || b.threadIds !== undefined, {
+		message: "scope only applies to threadIds",
+	});
+
+/**
+ * Permanent deletion, only ever of messages in the Trash: whole conversations
+ * (their trashed messages), exact messages, or the whole Trash ("Empty trash").
+ */
+export const purgeSchema = z
+	.object({
+		threadIds: z.array(z.string().min(1).max(200)).min(1).max(100).optional(),
+		messageIds: z.array(z.string().min(1).max(200)).min(1).max(1000).optional(),
+		emptyTrash: z.literal(true).optional(),
+	})
+	.refine(
+		(b) => [b.threadIds, b.messageIds, b.emptyTrash].filter((t) => t !== undefined).length === 1,
+		{ message: "Give exactly one of threadIds, messageIds or emptyTrash" },
+	);
+
 export const createDraftSchema = z.object({
 	to: z.array(z.string().email()).min(1),
 	cc: z.array(z.string().email()).optional(),
 	bcc: z.array(z.string().email()).optional(),
 	subject: z.string().min(1),
 	bodyText: z.string().optional(),
-	bodyHtml: z.string().optional(),
+	/** Sanitised server-side before storage (lib/html-sanitize.ts). */
+	bodyHtml: z.string().max(1_000_000).optional(),
 	threadId: z.string().optional(),
 	/** The message being answered, so the reply's In-Reply-To points at it rather
 	 * than at whatever arrived in the thread most recently. */
@@ -120,23 +170,42 @@ export const createDraftSchema = z.object({
 
 export const updateDraftSchema = createDraftSchema.partial();
 
+/** Forward: attach (some of) a message's files to a draft, by reference. */
+export const draftAttachmentsFromMessageSchema = z.object({
+	messageId: z.string().min(1).max(200),
+	/** Omitted: every file of the message. */
+	attachmentIds: z.array(z.string().min(1).max(200)).max(100).optional(),
+});
+
 export const confirmSendSchema = z.object({
 	idempotencyKey: z.string().min(1),
 });
+
+/**
+ * The web never lists automated reports (DMARC aggregate reports) in its
+ * folders or search; `reports=only` asks for them instead, for the "DMARC
+ * reports" view. MCP talks to the mailbox DO directly and is not filtered.
+ */
+const webReportsSchema = z.enum(["only"]).optional();
 
 export const searchQuerySchema = z.object({
 	q: z.string().min(1),
 	limit: z.coerce.number().int().min(1).max(100).default(25),
 	cursor: z.string().optional(),
+	reports: webReportsSchema,
 });
 
 export const threadListQuerySchema = z.object({
-	limit: z.coerce.number().int().min(1).max(100).default(25),
-	cursor: z.string().optional(),
+	limit: z.coerce.number().int().min(1).max(101).default(25),
+	/** `<latest_received_at>|<thread id>` of the previous page's last row. */
+	cursor: z.string().max(200).optional(),
+	/** Only conversations with something unread ("Unread" filter). */
+	unread: z.enum(["true"]).optional(),
 	q: z.string().optional(),
 	label: z.string().optional(),
 	// Folder filter. `draft` is excluded — drafts live in outbound_drafts, not messages.
 	state: z.enum(["inbox", "archive", "trash", "sent"]).optional(),
+	reports: webReportsSchema,
 });
 
 export const adminMailboxActionSchema = z.object({
@@ -181,7 +250,11 @@ export const updateTransactionalApiKeySchema = z.object({
 const templateIdList = z.array(z.string().trim().min(1).max(128)).max(100);
 /** Exactly one of `set`, or `add`/`remove` (either or both). */
 export const updateKeyTemplatesSchema = z
-	.object({ add: templateIdList.optional(), remove: templateIdList.optional(), set: templateIdList.optional() })
+	.object({
+		add: templateIdList.optional(),
+		remove: templateIdList.optional(),
+		set: templateIdList.optional(),
+	})
 	.strict()
 	.refine((b) => (b.set !== undefined) !== (b.add !== undefined || b.remove !== undefined), {
 		message: "Provide either set, or add/remove",

@@ -20,7 +20,12 @@ const suppressionSchema = z
 const reconcileSchema = z.object({ mailboxId: z.string().min(1).max(100).optional() }).strict();
 
 type Suppression = { email: string; reason?: string };
-async function suppression(env: Env, auth: Parameters<typeof requireMailboxOwner>[1], mailboxId: string, email: string) {
+async function suppression(
+	env: Env,
+	auth: Parameters<typeof requireMailboxOwner>[1],
+	mailboxId: string,
+	email: string,
+) {
 	await requireMailboxOwner(env, auth, mailboxId);
 	const result = await listSuppressions(env, auth, { mailboxId });
 	const rows = (result.value as { suppressions?: Suppression[] } | undefined)?.suppressions ?? [];
@@ -36,9 +41,18 @@ registerControlPlaneKind("suppression_remove", {
 	render: async (env, auth, payload) => {
 		const body = payload.body as z.infer<typeof suppressionSchema>["body"];
 		const row = await suppression(env, auth, String(payload.mailboxId), body.email);
-		const warnings = [{ code: "suppressed_recipient", message: "Este destinatario rebotó o se quejó: volver a enviarle puede dañar la reputación del dominio." }];
+		const warnings = [
+			{
+				code: "suppressed_recipient",
+				message:
+					"Este destinatario rebotó o se quejó: volver a enviarle puede dañar la reputación del dominio.",
+			},
+		];
 		if (body.allowProviderRemoval === true)
-			warnings.push({ code: "provider_removal", message: "Se elimina incluso la supresión del proveedor (rebote/queja)." });
+			warnings.push({
+				code: "provider_removal",
+				message: "Se elimina incluso la supresión del proveedor (rebote/queja).",
+			});
 		return {
 			title: "Quitar supresión de destinatario",
 			fields: [
@@ -69,7 +83,11 @@ async function staleCount(env: Env, mailboxId: string): Promise<number> {
 		.first<{ n: number }>();
 	return row?.n ?? 0;
 }
-async function reconcileTargets(env: Env, auth: Parameters<typeof requireMailboxOwner>[1], id: unknown) {
+async function reconcileTargets(
+	env: Env,
+	auth: Parameters<typeof requireMailboxOwner>[1],
+	id: unknown,
+) {
 	if (typeof id === "string") {
 		await requireMailboxOwner(env, auth, id);
 		const mailbox = await getMailbox(env.INDEX_DB, id);
@@ -107,7 +125,8 @@ registerControlPlaneKind("transactional_reconcile", {
 			warnings: [
 				{
 					code: "manual_review",
-					message: "Se marcan como «unknown» para revisión manual. No se reenvía ni reintenta ningún correo.",
+					message:
+						"Se marcan como «unknown» para revisión manual. No se reenvía ni reintenta ningún correo.",
 				},
 			],
 		};

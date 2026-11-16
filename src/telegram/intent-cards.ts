@@ -33,12 +33,18 @@ function fieldLine(field: IntentView["fields"][number]): { line: string; clipped
 			clipped,
 		};
 	}
-	const { text, clipped } = clip(field.value, field.format === "pre" ? PRE_FIELD_MAX : TEXT_FIELD_MAX);
+	const { text, clipped } = clip(
+		field.value,
+		field.format === "pre" ? PRE_FIELD_MAX : TEXT_FIELD_MAX,
+	);
 	return { line: `${label}: ${telegramEscape(text)}`, clipped };
 }
 
 /** The card body. Warnings come first and are marked; long content is cut, the link has it all. */
-export function renderIntentCardText(view: IntentView, options: { compact?: boolean } = {}): string {
+export function renderIntentCardText(
+	view: IntentView,
+	options: { compact?: boolean } = {},
+): string {
 	const parts: string[] = [`🔐 <b>${telegramEscape(view.title)}</b>`];
 	for (const warning of view.warnings) {
 		parts.push(`⚠️ <b>${telegramEscape(warning.message)}</b>`);

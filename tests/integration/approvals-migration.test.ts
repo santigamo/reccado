@@ -46,12 +46,17 @@ it("retains MCP approvals for 30 days after the later terminal timestamp", async
 		["mcp-recent-expiry", iso(-2), null, "mcp"],
 		["mcp-recent-consumption", iso(-40), iso(-2), "mcp"],
 		["mcp-old", iso(-40), iso(-35), "mcp"],
-	] as const) await insert.bind(token, iso(-50), expires, consumed, origin).run();
+	] as const)
+		await insert.bind(token, iso(-50), expires, consumed, origin).run();
 	await deleteExpiredApprovals(db);
 	for (const token of ["telegram-expired", "web-expired", "mcp-old"]) {
-		expect(await db.prepare("SELECT token FROM approvals WHERE token = ?").bind(token).first()).toBeNull();
+		expect(
+			await db.prepare("SELECT token FROM approvals WHERE token = ?").bind(token).first(),
+		).toBeNull();
 	}
 	for (const token of ["mcp-recent-expiry", "mcp-recent-consumption"]) {
-		expect(await db.prepare("SELECT token FROM approvals WHERE token = ?").bind(token).first()).not.toBeNull();
+		expect(
+			await db.prepare("SELECT token FROM approvals WHERE token = ?").bind(token).first(),
+		).not.toBeNull();
 	}
 });

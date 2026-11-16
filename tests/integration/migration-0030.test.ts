@@ -8,7 +8,9 @@ import { applyMigrations } from "../helpers/migrations";
 
 const db = env.INDEX_DB;
 const hasTable = async () =>
-	(await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_policies'").first()) !== null;
+	(await db
+		.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'mcp_client_policies'")
+		.first()) !== null;
 
 describe("migration 0030: drop mcp_client_policies", () => {
 	it("drops the table on a database that has it, keeps the approvals columns, and is idempotent", async () => {
@@ -16,7 +18,9 @@ describe("migration 0030: drop mcp_client_policies", () => {
 		expect(await hasTable()).toBe(true);
 		await applyMigrations(db, migrationDrop);
 		expect(await hasTable()).toBe(false);
-		const columns = (await db.prepare("PRAGMA table_info(approvals)").all<{ name: string }>()).results.map((c) => c.name);
+		const columns = (
+			await db.prepare("PRAGMA table_info(approvals)").all<{ name: string }>()
+		).results.map((c) => c.name);
 		expect(columns).toEqual(expect.arrayContaining(["approved_via", "auto_refused"]));
 		await applyMigrations(db, migrationDrop);
 		expect(await hasTable()).toBe(false);

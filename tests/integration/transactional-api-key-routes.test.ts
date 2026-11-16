@@ -54,59 +54,57 @@ async function call(
 }
 
 describe("transactional API key routes", () => {
-	it(
-		"return the plaintext key on create and rotate, and keep the D1 projection in step",
-		{ timeout: 20_000 },
-		async () => {
-			const mailboxId = "mbx_key_routes";
-			// Owned by the localhost dev-bypass identity so the ownership gate passes.
-			await insertMailbox(env.INDEX_DB, {
-				mailbox_id: mailboxId,
-				primary_address: "keys@routes.example",
-				display_name: null,
-				status: "active",
-				owner_email: "dev@local",
-			});
-			const base = `/api/mailboxes/${mailboxId}/transactional/api-keys`;
+	it("return the plaintext key on create and rotate, and keep the D1 projection in step", {
+		timeout: 20_000,
+	}, async () => {
+		const mailboxId = "mbx_key_routes";
+		// Owned by the localhost dev-bypass identity so the ownership gate passes.
+		await insertMailbox(env.INDEX_DB, {
+			mailbox_id: mailboxId,
+			primary_address: "keys@routes.example",
+			display_name: null,
+			status: "active",
+			owner_email: "dev@local",
+		});
+		const base = `/api/mailboxes/${mailboxId}/transactional/api-keys`;
 
-			const created = await call("POST", base, {
-				environment: "live",
-				sender: "hola@send.routes.example",
-				scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
-				templateAllowlist: ["magic-link"],
-				recipientPolicy: "@routes.example",
-				quotaMax: 50,
-			});
-			expect(created.status).toBe(201);
-			expect(created.body.plaintextKey).toMatch(/^rck_live_/);
-			const keyId = (created.body.key as { keyId: string }).keyId;
+		const created = await call("POST", base, {
+			environment: "live",
+			sender: "hola@send.routes.example",
+			scopes: ["transactional:send", "transactional:templates:use", "transactional:status"],
+			templateAllowlist: ["magic-link"],
+			recipientPolicy: "@routes.example",
+			quotaMax: 50,
+		});
+		expect(created.status).toBe(201);
+		expect(created.body.plaintextKey).toMatch(/^rck_live_/);
+		const keyId = (created.body.key as { keyId: string }).keyId;
 
-			const projected = await getApiKeyProjection(env.INDEX_DB, keyId);
-			expect(projected).toMatchObject({
-				key_id: keyId,
-				mailbox_id: mailboxId,
-				sender: "hola@send.routes.example",
-				environment: "live",
-				recipient_policy: "@routes.example",
-				quota_max: 50,
-				status: "active",
-			});
+		const projected = await getApiKeyProjection(env.INDEX_DB, keyId);
+		expect(projected).toMatchObject({
+			key_id: keyId,
+			mailbox_id: mailboxId,
+			sender: "hola@send.routes.example",
+			environment: "live",
+			recipient_policy: "@routes.example",
+			quota_max: 50,
+			status: "active",
+		});
 
-			const renamed = await call("PATCH", `${base}/${keyId}`, { senderName: "Routes" });
-			expect(renamed.status).toBe(200);
+		const renamed = await call("PATCH", `${base}/${keyId}`, { senderName: "Routes" });
+		expect(renamed.status).toBe(200);
 
-			const rotated = await call("POST", `${base}/${keyId}/rotate`);
-			expect(rotated.status).toBe(200);
-			expect(rotated.body.plaintextKey).toMatch(/^rck_live_/);
-			const newKeyId = (rotated.body.key as { keyId: string }).keyId;
-			expect((await getApiKeyProjection(env.INDEX_DB, keyId))?.status).toBe("revoked");
-			expect((await getApiKeyProjection(env.INDEX_DB, newKeyId))?.status).toBe("active");
+		const rotated = await call("POST", `${base}/${keyId}/rotate`);
+		expect(rotated.status).toBe(200);
+		expect(rotated.body.plaintextKey).toMatch(/^rck_live_/);
+		const newKeyId = (rotated.body.key as { keyId: string }).keyId;
+		expect((await getApiKeyProjection(env.INDEX_DB, keyId))?.status).toBe("revoked");
+		expect((await getApiKeyProjection(env.INDEX_DB, newKeyId))?.status).toBe("active");
 
-			const revoked = await call("POST", `${base}/${newKeyId}/revoke`);
-			expect(revoked.status).toBe(200);
-			expect((await getApiKeyProjection(env.INDEX_DB, newKeyId))?.status).toBe("revoked");
-		},
-	);
+		const revoked = await call("POST", `${base}/${newKeyId}/revoke`);
+		expect(revoked.status).toBe(200);
+		expect((await getApiKeyProjection(env.INDEX_DB, newKeyId))?.status).toBe("revoked");
+	});
 
 	it("accepts senderName on create, with no follow-up PATCH", { timeout: 20_000 }, async () => {
 		const mailboxId = "mbx_key_routes_name";

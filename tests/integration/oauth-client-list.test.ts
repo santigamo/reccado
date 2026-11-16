@@ -14,7 +14,7 @@ import migrationPasskey from "../../migrations/d1/0024_passkey.sql?raw";
 import worker from "../../src/server";
 import { applyMigrations } from "../helpers/migrations";
 
-/** GET /api/oauth-clients: the owner's connected apps with consent scopes, for /security. */
+/** GET /api/oauth-clients: the owner's connected apps with consent scopes, for /settings/agent-access. */
 
 type TestEnv = Env & { INDEX_DB: D1Database };
 const testEnv = env as unknown as TestEnv;
@@ -23,7 +23,8 @@ const OWNER = "owner@example.com";
 const STRANGER = "stranger@example.com";
 const ORIGIN = "https://inbox.imsanti.dev";
 
-const authEnv = () => ({ ...env, BETTER_AUTH_SECRET: TEST_SECRET, OWNER_BOOTSTRAP_EMAILS: OWNER }) as Env;
+const authEnv = () =>
+	({ ...env, BETTER_AUTH_SECRET: TEST_SECRET, OWNER_BOOTSTRAP_EMAILS: OWNER }) as Env;
 
 async function run(request: Request): Promise<Response> {
 	const ctx = createExecutionContext();
@@ -36,18 +37,40 @@ async function sessionCookieFor(email: string): Promise<{ cookie: string; userId
 	const { createAuth } = await import("#/api/better-auth");
 	const auth = await createAuth(authEnv(), { request: new Request(`${ORIGIN}/`) });
 	const ctx = await auth.$context;
-	const existing = await testEnv.INDEX_DB.prepare(`SELECT id FROM "user" WHERE email = ?`).bind(email).first<{ id: string }>();
+	const existing = await testEnv.INDEX_DB.prepare(`SELECT id FROM "user" WHERE email = ?`)
+		.bind(email)
+		.first<{ id: string }>();
 	const userId = existing
 		? existing.id
-		: (await ctx.internalAdapter.createUser({ email, name: email.split("@")[0] ?? email, emailVerified: true }, { method: "admin" })).id;
+		: (
+				await ctx.internalAdapter.createUser(
+					{ email, name: email.split("@")[0] ?? email, emailVerified: true },
+					{ method: "admin" },
+				)
+			).id;
 	const session = await ctx.internalAdapter.createSession(userId, false);
-	const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(ctx.secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+	const key = await crypto.subtle.importKey(
+		"raw",
+		new TextEncoder().encode(ctx.secret),
+		{ name: "HMAC", hash: "SHA-256" },
+		false,
+		["sign"],
+	);
 	const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(session.token));
 	const base64 = btoa(String.fromCharCode(...new Uint8Array(signature)));
-	return { cookie: `${ctx.authCookies.sessionToken.name}=${encodeURIComponent(`${session.token}.${base64}`)}`, userId };
+	return {
+		cookie: `${ctx.authCookies.sessionToken.name}=${encodeURIComponent(`${session.token}.${base64}`)}`,
+		userId,
+	};
 }
 
-async function insertClient(clientId: string, name: string, userId: string | null, redirect: string, createdAt: number): Promise<void> {
+async function insertClient(
+	clientId: string,
+	name: string,
+	userId: string | null,
+	redirect: string,
+	createdAt: number,
+): Promise<void> {
 	await testEnv.INDEX_DB.prepare(
 		`INSERT INTO "oauthClient" (id, "clientId", name, "userId", "redirectUris", "createdAt") VALUES (?, ?, ?, ?, ?, ?)`,
 	)
@@ -88,19 +111,49 @@ beforeEach(async () => {
 	}
 });
 
-type ListBody = { clients: Array<{ client_id: string; name: string | null; redirect_hosts: string[]; granted_scopes: string[]; authorized: boolean; last_token_at: string | null; created_at: string | null }> };
+type ListBody = {
+	clients: Array<{
+		client_id: string;
+		name: string | null;
+		redirect_hosts: string[];
+		granted_scopes: string[];
+		authorized: boolean;
+		last_token_at: string | null;
+		created_at: string | null;
+	}>;
+};
 
 describe("GET /api/oauth-clients", () => {
 	it("lists consented and never-consented clients with scopes, hosts and last token", async () => {
 		const { cookie, userId } = await sessionCookieFor(OWNER);
 		const other = await sessionCookieFor(STRANGER);
-		await insertClient("c-consented", "Claude", userId, "https://claude.example/cb", 1_700_000_000_000);
+		await insertClient(
+			"c-consented",
+			"Claude",
+			userId,
+			"https://claude.example/cb",
+			1_700_000_000_000,
+		);
 		await insertConsent("c-consented", userId, ["admin", "mail:draft"]);
 		await testEnv.INDEX_DB.prepare(
 			`INSERT INTO "oauthAccessToken" (id, token, "clientId", "userId", scopes, "createdAt") VALUES ('t1', 'tok1', 'c-consented', ?, '[]', ?), ('t2', 'tok2', 'c-consented', ?, '[]', ?)`,
-		).bind(userId, 1_700_000_100_000, userId, 1_700_000_200_000).run();
-		await insertClient("c-pending", "Pending app", userId, "https://pending.example/cb", 1_700_000_300_000);
-		await insertClient("c-foreign", "Foreign", other.userId, "https://foreign.example/cb", 1_700_000_400_000);
+		)
+			.bind(userId, 1_700_000_100_000, userId, 1_700_000_200_000)
+			.run();
+		await insertClient(
+			"c-pending",
+			"Pending app",
+			userId,
+			"https://pending.example/cb",
+			1_700_000_300_000,
+		);
+		await insertClient(
+			"c-foreign",
+			"Foreign",
+			other.userId,
+			"https://foreign.example/cb",
+			1_700_000_400_000,
+		);
 		await insertConsent("c-foreign", other.userId, ["mail:read"]);
 
 		const response = await run(new Request(`${ORIGIN}/api/oauth-clients`, { headers: { cookie } }));
@@ -108,9 +161,18 @@ describe("GET /api/oauth-clients", () => {
 		const { clients } = (await response.json()) as ListBody;
 		expect(clients.map((c) => c.client_id)).toEqual(["c-pending", "c-consented"]);
 		const consented = clients.find((c) => c.client_id === "c-consented")!;
-		expect(consented).toMatchObject({ name: "Claude", redirect_hosts: ["claude.example"], granted_scopes: ["admin", "mail:draft"], authorized: true });
+		expect(consented).toMatchObject({
+			name: "Claude",
+			redirect_hosts: ["claude.example"],
+			granted_scopes: ["admin", "mail:draft"],
+			authorized: true,
+		});
 		expect(consented.last_token_at).toBe(new Date(1_700_000_200_000).toISOString());
-		expect(clients.find((c) => c.client_id === "c-pending")).toMatchObject({ authorized: false, granted_scopes: [], last_token_at: null });
+		expect(clients.find((c) => c.client_id === "c-pending")).toMatchObject({
+			authorized: false,
+			granted_scopes: [],
+			last_token_at: null,
+		});
 	});
 
 	it("is owner-only", async () => {
@@ -122,10 +184,36 @@ describe("GET /api/oauth-clients", () => {
 		expect(stranger.status).toBe(403);
 	});
 
+	it("answers JSON 503 (not a thrown Response / 500) for the localhost dev-bypass identity when no owner exists", async () => {
+		// No BETTER_AUTH_SECRET and no owner: the web perimeter lets the local dev
+		// identity in, but it is never an MCP owner.
+		const devEnv = { ...env, BETTER_AUTH_SECRET: "", OWNER_BOOTSTRAP_EMAILS: "" } as Env;
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(
+			new Request("http://localhost/api/oauth-clients"),
+			devEnv,
+			ctx,
+		);
+		await waitOnExecutionContext(ctx);
+		expect(response.status).toBe(503);
+		expect(response.headers.get("content-type")).toContain("application/json");
+		expect(await response.json()).toMatchObject({ error: "mcp_not_configured" });
+	});
+
 	it("the delegation policy routes are gone", async () => {
 		const { cookie } = await sessionCookieFor(OWNER);
-		for (const [method, path] of [["GET", "/api/mcp-client-policies"], ["PUT", "/api/mcp-client-policies/c-x"], ["DELETE", "/api/mcp-client-policies/c-x"]] as const) {
-			const response = await run(new Request(`${ORIGIN}${path}`, { method, headers: { cookie, origin: ORIGIN, "content-type": "application/json" }, body: method === "PUT" ? "{}" : undefined }));
+		for (const [method, path] of [
+			["GET", "/api/mcp-client-policies"],
+			["PUT", "/api/mcp-client-policies/c-x"],
+			["DELETE", "/api/mcp-client-policies/c-x"],
+		] as const) {
+			const response = await run(
+				new Request(`${ORIGIN}${path}`, {
+					method,
+					headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
+					body: method === "PUT" ? "{}" : undefined,
+				}),
+			);
 			expect(response.status, `${method} ${path}`).toBe(404);
 		}
 	});

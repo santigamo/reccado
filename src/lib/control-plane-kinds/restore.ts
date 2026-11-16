@@ -33,7 +33,11 @@ async function loadSnapshot(env: Env, auth: AuthContext, opsEventId: string): Pr
 		.bind(opsEventId)
 		.first<{ payload_json: string }>();
 	if (!row) throw new AdminError("Snapshot not found", "snapshot_not_found", 404);
-	if (await env.INDEX_DB.prepare("SELECT 1 AS x FROM ops_events WHERE id = ?").bind(`restored:${opsEventId}`).first())
+	if (
+		await env.INDEX_DB.prepare("SELECT 1 AS x FROM ops_events WHERE id = ?")
+			.bind(`restored:${opsEventId}`)
+			.first()
+	)
 		throw new AdminError("Snapshot already restored", "snapshot_consumed", 409);
 	const parsed = JSON.parse(row.payload_json) as Snapshot;
 	// Snapshots written before `entity` existed are mailbox rows.
@@ -44,16 +48,22 @@ async function loadSnapshot(env: Env, auth: AuthContext, opsEventId: string): Pr
 /** Ownership of the thing being restored; disabled mailboxes fail requireMailboxOwner, so check the row. */
 async function requireOwnership(env: Env, auth: AuthContext, snap: Snapshot): Promise<void> {
 	const forbidden = () => new AdminError("Forbidden", "forbidden", 403, false);
-	const mailboxId = snap.entity === "mailbox" ? snap.mailbox_id : snap.mailbox_id ?? snap.mailboxId;
+	const mailboxId =
+		snap.entity === "mailbox" ? snap.mailbox_id : (snap.mailbox_id ?? snap.mailboxId);
 	if (typeof mailboxId === "string") {
 		const mailbox = await getMailbox(env.INDEX_DB, mailboxId);
-		if (!mailbox || mailbox.owner_email?.toLowerCase() !== auth.email.toLowerCase()) throw forbidden();
+		if (!mailbox || mailbox.owner_email?.toLowerCase() !== auth.email.toLowerCase())
+			throw forbidden();
 		return;
 	}
 	if (!snap.by || snap.by.toLowerCase() !== auth.email.toLowerCase()) throw forbidden();
 }
 
-type Plan = { title: string; fields: Array<{ label: string; value: string }>; apply: () => Promise<unknown> };
+type Plan = {
+	title: string;
+	fields: Array<{ label: string; value: string }>;
+	apply: () => Promise<unknown>;
+};
 
 async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Plan> {
 	const opsEventId = String(payload.opsEventId);
@@ -74,7 +84,10 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 					{ label: "Estado", value: `${now.status} → ${row.status}` },
 				],
 				apply: async () => {
-					await updateMailbox(env.INDEX_DB, row.mailbox_id, { status: row.status, display_name: row.display_name });
+					await updateMailbox(env.INDEX_DB, row.mailbox_id, {
+						status: row.status,
+						display_name: row.display_name,
+					});
 					return { restored: "mailbox", id: row.mailbox_id };
 				},
 			};
@@ -97,7 +110,12 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 			};
 		}
 		case "alias": {
-			const row = snap as unknown as { alias_address: string; mailbox_id: string; domain_id: string; status: "active" | "disabled" };
+			const row = snap as unknown as {
+				alias_address: string;
+				mailbox_id: string;
+				domain_id: string;
+				status: "active" | "disabled";
+			};
 			if (await getAlias(env.INDEX_DB, row.alias_address))
 				throw conflict(`Alias ${row.alias_address} already exists`, "alias_exists");
 			if (!(await getDomainById(env.INDEX_DB, row.domain_id)))
@@ -118,9 +136,15 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 		}
 		case "routing_rule": {
 			const row = snap as unknown as {
-				id: string; domain_id: string; pattern: string; priority: number;
-				action: "store" | "forward" | "reject"; mailbox_id: string | null;
-				forward_to_json: string; reject_reason: string | null; enabled: number;
+				id: string;
+				domain_id: string;
+				pattern: string;
+				priority: number;
+				action: "store" | "forward" | "reject";
+				mailbox_id: string | null;
+				forward_to_json: string;
+				reject_reason: string | null;
+				enabled: number;
 			};
 			if (!(await getDomainById(env.INDEX_DB, row.domain_id)))
 				throw new AdminError("Domain not found", "domain_not_found", 404);
@@ -131,23 +155,36 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 				fields: [
 					{ label: "Patrón", value: row.pattern },
 					{ label: "Acción", value: row.action },
-					{ label: "Estado actual", value: current ? "existe (se sobrescribe)" : "eliminada (se recrea)" },
+					{
+						label: "Estado actual",
+						value: current ? "existe (se sobrescribe)" : "eliminada (se recrea)",
+					},
 				],
 				apply: async () => {
 					if (current) {
 						await patchRule(env, auth, {
 							ruleId: row.id,
 							body: {
-								pattern: row.pattern, priority: row.priority, action: row.action,
-								mailboxId: row.mailbox_id, forwardTo: JSON.parse(row.forward_to_json) as string[],
-								rejectReason: row.reject_reason, enabled: Boolean(row.enabled),
+								pattern: row.pattern,
+								priority: row.priority,
+								action: row.action,
+								mailboxId: row.mailbox_id,
+								forwardTo: JSON.parse(row.forward_to_json) as string[],
+								rejectReason: row.reject_reason,
+								enabled: Boolean(row.enabled),
 							},
 						});
 					} else {
 						await insertRoutingRule(env.INDEX_DB, {
-							id: row.id, domain_id: row.domain_id, pattern: row.pattern, priority: row.priority,
-							action: row.action, mailbox_id: row.mailbox_id, forward_to_json: row.forward_to_json,
-							reject_reason: row.reject_reason, enabled: row.enabled,
+							id: row.id,
+							domain_id: row.domain_id,
+							pattern: row.pattern,
+							priority: row.priority,
+							action: row.action,
+							mailbox_id: row.mailbox_id,
+							forward_to_json: row.forward_to_json,
+							reject_reason: row.reject_reason,
+							enabled: row.enabled,
 						});
 					}
 					return { restored: "routing_rule", id: row.id };
@@ -155,9 +192,19 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 			};
 		}
 		case "template": {
-			const row = snap as unknown as { mailboxId: string; id: string; subject: string; body_text: string | null; body_html: string | null; archived?: boolean };
+			const row = snap as unknown as {
+				mailboxId: string;
+				id: string;
+				subject: string;
+				body_text: string | null;
+				body_html: string | null;
+				archived?: boolean;
+			};
 			if (row.archived)
-				throw conflict("Archived templates cannot be reactivated; create it again with template_upsert", "restore_unsupported");
+				throw conflict(
+					"Archived templates cannot be reactivated; create it again with template_upsert",
+					"restore_unsupported",
+				);
 			const current = await activeTemplate(env, auth, row.mailboxId, row.id);
 			if (!current) throw conflict("Template no longer active", "template_not_active");
 			return {
@@ -168,7 +215,8 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 				],
 				apply: async () => {
 					await updateTemplate(env, auth, {
-						mailboxId: row.mailboxId, templateId: row.id,
+						mailboxId: row.mailboxId,
+						templateId: row.id,
 						body: { subject: row.subject, body_text: row.body_text, body_html: row.body_html },
 					});
 					return { restored: "template", id: row.id };
@@ -184,9 +232,17 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 async function restoreApproval(env: Env, auth: AuthContext, payload: Operation) {
 	// An unreadable/consumed/foreign snapshot cannot restore anything: report that from the direct path.
 	const snap = await loadSnapshot(env, auth, String(payload.opsEventId)).catch(() => null);
-	if (!snap || snap.entity !== "routing_rule" || snap.action !== "forward" || typeof snap.forward_to_json !== "string") return "direct" as const;
+	if (
+		!snap ||
+		snap.entity !== "routing_rule" ||
+		snap.action !== "forward" ||
+		typeof snap.forward_to_json !== "string"
+	)
+		return "direct" as const;
 	const forward = JSON.parse(snap.forward_to_json) as string[];
-	return (await externalAddresses(env, forward)).length ? ("required" as const) : ("direct" as const);
+	return (await externalAddresses(env, forward)).length
+		? ("required" as const)
+		: ("direct" as const);
 }
 
 registerControlPlaneKind("restore", {
@@ -198,7 +254,13 @@ registerControlPlaneKind("restore", {
 		return {
 			title: p.title,
 			fields: p.fields,
-			warnings: [{ code: "restore", message: "Se reaplica el estado anterior guardado; los cambios posteriores sobre este elemento se pierden." }],
+			warnings: [
+				{
+					code: "restore",
+					message:
+						"Se reaplica el estado anterior guardado; los cambios posteriores sobre este elemento se pierden.",
+				},
+			],
 		};
 	},
 	execute: async (env, auth, payload) => {

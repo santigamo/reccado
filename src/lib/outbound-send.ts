@@ -9,7 +9,7 @@ import {
 	upsertMessageIndex,
 } from "../db/d1";
 import { enqueueTelegramCardRefresh } from "../telegram/cards";
-import { approvalProofSecret, signMcpApprovalProof, type McpApprovalProof } from "./approvals";
+import { approvalProofSecret, type McpApprovalProof, signMcpApprovalProof } from "./approvals";
 import { AppError } from "./errors";
 import { outboundSendIdempotencyKey } from "./idempotency";
 import { mailboxStub } from "./mailbox-stub";
@@ -44,6 +44,7 @@ type DoSendResult = {
 	receivedAt?: string;
 	rawR2Key?: string;
 	rawSha256?: string;
+	hasAttachments?: boolean;
 	reason?: string;
 	error?: string;
 };
@@ -250,7 +251,7 @@ export async function confirmDraftSend(
 			to_json: result.toJson ?? "[]",
 			snippet: result.snippet ?? null,
 			received_at: result.receivedAt ?? new Date().toISOString(),
-			has_attachments: 0,
+			has_attachments: result.hasAttachments ? 1 : 0,
 			labels_json: "[]",
 			state: "sent",
 			raw_r2_key: result.rawR2Key ?? `sent/${draftId}`, // gitleaks:allow (field name trips generic-api-key; no secret here)

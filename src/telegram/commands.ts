@@ -16,6 +16,7 @@
  */
 
 import { listMailboxes } from "../db/d1";
+import { mailboxStub } from "../lib/mailbox-stub";
 import {
 	answerCallbackQuery,
 	editMessageText,
@@ -41,7 +42,6 @@ import {
 	readQuietHours,
 	writeQuietHours,
 } from "./noise";
-import { mailboxStub } from "../lib/mailbox-stub";
 
 /**
  * What the "/" menu offers.
@@ -169,6 +169,8 @@ async function searchAllMailboxes(env: Env, query: string): Promise<SearchResult
 
 type ThreadListRow = {
 	id: string;
+	/** Unread messages in the conversation (outside the trash). */
+	unread_count?: number;
 	latest_is_read?: number;
 	latest_received_at?: string;
 };
@@ -191,7 +193,12 @@ async function collectUnreadInbox(env: Env, limit: number): Promise<MailIndexRow
 		if (!response.ok) continue;
 		const payload = (await response.json()) as { threads?: ThreadListRow[] };
 		const unread = (payload.threads ?? [])
-			.filter((thread) => Number(thread.latest_is_read ?? 0) === 0)
+			// Unread as a conversation (any message), the way the web inbox shows it.
+			.filter((thread) =>
+				thread.unread_count !== undefined
+					? Number(thread.unread_count) > 0
+					: Number(thread.latest_is_read ?? 0) === 0,
+			)
 			.map((thread) => thread.id);
 		rows.push(...(await listNewestInboxRowsForThreads(env.INDEX_DB, mailbox.mailbox_id, unread)));
 	}

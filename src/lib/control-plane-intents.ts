@@ -278,7 +278,12 @@ async function applyDirect(
 }
 
 /** `applied` is set when the change was direct and has already run; otherwise it is a pending approval. */
-export type ControlPlaneRequest = { id: string; expiresAt: string; payloadHash: string; applied?: DirectOutcome };
+export type ControlPlaneRequest = {
+	id: string;
+	expiresAt: string;
+	payloadHash: string;
+	applied?: DirectOutcome;
+};
 
 export async function requestControlPlaneChange(
 	env: Env,

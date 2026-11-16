@@ -369,7 +369,7 @@ describe("what the card lets the operator do", () => {
 		expect(buttons?.map((button) => button.callback_data ?? button.url)).toEqual([
 			"v1:a",
 			"v1:x",
-			"https://reccado.example/mailboxes/mbx_hello/thread_42",
+			"https://reccado.example/inbox/mbx_hello/thread_42",
 		]);
 		// No trash button, deliberately: a delete one thumb-width from archive is a
 		// machine for mistakes, and the two mistakes do not cost the same.

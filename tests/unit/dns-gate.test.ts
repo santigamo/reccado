@@ -291,9 +291,7 @@ describe("dns-gate upsert behaviour", () => {
 		const { domain } = await seedZone({});
 		// Provider-provisioned records come back quoted; API-created ones do not.
 		// Treating those as different is what created duplicate DMARC records before.
-		stubCloudflare([
-			{ id: "rec_1", type: "TXT", content: '"v=DMARC1; p=none; adkim=r; aspf=r"' },
-		]);
+		stubCloudflare([{ id: "rec_1", type: "TXT", content: '"v=DMARC1; p=none; adkim=r; aspf=r"' }]);
 		const outcome = await ensureDmarcRecord(TOKEN_ENV, env.INDEX_DB, {
 			sendingDomain: `notify.${domain}`,
 			policy: "none",

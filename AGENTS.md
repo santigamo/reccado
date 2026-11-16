@@ -36,13 +36,16 @@ informed decision from the user/supervisor.
 ### Outbound sending
 
 - **An agent may read, draft and act on mailbox content, but every outbound send it initiates over
-  MCP requires the owner's approval, bound to the exact payload (`payload_hash`), given only on
-  `/approve/:id` with the owner web session (the URL comes back from the tool; it is never
-  pre-authenticated). Telegram sends a notice with that link for critical requests — no ✅/❌ buttons.
-  The agent can never approve.** The same approval gates a short list of irreversible /
+  MCP requires the owner's approval, bound to the exact payload (`payload_hash`), given only with
+  the owner web session on this origin, through `POST /api/approvals/:id/approve` (same-Origin
+  required, session re-read with the cookie cache off): from `/approve/:id` or from the inbox
+  approvals pane (`/inbox`, the reading pane). Kinds that reveal a secret are approved only on
+  `/approve/:id`. The URL returned to the agent is always `/approve/:id` and is never
+  pre-authenticated. Never from Telegram (it sends a notice with that link for critical requests —
+  no ✅/❌ buttons), never by an agent: the agent can never approve.** The same approval gates a short list of irreversible /
   exfiltrating control-plane kinds, for any token: `api_key_create`, `api_key_rotate`,
   `api_key_scopes` (they issue a secret), `suppression_remove`, `domain_add`, `domain_provision`,
-  `domain_disable`, and an alias or forward/routing rule whose destination is outside the owner's
+  `domain_disable`, `address_route` (creates a Cloudflare Email Routing rule), and an alias or forward/routing rule whose destination is outside the owner's
   domains. **Every other control-plane write applies directly with its scope** (templates,
   `api_key_templates`, `api_key_revoke`, mailbox kinds, internal aliases/rules, `domain_update`,
   `restore`, `reconcile_stale`, `update_messages`): it keeps an `admin.before_snapshot` + ops event
@@ -145,14 +148,15 @@ actual repo state, fix this section rather than trusting it blindly.
   (`src/lib/mcp-scopes.ts`). `tools/list` shows only the tools whose scope was granted; a call
   missing a scope gets the spec `insufficient_scope` signal naming it. `send` and the critical
   control-plane kinds only create an *approval* (table `approvals`, frozen payload +
-  `payload_hash`, 10 min, single use) that the owner approves on `/approve/:id` with the owner
-  web session (Telegram carries a notice with the link, no buttons; passkeys/WebAuthn were removed
+  `payload_hash`, 10 min, single use) that the owner approves with the owner web session on
+  `/approve/:id` or in the inbox approvals pane (secret-revealing kinds on `/approve/:id` only;
+  both use `POST /api/approvals/:id/approve` with the `payload_hash`) (Telegram carries a notice with the link, no buttons; passkeys/WebAuthn were removed
   — the `0024` passkey table stays, unused). All other writes apply directly and are undoable via
   `restore`. Delegation policies (`mcp_client_policies`, `pnpm operator mcp policy`, auto-apply,
   Telegram undo) were removed in `0030`. Connection is one URL + browser login: OAuth 2.1 + PRM,
   CIMD on (`MCP_CIMD_ENABLED`, `@better-auth/cimd`) as the preferred client registration, open
-  DCR kept as compatibility fallback; the owner revokes clients under `/security` "Aplicaciones
-  conectadas". Control-plane kinds live in `src/lib/control-plane-kinds/*`. Better
+  DCR kept as compatibility fallback; the owner revokes clients under `/settings/agent-access` "Connected
+  agents". Control-plane kinds live in `src/lib/control-plane-kinds/*`. Better
   Auth/`@better-auth/mcp` is 1.7.20; migrations run through `0030` (`0021` Better Auth 1.7.20,
   `0022` approvals, `0024` passkey (unused), `0025`–`0028` audit/approval metadata, intent payload,
   pending uniqueness, `0029` `mcp_client_policies` + `approvals.approved_via`/`auto_refused`,

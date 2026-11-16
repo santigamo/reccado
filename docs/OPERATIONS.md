@@ -62,7 +62,7 @@ editing the repository.
 
 ## Provisioning a sending domain
 
-`POST /api/domains/:domain/provision` (and the **Domains** page over it) runs the whole
+`POST /api/domains/:domain/provision` (and **Settings → Domains & mailboxes**, `/settings/domains`, over it) runs the whole
 sequence: register the zone, enable Email Sending, publish the DMARC policy, enable
 inbound routing, subscribe to delivery feedback, create the mailbox.
 
@@ -90,12 +90,44 @@ Two orderings are load-bearing:
 | Zone · DNS · Edit | the zones you serve | Publishing the DMARC ramp record | `dmarc` blocked |
 | Zone · Email Routing · Edit | the zones you serve | Inbound routing | `email_routing` blocked |
 | Account · Event Subscriptions | account | The feedback subscription | `feedback_subscription` blocked |
+| Zone · Email Routing Rules · Edit | the zones you serve | **Route it** in Settings (one `to:<address> -> Worker` rule per mailbox) | Route it refuses with `permission` and shows the `pnpm setup:routing` fallback |
+| Zone · Zone Settings · Read | the zones you serve | Route it checks Email Routing is on before writing (also what the settings overview reads) | Route it refuses with `permission` |
 
 **Scope the token to the zones Reccado serves, not to all zones.** Only the last row is
 account-scoped; it is the one permission that cannot be bounded by zone. If you would
 rather not grant it, leave it off — that step reports `blocked` with its remedy and the
 rest of the run still completes. Do **not** substitute Queues · Edit: it can delete the
 inbound mail queue, and provisioning never needs it.
+
+### Routing a mailbox from Settings ("Route it")
+
+Creating a mailbox only writes Reccado's index; Cloudflare Email Routing must separately
+deliver the address to this Worker. **Settings → Domains & mailboxes** now does that itself:
+**Add mailbox** asks Cloudflare to route the new address right after creating it, and the
+**Route it** link in the mailboxes table (and on the Add domain *Ready* step) does the same for
+an existing one. Both call `POST /api/cloudflare/domains/:domain/routing` with
+`{ "address": "<name>@<domain>" }` — owner web session only (an MCP token gets `401`; agents
+cannot route, see below).
+
+- It creates **one** literal `to:<address> -> <this Worker>` rule and nothing else. The Worker is
+  `vars.WORKER_NAME`, which must equal the block's `name` in `wrangler.jsonc` (a unit test
+  enforces it). The zone comes from the `domains` registry, never from the request.
+- `200 already` when an enabled rule for the address, or the catch-all, already delivers to this
+  Worker; `201 created` otherwise, with an `admin.cloudflare_route_created` ops event
+  (`admin.cloudflare_route_failed` when Cloudflare errors).
+- It **refuses without writing** — `{ ok: false, reason, message, remedy }` — when the token is
+  missing or lacks the permissions above (`424`, with the `pnpm setup:routing` command as the
+  fallback), Email Routing is off for the zone (`422`; turning it on rewrites MX records, so
+  Route it never does), the domain is unregistered (`404`) or disabled (`422`), the address is
+  not an active mailbox/alias (`422`), or a rule or the catch-all already sends the address
+  somewhere else (`409`; it never edits or deletes someone's rule).
+- A routing failure never undoes the mailbox. Retry is safe: every attempt reads first.
+- `pnpm setup:routing` shares the Cloudflare client and rule logic (`src/lib/email-routing.ts`)
+  and is still the way to set the zone's **catch-all** to the Worker (`--catch-all`), which the
+  web UI deliberately does not do.
+- **MCP is unchanged:** `manage_mailbox` creates the mailbox row only and never calls Cloudflare.
+  Whether an agent may route an address, and under which approval kind, is an owner decision
+  that has not been made.
 
 ### Why DNS write is safe enough to grant
 
@@ -514,7 +546,23 @@ If D1 and the Durable Object disagree, the Durable Object wins. Repair D1 with
 - Backup manifests written by cron or `POST /api/admin/backups/run` are retained in R2 until an
   operator or lifecycle rule deletes them.
 - Mailbox metadata, message rows, search index entries, drafts, and send audit rows remain in the
-  mailbox Durable Object / D1 until explicit deletion logic is implemented and exercised.
+  mailbox Durable Object / D1 until the owner deletes the message forever (below).
+- **Delete forever / Empty trash** is the one deletion path, and only for messages in the Trash
+  (web owner session; not reachable over MCP). Per message it removes the DO rows (message,
+  attachments, headers, labels, search entry; the conversation is recounted or removed), the R2
+  objects it owns (raw MIME, stored HTML body, attachments — never one another message, attachment
+  or draft file still points at), and the D1 rows keyed by it (`message_index`, `telegram_links`,
+  `telegram_retained`). For a sent copy it also empties the draft it was sent from. It deliberately
+  keeps: the DO `ingest_events` row (marked `error_code = 'purged'`, no content) so a re-delivery of
+  the same email stays deleted; D1 `ingest_events` and `outbound_sends` (ids and status, no content;
+  the send audit); the `send:`/`draft_sending:` markers that make confirm-send idempotent; contacts;
+  D1 `approvals` (an agent send's frozen payload, kept as the owner's approval record); and any
+  backup manifests already written. Telegram messages already posted in the chat are not edited.
+  Large operations run in batches of 250 from the mailbox alarm; R2/D1 cleanup is a
+  `purge_message_objects` job in the DO `jobs` table that retries every 5 minutes (24 attempts,
+  then `status = 'failed'` with `last_error`, visible via the DO). Each finished operation writes one
+  `mailbox.messages_purged` ops event with counts only. There is no automatic Trash expiry: Trash
+  is kept until the owner empties it.
 
 ### What is not automated today
 
@@ -523,9 +571,9 @@ If D1 and the Durable Object disagree, the Durable Object wins. Repair D1 with
 - No full mailbox restore command exists.
 - No user-facing export job exists, although the architecture and implementation docs reserve an
   export format/path.
-- No end-user delete workflow guarantees removal of all raw MIME, attachment blobs, D1 rows, and
-  backup artifacts for a mailbox.
-- No documented trash-retention timer or legal-hold model exists.
+- Per-message permanent deletion exists (Delete forever / Empty trash, above), but there is no
+  whole-mailbox erasure workflow, and it does not touch backup manifests already written.
+- No trash-retention timer (auto-empty after N days) or legal-hold model exists.
 
 ### Operator policy you need to decide explicitly
 
@@ -550,7 +598,8 @@ all related R2 prefixes.
 - **Restore:** there is no automated restore path from R2 backup manifests back into Durable
   Objects. Backup manifests are operational evidence and partial recovery material, not a turnkey
   disaster-recovery workflow.
-- **Delete:** mailbox erasure is manual. If you perform it, you must identify and remove the DO
+- **Delete:** single messages are deleted from the web Trash ("Delete forever", "Empty trash").
+  Whole-mailbox erasure is manual. If you perform it, you must identify and remove the DO
   state plus the corresponding D1 rows and R2 prefixes, and you should capture evidence of exactly
   what was deleted.
 
@@ -742,7 +791,7 @@ mail. It sees only `manage_template`, `manage_api_key`, `restore`, `reconcile_st
 `restore`), while key create/rotate/scopes return an approval link. A call outside the granted scopes
 returns `insufficient_scope` naming the scope.
 
-**Revoking an app.** The owner opens `/security` → *Aplicaciones conectadas* and presses *Revocar*
+**Revoking an app.** The owner opens `/settings/agent-access` → *Connected agents* and presses *Revoke*
 (or runs the CLI below). Access JWTs already issued stay valid until they expire (≤ 3600 s).
 
 **Clients (optional fallback).** With an operator session (previous section), pre-register a client
@@ -761,7 +810,8 @@ tokens, consent and registration in one D1 batch.
 
 **Approvals (irreversible / exfiltrating only).** `send`, aliases or forward/routing rules whose
 destination is outside the owner's domains, `api_key_create`, `api_key_rotate`, `api_key_scopes`,
-`suppression_remove`, `domain_add`, `domain_provision` and `domain_disable` create an intent (frozen
+`suppression_remove`, `domain_add`, `domain_provision`, `domain_disable` and `address_route`
+(`manage_routing` `route_address`: the web "Route it" for one address) create an intent (frozen
 payload + `payload_hash`); the agent receives `https://<host>/approve/<id>`. The owner approves
 **only** on that page signed in as the owner (Origin check, payload hash posted back); Telegram
 sends a notice with the link, with no buttons (check the bridge with `pnpm operator telegram

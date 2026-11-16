@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { AutomatedKind } from "../lib/automated-mail";
 import type { TelegramCardRefresh } from "../telegram/cards";
 import { CARD_STATUS_LABELS, type TelegramCardStatus } from "../telegram/format";
 import type { InboundNotificationInput } from "../telegram/notify";
@@ -53,6 +54,17 @@ export type MailboxIngestResult = {
 	parseStatus?: "parsed" | "failed";
 	realtimeSeq?: number;
 	errorCode?: string;
+	/**
+	 * Set on `inserted` when the mailbox DO classified the message as automated
+	 * mail the inbox hides (`messages.automated_kind`, src/lib/automated-mail.ts);
+	 * null for ordinary mail. Absent from older DOs: treat as ordinary.
+	 */
+	automatedKind?: AutomatedKind | null;
+	/**
+	 * Set on `duplicate` when the message this delivery repeats was deleted
+	 * forever by the owner: it stays deleted (do/mailbox-purge.ts).
+	 */
+	purged?: boolean;
 };
 
 /**
