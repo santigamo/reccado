@@ -229,6 +229,25 @@ describe("notify consumer", () => {
 		expect(opsEventCalls[0]?.args[1]).toBe("telegram.notify_dropped");
 	});
 
+	it("accepts an approval-notice sync and acks it when the bridge is off", async () => {
+		const db = createMockDb();
+		const fetchSpy = vi.fn();
+		vi.stubGlobal("fetch", fetchSpy);
+		const message = buildMessage({
+			schemaVersion: 1,
+			eventType: "telegram.approval_notice.v1",
+			notice: { approvalId: "apr_1", compact: false },
+		});
+
+		await run(message, buildEnv(db, { TELEGRAM_BOT_TOKEN: undefined }));
+
+		// Parsed (a poison message is retried, never acked) and acked: a skip is a
+		// decision, not a failure.
+		expect(message.ack).toHaveBeenCalledTimes(1);
+		expect(message.retry).not.toHaveBeenCalled();
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
 	it("acks without touching Telegram when the bridge is off", async () => {
 		const db = createMockDb();
 		const fetchSpy = vi.fn();

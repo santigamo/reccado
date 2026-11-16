@@ -1,6 +1,4 @@
 import { getMailbox, insertOpsEvent, insertTelegramLink } from "../db/d1";
-import { buildApprovalUrl, getIntentCard } from "../lib/approvals";
-import { getRuntimeConfig, RUNTIME_CONFIG_KEYS } from "../db/runtime-config";
 import {
 	claimTelegramTopic,
 	forgetTelegramTopic,
@@ -15,10 +13,10 @@ import {
 	type TelegramConfig,
 	type TelegramMessage,
 } from "./api";
+import { announceApproval } from "./approval-notices";
 import { chatSupportsTopics, resolveTelegramChatId } from "./binding";
 import { buildCardContent, inboundNotificationKeyboard, restateCard } from "./cards";
-import { renderInboundNotification, telegramEscape } from "./format";
-import { intentCardKeyboard, renderIntentCardText } from "./intent-cards";
+import { renderInboundNotification } from "./format";
 import { findCardForThread } from "./links";
 import { flushTelegramDigest, isQuietNow, isSenderMuted, retainNotification } from "./noise";
 
@@ -27,10 +25,15 @@ export const INTENT_NOTIFY_COALESCE_MS = 60_000;
 
 /**
  * Notifies the owner of an MCP approval request (send or critical control-plane kind): a
- * server-rendered summary (warnings first) and the `/approve/:id` link. No approve/deny buttons;
- * direct (non-critical) changes never reach this function.
+ * server-rendered summary (warnings first), the expiry time and the `/approve/:id` link as
+ * the notice's one button. No approve/deny buttons; direct (non-critical) changes never
+ * reach this function.
+ *
+ * Only queues: the notice is sent, retried and later edited (approved / denied / expired)
+ * by the notify consumer -- see telegram/approval-notices.ts.
  */
 export async function notifyIntentCreated(env: Env, intentId: string): Promise<void> {
+	if (!readTelegramConfig(env)) return;
 	const principal = await env.INDEX_DB.prepare(
 		"SELECT token_sub, created_at FROM approvals WHERE token = ?",
 	)
@@ -50,18 +53,7 @@ export async function notifyIntentCreated(env: Env, intentId: string): Promise<v
 			.catch(() => null);
 		coalesced = Boolean(earlier);
 	}
-	const config = readTelegramConfig(env);
-	const chatId = await resolveTelegramChatId(env);
-	const origin = await getRuntimeConfig(env.INDEX_DB, RUNTIME_CONFIG_KEYS.deploymentOrigin);
-	if (!config || !chatId || !origin) return;
-	const url = buildApprovalUrl(origin, intentId);
-	if (!url) return;
-	const view = await getIntentCard(env, intentId);
-	await sendMessage(config, {
-		chatId,
-		text: `${renderIntentCardText(view, { compact: coalesced })}\n${telegramEscape(url)}`,
-		replyMarkup: intentCardKeyboard(url),
-	});
+	await announceApproval(env, { approvalId: intentId, compact: coalesced });
 }
 
 export type InboundNotificationInput = {

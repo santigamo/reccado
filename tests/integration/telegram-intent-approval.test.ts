@@ -10,6 +10,12 @@ import { insertMailbox } from "#/db/d1";
 import { createIntent, getIntentStatus, requestControlPlaneChange } from "#/lib/approvals";
 import { deriveWebhookSecret } from "#/telegram/api";
 import { notifyIntentCreated } from "#/telegram/notify";
+import { handleNotifyQueue } from "#/cloudflare/notify-consumer";
+import { reconcileApprovalNotices, syncApprovalNotice } from "#/telegram/approval-notices";
+import migrationTelegramTopics from "../../migrations/d1/0010_telegram_topics.sql?raw";
+import migrationTelegramTopicName from "../../migrations/d1/0020_telegram_topic_name.sql?raw";
+import migrationExperience from "../../migrations/d1/0014_telegram_experience.sql?raw";
+import migrationApprovalNotices from "../../migrations/d1/0031_telegram_approval_notices.sql?raw";
 import worker from "../../src/server";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
@@ -45,6 +51,33 @@ const OWNER_EMAIL = "tg-approval-owner@example.com";
 let webhookSecret = "";
 let owner: { userId: string; jar: Jar };
 const saved: Record<string, unknown> = {};
+type Queued = { body: unknown; delaySeconds?: number };
+const queued: Queued[] = [];
+
+/** Runs captured notify-queue messages through the real consumer, then forgets them. */
+async function deliverQueued(filter: (item: Queued) => boolean = () => true): Promise<void> {
+	const batch = queued.filter(filter);
+	queued.length = 0;
+	const acked: boolean[] = [];
+	await handleNotifyQueue(
+		{
+			queue: "inbox-mcp-notify-dev",
+			messages: batch.map((item, index) => ({
+				id: `q-${index}`,
+				timestamp: new Date(),
+				attempts: 1,
+				body: item.body,
+				ack: () => acked.push(true),
+				retry: () => acked.push(false),
+			})),
+			ackAll: () => undefined,
+			retryAll: () => undefined,
+		} as unknown as MessageBatch<unknown>,
+		shared,
+		createExecutionContext(),
+	);
+	expect(acked.every(Boolean)).toBe(true);
+}
 
 class Jar {
 	private readonly cookies = new Map<string, string>();
@@ -83,6 +116,10 @@ beforeAll(async () => {
 		migrationApprovalMeta,
 		migrationIntentPayload,
 		migrationPendingUnique,
+		migrationTelegramTopics,
+		migrationTelegramTopicName,
+		migrationExperience,
+		migrationApprovalNotices,
 	);
 	const now = new Date().toISOString();
 	await db
@@ -109,6 +146,15 @@ beforeAll(async () => {
 	shared.BETTER_AUTH_SECRET = TEST_SECRET;
 	shared.TELEGRAM_BOT_TOKEN = BOT_TOKEN;
 	shared.TELEGRAM_ALLOWED_USER_IDS = OPERATOR;
+	// Every notify-queue message this file produces is captured instead of being
+	// delivered by the real consumer in the background: the tests drive the
+	// consumer themselves (deliverQueued), with the Bot API stubbed.
+	saved.NOTIFY_QUEUE = shared.NOTIFY_QUEUE;
+	(shared as unknown as { NOTIFY_QUEUE: unknown }).NOTIFY_QUEUE = {
+		send: async (body: unknown, options?: { delaySeconds?: number }) => {
+			queued.push({ body, delaySeconds: options?.delaySeconds });
+		},
+	};
 	webhookSecret = await deriveWebhookSecret(BOT_TOKEN);
 	owner = await registerOwner(OWNER_EMAIL);
 });
@@ -270,9 +316,41 @@ async function sentRows(draftId: string) {
 
 const ownerAuth = () => ({ userId: owner.userId, email: OWNER_EMAIL, owners: [OWNER_EMAIL] });
 
+/** The owner's browser posting to the approval API, as the web page does. */
+async function webPost(path: string, body: unknown): Promise<Response> {
+	const ctx = createExecutionContext();
+	const response = await worker.fetch(
+		new Request(`${ORIGIN}${path}`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				origin: ORIGIN,
+				cookie: owner.jar.header(),
+			},
+			body: JSON.stringify(body),
+		}),
+		shared,
+		ctx,
+	);
+	await waitOnExecutionContext(ctx);
+	expect(response.status, await response.clone().text()).toBe(200);
+	return response;
+}
+
 describe("telegram notices for MCP approval requests", () => {
 	const legacy = (id: string, hash: string, verb: "ia" | "ix") =>
 		`${verb}:${id}:${hash.slice(0, 8)}`;
+
+	// Every request here is left pending on purpose; close them so the per-owner
+	// cap on pending approvals does not leak into the tests after this block.
+	afterEach(async () => {
+		await db
+			.prepare(
+				"UPDATE approvals SET consumed_at = ?, decision = 'denied' WHERE decision IS NULL AND consumed_at IS NULL",
+			)
+			.bind(new Date().toISOString())
+			.run();
+	});
 
 	it("the old approve/deny callbacks do nothing: Telegram can no longer approve or deny", async () => {
 		const { draft, intent } = await sendIntent("no telegram approval");
@@ -289,7 +367,16 @@ describe("telegram notices for MCP approval requests", () => {
 	it("a send approval request gets one notice with the web link and no ✅/❌ buttons", async () => {
 		const { intent } = await sendIntent("notice");
 		const calls = stubTelegram();
+		queued.length = 0;
 		await notifyIntentCreated(shared, intent.id);
+		// Nothing is sent inline: the notice goes through the notify queue, plus one
+		// delayed message timed just past the 10-minute expiry.
+		expect(calls).toHaveLength(0);
+		expect(queued).toHaveLength(2);
+		const delayed = queued.find((item) => item.delaySeconds !== undefined);
+		expect(delayed?.delaySeconds).toBeGreaterThan(590);
+		expect(delayed?.delaySeconds).toBeLessThanOrEqual(606);
+		await deliverQueued((item) => item.delaySeconds === undefined);
 		const sent = calls.filter((call) => call.method === "sendMessage");
 		expect(sent).toHaveLength(1);
 		const body = sent[0]!.body as {
@@ -299,7 +386,90 @@ describe("telegram notices for MCP approval requests", () => {
 		const buttons = body.reply_markup.inline_keyboard.flat();
 		expect(buttons.some((button) => button.callback_data !== undefined)).toBe(false);
 		expect(buttons.map((button) => button.url)).toEqual([`${ORIGIN}/approve/${intent.id}`]);
-		expect(body.text).toContain(`${ORIGIN}/approve/${intent.id}`);
+		// The URL is carried once, by the button.
+		expect(body.text).not.toContain(`${ORIGIN}/approve/${intent.id}`);
+		expect(body.text).toMatch(/Caduca a las \d{2}:\d{2} \(UTC\)/);
+	});
+
+	it("goes to the mailbox's topic when the request concerns a mailbox", async () => {
+		const { draft, intent } = await sendIntent("topic");
+		await db
+			.prepare(
+				"INSERT INTO telegram_topics (chat_id, mailbox_id, topic_id, created_at) VALUES (?, ?, 314, ?)",
+			)
+			.bind(CHAT, draft.mailboxId, new Date().toISOString())
+			.run();
+		const calls = stubTelegram();
+		queued.length = 0;
+		await notifyIntentCreated(shared, intent.id);
+		await deliverQueued((item) => item.delaySeconds === undefined);
+		expect(calls.find((call) => call.method === "sendMessage")?.body.message_thread_id).toBe(314);
+	});
+
+	it("is edited in place when the request is denied, approved or expires — and only once", async () => {
+		const notice = async (label: string) => {
+			const { intent } = await sendIntent(label);
+			stubTelegram();
+			queued.length = 0;
+			await notifyIntentCreated(shared, intent.id);
+			await deliverQueued((item) => item.delaySeconds === undefined);
+			return intent;
+		};
+		const editsOf = (calls: TelegramCall[]) =>
+			calls.filter((call) => call.method === "editMessageText");
+
+		// Denied on the web: the route queues the sync, the consumer edits the notice.
+		const denied = await notice("deny me");
+		await webPost(`/api/approvals/${denied.id}/deny`, {});
+		let calls = stubTelegram();
+		await deliverQueued();
+		expect(editsOf(calls)).toHaveLength(1);
+		expect(String(editsOf(calls)[0]!.body.text)).toContain("Denegado");
+		// Decided notices keep no button at all.
+		expect(editsOf(calls)[0]!.body.reply_markup).toBeUndefined();
+
+		// Approved on the web.
+		const approved = await notice("approve me");
+		await webPost(`/api/approvals/${approved.id}/approve`, {
+			payloadHash: approved.payloadHash,
+		});
+		calls = stubTelegram();
+		await deliverQueued();
+		expect(String(editsOf(calls)[0]?.body.text)).toContain("Aprobado");
+
+		// Expired: the delayed message (or the hourly sweep) redraws it.
+		const expired = await notice("let me expire");
+		await db
+			.prepare("UPDATE approvals SET expires_at = ? WHERE token = ?")
+			.bind(new Date(Date.now() - 1000).toISOString(), expired.id)
+			.run();
+		calls = stubTelegram();
+		await syncApprovalNotice(shared, { approvalId: expired.id });
+		expect(String(editsOf(calls)[0]?.body.text)).toContain("Caducado");
+
+		// A redelivery changes nothing: the drawn state already matches.
+		calls = stubTelegram();
+		await syncApprovalNotice(shared, { approvalId: expired.id });
+		expect(calls).toHaveLength(0);
+	});
+
+	it("the hourly sweep catches a notice whose expiry message was lost", async () => {
+		const { intent } = await sendIntent("sweep");
+		stubTelegram();
+		queued.length = 0;
+		await notifyIntentCreated(shared, intent.id);
+		await deliverQueued((item) => item.delaySeconds === undefined);
+		await db
+			.prepare("UPDATE approvals SET expires_at = ? WHERE token = ?")
+			.bind(new Date(Date.now() - 1000).toISOString(), intent.id)
+			.run();
+		const calls = stubTelegram();
+		expect(await reconcileApprovalNotices(shared)).toBeGreaterThanOrEqual(1);
+		expect(
+			calls.some(
+				(call) => call.method === "editMessageText" && String(call.body.text).includes("Caducado"),
+			),
+		).toBe(true);
 	});
 
 	it("a critical control-plane request gets a notice; a direct change sends nothing", async () => {
@@ -335,10 +505,14 @@ describe("telegram notices for MCP approval requests", () => {
 			principal,
 		);
 		expect(pendingIntent.applied).toBeUndefined();
+		queued.length = 0;
 		await notifyIntentCreated(shared, pendingIntent.id);
+		await deliverQueued((item) => item.delaySeconds === undefined);
 		const sent = calls.filter((call) => call.method === "sendMessage");
 		expect(sent).toHaveLength(1);
-		expect(String(sent[0]!.body.text)).toContain(`${ORIGIN}/approve/${pendingIntent.id}`);
+		expect(JSON.stringify(sent[0]!.body.reply_markup)).toContain(
+			`${ORIGIN}/approve/${pendingIntent.id}`,
+		);
 		expect(JSON.stringify(sent[0]!.body)).not.toContain("callback_data");
 	});
 });

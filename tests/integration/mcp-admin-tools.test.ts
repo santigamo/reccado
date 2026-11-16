@@ -29,6 +29,8 @@ import { getIntentView } from "#/lib/approvals";
 import { registerTools } from "../../src/mcp/tools";
 import { makeIntentCodec } from "../../src/mcp/intent-flow";
 import * as notification from "../../src/telegram/notify";
+import { syncApprovalNotice } from "../../src/telegram/approval-notices";
+import migrationApprovalNotices from "../../migrations/d1/0031_telegram_approval_notices.sql?raw";
 import { vi } from "vitest";
 import { applyMigrations } from "../helpers/migrations";
 
@@ -59,6 +61,7 @@ beforeAll(async () => {
 		migrationApprovalMeta,
 		migrationIntentPayload,
 		migrationPendingUnique,
+		migrationApprovalNotices,
 	);
 	await db
 		.prepare(
@@ -610,7 +613,24 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 			.spyOn(globalThis, "fetch")
 			.mockImplementation(async () => Response.json({ ok: true, result: { message_id: 1 } }));
 		try {
-			const telegramEnv = { ...env, TELEGRAM_BOT_TOKEN: "123:abc" } as Env;
+			// The notice goes through the notify queue: capture what is queued and run
+			// the immediate syncs the consumer would run.
+			const queued: Array<{
+				body: { notice: { approvalId: string; compact: boolean } };
+				delayed: boolean;
+			}> = [];
+			const telegramEnv = {
+				...env,
+				TELEGRAM_BOT_TOKEN: "123:abc",
+				NOTIFY_QUEUE: {
+					send: async (
+						body: { notice: { approvalId: string; compact: boolean } },
+						options?: { delaySeconds?: number },
+					) => {
+						queued.push({ body, delayed: options?.delaySeconds !== undefined });
+					},
+				},
+			} as unknown as Env;
 			const d = await registerOwner("principal-notify@example.com");
 			const auth = authFor(d, "principal-notify@example.com");
 			const ids: string[] = [];
@@ -618,6 +638,8 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 				ids.push((await pending(auth, `notify-${i}@example.com`)).content.intentId);
 			fetchSpy.mockClear();
 			for (const id of ids) await notification.notifyIntentCreated(telegramEnv, id);
+			for (const item of queued.filter((entry) => !entry.delayed))
+				await syncApprovalNotice(telegramEnv, item.body.notice);
 			const sent = fetchSpy.mock.calls.filter(([input]) =>
 				String(input instanceof Request ? input.url : input).includes("sendMessage"),
 			);
@@ -635,7 +657,8 @@ describe("mcp intent principal, approver binding and approval-fatigue limits", (
 				const buttons = body.reply_markup.inline_keyboard.flat();
 				expect(buttons.every((button) => button.callback_data === undefined)).toBe(true);
 				expect(buttons.map((button) => button.url)).toEqual([`${ORIGIN}/approve/${ids[i]}`]);
-				expect(body.text).toContain(`${ORIGIN}/approve/${ids[i]}`);
+				// The URL is carried once, by the button.
+				expect(body.text).not.toContain(`${ORIGIN}/approve/${ids[i]}`);
 			}
 			// Only the second (coalesced) one is the compact notice.
 			expect(bodies[0]!.text).toContain("notify-0.example.com");

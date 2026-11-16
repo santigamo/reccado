@@ -12,6 +12,7 @@
  * outage must not abort the rest of the pass.
  */
 
+import { reconcileApprovalNotices } from "./approval-notices";
 import { deleteExpiredDraftPreviews } from "./drafts";
 import { deleteStaleDigestItems, type DigestOutcome, flushTelegramDigest } from "./noise";
 
@@ -22,6 +23,8 @@ export type TelegramSweep = {
 	expiredDraftPreviews: number;
 	/** Digested rows old enough that nobody is still tapping their buttons. */
 	expiredDigestItems: number;
+	/** Approval notices redrawn as decided or expired by the backstop. */
+	approvalNotices: number;
 };
 
 export async function sweepTelegramBridge(env: Env): Promise<TelegramSweep> {
@@ -38,5 +41,7 @@ export async function sweepTelegramBridge(env: Env): Promise<TelegramSweep> {
 		deleteExpiredDraftPreviews(env.INDEX_DB).catch(() => 0),
 		deleteStaleDigestItems(env.INDEX_DB).catch(() => 0),
 	]);
-	return { digest, expiredDraftPreviews, expiredDigestItems };
+	// Backstop for the delayed queue message that marks a notice expired.
+	const approvalNotices = await reconcileApprovalNotices(env).catch(() => 0);
+	return { digest, expiredDraftPreviews, expiredDigestItems, approvalNotices };
 }

@@ -14,6 +14,8 @@ const CARD_BUDGET = 3600;
 const TEXT_FIELD_MAX = 240;
 const PRE_FIELD_MAX = 400;
 const LIST_ITEMS_MAX = 5;
+/** A notice is a summary; the request itself is one tap away. */
+const SUMMARY_FIELDS = 4;
 const MORE_IN_LINK = "… ver detalle completo en el enlace.";
 
 function clip(value: string, max: number): { text: string; clipped: boolean } {
@@ -40,10 +42,14 @@ function fieldLine(field: IntentView["fields"][number]): { line: string; clipped
 	return { line: `${label}: ${telegramEscape(text)}`, clipped };
 }
 
-/** The card body. Warnings come first and are marked; long content is cut, the link has it all. */
+/**
+ * The card body: a short summary, not the request. Warnings come first and are
+ * marked; at most SUMMARY_FIELDS fields follow, each clipped -- the page behind
+ * the button has it all. The URL is carried once, by the button, never in the text.
+ */
 export function renderIntentCardText(
 	view: IntentView,
-	options: { compact?: boolean } = {},
+	options: { compact?: boolean; expires?: string | null } = {},
 ): string {
 	const parts: string[] = [`🔐 <b>${telegramEscape(view.title)}</b>`];
 	for (const warning of view.warnings) {
@@ -52,9 +58,9 @@ export function renderIntentCardText(
 	let used = parts.join("\n").length;
 	let truncated = false;
 	if (!options.compact) {
-		for (const field of view.fields) {
+		for (const [index, field] of view.fields.entries()) {
 			const { line, clipped } = fieldLine(field);
-			if (used + line.length + 1 > CARD_BUDGET) {
+			if (index >= SUMMARY_FIELDS || used + line.length + 1 > CARD_BUDGET) {
 				truncated = true;
 				break;
 			}
@@ -66,11 +72,31 @@ export function renderIntentCardText(
 		truncated = true;
 	}
 	if (truncated) parts.push(`<i>${MORE_IN_LINK}</i>`);
+	if (options.expires) parts.push(`⏳ Caduca a las ${telegramEscape(options.expires)}.`);
 	parts.push("🔑 Se aprueba solo en la página web, con tu sesión de propietario.");
 	const text = parts.join("\n");
 	return text.length <= TELEGRAM_MAX_MESSAGE_CHARS
 		? text
 		: `🔐 <b>${telegramEscape(view.title)}</b>\n<i>${MORE_IN_LINK}</i>`;
+}
+
+/** What a notice says once the request is no longer pending. */
+export const DECIDED_LABELS = {
+	approved: "✅ Aprobado",
+	denied: "⛔ Denegado",
+	expired: "⌛ Caducado",
+	stale: "⌛ Ya no es válido: la petición cambió",
+} as const;
+
+export type DecidedNoticeState = keyof typeof DECIDED_LABELS;
+
+/**
+ * The notice after the fact: the state first, then the title. No fields and no
+ * button -- nothing left to review, and a live-looking link under a dead request
+ * is exactly the staleness this replaces.
+ */
+export function renderDecidedNotice(view: IntentView, state: DecidedNoticeState): string {
+	return `🔐 <b>${DECIDED_LABELS[state]}</b> · ${telegramEscape(view.title)}`;
 }
 
 /** One URL button: Telegram only notifies, the owner approves on the web page. */

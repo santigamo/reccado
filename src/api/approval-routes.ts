@@ -50,6 +50,7 @@ export function registerApprovalRoutes(api: Hono<ApiBindings>): void {
 			channel: "web",
 			approver: auth.userId,
 		});
+		await syncTelegramNotice(c.env, c.req.param("id"));
 		const status = result.error ? statusFor(result.error) : 200;
 		return json(result, status);
 	});
@@ -60,8 +61,20 @@ export function registerApprovalRoutes(api: Hono<ApiBindings>): void {
 		const auth = await owner(c.req.raw, c.env);
 		if (auth instanceof Response) return auth;
 		const { denyIntent } = await import("../lib/approvals");
-		return json(await denyIntent(c.env, c.req.param("id")), 200);
+		const result = await denyIntent(c.env, c.req.param("id"));
+		await syncTelegramNotice(c.env, c.req.param("id"));
+		return json(result, 200);
 	});
+}
+
+/**
+ * Queues the edit that makes the Telegram notice say Aprobado / Denegado. After
+ * the decision, never instead of it, and it never fails the request: the notice
+ * is a mirror of the decision, not part of it (telegram/approval-notices.ts).
+ */
+async function syncTelegramNotice(env: Env, id: string): Promise<void> {
+	const { enqueueApprovalNoticeSync } = await import("../telegram/approval-notices");
+	await enqueueApprovalNoticeSync(env, { approvalId: id });
 }
 
 function json(body: unknown, status: number): Response {
