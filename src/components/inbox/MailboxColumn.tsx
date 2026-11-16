@@ -75,7 +75,7 @@ export function MailboxColumn({
 			aria-label="Mailboxes"
 			className={cn("flex w-[216px] shrink-0 flex-col gap-0.5 pt-1", className)}
 		>
-			<div className="flex shrink-0 items-center gap-1">
+			<div className="group/head flex shrink-0 items-center gap-1">
 				<Link
 					to="/inbox"
 					search={{ folder: search.folder }}
@@ -103,6 +103,9 @@ export function MailboxColumn({
 						aria-label="Hide mailboxes"
 						size="sm"
 						onClick={onCollapse}
+						// Takes no room until the pointer or focus is here, so the label
+						// above keeps its full width; `[` folds the column either way.
+						className="hidden focus-visible:flex group-focus-within/head:flex group-hover/head:flex"
 					>
 						<PanelLeftClose />
 					</IconButton>
