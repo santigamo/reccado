@@ -140,7 +140,7 @@ export function asApiKeyError(error: unknown): ApiKeyError {
 export function explainKeyError(error: ApiKeyError): string | null {
 	switch (error.code) {
 		case "forbidden":
-			return "This mailbox is not owned by your Access identity.";
+			return "This mailbox is not owned by your account.";
 		case "transactional_api_not_configured":
 			return "The worker is missing the TRANSACTIONAL_API_KEY_PEPPER secret, so keys cannot be minted or rotated.";
 		case "key_not_found":
@@ -336,10 +336,32 @@ export async function rotateApiKey(mailboxId: string, keyId: string): Promise<Mi
 // --------------------------------------------------------------------------
 
 export const SCOPE_LABELS: Record<KeyScope, { label: string; hint: string }> = {
-	"transactional:send": { label: "send", hint: "Send transactional mail as the bound sender." },
-	"transactional:status": { label: "status", hint: "Read the delivery status of its own sends." },
-	"transactional:templates:use": { label: "templates", hint: "Render allowlisted templates." },
+	"transactional:send": {
+		label: "Send mail",
+		hint: "Send transactional mail as the bound sender.",
+	},
+	"transactional:status": {
+		label: "Read delivery status",
+		hint: "Read the delivery status of its own sends.",
+	},
+	"transactional:templates:use": {
+		label: "Use templates",
+		hint: "Render allowlisted templates. Every send renders one, so a sending key needs it.",
+	},
 };
+
+/** One plain-language line for a key's scopes ("Can send and read delivery status"). */
+export function scopeSummary(scopes: readonly KeyScope[]): string {
+	const send = scopes.includes("transactional:send");
+	const status = scopes.includes("transactional:status");
+	const templates = scopes.includes("transactional:templates:use");
+	if (send && status) return "Can send and read delivery status";
+	if (send) return "Can send";
+	if (status && templates) return "Reads delivery status and renders templates";
+	if (status) return "Reads delivery status only";
+	if (templates) return "Renders templates only";
+	return "No scopes";
+}
 
 /** `revoked` wins; otherwise an `expiresAt` in the past reads as `expired`. */
 export function displayStatus(key: TransactionalApiKey, now: number = Date.now()): DisplayStatus {
@@ -354,17 +376,4 @@ export function displayStatus(key: TransactionalApiKey, now: number = Date.now()
 /** `rck_live_…a1b2c3` — the shape of the key without any secret material. */
 export function maskedKey(key: TransactionalApiKey): string {
 	return `rck_${key.environment}_…${key.displaySuffix}`;
-}
-
-export function formatKeyDate(iso: string | null): string {
-	if (!iso) return "—";
-	const at = new Date(iso);
-	if (Number.isNaN(at.getTime())) return iso;
-	return at.toLocaleString(undefined, {
-		year: "numeric",
-		month: "short",
-		day: "numeric",
-		hour: "2-digit",
-		minute: "2-digit",
-	});
 }

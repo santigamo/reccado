@@ -1,18 +1,18 @@
-import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, env, waitOnExecutionContext } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import worker from "../../src/server";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
 import migrationRuntimeConfig from "../../migrations/d1/0009_runtime_config.sql?raw";
 import migrationOwnerRegistry from "../../migrations/d1/0012_owner_registry.sql?raw";
 import migrationBetterAuth from "../../migrations/d1/0016_better_auth.sql?raw";
+import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql?raw";
+import migrationBetterAuthMcpFkFix from "../../migrations/d1/0018_better_auth_mcp_fk_fix.sql?raw";
 import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
 import migrationAuthUpgrade from "../../migrations/d1/0021_better_auth_1_7_20.sql?raw";
 import migrationPasskey from "../../migrations/d1/0024_passkey.sql?raw";
-import migrationBetterAuthMcp from "../../migrations/d1/0017_better_auth_mcp.sql?raw";
-import migrationBetterAuthMcpFkFix from "../../migrations/d1/0018_better_auth_mcp_fk_fix.sql?raw";
-import { sweepStaleOAuthClients, checkRegistrationBody } from "../../src/lib/oauth-client-hygiene";
+import { checkRegistrationBody, sweepStaleOAuthClients } from "../../src/lib/oauth-client-hygiene";
+import worker from "../../src/server";
 import { renderClientConnectedNotice } from "../../src/telegram/client-connected";
 import { applyMigrations } from "../helpers/migrations";
 
@@ -102,7 +102,10 @@ describe("discovery", () => {
 		const unauth = await run(
 			new Request(`${ORIGIN}/mcp`, {
 				method: "POST",
-				headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+				headers: {
+					"content-type": "application/json",
+					accept: "application/json, text/event-stream",
+				},
 				body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
 			}),
 		);
@@ -111,7 +114,10 @@ describe("discovery", () => {
 
 		const resource = await run(new Request(`${ORIGIN}/.well-known/oauth-protected-resource/mcp`));
 		expect(resource.status).toBe(200);
-		const resourceDoc = (await resource.json()) as { resource: string; authorization_servers: string[] };
+		const resourceDoc = (await resource.json()) as {
+			resource: string;
+			authorization_servers: string[];
+		};
 		expect(resourceDoc.resource).toBe(`${ORIGIN}/mcp`);
 
 		for (const path of [
@@ -128,9 +134,10 @@ describe("discovery", () => {
 
 describe("open dynamic client registration", () => {
 	it("registers without a session, sanitizes the name and records an ops event", async () => {
-		const response = await register({ client_name: "Evil\u0000‮Name" + "x".repeat(300) });
+		const response = await register({ client_name: `Evil\u0000‮Name${"x".repeat(300)}` });
 		expect(response.status, await response.clone().text()).toBe(201);
 		const client = (await response.json()) as { client_id: string; client_name: string };
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: asserting control characters were stripped
 		expect(client.client_name).not.toMatch(/[\u0000‮]/);
 		expect(client.client_name.length).toBeLessThanOrEqual(100);
 		const row = await testEnv.INDEX_DB.prepare(
@@ -180,10 +187,19 @@ describe("PKCE flow after open registration", () => {
 		const { client_id: clientId } = (await reg.json()) as { client_id: string };
 
 		const verifier = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
-			.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+			.replace(/\+/g, "-")
+			.replace(/\//g, "_")
+			.replace(/=+$/, "");
 		const challenge = btoa(
-			String.fromCharCode(...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)))),
-		).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+			String.fromCharCode(
+				...new Uint8Array(
+					await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)),
+				),
+			),
+		)
+			.replace(/\+/g, "-")
+			.replace(/\//g, "_")
+			.replace(/=+$/, "");
 		const authorize = new URL(`${ORIGIN}/api/auth/oauth2/authorize`);
 		for (const [k, v] of Object.entries({
 			response_type: "code",
@@ -209,7 +225,10 @@ describe("PKCE flow after open registration", () => {
 			.run();
 		const pairing = await post("/api/auth/pairing", { email: OWNER, code: "std-code" });
 		expect(pairing.status).toBe(200);
-		const cookie = pairing.headers.getSetCookie().map((c) => c.split(";")[0]).join("; ");
+		const cookie = pairing.headers
+			.getSetCookie()
+			.map((c) => c.split(";")[0])
+			.join("; ");
 
 		const logged = await run(new Request(authorize, { headers: { cookie }, redirect: "manual" }));
 		const location = logged.headers.get("location") ?? "";
@@ -218,7 +237,9 @@ describe("PKCE flow after open registration", () => {
 		// Nothing is granted before consent: there is no consent row yet.
 		const before = await testEnv.INDEX_DB.prepare(
 			`SELECT COUNT(*) AS n FROM "oauthConsent" WHERE "clientId" = ?`,
-		).bind(clientId).first<{ n: number }>();
+		)
+			.bind(clientId)
+			.first<{ n: number }>();
 		expect(before!.n).toBe(0);
 
 		const consent = await post(
@@ -277,7 +298,9 @@ describe("stale client sweep", () => {
 		const insert = (id: string, createdAt: number) =>
 			testEnv.INDEX_DB.prepare(
 				`INSERT INTO "oauthClient" ("id","clientId","redirectUris","createdAt") VALUES (?,?,?,?)`,
-			).bind(`row-${id}`, id, '["https://c.example/cb"]', createdAt).run();
+			)
+				.bind(`row-${id}`, id, '["https://c.example/cb"]', createdAt)
+				.run();
 		await insert("sweep-old-unused", now - 25 * 3600_000);
 		await insert("sweep-new-unused", now - 1 * 3600_000);
 		const removed = await sweepStaleOAuthClients(testEnv.INDEX_DB, now);
@@ -300,5 +323,6 @@ describe("first-consent notice", () => {
 		expect(text).toContain("&lt;b&gt;Claude&lt;/b&gt;");
 		expect(text).toContain("claude.ai");
 		expect(text).toContain("mail:read admin");
+		expect(text).toContain("/settings/agent-access");
 	});
 });

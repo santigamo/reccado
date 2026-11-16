@@ -1,495 +1,199 @@
-
-@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Manrope:wght@400;500;600;700;800&display=swap");
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
-@theme {
-  --font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
-}
-
-:root {
-  --sea-ink: #173a40;
-  --sea-ink-soft: #416166;
-  --lagoon: #4fb8b2;
-  --lagoon-deep: #328f97;
-  --palm: #2f6a4a;
-  --sand: #e7f0e8;
-  --foam: #f3faf5;
-  --surface: rgba(255, 255, 255, 0.74);
-  --surface-strong: rgba(255, 255, 255, 0.9);
-  --line: rgba(23, 58, 64, 0.14);
-  --inset-glint: rgba(255, 255, 255, 0.82);
-  --kicker: rgba(47, 106, 74, 0.9);
-  --bg-base: #e7f3ec;
-  --header-bg: rgba(251, 255, 248, 0.84);
-  --chip-bg: rgba(255, 255, 255, 0.8);
-  --chip-line: rgba(47, 106, 74, 0.18);
-  --link-bg-hover: rgba(255, 255, 255, 0.9);
-  --hero-a: rgba(79, 184, 178, 0.36);
-  --hero-b: rgba(47, 106, 74, 0.2);
-}
-
-:root[data-theme="dark"] {
-  --sea-ink: #d7ece8;
-  --sea-ink-soft: #afcdc8;
-  --lagoon: #60d7cf;
-  --lagoon-deep: #8de5db;
-  --palm: #6ec89a;
-  --sand: #0f1a1e;
-  --foam: #101d22;
-  --surface: rgba(16, 30, 34, 0.8);
-  --surface-strong: rgba(15, 27, 31, 0.92);
-  --line: rgba(141, 229, 219, 0.18);
-  --inset-glint: rgba(194, 247, 238, 0.14);
-  --kicker: #b8efe5;
-  --bg-base: #0a1418;
-  --header-bg: rgba(10, 20, 24, 0.8);
-  --chip-bg: rgba(13, 28, 32, 0.9);
-  --chip-line: rgba(141, 229, 219, 0.24);
-  --link-bg-hover: rgba(24, 44, 49, 0.8);
-  --hero-a: rgba(96, 215, 207, 0.18);
-  --hero-b: rgba(110, 200, 154, 0.12);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --sea-ink: #d7ece8;
-    --sea-ink-soft: #afcdc8;
-    --lagoon: #60d7cf;
-    --lagoon-deep: #8de5db;
-    --palm: #6ec89a;
-    --sand: #0f1a1e;
-    --foam: #101d22;
-    --surface: rgba(16, 30, 34, 0.8);
-    --surface-strong: rgba(15, 27, 31, 0.92);
-    --line: rgba(141, 229, 219, 0.18);
-    --inset-glint: rgba(194, 247, 238, 0.14);
-    --kicker: #b8efe5;
-    --bg-base: #0a1418;
-    --header-bg: rgba(10, 20, 24, 0.8);
-    --chip-bg: rgba(13, 28, 32, 0.9);
-    --chip-line: rgba(141, 229, 219, 0.24);
-    --link-bg-hover: rgba(24, 44, 49, 0.8);
-    --hero-a: rgba(96, 215, 207, 0.18);
-    --hero-b: rgba(110, 200, 154, 0.12);
-  }
-}
-
 /* ---------------------------------------------------------------------------
-   App theme — the Gmail-style mail client (mailbox routes) uses this flat,
-   dense surface palette instead of the marketing "island/lagoon" look. Same
-   three-layer dark-mode mechanism as above (explicit data-theme + system
-   fallback); only the values differ. Marketing tokens stay untouched.
+   Reccado design tokens — mirrored from the Paper file "Reccado — UI"
+   (01M7J1YJJ1R3WPFMG0TVQTADVY, get_tokens). Light "maritime" palette: fog-grey
+   backdrop, white panels, navy brand, amber reserved for approvals only.
+
+   `@theme static` so every token is emitted as a CSS variable even when no
+   utility uses it (components read several of them through var()/color-mix()).
+   Utilities you get for free: bg-panel, bg-content, text-text-muted,
+   border-border-card, rounded-card, text-body, font-brand, …
 --------------------------------------------------------------------------- */
+@theme static {
+	--font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+	--font-brand: "Lato", "Inter", ui-sans-serif, system-ui, sans-serif;
+	--font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+	--color-backdrop: #d5dae0;
+	--color-shell: #f1f3f6;
+	--color-shell-border: #e1e5ea;
+	--color-panel: #ffffff;
+	--color-content: #f5f6f8;
+	--color-row-selected: #f3f5f8;
+	/* Read state in mail lists (unread rows stay on --color-panel). Muted text keeps
+	   WCAG AA on all three: #6b6b6b is 4.93:1 on read, 4.67 on its hover, 4.57 on
+	   the open conversation's row. */
+	--color-row-read: #f5f6f8;
+	--color-row-read-hover: #eef0f3;
+	--color-row-current: #e9eef6;
+	--color-pill: #eff1f5;
+	--color-border: #e3e6eb;
+	--color-border-card: #e6e9ed;
+	--color-divider: #e9ecf0;
+	--color-ink: #1e1e1e;
+	--color-text: #2b2b2b;
+	--color-text-secondary: #4a4a4a;
+	--color-text-muted: #6b6b6b;
+	--color-text-faint: #9a9a9a;
+	--color-icon: #7a7a7a;
+	--color-hover: rgba(27, 42, 65, 0.05);
+	--color-verified: #3b9cf4;
+	--color-approval: #a85a00;
+	--color-approval-surface: #fff6e5;
+	--color-approval-border: #f1ddb5;
+	--color-brand: #1b2a41;
+	--color-brand-hover: #26385a;
+	--color-success: #2f8f68;
+	--color-agent-on: #2fa36b;
+	--color-danger: #b5473f;
+	--color-disabled: #c5cad3;
+	--color-code-text: #dce4f0;
+
+	/* Per-mailbox palette, in assignment order (see src/lib/mailbox-color.ts). */
+	--color-mbx-hello: #4f84c4;
+	--color-mbx-billing: #4a9b7e;
+	--color-mbx-support: #8474c2;
+	--color-mbx-security: #3e9aab;
+	--color-mbx-hola: #c2688c;
+	--color-mbx-free-1: #7f9651;
+	--color-mbx-free-2: #b8806a;
+	--color-mbx-free-3: #68788f;
+
+	--text-meta: 12px;
+	--text-meta--line-height: 16px;
+	--text-label: 13px;
+	--text-label--line-height: 18px;
+	--text-body: 14px;
+	--text-body--line-height: 20px;
+	--text-sender: 15px;
+	--text-sender--line-height: 20px;
+	--text-title: 20px;
+	--text-title--line-height: 26px;
+
+	--radius-control: 8px;
+	--radius-card: 14px;
+	--radius-panel: 16px;
+	--radius-shell: 20px;
+	--radius-pill: 999px;
+
+	--shadow-card: 0 1px 2px rgba(0, 0, 0, 0.03);
+	--shadow-primary: inset 0 0 0 1px #101b2d, 0 2px 4px rgba(27, 42, 65, 0.2);
+	--shadow-dialog: 0 1px 2px rgba(27, 42, 65, 0.06), 0 24px 48px -12px rgba(27, 42, 65, 0.22);
+	--shadow-popover: 0 1px 2px rgba(27, 42, 65, 0.06), 0 12px 32px -8px rgba(27, 42, 65, 0.22);
+	--shadow-sticky: 0 -4px 12px rgba(0, 0, 0, 0.04);
+}
+
 :root {
-  --app-bg: #f6f8fc;
-  --app-surface: #ffffff;
-  --app-surface-2: #f1f3f4;
-  --app-hover: rgba(32, 33, 36, 0.06);
-  --app-selected: color-mix(in oklab, var(--lagoon) 18%, white);
-  --app-selected-strong: color-mix(in oklab, var(--lagoon) 32%, white);
-  --app-selected-text: var(--sea-ink);
-  --app-border: #e4e7ec;
-  --app-border-strong: #d5d9df;
-  --app-text: #202124;
-  --app-text-soft: #5f6368;
-  --app-text-faint: #80868b;
-  --app-accent: #1f6b71;
-  --app-accent-hover: #17565b;
-  --app-on-accent: #ffffff;
-  --app-danger: #d93025;
-  --app-shadow: 0 1px 3px rgba(60, 64, 67, 0.15), 0 4px 8px rgba(60, 64, 67, 0.08);
-
-  /* Liquid Glass material — functional layer only (sidebar, toolbars, compose
-     chrome, floating buttons). Never applied to content-layer surfaces
-     (thread rows, message cards) per Apple HIG. */
-  --glass-bg: rgba(255, 255, 255, 0.46);
-  --glass-bg-strong: rgba(255, 255, 255, 0.68);
-  --glass-border: rgba(255, 255, 255, 0.65);
-  --glass-highlight: rgba(255, 255, 255, 0.95);
-  --glass-shadow: 0 12px 40px rgba(23, 58, 64, 0.22), 0 2px 8px rgba(23, 58, 64, 0.1);
-  --glass-tint-accent: rgba(79, 184, 178, 0.28);
-
-  /* Stronger-than-marketing aurora, specifically for behind the glass shell —
-     glass needs real color/contrast to blur and refract, or it just reads as
-     a flat translucent gray. */
-  --app-aurora-a: rgba(79, 184, 178, 0.6);
-  --app-aurora-b: rgba(47, 106, 74, 0.38);
-  --app-aurora-c: rgba(246, 130, 31, 0.22);
+	color-scheme: light;
+	/* Dimmed-app scrim behind dialogs (#1B2A41 @ 32%). */
+	--scrim: rgba(27, 42, 65, 0.32);
 }
 
-:root[data-theme="dark"] {
-  --app-bg: #131314;
-  --app-surface: #1e1f20;
-  --app-surface-2: #2d2e30;
-  --app-hover: rgba(227, 227, 227, 0.08);
-  --app-selected: color-mix(in oklab, var(--lagoon-deep) 28%, black);
-  --app-selected-strong: color-mix(in oklab, var(--lagoon-deep) 42%, black);
-  --app-selected-text: var(--kicker);
-  --app-border: #333438;
-  --app-border-strong: #444649;
-  --app-text: #e3e3e3;
-  --app-text-soft: #9aa0a6;
-  --app-text-faint: #7a7d81;
-  --app-accent: #60d7cf;
-  --app-accent-hover: #7fe2da;
-  --app-on-accent: #062723;
-  --app-danger: #f28b82;
-  --app-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.4);
+@layer base {
+	html,
+	body,
+	#app {
+		min-height: 100%;
+	}
 
-  --glass-bg: rgba(18, 32, 36, 0.46);
-  --glass-bg-strong: rgba(14, 26, 29, 0.7);
-  --glass-border: rgba(255, 255, 255, 0.1);
-  --glass-highlight: rgba(255, 255, 255, 0.16);
-  --glass-shadow: 0 12px 40px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
-  --glass-tint-accent: rgba(96, 215, 207, 0.22);
+	body {
+		margin: 0;
+		background-color: var(--color-backdrop);
+		color: var(--color-text);
+		font-family: var(--font-sans);
+		font-size: var(--text-body);
+		line-height: 20px;
+		-webkit-font-smoothing: antialiased;
+		-moz-osx-font-smoothing: grayscale;
+		font-synthesis: none;
+	}
 
-  --app-aurora-a: rgba(96, 215, 207, 0.4);
-  --app-aurora-b: rgba(110, 200, 154, 0.28);
-  --app-aurora-c: rgba(246, 130, 31, 0.16);
+	a {
+		color: inherit;
+		text-underline-offset: 2px;
+	}
+
+	button,
+	a {
+		transition:
+			background-color 140ms ease,
+			color 140ms ease,
+			border-color 140ms ease,
+			box-shadow 140ms ease;
+	}
+
+	code,
+	kbd,
+	pre {
+		font-family: var(--font-mono);
+	}
+
+	:focus-visible {
+		outline: 2px solid color-mix(in srgb, var(--color-brand) 55%, transparent);
+		outline-offset: 2px;
+	}
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --app-bg: #131314;
-    --app-surface: #1e1f20;
-    --app-surface-2: #2d2e30;
-    --app-hover: rgba(227, 227, 227, 0.08);
-    --app-selected: color-mix(in oklab, var(--lagoon-deep) 28%, black);
-    --app-selected-strong: color-mix(in oklab, var(--lagoon-deep) 42%, black);
-    --app-selected-text: var(--kicker);
-    --app-border: #333438;
-    --app-border-strong: #444649;
-    --app-text: #e3e3e3;
-    --app-text-soft: #9aa0a6;
-    --app-text-faint: #7a7d81;
-    --app-accent: #60d7cf;
-    --app-accent-hover: #7fe2da;
-    --app-on-accent: #062723;
-    --app-danger: #f28b82;
-    --app-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 4px 12px rgba(0, 0, 0, 0.4);
-
-    --glass-bg: rgba(18, 32, 36, 0.46);
-    --glass-bg-strong: rgba(14, 26, 29, 0.7);
-    --glass-border: rgba(255, 255, 255, 0.1);
-    --glass-highlight: rgba(255, 255, 255, 0.16);
-    --glass-shadow: 0 12px 40px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
-    --glass-tint-accent: rgba(96, 215, 207, 0.22);
-
-    --app-aurora-a: rgba(96, 215, 207, 0.4);
-    --app-aurora-b: rgba(110, 200, 154, 0.28);
-    --app-aurora-c: rgba(246, 130, 31, 0.16);
-  }
-}
-
-* {
-  box-sizing: border-box;
-}
-
-/* The mail client keeps a faint version of the marketing aurora behind it so
-   the glass functional layer (sidebar, floating toolbar, compose window) has
-   something to blur and refract. Content-layer surfaces (thread list, message
-   cards) stay opaque on top of it — see .glass below for the rule on where
-   translucency is and isn't allowed. */
-.app-surface-root {
-  /* A flat or corner-only background gives backdrop-filter almost nothing to
-     blur, so the glass panels just look like plain translucent gray — this
-     needs to be an actual colored, varied surface across the whole viewport,
-     not a subtle marketing-style vignette. */
-  position: relative;
-  background:
-    radial-gradient(900px 640px at 10% 4%, var(--app-aurora-a), transparent 70%),
-    radial-gradient(820px 640px at 90% 92%, var(--app-aurora-b), transparent 70%),
-    radial-gradient(700px 560px at 60% 30%, var(--app-aurora-c), transparent 72%),
-    linear-gradient(
-      135deg,
-      color-mix(in oklab, var(--lagoon) 24%, var(--app-bg)) 0%,
-      color-mix(in oklab, var(--palm) 16%, var(--app-bg)) 50%,
-      color-mix(in oklab, var(--lagoon-deep) 20%, var(--app-bg)) 100%
-    );
-  color: var(--app-text);
-}
-
-/* The "liquid" in Liquid Glass: two soft color blobs that drift very slowly
-   behind the glass panels, so the blur/saturation the panels pick up shifts
-   gently over time instead of sitting static. Transform + opacity only (GPU
-   compositable), sunk behind normal content via z-index on a positioned
-   parent, off by default under reduced motion. */
-.app-surface-root::before,
-.app-surface-root::after {
-  content: "";
-  position: absolute;
-  z-index: -1;
-  border-radius: 999px;
-  filter: blur(90px);
-  pointer-events: none;
-}
-
-.app-surface-root::before {
-  top: -15%;
-  left: -8%;
-  width: 46vw;
-  height: 46vw;
-  background: var(--app-aurora-a);
-  animation: aurora-drift-a 46s ease-in-out infinite alternate;
-}
-
-.app-surface-root::after {
-  bottom: -20%;
-  right: -8%;
-  width: 42vw;
-  height: 42vw;
-  background: var(--app-aurora-b);
-  animation: aurora-drift-b 54s ease-in-out infinite alternate;
-}
-
-@keyframes aurora-drift-a {
-  from {
-    transform: translate(0, 0) scale(1);
-  }
-  to {
-    transform: translate(7vw, 9vh) scale(1.12);
-  }
-}
-
-@keyframes aurora-drift-b {
-  from {
-    transform: translate(0, 0) scale(1);
-  }
-  to {
-    transform: translate(-6vw, -7vh) scale(1.1);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .app-surface-root::before,
-  .app-surface-root::after {
-    animation: none;
-  }
-}
-
-/* Liquid Glass — the translucent functional-layer material. Regular variant:
-   blurs and saturates whatever scrolls behind it so nav/toolbar/compose
-   controls stay legible over the aurora. Do not apply to content-layer
-   elements (thread rows, message bodies, cards). Note: blur only reads as
-   "glass" when there's something colorful/moving behind it to distort — a
-   flat background makes this look like a plain translucent panel. */
-.glass {
-  background: var(--glass-bg);
-  backdrop-filter: blur(28px) saturate(1.8);
-  -webkit-backdrop-filter: blur(28px) saturate(1.8);
-  box-shadow: var(--glass-shadow), inset 0 1px 0 var(--glass-highlight);
-}
-
-/* Border is applied per-element via Tailwind (border-[var(--glass-border)])
-   since sidebar/toolbar/modal each need a different subset of edges. */
-
-/* Same material, higher opacity — for text-dense glass surfaces (compose
-   window) that need more contrast than the sidebar/toolbar. Use instead of
-   .glass, not alongside it. */
-.glass-strong {
-  background: var(--glass-bg-strong);
-  backdrop-filter: blur(28px) saturate(1.8);
-  -webkit-backdrop-filter: blur(28px) saturate(1.8);
-  box-shadow: var(--glass-shadow), inset 0 1px 0 var(--glass-highlight);
-}
-
-/* Thinner variant for glass sitting on top of an already-opaque content card
-   (e.g. a sticky in-thread toolbar) rather than over the open aurora. */
-.glass-thin {
-  background: color-mix(in oklab, var(--app-surface) 85%, transparent);
-  backdrop-filter: blur(14px) saturate(1.3);
-  -webkit-backdrop-filter: blur(14px) saturate(1.3);
-}
-
-@media (prefers-reduced-transparency: reduce) {
-  .glass,
-  .glass-strong,
-  .glass-thin {
-    backdrop-filter: none;
-    -webkit-backdrop-filter: none;
-    background: var(--app-surface);
-  }
-}
-
-/* Slim, theme-aware scrollbars for the dense list/reading panes. */
+/* Slim scrollbars for the dense list/reading panes. */
 .app-scroll {
-  scrollbar-width: thin;
-  scrollbar-color: var(--app-border-strong) transparent;
+	scrollbar-width: thin;
+	scrollbar-color: var(--color-border) transparent;
 }
 .app-scroll::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+	width: 10px;
+	height: 10px;
 }
 .app-scroll::-webkit-scrollbar-thumb {
-  background-color: var(--app-border-strong);
-  border-radius: 999px;
-  border: 3px solid transparent;
-  background-clip: content-box;
+	background-color: var(--color-border);
+	border-radius: 999px;
+	border: 3px solid transparent;
+	background-clip: content-box;
 }
 .app-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: var(--app-text-faint);
+	background-color: var(--color-disabled);
 }
 
-html,
-body,
-#app {
-  min-height: 100%;
+/* Horizontal bars (folder tabs on narrow screens) scroll without a visible bar. */
+.no-scrollbar {
+	scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+	display: none;
 }
 
-body {
-  margin: 0;
-  color: var(--sea-ink);
-  font-family: var(--font-sans);
-  background-color: var(--bg-base);
-  background:
-    radial-gradient(1100px 620px at -8% -10%, var(--hero-a), transparent 58%),
-    radial-gradient(1050px 620px at 112% -12%, var(--hero-b), transparent 62%),
-    radial-gradient(720px 380px at 50% 115%, rgba(79, 184, 178, 0.1), transparent 68%),
-    linear-gradient(180deg, color-mix(in oklab, var(--sand) 68%, white) 0%, var(--foam) 44%, var(--bg-base) 100%);
-  overflow-x: hidden;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+/* Compose body (RichTextEditor): the few structures an email body carries, drawn
+   the way most mail clients will show them to the recipient. */
+.compose-body ul,
+.compose-body ol {
+	margin: 4px 0;
+	padding-left: 24px;
 }
-
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: -1;
-  opacity: 0.28;
-  background:
-    radial-gradient(circle at 20% 15%, rgba(255, 255, 255, 0.8), transparent 34%),
-    radial-gradient(circle at 78% 26%, rgba(79, 184, 178, 0.2), transparent 42%),
-    radial-gradient(circle at 42% 82%, rgba(47, 106, 74, 0.14), transparent 36%);
+.compose-body ul {
+	list-style: disc;
 }
-
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: -1;
-  opacity: 0.14;
-  background-image:
-    linear-gradient(rgba(255, 255, 255, 0.07) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.06) 1px, transparent 1px);
-  background-size: 28px 28px;
-  mask-image: radial-gradient(circle at 50% 30%, black, transparent 78%);
+.compose-body ol {
+	list-style: decimal;
 }
-
-a {
-  color: var(--lagoon-deep);
-  text-decoration-color: rgba(50, 143, 151, 0.4);
-  text-decoration-thickness: 1px;
-  text-underline-offset: 2px;
+.compose-body blockquote {
+	margin: 4px 0 4px 2px;
+	padding-left: 12px;
+	border-left: 2px solid var(--color-border-card);
+	color: var(--color-text-muted);
 }
-
-a:hover {
-  color: #246f76;
+.compose-body a {
+	color: var(--color-ink);
+	text-decoration: underline;
 }
-
-code {
-  font-size: 0.9em;
-  border: 1px solid var(--line);
-  background: color-mix(in oklab, var(--surface-strong) 82%, white 18%);
-  border-radius: 7px;
-  padding: 2px 7px;
+.compose-body h1,
+.compose-body h2,
+.compose-body h3,
+.compose-body h4 {
+	font-weight: 600;
 }
-
-pre code {
-  border: 0;
-  background: transparent;
-  padding: 0;
-  border-radius: 0;
-  font-size: inherit;
-  color: inherit;
+.compose-body pre,
+.compose-body code {
+	font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+	font-size: 0.92em;
 }
-
-.page-wrap {
-  width: min(1080px, calc(100% - 2rem));
-  margin-inline: auto;
-}
-
-.display-title {
-  font-family: "Fraunces", Georgia, serif;
-}
-
-.island-shell {
-  border: 1px solid var(--line);
-  background: linear-gradient(165deg, var(--surface-strong), var(--surface));
-  box-shadow:
-    0 1px 0 var(--inset-glint) inset,
-    0 22px 44px rgba(30, 90, 72, 0.1),
-    0 6px 18px rgba(23, 58, 64, 0.08);
-  backdrop-filter: blur(4px);
-}
-
-button,
-.island-shell,
-a {
-  transition: background-color 180ms ease, color 180ms ease, border-color 180ms ease,
-    transform 180ms ease;
-}
-
-.island-kicker {
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  font-weight: 700;
-  font-size: 0.69rem;
-  color: var(--kicker);
-}
-
-.nav-link {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  text-decoration: none;
-  color: var(--sea-ink-soft);
-}
-
-.nav-link::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  bottom: -6px;
-  width: 100%;
-  height: 2px;
-  transform: scaleX(0);
-  transform-origin: left;
-  background: linear-gradient(90deg, var(--lagoon), #7ed3bf);
-  transition: transform 170ms ease;
-}
-
-.nav-link:hover,
-.nav-link.is-active {
-  color: var(--sea-ink);
-}
-
-.nav-link:hover::after,
-.nav-link.is-active::after {
-  transform: scaleX(1);
-}
-
-@media (max-width: 640px) {
-  .nav-link::after {
-    bottom: -4px;
-  }
-}
-
-.rise-in {
-  animation: rise-in 700ms cubic-bezier(0.16, 1, 0.3, 1) both;
-}
-
-@keyframes rise-in {
-  from {
-    opacity: 0;
-    transform: translateY(12px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-

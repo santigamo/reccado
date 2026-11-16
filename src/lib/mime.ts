@@ -2,6 +2,10 @@ import PostalMime from "postal-mime";
 
 export type ParsedEmail = {
 	from: string;
+	/** The From display name exactly as parsed (unsanitised; see display-name.ts). */
+	fromName: string | null;
+	/** To/Cc display names as parsed, one entry per named recipient. */
+	recipientNames: Array<{ address: string; name: string }>;
 	to: string[];
 	cc: string[];
 	bcc: string[];
@@ -37,6 +41,11 @@ export async function parseMimeBytes(rawBytes: Uint8Array): Promise<ParsedEmail>
 	const email = await parser.parse(rawBytes);
 	const from = email.from?.address ?? "unknown@invalid";
 	const mapAddr = (addr: { address?: string } | null | undefined) => addr?.address ?? "";
+	const recipientNames = [...(email.to ?? []), ...(email.cc ?? [])].flatMap((addr) =>
+		addr && "address" in addr && addr.address && addr.name
+			? [{ address: addr.address, name: addr.name }]
+			: [],
+	);
 	const references = Array.isArray(email.references)
 		? email.references
 		: email.references
@@ -44,6 +53,8 @@ export async function parseMimeBytes(rawBytes: Uint8Array): Promise<ParsedEmail>
 			: [];
 	return {
 		from: from.toLowerCase(),
+		fromName: email.from?.name || null,
+		recipientNames,
 		to: (email.to ?? []).map(mapAddr).filter(Boolean),
 		cc: (email.cc ?? []).map(mapAddr).filter(Boolean),
 		bcc: (email.bcc ?? []).map(mapAddr).filter(Boolean),

@@ -12,6 +12,8 @@ export type McpThread = {
 	unread_count: number;
 	latest_subject: string | null;
 	latest_from: string | null;
+	/** Sender display name, sanitised at ingest; null when unknown. */
+	latest_from_name: string | null;
 	latest_snippet: string | null;
 	latest_received_at: string;
 	latest_has_attachments: number;
@@ -25,6 +27,8 @@ export type McpSearchResult = {
 	mailbox_id?: string;
 	subject: string | null;
 	from_addr: string;
+	/** Sender display name, sanitised at ingest; null when unknown. */
+	from_name: string | null;
 	snippet: string | null;
 	received_at: string;
 };
@@ -40,6 +44,8 @@ export type McpMessageDto = {
 	thread_id: string;
 	direction: "inbound" | "outbound";
 	from_addr: string;
+	/** Sender display name, sanitised at ingest; null when unknown. */
+	from_name: string | null;
 	to: string[];
 	cc: string[];
 	subject: string | null;
@@ -66,4 +72,3 @@ export type McpSendAuth = import("./scopes").McpAuthContext & {
 	tokenSub?: string;
 	tokenJti?: string;
 };
-

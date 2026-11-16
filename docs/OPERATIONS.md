@@ -62,7 +62,7 @@ editing the repository.
 
 ## Provisioning a sending domain
 
-`POST /api/domains/:domain/provision` (and the **Domains** page over it) runs the whole
+`POST /api/domains/:domain/provision` (and **Settings → Domains & mailboxes**, `/settings/domains`, over it) runs the whole
 sequence: register the zone, enable Email Sending, publish the DMARC policy, enable
 inbound routing, subscribe to delivery feedback, create the mailbox.
 
@@ -90,12 +90,44 @@ Two orderings are load-bearing:
 | Zone · DNS · Edit | the zones you serve | Publishing the DMARC ramp record | `dmarc` blocked |
 | Zone · Email Routing · Edit | the zones you serve | Inbound routing | `email_routing` blocked |
 | Account · Event Subscriptions | account | The feedback subscription | `feedback_subscription` blocked |
+| Zone · Email Routing Rules · Edit | the zones you serve | **Route it** in Settings (one `to:<address> -> Worker` rule per mailbox) | Route it refuses with `permission` and shows the `pnpm setup:routing` fallback |
+| Zone · Zone Settings · Read | the zones you serve | Route it checks Email Routing is on before writing (also what the settings overview reads) | Route it refuses with `permission` |
 
 **Scope the token to the zones Reccado serves, not to all zones.** Only the last row is
 account-scoped; it is the one permission that cannot be bounded by zone. If you would
 rather not grant it, leave it off — that step reports `blocked` with its remedy and the
 rest of the run still completes. Do **not** substitute Queues · Edit: it can delete the
 inbound mail queue, and provisioning never needs it.
+
+### Routing a mailbox from Settings ("Route it")
+
+Creating a mailbox only writes Reccado's index; Cloudflare Email Routing must separately
+deliver the address to this Worker. **Settings → Domains & mailboxes** now does that itself:
+**Add mailbox** asks Cloudflare to route the new address right after creating it, and the
+**Route it** link in the mailboxes table (and on the Add domain *Ready* step) does the same for
+an existing one. Both call `POST /api/cloudflare/domains/:domain/routing` with
+`{ "address": "<name>@<domain>" }` — owner web session only (an MCP token gets `401`; agents
+cannot route, see below).
+
+- It creates **one** literal `to:<address> -> <this Worker>` rule and nothing else. The Worker is
+  `vars.WORKER_NAME`, which must equal the block's `name` in `wrangler.jsonc` (a unit test
+  enforces it). The zone comes from the `domains` registry, never from the request.
+- `200 already` when an enabled rule for the address, or the catch-all, already delivers to this
+  Worker; `201 created` otherwise, with an `admin.cloudflare_route_created` ops event
+  (`admin.cloudflare_route_failed` when Cloudflare errors).
+- It **refuses without writing** — `{ ok: false, reason, message, remedy }` — when the token is
+  missing or lacks the permissions above (`424`, with the `pnpm setup:routing` command as the
+  fallback), Email Routing is off for the zone (`422`; turning it on rewrites MX records, so
+  Route it never does), the domain is unregistered (`404`) or disabled (`422`), the address is
+  not an active mailbox/alias (`422`), or a rule or the catch-all already sends the address
+  somewhere else (`409`; it never edits or deletes someone's rule).
+- A routing failure never undoes the mailbox. Retry is safe: every attempt reads first.
+- `pnpm setup:routing` shares the Cloudflare client and rule logic (`src/lib/email-routing.ts`)
+  and is still the way to set the zone's **catch-all** to the Worker (`--catch-all`), which the
+  web UI deliberately does not do.
+- **MCP is unchanged:** `manage_mailbox` creates the mailbox row only and never calls Cloudflare.
+  Whether an agent may route an address, and under which approval kind, is an owner decision
+  that has not been made.
 
 ### Why DNS write is safe enough to grant
 
@@ -720,7 +752,7 @@ mail. It sees only `manage_template`, `manage_api_key`, `restore`, `reconcile_st
 `restore`), while key create/rotate/scopes return an approval link. A call outside the granted scopes
 returns `insufficient_scope` naming the scope.
 
-**Revoking an app.** The owner opens `/security` → *Aplicaciones conectadas* and presses *Revocar*
+**Revoking an app.** The owner opens `/settings/agent-access` → *Connected agents* and presses *Revoke*
 (or runs the CLI below). Access JWTs already issued stay valid until they expire (≤ 3600 s).
 
 **Clients (optional fallback).** With an operator session (previous section), pre-register a client

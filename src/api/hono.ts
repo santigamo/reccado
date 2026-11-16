@@ -7,14 +7,15 @@ import * as mailboxAdmin from "../lib/admin/mailboxes";
 import * as routingAdmin from "../lib/admin/routing";
 import { AppError } from "../lib/errors";
 import { getAuthConfigStatus, isLocalRequest } from "../lib/runtime-config";
+import { registerApprovalRoutes } from "./approval-routes";
 import { type getAuthContext, requireAuth } from "./auth";
 import { handleAuthRequest, handleSetPasswordRequest } from "./better-auth";
+import { registerCloudflareReadRoutes } from "./cloudflare-routes";
 import {
 	registerAdminRoutes,
 	registerMailboxRoutes,
 	registerMailboxSuppressionRoutes,
 } from "./mailbox-routes";
-import { registerApprovalRoutes } from "./approval-routes";
 import { registerOAuthClientRoutes } from "./oauth-client-routes";
 import { registerTelegramRoutes } from "./telegram-routes";
 
@@ -63,6 +64,9 @@ async function checkIndexDbHealth(indexDb: D1Database): Promise<IndexDbHealth> {
 	}
 }
 
+/** The one API response the app frames: GET /api/mailboxes/:id/messages/:messageId/html. */
+const MESSAGE_HTML_PATH = /^\/api\/mailboxes\/[^/]+\/messages\/[^/]+\/html$/;
+
 export function createApiApp(): Hono<ApiBindings> {
 	const api = new Hono<ApiBindings>();
 
@@ -77,13 +81,35 @@ export function createApiApp(): Hono<ApiBindings> {
 		}
 		const headers = new Headers(c.res.headers);
 		headers.set("X-Content-Type-Options", "nosniff");
-		headers.set("X-Frame-Options", "DENY");
+		// DENY everywhere, with one exception: a message's HTML body, which the
+		// inbox itself frames (sandboxed) and which declares SAMEORIGIN to match its
+		// CSP frame-ancestors 'self'. Pages that ask for decisions (/approve,
+		// /login, /consent) are not served by this app and keep their own DENY.
+		const framable =
+			MESSAGE_HTML_PATH.test(c.req.path) && headers.get("X-Frame-Options") === "SAMEORIGIN";
+		if (!framable) headers.set("X-Frame-Options", "DENY");
 		headers.set("Referrer-Policy", "no-referrer");
 		c.res = new Response(c.res.body, {
 			status: c.res.status,
 			statusText: c.res.statusText,
 			headers,
 		});
+	});
+
+	// Auth helpers (requireAuth, assertMailboxAccess, requireMcpOwner) signal a
+	// denial by THROWING a ready-made Response. Hono's onError only receives
+	// thrown Errors — anything else is rethrown past it and escapes the app as a
+	// 500. Catch it here, once, for every route registered on this app (including
+	// those server.ts adds afterwards), and answer with the Response exactly as
+	// the helper built it. Registered after the security-headers middleware so
+	// those headers still wrap the answer.
+	api.use("*", async (_c, next) => {
+		try {
+			await next();
+		} catch (error) {
+			if (error instanceof Response) return error;
+			throw error;
+		}
 	});
 
 	// Lightweight CSRF defense for state-changing requests: an Origin header that doesn't
@@ -427,6 +453,7 @@ export function createApiApp(): Hono<ApiBindings> {
 	registerOAuthClientRoutes(api);
 	registerTelegramRoutes(api);
 	registerApprovalRoutes(api);
+	registerCloudflareReadRoutes(api);
 
 	// MCP endpoint: forward all methods (GET/POST/OPTIONS) to the MCP handler.
 	api.all("/mcp", async (c) => {

@@ -151,8 +151,8 @@ actual repo state, fix this section rather than trusting it blindly.
   `restore`. Delegation policies (`mcp_client_policies`, `pnpm operator mcp policy`, auto-apply,
   Telegram undo) were removed in `0030`. Connection is one URL + browser login: OAuth 2.1 + PRM,
   CIMD on (`MCP_CIMD_ENABLED`, `@better-auth/cimd`) as the preferred client registration, open
-  DCR kept as compatibility fallback; the owner revokes clients under `/security` "Aplicaciones
-  conectadas". Control-plane kinds live in `src/lib/control-plane-kinds/*`. Better
+  DCR kept as compatibility fallback; the owner revokes clients under `/settings/agent-access` "Connected
+  agents". Control-plane kinds live in `src/lib/control-plane-kinds/*`. Better
   Auth/`@better-auth/mcp` is 1.7.20; migrations run through `0030` (`0021` Better Auth 1.7.20,
   `0022` approvals, `0024` passkey (unused), `0025`–`0028` audit/approval metadata, intent payload,
   pending uniqueness, `0029` `mcp_client_policies` + `approvals.approved_via`/`auto_refused`,

@@ -1,32 +1,54 @@
 import { cn } from "#/lib/cn";
 import { avatarHue, initials } from "#/lib/mail";
 
+export type AvatarSize = "sm" | "md" | "lg";
+
+const SIZES: Record<AvatarSize, string> = {
+	sm: "h-7 w-7 text-[11px]",
+	md: "h-8 w-8 text-meta",
+	lg: "h-10 w-10 text-label",
+};
+
 /**
- * Gmail-style round sender avatar: initials on a per-sender deterministic hue.
+ * Round initials avatar.
+ * - `tone="sender"` (default): soft pastel derived from the address, so a
+ *   sender always gets the same colour (deterministic, SSR-safe).
+ * - `tone="neutral"`: the grey owner chip in the app header.
+ * `label` overrides the initials (e.g. "SA" for the signed-in owner).
+ * `name` is the sender's stored display name: initials prefer it, the colour
+ * stays keyed on the address.
  */
 export function Avatar({
 	from,
+	name,
+	label,
 	size = "md",
+	tone = "sender",
 	className,
 }: {
 	from: string | null | undefined;
-	size?: "sm" | "md" | "lg";
+	name?: string | null;
+	label?: string;
+	size?: AvatarSize;
+	tone?: "sender" | "neutral";
 	className?: string;
 }) {
 	const hue = avatarHue(from);
-	const dim =
-		size === "sm" ? "h-7 w-7 text-xs" : size === "lg" ? "h-10 w-10 text-base" : "h-9 w-9 text-sm";
+	const style =
+		tone === "neutral"
+			? { backgroundColor: "#E4E4E4", color: "#3A3A3A" }
+			: { backgroundColor: `hsl(${hue} 62% 90%)`, color: `hsl(${hue} 48% 28%)` };
 	return (
 		<span
 			aria-hidden="true"
 			className={cn(
-				"inline-flex shrink-0 items-center justify-center rounded-full font-medium text-white",
-				dim,
+				"inline-flex shrink-0 select-none items-center justify-center rounded-full font-semibold",
+				SIZES[size],
 				className,
 			)}
-			style={{ backgroundColor: `hsl(${hue} 52% 45%)` }}
+			style={style}
 		>
-			{initials(from)}
+			{label ?? initials(from, name)}
 		</span>
 	);
 }

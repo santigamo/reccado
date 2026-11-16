@@ -213,9 +213,17 @@ async function listOwnedClients(db: D1Database, ownerUserId: string): Promise<Co
        ORDER BY c."createdAt" DESC`,
 		)
 		.bind(ownerUserId)
-		.all<{ clientId: string; name: string | null; redirectUris: string | null; createdAt: unknown; lastToken: unknown }>();
+		.all<{
+			clientId: string;
+			name: string | null;
+			redirectUris: string | null;
+			createdAt: unknown;
+			lastToken: unknown;
+		}>();
 	const consents = await db
-		.prepare(`SELECT "clientId" AS clientId, "scopes" AS scopes FROM "oauthConsent" WHERE "userId" = ?`)
+		.prepare(
+			`SELECT "clientId" AS clientId, "scopes" AS scopes FROM "oauthConsent" WHERE "userId" = ?`,
+		)
 		.bind(ownerUserId)
 		.all<{ clientId: string; scopes: string | null }>();
 	const granted = new Map<string, Set<string>>();
@@ -237,6 +245,9 @@ async function listOwnedClients(db: D1Database, ownerUserId: string): Promise<Co
 
 export function registerOAuthClientRoutes(api: Hono<ApiBindings>): void {
 	api.get("/api/oauth-clients", async (c) => {
+		// requireMcpOwner throws a Response on denial (503 mcp_not_configured when no
+		// owner exists — always the case for the localhost dev-bypass identity — 403
+		// forbidden otherwise); createApiApp's thrown-Response middleware returns it.
 		const auth = requireMcpOwner(c.get("auth")!, c.env);
 		return c.json({ clients: await listOwnedClients(c.env.INDEX_DB, auth.userId) });
 	});

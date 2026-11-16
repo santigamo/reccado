@@ -1,15 +1,17 @@
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflare/types";
+import {
+	type AuthMailSecretEnv,
+	extractAuthMarker,
+	INSTANCE_AUTH_KIND,
+	isInstanceAuthMail,
+} from "../lib/auth-mail";
+import { type AutomatedKind, classifyAutomatedMail } from "../lib/automated-mail";
 import { sha256Hex } from "../lib/crypto";
+import { sanitizeAddressNames, sanitizeDisplayName } from "../lib/display-name";
 import { domainFromAddress } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
 import { normalizeSubject, parseMimeBytes, snippetFromText } from "../lib/mime";
 import { attachmentR2Key, bodyHtmlR2Key, sanitizeFilename } from "../lib/r2-keys";
-import {
-	INSTANCE_AUTH_KIND,
-	extractAuthMarker,
-	isInstanceAuthMail,
-	type AuthMailSecretEnv,
-} from "../lib/auth-mail";
 import { classifySensitive, type StoredSensitiveKind } from "../lib/sensitive-mail";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
@@ -208,15 +210,18 @@ export function resolveThreadId(
 	return crypto.randomUUID();
 }
 
-function bumpContact(sql: SqlStorage, email: string, now: string): void {
+function bumpContact(sql: SqlStorage, email: string, name: string | null, now: string): void {
+	// The newest usable name wins; a message without one keeps the name already known.
 	sql.exec(
 		`INSERT INTO contacts (email, name, last_seen_at, message_count, updated_at)
-     VALUES (?, NULL, ?, 1, ?)
+     VALUES (?, ?, ?, 1, ?)
      ON CONFLICT(email) DO UPDATE SET
+       name = COALESCE(excluded.name, name),
        last_seen_at = excluded.last_seen_at,
        message_count = message_count + 1,
        updated_at = excluded.updated_at`,
 		email,
+		name,
 		now,
 		now,
 	);
@@ -356,6 +361,10 @@ export async function ingestInboundEmail(
 	let bodyHtmlR2KeyValue: string | null = null;
 	let subject = message.headers.subject;
 	let fromAddr = message.sender;
+	// Display names, sanitised once here (src/lib/display-name.ts). A parse failure
+	// leaves both null: the row then renders the address, as every older row does.
+	let fromName: string | null = null;
+	let recipientNamesJson: string | null = null;
 	// Kept as arrays, not JSON: thread resolution needs the addresses themselves.
 	let toAddresses: string[] = [message.recipient];
 	let ccAddresses: string[] = [];
@@ -376,6 +385,9 @@ export async function ingestInboundEmail(
 		const parsed = await parseMimeBytes(rawBytes);
 		subject = parsed.subject ?? subject;
 		fromAddr = parsed.from || fromAddr;
+		fromName = sanitizeDisplayName(parsed.fromName, fromAddr);
+		const recipientNames = sanitizeAddressNames(parsed.recipientNames);
+		recipientNamesJson = recipientNames ? JSON.stringify(recipientNames) : null;
 		toAddresses = parsed.to.length ? parsed.to : [message.recipient];
 		ccAddresses = parsed.cc;
 		inReplyTo = normalizeMessageId(parsed.inReplyTo) ?? inReplyTo;
@@ -457,28 +469,62 @@ export async function ingestInboundEmail(
 			});
 		}
 
+		// Automated mail (DMARC aggregate reports) the web keeps out of its folders.
+		// Stored exactly like any other message; it only arrives already read, so it
+		// never inflates an unread figure anywhere. A classifier error leaves it
+		// ordinary mail: shown, never lost.
+		let automatedKind: AutomatedKind | null = null;
+		try {
+			automatedKind = classifyAutomatedMail({
+				from: fromAddr,
+				subject,
+				inReplyTo,
+				references: JSON.parse(referencesJson) as string[],
+				attachments: attachments.map((a) => ({ filename: a.filename, contentType: a.contentType })),
+			});
+		} catch (error) {
+			console.error("mailbox.automated_classification_failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+		const isRead = automatedKind ? 1 : 0;
+
 		ctx.transactionSync(() => {
 			ctx.sql.exec(
 				`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
-         VALUES (?, ?, ?, 1, 1, ?, ?)
+         VALUES (?, ?, ?, 1, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           last_message_at = excluded.last_message_at,
+           last_message_at = MAX(last_message_at, excluded.last_message_at),
            message_count = message_count + 1,
-           unread_count = unread_count + 1,
+           unread_count = unread_count + excluded.unread_count,
            updated_at = excluded.updated_at`,
 				threadId,
 				subjectNorm,
 				message.receivedAt,
+				1 - isRead,
 				now,
 				now,
 			);
 
+			// Gmail's rule: a new reply brings an archived conversation back to the
+			// inbox, whole. Trashed messages stay in the trash, and your own replies
+			// stay in Sent. A hidden automated report never does: nothing visible
+			// arrived.
+			if (!automatedKind) {
+				ctx.sql.exec(
+					`UPDATE messages SET state = 'inbox', updated_at = ?
+          WHERE thread_id = ? AND state = 'archive' AND direction = 'inbound'`,
+					now,
+					threadId,
+				);
+			}
+
 			ctx.sql.exec(
 				`INSERT INTO messages
          (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
-          from_addr, to_json, cc_json, bcc_json, subject, snippet, date_header, received_at, raw_r2_key,
-          raw_sha256, raw_size, body_text, body_html_r2_key, sensitive_kind, sensitive_classified, parse_status, has_attachments, is_read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'parsed', ?, 0, ?, ?)`,
+          from_addr, from_name, to_json, cc_json, bcc_json, recipient_names_json, subject, snippet, date_header, received_at, raw_r2_key,
+          raw_sha256, raw_size, body_text, body_html_r2_key, sensitive_kind, sensitive_classified, automated_kind, parse_status, has_attachments, is_read, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'parsed', ?, ?, ?, ?)`,
 				messageLocalId,
 				message.idempotencyKey,
 				threadId,
@@ -486,8 +532,10 @@ export async function ingestInboundEmail(
 				inReplyTo,
 				referencesJson,
 				fromAddr,
+				fromName,
 				toJson,
 				ccJson,
+				recipientNamesJson,
 				subject,
 				snippet,
 				message.headers.date,
@@ -499,7 +547,9 @@ export async function ingestInboundEmail(
 				bodyHtmlR2KeyValue,
 				sensitiveKind,
 				sensitiveClassified,
+				automatedKind,
 				attachments.length > 0 ? 1 : 0,
+				isRead,
 				now,
 				now,
 			);
@@ -527,7 +577,8 @@ export async function ingestInboundEmail(
          VALUES (?, ?, ?, ?, ?, ?)`,
 				messageLocalId,
 				subject ?? "",
-				fromAddr,
+				// The name rides along so a search for "Noor Haddad" finds her mail.
+				fromName ? `${fromAddr} ${fromName}` : fromAddr,
 				toJson,
 				snippet,
 				bodyText ?? "",
@@ -545,7 +596,7 @@ export async function ingestInboundEmail(
 				now,
 			);
 
-			bumpContact(ctx.sql, fromAddr, now);
+			bumpContact(ctx.sql, fromAddr, fromName, now);
 		});
 
 		const seq = recordRealtimeEvent(ctx.sql, "message.created", {
@@ -688,13 +739,22 @@ export function searchMessages(
 	sql: SqlStorage,
 	query: string,
 	limit: number,
-	opts: { includeSensitive?: boolean } = {},
+	opts: { includeSensitive?: boolean; reports?: "exclude" | "only" } = {},
 ): Array<{ message_id: string }> {
 	const phrase = `"${query.replace(/"/g, '""')}"`;
+	// Automated reports (see ReportsFilter in mailbox-do.ts): absent = everything,
+	// as MCP has always searched; the web asks for `exclude`, or `only` in its
+	// reports view. Answered from idx_messages_reports, which holds only reports.
+	const reports =
+		opts.reports === "exclude"
+			? " AND message_id NOT IN (SELECT id FROM messages WHERE automated_kind IS NOT NULL)"
+			: opts.reports === "only"
+				? " AND message_id IN (SELECT id FROM messages WHERE automated_kind IS NOT NULL)"
+				: "";
 	if (opts.includeSensitive) {
 		return sql
 			.exec<{ message_id: string }>(
-				`SELECT message_id FROM message_fts WHERE message_fts MATCH ? ORDER BY rank LIMIT ?`,
+				`SELECT message_id FROM message_fts WHERE message_fts MATCH ?${reports} ORDER BY rank LIMIT ?`,
 				phrase,
 				limit,
 			)
@@ -705,7 +765,7 @@ export function searchMessages(
 	// redacted code mail. Those rows match on subject/sender/recipients only.
 	const hits = sql
 		.exec<{ message_id: string }>(
-			`SELECT message_id FROM message_fts WHERE message_fts MATCH ? ORDER BY rank LIMIT ?`,
+			`SELECT message_id FROM message_fts WHERE message_fts MATCH ?${reports} ORDER BY rank LIMIT ?`,
 			phrase,
 			Math.max(limit, 1) * 4,
 		)

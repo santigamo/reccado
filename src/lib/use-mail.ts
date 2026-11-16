@@ -8,24 +8,22 @@ import {
 	useRef,
 	useState,
 } from "react";
-import {
-	type Draft,
-	type Folder,
-	fetchDrafts,
-	fetchMailboxes,
-	fetchThread,
-	fetchThreads,
-	type Mailbox,
-	searchThreads,
-	type ThreadDetail,
-	type ThreadRow,
-} from "./mail";
+import { fetchMailboxes, fetchThread, type Mailbox, type ThreadDetail } from "./mail";
 
 type Resource<T> = {
 	data: T;
 	loading: boolean;
 	error: string | null;
 	refetch: () => void;
+	/**
+	 * Id of the load whose result `data` holds. Loads are numbered in the order
+	 * they start, so `appliedRun > n` means the data on screen was fetched by a
+	 * load that started after `startedRuns()` returned n (optimistic UI uses this
+	 * to know when the server's answer can replace its guess).
+	 */
+	appliedRun: number;
+	/** How many loads have started so far. */
+	startedRuns: () => number;
 };
 
 /**
@@ -44,7 +42,7 @@ export function MailSyncProvider({ token, children }: { token: number; children:
  * which deliberately sidesteps SSR relative-fetch issues in Workers. `deps`
  * re-runs the loader; `refetch()` forces a reload (used on WS events / actions).
  */
-function useAsyncResource<T>(
+export function useAsyncResource<T>(
 	loader: () => Promise<T>,
 	initial: T,
 	deps: ReadonlyArray<unknown>,
@@ -53,20 +51,37 @@ function useAsyncResource<T>(
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
 	const [nonce, setNonce] = useState(0);
+	const [appliedRun, setAppliedRun] = useState(0);
+	const runRef = useRef(0);
 	const syncToken = useContext(MailSyncContext);
 	// Keep the latest loader without making it a dependency of the effect.
 	const loaderRef = useRef(loader);
 	loaderRef.current = loader;
+	const initialRef = useRef(initial);
+	initialRef.current = initial;
+	// A change of `deps` is a different resource: reset to the loading state.
+	// A refetch / sync bump of the same resource revalidates in the background,
+	// keeping the current data on screen (no spinner flash on new mail).
+	const depsKey = JSON.stringify(deps);
+	const lastDepsKeyRef = useRef<string | null>(null);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: `nonce` and `syncToken` are deliberate re-run triggers (manual refetch + WS revalidation); the loader is read via a ref, so it is intentionally not a dependency.
 	useEffect(() => {
 		let alive = true;
-		setLoading(true);
+		if (lastDepsKeyRef.current !== depsKey) {
+			lastDepsKeyRef.current = depsKey;
+			setData(initialRef.current);
+			setLoading(true);
+		}
 		setError(null);
+		const run = ++runRef.current;
 		loaderRef
 			.current()
 			.then((result) => {
-				if (alive) setData(result);
+				if (alive) {
+					setData(result);
+					setAppliedRun(run);
+				}
 			})
 			.catch((err: unknown) => {
 				if (alive) setError(err instanceof Error ? err.message : "Something went wrong");
@@ -77,28 +92,15 @@ function useAsyncResource<T>(
 		return () => {
 			alive = false;
 		};
-	}, [...deps, nonce, syncToken]);
+	}, [depsKey, nonce, syncToken]);
 
 	const refetch = useCallback(() => setNonce((n) => n + 1), []);
-	return { data, loading, error, refetch };
+	const startedRuns = useCallback(() => runRef.current, []);
+	return { data, loading, error, refetch, appliedRun, startedRuns };
 }
 
 export function useMailboxes(): Resource<Mailbox[]> {
 	return useAsyncResource<Mailbox[]>(() => fetchMailboxes(), [], []);
-}
-
-export function useThreads(mailboxId: string, folder: Folder, q?: string): Resource<ThreadRow[]> {
-	return useAsyncResource<ThreadRow[]>(
-		() => {
-			const query = q?.trim();
-			if (query) {
-				return searchThreads(mailboxId, query, { state: folder.state });
-			}
-			return fetchThreads(mailboxId, { state: folder.state });
-		},
-		[],
-		[mailboxId, folder.key, q],
-	);
 }
 
 export function useThread(mailboxId: string, threadId: string): Resource<ThreadDetail | null> {
@@ -106,10 +108,6 @@ export function useThread(mailboxId: string, threadId: string): Resource<ThreadD
 		mailboxId,
 		threadId,
 	]);
-}
-
-export function useDrafts(mailboxId: string): Resource<Draft[]> {
-	return useAsyncResource<Draft[]>(() => fetchDrafts(mailboxId), [], [mailboxId]);
 }
 
 export type MailSocketEvent = {

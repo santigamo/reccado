@@ -153,7 +153,7 @@ PASS: local email smoke completed with one DO message after duplicate delivery
 
 The first delivery is the success signal that matters: `r2-head.exists: true` means the raw MIME
 landed in R2, and `debug.messageCount: 1` after **two** deliveries of the same fixture proves the
-Durable Object deduplicated it. Open `http://localhost:3000/mailboxes` to see the seeded
+Durable Object deduplicated it. Open `http://localhost:3000/inbox` to see the seeded
 `test@example.com` mailbox in the UI.
 
 Other local commands:
@@ -264,6 +264,10 @@ prints the required MX/SPF/DKIM records. Add `--catch-all` to configure `*@<you.
 that path uses Cloudflare's Email Routing REST API because **Wrangler currently rejects catch-all
 `worker` actions client-side even though the platform supports them**. The **DNS records are the one
 part you must add yourself** (check status with `pnpm wrangler email routing settings <you.com>`).
+Once routing is enabled on the zone, individual mailboxes can also be routed from the web:
+**Settings → Domains & mailboxes** routes a new mailbox when you create it, and **Route it** does
+it for an existing one (needs `CLOUDFLARE_API_TOKEN` with Zone · Email Routing Rules · Edit and
+Zone · Zone Settings · Read — see `docs/OPERATIONS.md`, "Routing a mailbox from Settings").
 
 **Email Sending** — configure outbound identity on a dedicated sending subdomain.
 
@@ -543,8 +547,8 @@ registering), then opens your browser for the owner login (e-mail OTP) and the c
 **You choose the scopes there.** `mail:send`, `mail:read:sensitive`, `keys:write`, `routing:write`
 and `domains:write` each need their own tick. A *product maintenance client* (an app that only keeps
 a product's templates and API keys in shape) gets just `templates:write` + `keys:write`. The first
-time a new app is consented you also get a Telegram notice. Revoke any app under `/security` →
-*Aplicaciones conectadas*. `pnpm operator mcp register` remains as an optional pre-registration
+time a new app is consented you also get a Telegram notice. Revoke any app under
+`/settings/agent-access` → *Connected agents*. `pnpm operator mcp register` remains as an optional pre-registration
 fallback.
 
 **Approval is only for irreversible actions.** Sends, API-key create/rotate/scopes (they issue a
@@ -643,8 +647,9 @@ Key points (details in [`docs/OPERATIONS.md`](docs/OPERATIONS.md#transactional-a
 | `BETTER_AUTH_SECRET` | secret | Signing key for the Better Auth issuer inside the worker (web sessions, `/api/auth/*`, `/mcp` OAuth tokens). Machine-generated and uploaded by `pnpm setup:auth --apply`. Auth fails closed outside `localhost` without it, or if it is shorter than 32 characters. Rotating it signs out every current session. | **Required** for any non-`localhost` deployment |
 | `OWNER_BOOTSTRAP_EMAILS` | secret | Bootstrap for the owner registry (`owner_identities` in D1), unioned with it — not the record itself. It is the **master key into the registry**: `/login` only emails an OTP to an address in this union, and `/mcp` OAuth only issues tokens to it. With an empty registry **and** this unset, `/api/*` and `/mcp` fail closed (`503`) — use the pairing-code rescue (see [Wire your domain](#2-wire-your-domain)) to open the first session. | Optional once an owner is registered in D1 |
 | `TRANSACTIONAL_API_KEY_PEPPER` | secret | HMAC-SHA256 pepper that hashes transactional API keys (`rck_*`). Key ops and the `/v1/.../transactional/*` send/status endpoints fail closed (`503`) without it. Rotating it invalidates all existing transactional keys. | Required to enable the transactional API |
-| `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, DNS edit for setup:sending's SPF/DMARC/DKIM/MX records, Email Routing write for catch-all API setup, WAF rate-limiting rule creation for `/api/auth/*` in setup:auth). Also enables setup:domain's up-front custom-domain conflict check via the Workers Custom Domains API. | Optional |
+| `CLOUDFLARE_API_TOKEN` | secret | Least-privilege token for admin provisioning workflows (zone read, DNS edit for setup:sending's SPF/DMARC/DKIM/MX records, Email Routing write for catch-all API setup and Settings' "Route it" (Email Routing Rules Edit + Zone Settings Read), WAF rate-limiting rule creation for `/api/auth/*` in setup:auth). Also enables setup:domain's up-front custom-domain conflict check via the Workers Custom Domains API. | Optional |
 | `PHASE0_DEBUG_TOKEN` | secret | Gates the `/api/debug/phase0/*` introspection endpoints (R2 head, DO schema/state dumps, local email simulation in deployed environments). These endpoints are unreachable unless this token is set, and every request must present it. | Optional (leave unset to disable debug endpoints entirely) |
+| `WORKER_NAME` | var (`wrangler.jsonc` → `vars`) | This Worker's own script name (a Worker cannot read it at runtime). Settings' "Route it" creates Email Routing rules that deliver to it. Must equal the block's `name`; a unit test enforces that. | Required for "Route it" (it refuses with `worker_unknown` otherwise) |
 | `MAIL_FROM_ADDRESS` | var (`wrangler.jsonc` → `vars`) | Default outbound sender address. Must be a verified sender on a domain onboarded to Cloudflare Email Sending. | **Required** |
 | `MAIL_SENDING_DOMAINS` | var | Comma-separated domains verified in Cloudflare Email Sending. A mailbox whose domain is listed replies as itself; anything else goes out as `MAIL_FROM_ADDRESS` with `Reply-To` set to the mailbox. | Optional (recommended once your domain is verified) |
 | `TELEGRAM_BOT_TOKEN` | secret | Bot token from @BotFather. Unset = the Telegram bridge is off entirely and `/telegram/webhook` answers 404. | Optional |

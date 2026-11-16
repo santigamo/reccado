@@ -1,13 +1,16 @@
 import type { Hono } from "hono";
 import { getMailbox } from "../db/d1";
-import { isPreviewableImage } from "../lib/attachment-preview";
-import * as templates from "../lib/admin/templates";
 import * as keys from "../lib/admin/api-keys";
-import * as suppressions from "../lib/admin/suppressions";
-import * as ops from "../lib/admin/ops";
 import { adminResponse } from "../lib/admin/errors";
+import * as ops from "../lib/admin/ops";
+import * as suppressions from "../lib/admin/suppressions";
+import * as templates from "../lib/admin/templates";
+import { isPreviewableImage } from "../lib/attachment-preview";
 import { AppError } from "../lib/errors";
+import { sanitizeOwnerHtml } from "../lib/html-sanitize";
+import { mailboxStub } from "../lib/mailbox-stub";
 import { confirmDraftSend } from "../lib/outbound-send";
+import { htmlToPlainText } from "../lib/rich-text";
 import { enqueueTelegramCardRefreshForAction } from "../telegram/cards";
 import { assertMailboxAccess } from "./auth";
 import type { ApiBindings } from "./hono";
@@ -19,7 +22,6 @@ import {
 	threadListQuerySchema,
 	updateDraftSchema,
 } from "./schemas";
-import { mailboxStub } from "../lib/mailbox-stub";
 
 // CSP applied to rendered email HTML. `default-src 'none'` denies everything by
 // default (scripts, fetch, frames, forms — no script-src is defined, so scripts
@@ -48,6 +50,55 @@ function injectBaseTarget(html: string): string {
 		return html.replace(/(<html[^>]*>)/i, `$1<head>${baseTag}</head>`);
 	}
 	return `${baseTag}${html}`;
+}
+
+/**
+ * Last touches on a stored email body before it is framed: every link opens a
+ * new tab without an opener or a referrer, and cid: images resolve to this
+ * message's own attachments. Scripts, forms and remote frames are not touched
+ * here — the CSP (default-src 'none', no script-src, form-action 'none') and the
+ * iframe sandbox are what block them.
+ */
+async function prepareEmailHtml(html: string, cidMap: Map<string, string>): Promise<string> {
+	const rewriter = new HTMLRewriter()
+		.on("a[href], area[href]", {
+			element(el) {
+				el.setAttribute("target", "_blank");
+				el.setAttribute("rel", "noopener noreferrer");
+			},
+		})
+		.on("img[src]", {
+			element(el) {
+				const src = el.getAttribute("src") ?? "";
+				const match = /^cid:(.+)$/i.exec(src.trim());
+				if (!match) return;
+				let cid = match[1]!;
+				try {
+					cid = decodeURIComponent(cid);
+				} catch {
+					// Not percent-encoded after all: use it as written.
+				}
+				const target = cidMap.get(cid.replace(/^<|>$/g, "").trim().toLowerCase());
+				if (target) el.setAttribute("src", target);
+				else el.removeAttribute("src");
+			},
+		});
+	return rewriter.transform(new Response(html)).text();
+}
+
+/**
+ * Owner HTML is sanitised before the mailbox DO ever stores it (allowlist in
+ * lib/rich-text.ts), and its text/plain alternative is derived from that clean
+ * markup, so the two parts of the multipart/alternative always say the same
+ * thing. An empty body after cleaning is stored as "" — a text-only send.
+ */
+async function withCleanHtml<T extends { bodyHtml?: string; bodyText?: string }>(
+	body: T,
+): Promise<T> {
+	if (body.bodyHtml === undefined) return body;
+	const bodyHtml = await sanitizeOwnerHtml(body.bodyHtml);
+	const derived = bodyHtml ? htmlToPlainText(bodyHtml) : "";
+	return { ...body, bodyHtml, bodyText: bodyHtml ? derived : (body.bodyText ?? "") };
 }
 
 function sanitizeAttachmentFilename(
@@ -81,6 +132,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			q: c.req.query("q"),
 			label: c.req.query("label"),
 			state: c.req.query("state"),
+			reports: c.req.query("reports"),
 		});
 		const stub = await requireMailboxStub(c.env, mailboxId);
 		const url = new URL("https://mailbox-do/threads");
@@ -88,7 +140,23 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		if (query.state) {
 			url.searchParams.set("state", query.state);
 		}
+		// Automated reports stay out of every web folder; the reports view asks for them.
+		url.searchParams.set("reports", query.reports ?? "exclude");
 		return stub.fetch(url.toString());
+	});
+
+	// Real totals for the web UI (header subtitle, folder badges, "1 of N"),
+	// computed by the mailbox DO from its own tables, automated reports apart
+	// (`counts.reports`). Same gate as the thread list.
+	api.get("/api/mailboxes/:mailboxId/counts", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		const upstream = await stub.fetch("https://mailbox-do/counts");
+		if (!upstream.ok) return upstream;
+		const { counts } = (await upstream.json()) as { counts: unknown };
+		return c.json({ mailbox_id: mailboxId, counts });
 	});
 
 	api.get("/api/mailboxes/:mailboxId/threads/:threadId", async (c) => {
@@ -125,16 +193,44 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
+		const messageId = c.req.param("messageId");
 		const stub = await requireMailboxStub(c.env, mailboxId);
-		const upstream = await stub.fetch(
-			`https://mailbox-do/messages/${c.req.param("messageId")}/html`,
-		);
+		const upstream = await stub.fetch(`https://mailbox-do/messages/${messageId}/html`);
 		if (!upstream.ok) return c.json({ error: "html_not_found" }, 404);
-		const html = injectBaseTarget(await upstream.text());
+		// Inline images (cid:) point at this message's own attachments; anything
+		// else that is not http(s)/data stays unresolvable under the CSP.
+		const cidMap = new Map<string, string>();
+		const raw = await upstream.text();
+		if (/\bcid:/i.test(raw)) {
+			const meta = await stub.fetch(`https://mailbox-do/messages/${messageId}`);
+			if (meta.ok) {
+				const payload = (await meta.json()) as {
+					message?: {
+						attachments?: Array<{ id: string; content_id?: string | null; content_type?: string }>;
+					};
+				};
+				for (const att of payload.message?.attachments ?? []) {
+					const cid = att.content_id?.replace(/^<|>$/g, "").trim().toLowerCase();
+					if (cid && isPreviewableImage(att.content_type)) {
+						cidMap.set(
+							cid,
+							`/api/mailboxes/${encodeURIComponent(mailboxId)}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(att.id)}?inline=1`,
+						);
+					}
+				}
+			}
+		}
+		const html = await prepareEmailHtml(injectBaseTarget(raw), cidMap);
 		return new Response(html, {
 			headers: {
 				"content-type": "text/html; charset=utf-8",
 				"content-security-policy": EMAIL_HTML_CSP,
+				// The one HTML response the app frames itself. The global middleware
+				// leaves this exact value alone for this route only (see api/hono.ts);
+				// every other response keeps DENY. A DENY here conflicts with
+				// frame-ancestors 'self', and browsers that honour X-Frame-Options over
+				// CSP then show an empty frame instead of the message.
+				"x-frame-options": "SAMEORIGIN",
 				"x-content-type-options": "nosniff",
 				"referrer-policy": "no-referrer",
 				"cache-control": "private, no-store",
@@ -219,11 +315,13 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			q: c.req.query("q"),
 			limit: c.req.query("limit"),
 			cursor: c.req.query("cursor"),
+			reports: c.req.query("reports"),
 		});
 		const stub = await requireMailboxStub(c.env, mailboxId);
 		const url = new URL("https://mailbox-do/search");
 		url.searchParams.set("q", query.q);
 		url.searchParams.set("limit", String(query.limit));
+		url.searchParams.set("reports", query.reports ?? "exclude");
 		return stub.fetch(url.toString());
 	});
 
@@ -247,7 +345,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
-		const body = createDraftSchema.parse(await c.req.json());
+		const body = await withCleanHtml(createDraftSchema.parse(await c.req.json()));
 		const stub = await requireMailboxStub(c.env, mailboxId);
 		return stub.fetch("https://mailbox-do/drafts", {
 			method: "POST",
@@ -260,7 +358,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
-		const body = updateDraftSchema.parse(await c.req.json());
+		const body = await withCleanHtml(updateDraftSchema.parse(await c.req.json()));
 		const stub = await requireMailboxStub(c.env, mailboxId);
 		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}`, {
 			method: "PATCH",

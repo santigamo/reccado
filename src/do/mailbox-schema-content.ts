@@ -42,9 +42,15 @@ CREATE TABLE IF NOT EXISTS messages (
   direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
   state TEXT NOT NULL CHECK (state IN ('inbox', 'archive', 'trash', 'sent', 'draft')),
   from_addr TEXT NOT NULL,
+  -- Sanitised From display name (src/lib/display-name.ts). NULL for rows stored
+  -- before v10, for mail with no name, and for a name that was not trustworthy.
+  from_name TEXT,
   to_json TEXT NOT NULL,
   cc_json TEXT NOT NULL DEFAULT '[]',
   bcc_json TEXT NOT NULL DEFAULT '[]',
+  -- JSON {"lowercased address": "sanitised name"} for the To/Cc recipients that
+  -- had a name; NULL when none did (and for rows stored before v10).
+  recipient_names_json TEXT,
   subject TEXT,
   snippet TEXT,
   date_header TEXT,
@@ -56,6 +62,11 @@ CREATE TABLE IF NOT EXISTS messages (
   body_html_r2_key TEXT,
   sensitive_kind TEXT,
   sensitive_classified INTEGER NOT NULL DEFAULT 0,
+  -- Automated mail the web inbox keeps out of its folders and counts
+  -- (src/lib/automated-mail.ts): 'dmarc_report', or NULL for ordinary mail.
+  -- Added by v11 on older mailboxes, which also backfills it; its two partial
+  -- indexes are created there too, for the same reason as the v10 index below.
+  automated_kind TEXT,
   parse_status TEXT NOT NULL CHECK (parse_status IN ('pending', 'parsed', 'failed')),
   has_attachments INTEGER NOT NULL DEFAULT 0,
   is_read INTEGER NOT NULL DEFAULT 0,
@@ -66,6 +77,10 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, received_at ASC);
 CREATE INDEX IF NOT EXISTS idx_messages_received ON messages(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_rfc_message_id ON messages(rfc_message_id);
+-- NOTE: idx_messages_folder_counts (state, thread_id, is_read), which serves the
+-- per-folder counts, is created by the v10 migration rather than here, for the
+-- same reason as idx_drafts_idempotency below: this SQL runs before any
+-- migration on every cold start.
 -- msg-ids are case-sensitive data compared case-insensitively (see resolveThreadId):
 -- rows written before ids stopped being lowercased still have to match a reply that
 -- quotes the original case. A plain index cannot serve a NOCASE comparison, hence

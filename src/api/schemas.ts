@@ -111,7 +111,8 @@ export const createDraftSchema = z.object({
 	bcc: z.array(z.string().email()).optional(),
 	subject: z.string().min(1),
 	bodyText: z.string().optional(),
-	bodyHtml: z.string().optional(),
+	/** Sanitised server-side before storage (lib/html-sanitize.ts). */
+	bodyHtml: z.string().max(1_000_000).optional(),
 	threadId: z.string().optional(),
 	/** The message being answered, so the reply's In-Reply-To points at it rather
 	 * than at whatever arrived in the thread most recently. */
@@ -124,10 +125,18 @@ export const confirmSendSchema = z.object({
 	idempotencyKey: z.string().min(1),
 });
 
+/**
+ * The web never lists automated reports (DMARC aggregate reports) in its
+ * folders or search; `reports=only` asks for them instead, for the "DMARC
+ * reports" view. MCP talks to the mailbox DO directly and is not filtered.
+ */
+const webReportsSchema = z.enum(["only"]).optional();
+
 export const searchQuerySchema = z.object({
 	q: z.string().min(1),
 	limit: z.coerce.number().int().min(1).max(100).default(25),
 	cursor: z.string().optional(),
+	reports: webReportsSchema,
 });
 
 export const threadListQuerySchema = z.object({
@@ -137,6 +146,7 @@ export const threadListQuerySchema = z.object({
 	label: z.string().optional(),
 	// Folder filter. `draft` is excluded — drafts live in outbound_drafts, not messages.
 	state: z.enum(["inbox", "archive", "trash", "sent"]).optional(),
+	reports: webReportsSchema,
 });
 
 export const adminMailboxActionSchema = z.object({
@@ -181,7 +191,11 @@ export const updateTransactionalApiKeySchema = z.object({
 const templateIdList = z.array(z.string().trim().min(1).max(128)).max(100);
 /** Exactly one of `set`, or `add`/`remove` (either or both). */
 export const updateKeyTemplatesSchema = z
-	.object({ add: templateIdList.optional(), remove: templateIdList.optional(), set: templateIdList.optional() })
+	.object({
+		add: templateIdList.optional(),
+		remove: templateIdList.optional(),
+		set: templateIdList.optional(),
+	})
 	.strict()
 	.refine((b) => (b.set !== undefined) !== (b.add !== undefined || b.remove !== undefined), {
 		message: "Provide either set, or add/remove",

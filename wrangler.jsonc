@@ -16,6 +16,10 @@
 	// Front public installs with a custom domain and Cloudflare Access.
 	"workers_dev": false,
 	"vars": {
+		// The Worker's own script name, which a Worker cannot otherwise read at runtime.
+		// Settings > "Route it" creates Email Routing rules that target it, so it must
+		// equal "name" above (tests/unit/worker-name.test.ts enforces that per block).
+		"WORKER_NAME": "reccado",
 		"MCP_CIMD_ENABLED": "true",
 		"MCP_ALLOWED_HOSTS": "",
 		"MAIL_FROM_ADDRESS": "noreply@mail.example.com",
@@ -160,6 +164,7 @@
 			// TELEGRAM_ALLOWED_USER_IDS survives as an emergency bootstrap and is
 			// deliberately not set here.
 			"vars": {
+				"WORKER_NAME": "reccado-dev",
 				"MCP_CIMD_ENABLED": "true",
 				"MCP_ALLOWED_HOSTS": "inbox.imsanti.dev",
 				"MAIL_FROM_ADDRESS": "noreply@send.imsanti.dev",

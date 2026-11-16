@@ -1,12 +1,19 @@
 import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflare/types";
-import { approvalProofSecret, verifyMcpApprovalProof, type McpApprovalProof } from "../lib/approvals";
+import {
+	approvalProofSecret,
+	type McpApprovalProof,
+	verifyMcpApprovalProof,
+} from "../lib/approvals";
+import { classifyAutomatedMail } from "../lib/automated-mail";
 import { sha256Hex } from "../lib/crypto";
+import { sanitizeDisplayName } from "../lib/display-name";
 import { buildReferences, messageIdHeader, referencesHeader } from "../lib/email-headers";
 import { normalizeMessageId } from "../lib/email-metadata";
 import { AmbiguousSendError } from "../lib/errors";
-import { normalizeSubject } from "../lib/mime";
+import { normalizeSubject, snippetFromText } from "../lib/mime";
+import { stripQuotedText } from "../lib/quoted-text";
 import { bodyHtmlR2Key } from "../lib/r2-keys";
 import {
 	resolveDeliveredAlias,
@@ -14,6 +21,11 @@ import {
 	type SenderEnv,
 	type SenderIdentity,
 } from "../lib/sender-identity";
+import {
+	buildParticipants,
+	type ParticipantSource,
+	type ThreadParticipant,
+} from "../lib/thread-summary";
 import { httpStatusForTransactionalResult } from "../lib/transactional-send";
 import { ingestInboundEmail, recordRealtimeEvent, searchMessages } from "./mailbox-ingest";
 import {
@@ -28,7 +40,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 9;
+const MAILBOX_SCHEMA_VERSION = 11;
 
 export type DraftOrigin = "web" | "telegram" | "mcp";
 
@@ -178,16 +190,19 @@ export function isThreadListState(value: string | null | undefined): value is Th
 }
 
 // Columns the Gmail-style thread list needs: enough to render a full row
-// (sender, subject, snippet, time, attachment/unread affordances) without a
-// second round-trip per thread. `latest_*` describe the representative message
-// of the thread — overall newest for the unfiltered ("All mail") view, or the
-// newest message *in the requested folder* when a state filter is applied, so a
-// Sent/Archive/Trash row previews the right message.
+// (participants, subject, snippet, time, attachment/unread affordances) without
+// a second round-trip per thread. `latest_*` describe the representative message
+// of the conversation: its newest message among the ones the folder shows (every
+// message but trashed ones, or only trashed ones in Trash), so a reply you just
+// sent is what the Inbox row previews, and what it is sorted by.
 const THREAD_LIST_COLUMNS = `
-  t.id, t.subject_norm, t.last_message_at, t.message_count, t.unread_count,
+  t.id, t.subject_norm, t.last_message_at,
   t.created_at, t.updated_at,
   lm.subject AS latest_subject,
   lm.from_addr AS latest_from,
+  lm.from_name AS latest_from_name,
+  lm.to_json AS latest_to_json,
+  lm.recipient_names_json AS latest_recipient_names_json,
   lm.snippet AS latest_snippet,
   lm.received_at AS latest_received_at,
   lm.has_attachments AS latest_has_attachments,
@@ -195,42 +210,267 @@ const THREAD_LIST_COLUMNS = `
   lm.direction AS latest_direction,
   lm.state AS latest_state`;
 
-function listThreads(sql: SqlStorage, limit: number, state?: ThreadListState, unread?: boolean) {
-	const unreadClause =
-		unread === undefined ? "" : unread ? "WHERE t.unread_count > 0" : "WHERE t.unread_count = 0";
-	if (state) {
-		// The JOIN's correlated subquery only resolves for threads that actually
-		// have a message in this state, so it doubles as the folder filter — a
-		// thread with no message in `state` is dropped. Order by the folder
-		// message's time so the folder view sorts by folder activity.
-		return sql
-			.exec(
-				`SELECT ${THREAD_LIST_COLUMNS}
-          FROM threads t
-          JOIN messages lm ON lm.id = (
-            SELECT m.id FROM messages m
-            WHERE m.thread_id = t.id AND m.state = ?
-            ORDER BY m.received_at DESC LIMIT 1
-          )
-          ${unreadClause} ORDER BY lm.received_at DESC
-          LIMIT ?`,
-				state,
-				limit,
-			)
-			.toArray();
-	}
-	return sql
+/**
+ * Which messages of a conversation a folder shows. Gmail's model: a conversation
+ * is in a folder when any of its messages is, and it is then shown — and sorted —
+ * by its newest message outside the trash. Trash shows the trashed messages only.
+ * "All mail" (no state) shows everything.
+ */
+function visibleClause(
+	alias: string,
+	state: ThreadListState | undefined,
+	reports?: ReportsFilter,
+): string {
+	const folder =
+		state === "trash" ? `${alias}.state = 'trash'` : state ? `${alias}.state != 'trash'` : "1 = 1";
+	return `${folder}${reportsClause(alias, reports)}`;
+}
+
+/**
+ * Automated mail (DMARC aggregate reports, src/lib/automated-mail.ts) in a list
+ * or a search. Absent: everything, as MCP has always seen it. `exclude`: the
+ * web's normal folders, where a report is neither listed nor counted, and a
+ * conversation made only of reports disappears while a person's conversation
+ * that happens to hold one stays. `only`: the web's "DMARC reports" view.
+ */
+export type ReportsFilter = "exclude" | "only";
+
+export function parseReportsFilter(value: string | null | undefined): ReportsFilter | undefined {
+	return value === "exclude" || value === "only" ? value : undefined;
+}
+
+function reportsClause(alias: string, reports: ReportsFilter | undefined): string {
+	if (reports === "exclude") return ` AND ${alias}.automated_kind IS NULL`;
+	if (reports === "only") return ` AND ${alias}.automated_kind IS NOT NULL`;
+	return "";
+}
+
+export type ThreadListRow = Record<string, unknown> & {
+	id: string;
+	message_count: number;
+	unread_count: number;
+	participants: ThreadParticipant[];
+};
+
+/**
+ * Exported for tests. Newest activity first in every folder: the order key is the
+ * representative message's received_at (ISO-8601 UTC everywhere, so string order
+ * is time order), with the thread id as a tie-breaker so the order is total and a
+ * merged multi-mailbox list stays stable across refreshes. Within a thread, ties
+ * on received_at (same-millisecond writes) fall back to insertion order.
+ */
+export function listThreads(
+	sql: SqlStorage,
+	limit: number,
+	state?: ThreadListState,
+	unread?: boolean,
+	reports?: ReportsFilter,
+): ThreadListRow[] {
+	const visible = (alias: string) => visibleClause(alias, state, reports);
+	const folderFilter = state
+		? `WHERE EXISTS (SELECT 1 FROM messages f WHERE f.thread_id = t.id AND f.state = ?${reportsClause("f", reports)})`
+		: "";
+	const unreadFilter =
+		unread === undefined ? "" : unread ? "WHERE unread_count > 0" : "WHERE unread_count = 0";
+	const rows = sql
 		.exec(
-			`SELECT ${THREAD_LIST_COLUMNS}
-        FROM threads t
-        JOIN messages lm ON lm.id = (
-          SELECT m.id FROM messages m WHERE m.thread_id = t.id ORDER BY m.received_at DESC LIMIT 1
-        )
-        ${unreadClause} ORDER BY t.last_message_at DESC
-        LIMIT ?`,
+			`SELECT * FROM (
+         SELECT ${THREAD_LIST_COLUMNS},
+           (SELECT COUNT(*) FROM messages c WHERE c.thread_id = t.id AND ${visible("c")}) AS message_count,
+           (SELECT COUNT(*) FROM messages u WHERE u.thread_id = t.id AND u.is_read = 0 AND ${visible("u")}) AS unread_count
+         FROM threads t
+         JOIN messages lm ON lm.id = (
+           SELECT m.id FROM messages m WHERE m.thread_id = t.id AND ${visible("m")}
+           ORDER BY m.received_at DESC, m.rowid DESC LIMIT 1
+         )
+         ${folderFilter}
+       ) ${unreadFilter}
+       ORDER BY latest_received_at DESC, id DESC
+       LIMIT ?`,
+			...(state ? [state] : []),
 			limit,
 		)
+		.toArray() as Array<Record<string, SqlStorageValue>>;
+	if (rows.length === 0) return [];
+
+	// Participants for the whole page in one indexed read, oldest message first.
+	const ids = rows.map((r) => String(r.id));
+	const senders = sql
+		.exec<{ thread_id: string } & ParticipantSource>(
+			`SELECT m.thread_id, m.direction, m.from_addr, m.from_name, m.is_read
+         FROM messages m
+        WHERE m.thread_id IN (${ids.map(() => "?").join(",")}) AND ${visible("m")}
+        ORDER BY m.received_at ASC, m.rowid ASC`,
+			...ids,
+		)
 		.toArray();
+	const byThread = new Map<string, ParticipantSource[]>();
+	for (const row of senders) {
+		const list = byThread.get(row.thread_id) ?? [];
+		list.push(row);
+		byThread.set(row.thread_id, list);
+	}
+	return rows.map((row) => ({
+		...row,
+		id: String(row.id),
+		message_count: Number(row.message_count ?? 0),
+		unread_count: Number(row.unread_count ?? 0),
+		participants: buildParticipants(byThread.get(String(row.id)) ?? []),
+	}));
+}
+
+export type FolderCounts = {
+	/** Conversations with at least one message in this folder (the list's rows). */
+	threads: number;
+	/** Of those, conversations with at least one unread message in this folder. */
+	unread: number;
+	/** Messages in this folder. */
+	messages: number;
+};
+
+export type MailboxCounts = Record<ThreadListState | "all", FolderCounts> & {
+	/** Open drafts: still editable or awaiting confirmation. */
+	drafts: number;
+	/**
+	 * Automated reports (every state), kept out of every other figure here. Read
+	 * on arrival, so `unread` is normally 0; the web shows no badge for it.
+	 */
+	reports: FolderCounts;
+};
+
+/**
+ * Real per-folder totals for the web UI, from the mailbox's own tables. One
+ * statement answered entirely from idx_messages_web_counts (state, thread_id,
+ * is_read, …) WHERE automated_kind IS NULL, so it reads that partial index, never
+ * the message rows, and automated reports never reach a folder figure; the
+ * "all" branch scans the same index. The reports' own figure comes from
+ * idx_messages_reports. Unread is counted from messages.is_read, which every
+ * action maintains — threads.unread_count only ever goes up and is not used here.
+ */
+export function folderCounts(sql: SqlStorage): MailboxCounts {
+	const empty = (): FolderCounts => ({ threads: 0, unread: 0, messages: 0 });
+	const counts: MailboxCounts = {
+		inbox: empty(),
+		sent: empty(),
+		archive: empty(),
+		trash: empty(),
+		all: empty(),
+		drafts: 0,
+		reports: empty(),
+	};
+	const rows = sql
+		.exec<{ folder: string; threads: number; unread: number; messages: number }>(
+			`SELECT state AS folder, COUNT(DISTINCT thread_id) AS threads,
+              COUNT(DISTINCT CASE WHEN is_read = 0 THEN thread_id END) AS unread,
+              COUNT(*) AS messages
+         FROM messages WHERE automated_kind IS NULL GROUP BY state
+       UNION ALL
+       SELECT 'all', COUNT(DISTINCT thread_id),
+              COUNT(DISTINCT CASE WHEN is_read = 0 THEN thread_id END),
+              COUNT(*)
+         FROM messages WHERE automated_kind IS NULL
+       UNION ALL
+       SELECT 'reports', COUNT(DISTINCT thread_id),
+              COUNT(DISTINCT CASE WHEN is_read = 0 THEN thread_id END),
+              COUNT(*)
+         FROM messages WHERE automated_kind IS NOT NULL`,
+		)
+		.toArray();
+	for (const row of rows) {
+		if (row.folder === "all" || row.folder === "reports" || isThreadListState(row.folder)) {
+			counts[row.folder] = { threads: row.threads, unread: row.unread, messages: row.messages };
+		}
+	}
+	counts.drafts =
+		sql
+			.exec<{ n: number }>(
+				"SELECT COUNT(*) AS n FROM outbound_drafts WHERE status IN ('draft', 'pending_confirmation')",
+			)
+			.toArray()[0]?.n ?? 0;
+	return counts;
+}
+
+/**
+ * The indexes behind the web counts and the reports view. Partial, so the
+ * reports index holds only reports. Each carries automated_kind as its last
+ * column although its WHERE already fixes it: SQLite only treats an index as
+ * covering when every column the query names is in it. Created by the v11 migration, not
+ * MAILBOX_SCHEMA_SQL, which runs before any migration on every cold start and
+ * would fail on a mailbox that does not have the column yet.
+ */
+export function createAutomatedMailIndexes(sql: SqlStorage): void {
+	sql.exec(
+		`CREATE INDEX IF NOT EXISTS idx_messages_web_counts
+       ON messages(state, thread_id, is_read, automated_kind) WHERE automated_kind IS NULL`,
+	);
+	sql.exec(
+		`CREATE INDEX IF NOT EXISTS idx_messages_reports
+       ON messages(thread_id, id, is_read, automated_kind) WHERE automated_kind IS NOT NULL`,
+	);
+}
+
+/**
+ * Classifies the mail a mailbox already holds, from what is stored: subject,
+ * sender, In-Reply-To/References and attachment file names and types. No R2
+ * read. Only parsed inbound mail is a candidate (a parse failure is never
+ * classified), and only rows with an attachment or "report" in the subject are
+ * looked at. A report found is marked read too, like one arriving now. Returns
+ * how many rows it classified. Safe to run again: it only touches NULL rows.
+ */
+export function backfillAutomatedKind(sql: SqlStorage): number {
+	const candidates = `m.direction = 'inbound' AND m.parse_status = 'parsed'
+     AND m.automated_kind IS NULL AND (m.has_attachments = 1 OR m.subject LIKE '%report%')`;
+	const rows = sql
+		.exec<{
+			id: string;
+			from_addr: string;
+			subject: string | null;
+			in_reply_to: string | null;
+			references_json: string | null;
+		}>(
+			`SELECT m.id, m.from_addr, m.subject, m.in_reply_to, m.references_json
+         FROM messages m WHERE ${candidates}`,
+		)
+		.toArray();
+	if (rows.length === 0) return 0;
+	const files = new Map<string, Array<{ filename: string | null; contentType: string | null }>>();
+	for (const a of sql
+		.exec<{ message_id: string; filename: string | null; content_type: string | null }>(
+			`SELECT a.message_id, a.filename, a.content_type
+         FROM attachments a JOIN messages m ON m.id = a.message_id WHERE ${candidates}`,
+		)
+		.toArray()) {
+		const list = files.get(a.message_id) ?? [];
+		list.push({ filename: a.filename, contentType: a.content_type });
+		files.set(a.message_id, list);
+	}
+	const now = new Date().toISOString();
+	let classified = 0;
+	for (const row of rows) {
+		let references: string[] = [];
+		try {
+			const parsed = JSON.parse(row.references_json ?? "[]") as unknown;
+			if (Array.isArray(parsed)) references = parsed.map(String);
+		} catch {
+			// Unreadable references: treat as none; In-Reply-To and the subject still gate.
+		}
+		const kind = classifyAutomatedMail({
+			from: row.from_addr,
+			subject: row.subject,
+			inReplyTo: row.in_reply_to,
+			references,
+			attachments: files.get(row.id) ?? [],
+		});
+		if (!kind) continue;
+		sql.exec(
+			"UPDATE messages SET automated_kind = ?, is_read = 1, updated_at = ? WHERE id = ?",
+			kind,
+			now,
+			row.id,
+		);
+		classified++;
+	}
+	return classified;
 }
 
 function getThread(sql: SqlStorage, threadId: string | undefined) {
@@ -289,12 +529,20 @@ function applyMessageAction(sql: SqlStorage, messageId: string | undefined, acti
 		sql.exec("UPDATE messages SET is_read = 1, updated_at = ? WHERE id = ?", now, messageId);
 	} else if (action === "mark_unread") {
 		sql.exec("UPDATE messages SET is_read = 0, updated_at = ? WHERE id = ?", now, messageId);
-	} else if (action === "archive") {
-		sql.exec("UPDATE messages SET state = 'archive', updated_at = ? WHERE id = ?", now, messageId);
+	} else if (action === "archive" || action === "restore_inbox") {
+		// Folder moves act on a conversation, and a conversation holds your own
+		// replies too. Those are never "in the inbox" or "archived": they stay in
+		// Sent, so archiving a thread doesn't empty Sent and restoring it doesn't
+		// drop your replies into the Inbox as if someone had written them.
+		sql.exec(
+			`UPDATE messages SET state = CASE WHEN direction = 'outbound' THEN 'sent' ELSE ? END,
+         updated_at = ? WHERE id = ?`,
+			action === "archive" ? "archive" : "inbox",
+			now,
+			messageId,
+		);
 	} else if (action === "trash") {
 		sql.exec("UPDATE messages SET state = 'trash', updated_at = ? WHERE id = ?", now, messageId);
-	} else if (action === "restore_inbox") {
-		sql.exec("UPDATE messages SET state = 'inbox', updated_at = ? WHERE id = ?", now, messageId);
 	}
 	return { ok: true, messageId, action };
 }
@@ -909,7 +1157,8 @@ export async function confirmSendDraft(
 			replyTo: snapshot.identity.replyTo ?? undefined,
 			subject: draft.subject,
 			text: draft.body_text ?? undefined,
-			html: draft.body_html ?? undefined,
+			// "" is a draft whose rich body was emptied: a text-only send.
+			html: draft.body_html || undefined,
 			...(Object.keys(outboundHeaders).length > 0 ? { headers: outboundHeaders } : {}),
 		});
 		providerMessageId = extractProviderMessageId(providerResult);
@@ -982,6 +1231,11 @@ export async function confirmSendDraft(
 			}),
 		),
 	);
+	// The list row previews the reply itself, not the quoted conversation under it.
+	const sentSnippet =
+		snippetFromText(stripQuotedText(draft.body_text ?? ""), null) ||
+		snippetFromText(draft.body_text, draft.body_html) ||
+		draft.subject.slice(0, 200);
 	ctx.transactionSync(() => {
 		ctx.sql.exec(
 			"UPDATE mailbox_meta SET value = ?, updated_at = ? WHERE key = ?",
@@ -1003,7 +1257,7 @@ export async function confirmSendDraft(
 			`INSERT INTO threads (id, subject_norm, last_message_at, message_count, unread_count, created_at, updated_at)
          VALUES (?, ?, ?, 1, 0, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
-           last_message_at = excluded.last_message_at,
+           last_message_at = MAX(last_message_at, excluded.last_message_at),
            message_count = message_count + 1,
            updated_at = excluded.updated_at`,
 			threadId,
@@ -1015,10 +1269,10 @@ export async function confirmSendDraft(
 		ctx.sql.exec(
 			`INSERT INTO messages
          (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
-          from_addr, to_json, cc_json, bcc_json, subject, snippet,
+          from_addr, from_name, to_json, cc_json, bcc_json, subject, snippet,
           received_at, raw_r2_key, raw_sha256, raw_size, body_text, body_html_r2_key,
           parse_status, has_attachments, is_read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'parsed', 0, 1, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, 'outbound', 'sent', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'parsed', 0, 1, ?, ?)`,
 			messageLocalId,
 			sentKey,
 			threadId,
@@ -1026,11 +1280,13 @@ export async function confirmSendDraft(
 			inReplyTo,
 			JSON.stringify(references),
 			fromAddress,
+			// The phrase the From header actually carried, through the same sanitiser.
+			sanitizeDisplayName(snapshot.identity.fromName, fromAddress),
 			draft.to_json,
 			draft.cc_json,
 			draft.bcc_json,
 			draft.subject,
-			(draft.body_text ?? draft.subject).slice(0, 200),
+			sentSnippet,
 			now,
 			rawR2Key,
 			rawSha256,
@@ -1059,7 +1315,7 @@ export async function confirmSendDraft(
 		subject: draft.subject,
 		fromAddr: fromAddress,
 		toJson: draft.to_json,
-		snippet: (draft.body_text ?? draft.subject).slice(0, 200),
+		snippet: sentSnippet,
 		receivedAt: now,
 		rawR2Key,
 		rawSha256,
@@ -1179,6 +1435,36 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 9) {
 			const columns = this.columnNames("outbound_drafts");
 			this.addColumnIfMissing("outbound_drafts", columns, "origin", "TEXT NOT NULL DEFAULT 'web'");
+		}
+		// v10: sender/recipient display names (nullable, no backfill: a row without
+		// one renders the address-derived name it always did), and the covering
+		// index the per-folder counts are answered from.
+		if (currentVersion < 10) {
+			const columns = this.columnNames("messages");
+			this.addColumnIfMissing("messages", columns, "from_name", "TEXT");
+			this.addColumnIfMissing("messages", columns, "recipient_names_json", "TEXT");
+			this.ctx.storage.sql.exec(
+				"CREATE INDEX IF NOT EXISTS idx_messages_folder_counts ON messages(state, thread_id, is_read)",
+			);
+		}
+		// v11: automated mail (DMARC aggregate reports) the web keeps out of its
+		// folders and counts. An additive nullable column, the two partial indexes
+		// the web counts and the reports view are answered from, and a backfill of
+		// the mail already stored, classified from its stored subject, headers and
+		// attachment metadata (no R2 read).
+		if (currentVersion < 11) {
+			const columns = this.columnNames("messages");
+			this.addColumnIfMissing("messages", columns, "automated_kind", "TEXT");
+			createAutomatedMailIndexes(this.ctx.storage.sql);
+			try {
+				backfillAutomatedKind(this.ctx.storage.sql);
+			} catch (error) {
+				// A failed backfill only leaves old reports visible; it must not stop
+				// the mailbox from booting.
+				console.error("mailbox.automated_backfill_failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -1358,6 +1644,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			return Response.json({
 				results: searchMessages(this.ctx.storage.sql, q, limit, {
 					includeSensitive: url.searchParams.get("sensitive") === "1",
+					reports: parseReportsFilter(url.searchParams.get("reports")),
 				}),
 			});
 		}
@@ -1369,8 +1656,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 					Number(url.searchParams.get("limit") ?? "25"),
 					state,
 					url.searchParams.has("unread") ? url.searchParams.get("unread") === "true" : undefined,
+					parseReportsFilter(url.searchParams.get("reports")),
 				),
 			});
+		}
+		if (url.pathname === "/counts" && request.method === "GET") {
+			return Response.json({ counts: folderCounts(this.ctx.storage.sql) });
 		}
 		if (url.pathname.startsWith("/threads/") && request.method === "GET") {
 			const threadId = url.pathname.split("/")[2];
@@ -2242,8 +2533,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		return result;
 	}
 
-	private listThreads(limit: number, state?: ThreadListState, unread?: boolean) {
-		return listThreads(this.ctx.storage.sql, limit, state, unread);
+	private listThreads(
+		limit: number,
+		state?: ThreadListState,
+		unread?: boolean,
+		reports?: ReportsFilter,
+	) {
+		return listThreads(this.ctx.storage.sql, limit, state, unread, reports);
 	}
 
 	private getThread(threadId: string | undefined) {

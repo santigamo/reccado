@@ -257,7 +257,7 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
   `mcp.client_registered` ops event; the first consent of a client raises a Telegram notice. The
   consent page shows client name, redirect host and a "Cliente nuevo" note.
   `pnpm operator mcp register` remains as an optional pre-registration fallback.
-- **Revoking a client.** The owner opens `/security` → *Aplicaciones conectadas* and revokes, or
+- **Revoking a client.** The owner opens `/settings/agent-access` → *Connected agents* and revokes, or
   runs `pnpm operator mcp revoke <client_id>`: access tokens, refresh tokens, consent and
   registration are deleted. Access JWTs already issued stay valid until they expire (≤ 3600 s), so
   revocation is not instant.

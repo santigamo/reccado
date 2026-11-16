@@ -1,11 +1,10 @@
-import { AlertTriangle, Check, Copy, KeyRound } from "lucide-react";
+import { Check, Copy, KeyRound } from "lucide-react";
 import { type ReactElement, useEffect, useId, useState } from "react";
 import { Button } from "#/components/ui/Button";
-import { cn } from "#/lib/cn";
 import type { MintedApiKey } from "./api-keys";
 
 /**
- * The one and only reveal of a plaintext API key.
+ * The one and only reveal of a plaintext API key (Paper artboard 3JX-0).
  *
  * Hard rules this component upholds (see docs/plans/transactional-api.md):
  *  - the secret lives in React state owned by the route and dies with it — it is
@@ -28,6 +27,7 @@ export function OneTimeSecret({
 	const [acknowledged, setAcknowledged] = useState(false);
 	const ackId = useId();
 	const rotated = Boolean(minted.previousKeyId);
+	const live = minted.key.environment === "live";
 
 	// Losing the page loses the secret for good — make that cost a confirmation.
 	useEffect(() => {
@@ -56,96 +56,82 @@ export function OneTimeSecret({
 		}
 	}
 
+	const title = rotated
+		? `Rotated ${live ? "live" : "test"} key. Copy it now.`
+		: `New ${live ? "live" : "test"} key. Copy it now.`;
+
 	return (
 		<section
 			aria-labelledby={`${ackId}-title`}
-			className="rounded-2xl border-2 border-[var(--app-accent)] bg-[color-mix(in_oklab,var(--app-accent)_8%,var(--app-surface))] p-4 shadow-[var(--app-shadow)] sm:p-5"
+			className="flex shrink-0 flex-col gap-4 rounded-card border-[1.5px] border-brand bg-panel px-5 pt-4.5 pb-4"
 		>
 			<div className="flex items-start gap-3">
-				<span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--app-accent)] text-[var(--app-on-accent)]">
-					<KeyRound className="h-5 w-5" />
+				<span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-brand text-panel">
+					<KeyRound className="size-4" aria-hidden="true" />
 				</span>
-				<div className="min-w-0 flex-1">
-					<h2 id={`${ackId}-title`} className="text-[15px] font-semibold text-[var(--app-text)]">
-						{rotated ? "Rotated key — copy it now" : "New key — copy it now"}
+				<div className="flex min-w-0 flex-col gap-0.5">
+					<h2
+						id={`${ackId}-title`}
+						className="m-0 text-sender font-semibold tracking-[-0.01em] text-ink"
+					>
+						{title}
 					</h2>
-					<p className="mt-1 flex items-start gap-1.5 text-sm font-medium text-[var(--app-danger)]">
-						<AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-						<span>
-							This secret is shown once and is never stored in plaintext. Close this panel or leave
-							the page and it is gone for good — there is no way to recover it.
-						</span>
+					<p className="m-0 text-label text-text-secondary">
+						This is the only time the secret is shown. Reccado keeps a hash, not the key, so it
+						cannot be recovered after you close this.
 					</p>
 					{rotated ? (
-						<p className="mt-1.5 text-sm text-[var(--app-text-soft)]">
-							The previous key{" "}
-							<code className="rounded bg-[var(--app-surface-2)] px-1 py-0.5 font-mono text-[12px]">
-								{minted.previousKeyId}
-							</code>{" "}
-							was revoked in the same operation and stops working immediately.
+						<p className="m-0 text-label text-text-muted">
+							The previous key <code className="font-mono text-meta">{minted.previousKeyId}</code>{" "}
+							was revoked in the same step and stops working now.
 						</p>
 					) : null}
 				</div>
 			</div>
 
-			<div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-stretch">
-				{/* `select-all` makes one click select the whole key, which is the
-				    fallback when the clipboard API is unavailable. */}
-				<code className="min-w-0 flex-1 select-all break-all rounded-xl border border-[var(--app-border-strong)] bg-[var(--app-surface)] px-3 py-2.5 font-mono text-[13px] leading-relaxed text-[var(--app-text)]">
+			<div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
+				{/* `select-all` makes one click select the whole key — the fallback
+				    when the clipboard API is unavailable. */}
+				<code className="flex min-h-11 min-w-0 flex-1 select-all items-center break-all rounded-[10px] bg-brand px-3.5 py-2.5 font-mono text-label leading-5 text-code-text">
 					{minted.plaintextKey}
 				</code>
 				<Button
-					variant="primary"
+					variant="secondary"
 					onClick={() => void handleCopy()}
-					className="h-auto shrink-0 self-stretch rounded-xl px-4 sm:min-w-[7.5rem]"
+					className="h-11 shrink-0 rounded-[10px] px-4 sm:min-w-30"
 				>
-					{copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+					{copied ? <Check /> : <Copy />}
 					{copied ? "Copied" : "Copy key"}
 				</Button>
 			</div>
 
 			{copyFailed ? (
-				<p className="mt-2 text-xs text-[var(--app-danger)]">
-					Could not reach the clipboard. Click the key above to select it, then copy manually.
+				<p role="alert" className="m-0 -mt-2 text-label text-danger">
+					Could not reach the clipboard. Click the key to select it, then copy it by hand.
 				</p>
 			) : null}
 
-			<dl className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-[var(--app-text-soft)]">
-				<div className="flex gap-1.5">
-					<dt className="text-[var(--app-text-faint)]">Key ID</dt>
-					<dd className="font-mono">{minted.key.keyId}</dd>
-				</div>
-				<div className="flex gap-1.5">
-					<dt className="text-[var(--app-text-faint)]">Environment</dt>
-					<dd className="font-medium uppercase">{minted.key.environment}</dd>
-				</div>
-				<div className="flex gap-1.5">
-					<dt className="text-[var(--app-text-faint)]">Sender</dt>
-					<dd className="break-all">{minted.key.sender}</dd>
-				</div>
-			</dl>
+			<p className="m-0 -mt-1 text-meta text-text-muted">
+				<span className="font-mono">{minted.key.keyId}</span> · {live ? "Live" : "Test"} · sends as{" "}
+				{minted.key.sender}
+			</p>
 
-			<div className="mt-4 flex flex-col gap-3 border-t border-[var(--app-border)] pt-3 sm:flex-row sm:items-center sm:justify-between">
+			<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 				<label
 					htmlFor={ackId}
-					className="flex cursor-pointer items-center gap-2 text-sm text-[var(--app-text-soft)]"
+					className="flex cursor-pointer items-center gap-2.5 text-body text-text"
 				>
 					<input
 						id={ackId}
 						type="checkbox"
 						checked={acknowledged}
 						onChange={(event) => setAcknowledged(event.target.checked)}
-						className="h-4 w-4 shrink-0 accent-[var(--app-accent)]"
+						className="size-4 shrink-0 accent-[var(--color-brand)]"
 					/>
-					I have stored this key somewhere safe.
+					I have stored this key somewhere safe
 				</label>
-				<Button
-					variant="secondary"
-					disabled={!acknowledged}
-					onClick={onDismiss}
-					className={cn(acknowledged && "border-[var(--app-accent)] text-[var(--app-accent)]")}
-				>
-					Done — hide it
+				<Button variant="primary" disabled={!acknowledged} onClick={onDismiss}>
+					Done, hide it
 				</Button>
 			</div>
 		</section>

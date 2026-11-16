@@ -1,15 +1,15 @@
 import { getMailboxForOwner, listMailboxesByOwner } from "../db/d1";
-import type { McpDraftResult, McpMessageDto, McpSearchResult, McpThread } from "./types";
-import { mailboxStub } from "../lib/mailbox-stub";
 import { isInstanceAuthSender } from "../lib/auth-mail";
+import { mailboxStub } from "../lib/mailbox-stub";
 import {
 	redactSensitive,
-	sensitiveKindForRead,
 	type SensitiveKind,
 	type StoredSensitiveKind,
+	sensitiveKindForRead,
 } from "../lib/sensitive-mail";
 import { enqueueTelegramCardRefreshForAction, type TelegramCardAction } from "../telegram/cards";
 import { assertScope, type McpAuthContext } from "./scopes";
+import type { McpDraftResult, McpMessageDto, McpSearchResult, McpThread } from "./types";
 
 const MCP_MAX_BODY_CHARS = 10_000;
 
@@ -23,6 +23,7 @@ type RawThread = {
 	updated_at: string;
 	latest_subject: string | null;
 	latest_from: string | null;
+	latest_from_name?: string | null;
 	latest_snippet: string | null;
 	latest_received_at: string;
 	latest_has_attachments: number;
@@ -46,8 +47,11 @@ function isMessageAction(action: string): action is TelegramCardAction {
 }
 
 async function draftMutationError(response: Response): Promise<Error> {
-	const body = (await response.json().catch(() => null)) as { currentStatus?: string | null } | null;
-	if (response.status === 409) return new Error(body?.currentStatus ? "draft_not_editable" : "not_found");
+	const body = (await response.json().catch(() => null)) as {
+		currentStatus?: string | null;
+	} | null;
+	if (response.status === 409)
+		return new Error(body?.currentStatus ? "draft_not_editable" : "not_found");
 	if (response.status === 404) return new Error("not_found");
 	return new Error("internal_error");
 }
@@ -58,6 +62,8 @@ type RawMessage = {
 	direction: string;
 	state: string;
 	from_addr: string;
+	/** Sanitised at ingest; absent/null on rows stored before display names. */
+	from_name?: string | null;
 	to_json: string;
 	cc_json: string;
 	bcc_json: string;
@@ -151,6 +157,7 @@ export class McpMailboxFacade {
 					unread_count: visible.filter((message) => !message.is_read).length,
 					latest_subject: protect(hiddenLatest ? latest.subject : t.latest_subject),
 					latest_from: protect(hiddenLatest ? latest.from_addr : t.latest_from),
+					latest_from_name: protect((hiddenLatest ? latest.from_name : t.latest_from_name) ?? null),
 					latest_snippet: protect(hiddenLatest ? latest.snippet : t.latest_snippet),
 					latest_received_at: hiddenLatest ? latest.received_at : t.latest_received_at,
 					latest_has_attachments: hiddenLatest ? latest.has_attachments : t.latest_has_attachments,
@@ -213,6 +220,7 @@ export class McpMailboxFacade {
 				mailbox_id: mailboxId,
 				subject: protect(msg.subject),
 				from_addr: protect(msg.from_addr) ?? "",
+				from_name: protect(msg.from_name ?? null),
 				snippet: protect(msg.snippet),
 				received_at: msg.received_at,
 			});
@@ -290,6 +298,7 @@ export class McpMailboxFacade {
 			thread_id: msg.thread_id,
 			direction: msg.direction as "inbound" | "outbound",
 			from_addr: protect(msg.from_addr),
+			from_name: msg.from_name ? protect(msg.from_name) : null,
 			to: (JSON.parse(msg.to_json) as string[]).map(protect),
 			cc: (JSON.parse(msg.cc_json) as string[]).map(protect),
 			subject: msg.subject === null ? null : protect(msg.subject),

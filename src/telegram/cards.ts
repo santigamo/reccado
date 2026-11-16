@@ -100,7 +100,7 @@ function inboundCardKeyboard(input: {
 	if (input.origin) {
 		buttons.push({
 			text: "↗ Abrir",
-			url: `${input.origin}/mailboxes/${input.mailboxId}/${input.threadId}`,
+			url: `${input.origin}/inbox/${input.mailboxId}/${input.threadId}`,
 		});
 	}
 	// Second row, and deliberately quieter than the first: these two answer

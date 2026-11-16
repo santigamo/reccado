@@ -11,6 +11,75 @@ package.
 
 ### Added
 
+- **DMARC aggregate reports kept out of the web inbox; read state you can see (2026-11-16).**
+  *Reports.* Inbound mail is classified at ingest (`src/lib/automated-mail.ts`) as
+  `automated_kind = 'dmarc_report'` only on structural signals: the RFC 7489 subject
+  (`Report Domain: … Submitter: … Report-ID: …`, any case/spacing) or that subject without the
+  Report-ID plus a report file, or only `receiver!domain!begin!end[!id].{xml,xml.gz,gz,zip}`
+  attachments with a report-ish subject from an automated mailbox; never a reply/forward
+  (In-Reply-To, References, `Re:`/`Fwd:`…), never a parse failure. Reports are stored like any mail
+  but arrive read, do not un-archive a conversation, and the web's `/threads`, `/search` and
+  `/counts` leave them out (a conversation of only reports disappears; a person's conversation
+  holding one stays). They are listed under More → "DMARC reports" (`?folder=reports`,
+  `reports=only`), with no badge. MCP talks to the DO without the filter and still sees them;
+  Telegram notices are unchanged. Mailbox DO schema v11: nullable `messages.automated_kind`,
+  partial covering indexes `idx_messages_web_counts` / `idx_messages_reports`, and a backfill of
+  stored mail from subject/headers/attachment metadata (no R2 read) that also marks found reports
+  read. *Read state.* Unread rows are white with an 8px navy dot in a fixed slot and semibold ink
+  sender/subject/time; read rows sit on a quiet grey (`--color-row-read`) in regular weight and
+  secondary/muted text; the open row is a blue-grey with a wider mailbox stripe; collapsed messages
+  in a thread and the mailbox column follow the same language. Opening a conversation and mark
+  read/unread update rows and unread figures at once, and the guess holds until a reload that
+  started after the write has landed (no flicker back). The dropdown menu is now anchored to the
+  viewport, so "More" is no longer clipped by the scrolling toolbar.
+
+- **Gmail-style mail client: conversation order, rich text, threads (2026-11-16).**
+  *Order.* Every folder lists conversations by their newest message outside the trash (Trash: the
+  newest trashed one), your own replies included, so replying moves a thread to the top; ties break
+  on thread id, so merged multi-mailbox lists and search results are stable. `threads.last_message_at`
+  only moves forward (a late or replayed older mail no longer pulls a thread down). An open
+  conversation lands on its newest message: older read messages are one-line rows and a run of them
+  folds into "N older messages". *Reading.* Message HTML is served with `X-Frame-Options:
+  SAMEORIGIN` (matching its CSP `frame-ancestors 'self'`) instead of the global `DENY` that
+  conflicted with it; every other response, and `/approve`, `/login`, `/consent`, keep `DENY` /
+  `frame-ancestors 'none'`. Links in mail get `target=_blank rel="noopener noreferrer"`, `cid:`
+  inline images resolve to the message's own attachments, and a frame that cannot load falls back to
+  the text part. Plain-text mail keeps line breaks, wraps long lines, links URLs/addresses (React
+  nodes, never HTML) and folds a trailing quoted reply behind "···". *Writing.* Compose is a
+  dependency-free rich text editor (bold, italic, underline, links, lists, quote, clear formatting;
+  ⌘B/I/U/K, ⌘⇧7/8/9, ⌘\\), with sanitised paste, autosave into one draft, replies that quote the
+  original under an attribution line and set `parentMessageId`, and forwards with the original
+  header block. `POST/PATCH /api/mailboxes/:id/drafts` now sanitise `bodyHtml` server-side
+  (`src/lib/html-sanitize.ts`, HTMLRewriter allowlist: no scripts, handlers, images, iframes,
+  external styles, `url()`/`javascript:`; max 1 MB) and derive `bodyText` from the clean HTML, so
+  the multipart/alternative parts agree and the approval `payload_hash` covers the clean markup.
+  Text-only drafts, Telegram and MCP drafts are unchanged. *Threads.* Thread rows (`GET
+  /threads`, MCP `list_threads`) gain additive `participants` (senders oldest first, owner as
+  `me`), `latest_to_json` and `latest_recipient_names_json`; `message_count` and `unread_count` are
+  now computed per folder view (non-trash / trash) from the messages — `unread_count` was a counter
+  that only went up — and `?unread=` filters on it. Rows read "Rico, me · 2"; outbound-only rows
+  say "To: <recipients>" from the real recipients instead of the mailbox's own address; a
+  conversation is bold while any message is unread. Archive / restore of a conversation keep your
+  sent messages in Sent (outbound messages are never moved to Inbox/Archive), and a new inbound
+  reply moves the conversation's archived messages back to the inbox. Reply drafts show inline at
+  the bottom of their thread, and Reply resumes an existing draft instead of starting a second one.
+  Keyboard: `j`/`k` next/previous, `e` archive, `#` trash, `r` reply, `f` forward, `Esc`/`u` back.
+  No schema or D1 migration; deploy is code-only.
+- **Sender display names and real folder counts (2026-11-16).** Mailbox DO schema **v10**
+  (automatic on first DO start, additive): nullable `messages.from_name` and
+  `messages.recipient_names_json`, filled at ingest from the parsed From/To/Cc headers through one
+  sanitiser (`src/lib/display-name.ts`: control/bidi/zero-width/tag characters stripped, 80 code
+  points max, a name that is the address or names a *different* address is dropped). Sent copies
+  store the From phrase they went out with. No backfill: older rows keep the address-derived name.
+  Exposed additively as `latest_from_name` on thread rows, `from_name`/`recipient_names_json` on
+  message rows, and `from_name`/`latest_from_name` on MCP `list_threads`, `search_messages`,
+  `read_message`/`read_thread`; the FTS sender column includes the name. The web UI shows the name
+  and always keeps the real address visible (header line, `title`). New owner-session endpoint
+  `GET /api/mailboxes/:mailboxId/counts` → `{ mailbox_id, counts: { inbox|sent|archive|trash|all:
+  { threads, unread, messages }, drafts } }`, computed by the DO from the new covering index
+  `idx_messages_folder_counts (state, thread_id, is_read)`; the inbox header, folder badges, mailbox
+  unread counts and "1 of N" use it instead of counting loaded rows (no more "+" lower bounds).
+  No D1 migration.
 - **Standard MCP connection (2026-11-14).** `claude mcp add --transport http reccado https://<host>/mcp`
   (and claude.ai custom connectors, Cursor, …) now works with no operator step: unauthenticated
   RFC 7591 client registration is open on `/api/auth/oauth2/register`, hardened by a D1-backed
