@@ -1,7 +1,8 @@
 import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactElement, ReactNode } from "react";
 import { forwardRef, useId } from "react";
+import { ReccadoMark } from "#/components/brand/ReccadoMark";
 import { cn } from "#/lib/cn";
-import { AlertCircleIcon, CheckIcon, LockIcon, LogoGlyph, WarningIcon } from "./icons";
+import { AlertCircleIcon, CheckIcon, LockIcon, WarningIcon } from "./icons";
 
 /**
  * Shared pieces of the standalone pages (login, consent, approve). These pages
@@ -31,7 +32,7 @@ export function AuthPage({
 	);
 }
 
-/** The logo tile and the Lato wordmark. */
+/** The Reccado mark and the Lato wordmark. */
 export function Brand({
 	className,
 	compact = false,
@@ -41,9 +42,7 @@ export function Brand({
 }): ReactElement {
 	return (
 		<div className={cn("flex items-center gap-2.5", className)}>
-			<span className="flex size-7 shrink-0 items-center justify-center rounded-[7px] bg-brand">
-				<LogoGlyph />
-			</span>
+			<ReccadoMark size={28} className="shrink-0" />
 			<span
 				className={cn(
 					"font-brand font-bold tracking-[-0.01em] text-brand",

@@ -42,7 +42,13 @@ export function ThreadDraftRow({
 						to {to.join(", ") || "(no recipients)"}
 					</span>
 					{byAgent ? <Pill tone="neutral">Written by the agent</Pill> : null}
-					{draft.status === "pending_confirmation" ? <Pill tone="approval">Sending</Pill> : null}
+					{draft.status === "pending_confirmation" ? (
+						// An agent draft only reaches this row once its approval request is
+						// gone (the live one is drawn as the approval card instead).
+						<Pill tone={byAgent ? "neutral" : "approval"}>
+							{byAgent ? "Approval expired" : "Sending"}
+						</Pill>
+					) : null}
 					{files > 0 ? (
 						<Paperclip
 							aria-label={files === 1 ? "1 attachment" : `${files} attachments`}

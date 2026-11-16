@@ -1,6 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { ArrowLeft, LogOut, Search, Settings2, ShieldCheck } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
+import { ReccadoMark } from "#/components/brand/ReccadoMark";
 import { Avatar } from "#/components/ui/Avatar";
 import { IconButton, iconButtonClassName } from "#/components/ui/IconButton";
 import { Menu } from "#/components/ui/Menu";
@@ -27,6 +28,7 @@ export async function signOut(): Promise<void> {
 }
 
 /** The navy square with the white asterisk. */
+/** The agent glyph (a navy tile with a spark): marks what an agent wrote. Not the product logo. */
 export function BrandMark({ className }: { className?: string }) {
 	return (
 		<span
@@ -177,7 +179,7 @@ export function AppShell({
 					<header className="relative flex h-16 shrink-0 items-center gap-2 border-b border-divider px-3 sm:gap-3.5 sm:px-[18px]">
 						{headerLeading}
 						<Link to="/inbox" aria-label="Reccado — go to inbox" className="shrink-0 rounded-[7px]">
-							<BrandMark />
+							<ReccadoMark size={28} />
 						</Link>
 						<h1 className="m-0 flex min-w-0 shrink items-center gap-3.5 text-title font-normal tracking-[-0.01em]">
 							<span className="shrink-0 whitespace-nowrap text-[#5C5C5C]">{title}</span>

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { reccadoMarkSvg } from "./reccado-mark";
 
 /**
  * The browser tab says where you are and what is waiting: "(3) Inbox — Reccado",
@@ -10,7 +11,12 @@ export function documentTitle(label: string, unread: number): string {
 
 /** The brand mark as an SVG favicon, with an unread dot when `dot`. */
 export function faviconHref(dot: boolean): string {
-	const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect x="2" y="2" width="28" height="28" rx="7" fill="#1b2a41"/><path d="M16 7.5v17M7.5 16h17M10 10l12 12M22 10L10 22" stroke="#fff" stroke-width="2.6" stroke-linecap="round" fill="none"/>${dot ? '<circle cx="25" cy="7" r="6.5" fill="#d93f33" stroke="#fff" stroke-width="2"/>' : ""}</svg>`;
+	const svg = reccadoMarkSvg({
+		tile: true,
+		extra: dot
+			? '<circle cx="25" cy="7" r="6.5" fill="#d93f33" stroke="#fff" stroke-width="2"/>'
+			: "",
+	});
 	return `data:image/svg+xml,${encodeURIComponent(svg)}`;
 }
 

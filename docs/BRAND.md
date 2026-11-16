@@ -24,9 +24,11 @@ green palette for Cloudflare orange.
   hero shape.
 - **Wordmark**: the word **RECCADO** in a bold geometric sans-serif, white, on the dark surface.
 - **In imagery**: uppercase `RECCADO`. **In prose**: title-case `Reccado`.
-- **Favicon** is a *simplified, flat* version of a single envelope / stacked-envelope mark
-  (`assets/favicon.svg`) so it stays legible at 16–32 px, where the full glass render turns to
-  mush.
+- **Flat mark** — two stacked envelopes in the amber→orange→ember gradient
+  (`assets/logomark.svg`; drawn from `src/lib/reccado-mark.ts`). It is what the app header, the
+  sign-in pages and the favicon use, because the full glass render turns to mush below ~64 px.
+- **Favicon** is that flat mark on the Slate-dark tile (`public/favicon.svg`, plus
+  `favicon.ico`, `logo192.png`, `logo512.png` rendered from it).
 - Give the mark generous clear space. Don't stretch, rotate, or flatten it into a dated glossy
   "white glyph on an orange squircle" app icon — keep the glass depth.
 
@@ -74,11 +76,12 @@ at tiny sizes — use the flat favicon.
 
 ## Asset generation recipe
 
-The committed banner (`assets/banner.jpg`) is the **"edge flow" hero** — translucent glass envelopes
-streaming out of a glowing Cloudflare-orange edge-portal with god-rays and particles — generated with
-**gpt-image-2** (recipe below). A hand-authored HTML source (`assets/banner.html`) is kept as a
-**zero-credit, fully reproducible** fallback that can be re-rendered via headless Chrome. Midjourney
-V8.1 (via MeiGen) is an alternative for the logomark/avatar.
+The committed banner (`assets/banner.jpg`) shows **the product itself**: the wordmark and the
+flat logomark on the dark surface, next to a real screenshot of the web inbox
+(`assets/screenshot-inbox.jpg`) lifted on the orange glow. Its source is the hand-authored
+`assets/banner.html`, so it is **fully reproducible with no image generation**. Retake the
+screenshot from a local dev server when the UI changes. The earlier gpt-image-2 "edge flow" hero
+(glass envelopes streaming out of a portal) is kept below as a recipe for social art.
 
 **Reproduce the current banner** (no credits, macOS):
 
@@ -86,7 +89,7 @@ V8.1 (via MeiGen) is an alternative for the logomark/avatar.
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 "$CHROME" --headless=new --disable-gpu --hide-scrollbars \
   --force-device-scale-factor=2 --window-size=1440,617 \
-  --virtual-time-budget=3500 --default-background-color=00000000 \
+  --timeout=6000 --default-background-color=00000000 \
   --screenshot=banner@2x.png "file://$PWD/docs/assets/banner.html"
 sips -Z 1440 banner@2x.png --out banner-1440.png
 sips -s format jpeg -s formatOptions 82 banner-1440.png --out docs/assets/banner.jpg
@@ -98,7 +101,7 @@ sips -s format jpeg -s formatOptions 82 banner-1440.png --out docs/assets/banner
 > depth, soft reflections and inner glow, in a vibrant amber-orange to ember iridescent gradient,
 > on a deep charcoal background. Ultra-clean, minimal, premium, centered. No text, no letters.
 
-**Banner — current hero, gpt-image-2 ("edge flow")**. Generated with OpenAI **gpt-image-2**. Easiest
+**Hero art, gpt-image-2 ("edge flow")** (the previous banner). Generated with OpenAI **gpt-image-2**. Easiest
 path: Codex's native image tool — enable once with `image_generation = true` under `[features]` in
 `~/.codex/config.toml` (or `codex features enable image_generation`) and restart the session; **no
 OpenAI API key needed**. Generate at landscape `1536x1024`, quality `high`, then crop/fit to
@@ -133,6 +136,6 @@ sips -c 1500 1500 logo.png --out icon.png      # drop baked text, square
 |---|---|---|
 | **Hero banner** | `assets/banner.jpg` | README header, 1440×617 (21:9), dark glass |
 | **Logomark / avatar** | `assets/avatar.png` | 512×512 glass stacked-envelopes — logo & GitHub/social avatar |
-| **Favicon** | `assets/favicon.svg` · `assets/favicon-32.png` · `assets/favicon-16.png` | Flat simplified envelope (legible small) |
+| **Favicon** | `public/favicon.svg` · `public/favicon.ico` · `public/logo192.png` · `public/logo512.png` | Flat simplified envelope (legible small) |
 
 _Full-resolution sources are kept outside the repo; regenerate from the recipe above when needed._
