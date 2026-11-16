@@ -472,6 +472,39 @@ describe("telegram notices for MCP approval requests", () => {
 		).toBe(true);
 	});
 
+	it("/approvals lists pending requests with link buttons only", async () => {
+		const { intent } = await sendIntent("listed");
+		const calls = stubTelegram();
+		const ctx = createExecutionContext();
+		await worker.fetch(
+			new Request("https://reccado.test/telegram/webhook", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					"x-telegram-bot-api-secret-token": webhookSecret,
+				},
+				body: JSON.stringify({
+					update_id: Math.floor(Math.random() * 1e9),
+					message: {
+						message_id: 501,
+						chat: { id: Number(CHAT), type: "private" },
+						from: { id: Number(OPERATOR) },
+						text: "/approvals",
+					},
+				}),
+			}),
+			shared,
+			ctx,
+		);
+		await waitOnExecutionContext(ctx);
+		const sent = calls.find((call) => call.method === "sendMessage");
+		expect(String(sent?.body.text)).toContain("pendiente");
+		expect(String(sent?.body.text)).toContain("caduca a las");
+		const markup = JSON.stringify(sent?.body.reply_markup);
+		expect(markup).toContain(`${ORIGIN}/approve/${intent.id}`);
+		expect(markup).not.toContain("callback_data");
+	});
+
 	it("a critical control-plane request gets a notice; a direct change sends nothing", async () => {
 		await insertMailbox(db, {
 			mailbox_id: "mbx_tg_notice",

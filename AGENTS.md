@@ -157,10 +157,12 @@ actual repo state, fix this section rather than trusting it blindly.
   CIMD on (`MCP_CIMD_ENABLED`, `@better-auth/cimd`) as the preferred client registration, open
   DCR kept as compatibility fallback; the owner revokes clients under `/settings/agent-access` "Connected
   agents". Control-plane kinds live in `src/lib/control-plane-kinds/*`. Better
-  Auth/`@better-auth/mcp` is 1.7.20; migrations run through `0030` (`0021` Better Auth 1.7.20,
+  Auth/`@better-auth/mcp` is 1.7.20; migrations run through `0031` (`0021` Better Auth 1.7.20,
   `0022` approvals, `0024` passkey (unused), `0025`–`0028` audit/approval metadata, intent payload,
   pending uniqueness, `0029` `mcp_client_policies` + `approvals.approved_via`/`auto_refused`,
-  `0030` drops `mcp_client_policies`; `0023` does not exist). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
+  `0030` drops `mcp_client_policies`, `0031` `telegram_approval_notices`; `0023` does not exist).
+  Telegram never prints sensitive mail (codes, reset/magic links, this instance's own sign-in
+  mail): every bridge surface asks `src/telegram/sensitive.ts`. Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
   Gateway) has not started — do not claim it. Cloudflare Email Sending lifecycle events are
   consumed by the `inbox-mcp-email-events` Queue and hard-bounce/complaint suppressions are
   enforced in the mailbox DO. The per-domain Email Sending event subscription is now created and
