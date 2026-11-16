@@ -42,7 +42,12 @@ jobs:
         # that expect 200/404) and sets PHASE0_DEBUG_TOKEN (which violates the
         # tests/integration/api-security.test.ts assertion that it is undefined).
         run: |
-          printf 'ACCESS_JWT_AUDIENCE=\nACCESS_TEAM_DOMAIN=\n' > .dev.vars
+          # MAILBOX_JURISDICTION=none: workerd does not implement Durable Object
+          # jurisdictions, so the deployed value (eu, from wrangler.jsonc) fails every
+          # test that touches a mailbox. Local dev sets the same through .dev.vars.
+          # TRANSACTIONAL_API_KEY_PEPPER: any non-empty value; without it no transactional
+          # key can be minted and those suites fail. A placeholder, never a deployed secret.
+          printf 'ACCESS_JWT_AUDIENCE=\nACCESS_TEAM_DOMAIN=\nMAILBOX_JURISDICTION=none\nTRANSACTIONAL_API_KEY_PEPPER=ci-test-pepper\n' > .dev.vars
 
       - name: Typecheck
         run: pnpm run typecheck
@@ -67,7 +72,7 @@ jobs:
           # Test step above wrote a hermetic .dev.vars without PHASE0_DEBUG_TOKEN.
           # This smoke hits the token-gated /api/debug/phase0/* routes, so it
           # needs its own .dev.vars carrying PHASE0_DEBUG_TOKEN.
-          printf 'PHASE0_DEBUG_TOKEN=%s\nACCESS_JWT_AUDIENCE=\nACCESS_TEAM_DOMAIN=\n' \
+          printf 'PHASE0_DEBUG_TOKEN=%s\nACCESS_JWT_AUDIENCE=\nACCESS_TEAM_DOMAIN=\nMAILBOX_JURISDICTION=none\n' \
             "$PHASE0_DEBUG_TOKEN" > .dev.vars
 
           pnpm dev --host 127.0.0.1 --strictPort > /tmp/reccado-ci-dev.log 2>&1 &
@@ -86,7 +91,8 @@ jobs:
           done
 
           curl --silent --fail http://127.0.0.1:3000/api/health | tee /tmp/reccado-ci-health.json
-          curl --silent --fail http://127.0.0.1:3000/ >/tmp/reccado-ci-root.html
+          # `/` redirects to the inbox, so follow it: the page that must render is /inbox.
+          curl --silent --fail --location http://127.0.0.1:3000/ >/tmp/reccado-ci-root.html
           test -s /tmp/reccado-ci-root.html
 
           # By the time /api/health is healthy, `pnpm dev`'s predev hook has
