@@ -134,7 +134,10 @@ async function recordClientRegistered(
 			}),
 		});
 	} catch (error) {
-		console.warn("mcp.client_registered.record_failed", error instanceof Error ? error.message : error);
+		console.warn(
+			"mcp.client_registered.record_failed",
+			error instanceof Error ? error.message : error,
+		);
 	}
 }
 
@@ -144,11 +147,19 @@ async function detectFirstConsent(
 	request: Request,
 ): Promise<{ clientId: string; scopes: string[] } | null> {
 	try {
-		const body = (await request.clone().json()) as { accept?: unknown; scope?: unknown; oauth_query?: unknown };
+		const body = (await request.clone().json()) as {
+			accept?: unknown;
+			scope?: unknown;
+			oauth_query?: unknown;
+		};
 		if (body.accept !== true) return null;
-		const clientId = new URLSearchParams(typeof body.oauth_query === "string" ? body.oauth_query : "").get("client_id");
+		const clientId = new URLSearchParams(
+			typeof body.oauth_query === "string" ? body.oauth_query : "",
+		).get("client_id");
 		if (!clientId) return null;
-		const existing = await env.INDEX_DB.prepare(`SELECT 1 AS n FROM "oauthConsent" WHERE "clientId" = ? LIMIT 1`)
+		const existing = await env.INDEX_DB.prepare(
+			`SELECT 1 AS n FROM "oauthConsent" WHERE "clientId" = ? LIMIT 1`,
+		)
 			.bind(clientId)
 			.first();
 		if (existing) return null;
@@ -164,7 +175,9 @@ async function announceFirstConsent(
 	first: { clientId: string; scopes: string[] },
 ): Promise<void> {
 	try {
-		const row = await env.INDEX_DB.prepare(`SELECT "name", "redirectUris" FROM "oauthClient" WHERE "clientId" = ?`)
+		const row = await env.INDEX_DB.prepare(
+			`SELECT "name", "redirectUris" FROM "oauthClient" WHERE "clientId" = ?`,
+		)
 			.bind(first.clientId)
 			.first<{ name: string | null; redirectUris: string | null }>();
 		let uris: unknown = [];
@@ -507,11 +520,14 @@ export async function constrainConsentScopes(request: Request): Promise<Request>
 		return request;
 	}
 	if (body.accept !== true) return request;
-	const requested = new URLSearchParams(typeof body.oauth_query === "string" ? body.oauth_query : "")
-		.get("scope")
-		?.split(/\s+/)
-		.filter(Boolean) ?? [];
-	const ticked = new Set(typeof body.scope === "string" ? body.scope.split(/\s+/).filter(Boolean) : []);
+	const requested =
+		new URLSearchParams(typeof body.oauth_query === "string" ? body.oauth_query : "")
+			.get("scope")
+			?.split(/\s+/)
+			.filter(Boolean) ?? [];
+	const ticked = new Set(
+		typeof body.scope === "string" ? body.scope.split(/\s+/).filter(Boolean) : [],
+	);
 	const granted = requested.filter(
 		(scope) => !HIGH_RISK_CONSENT_SCOPES.has(scope) || ticked.has(scope),
 	);
@@ -569,7 +585,10 @@ export async function handleAuthRequest(
 			authRequest = new Request(url, request);
 		}
 		let registrationHosts: string[] = [];
-		if (url.pathname === `${AUTH_BASE_PATH}${REGISTRATION_PATH_SUFFIX}` && request.method === "POST") {
+		if (
+			url.pathname === `${AUTH_BASE_PATH}${REGISTRATION_PATH_SUFFIX}` &&
+			request.method === "POST"
+		) {
 			let raw: unknown = null;
 			try {
 				raw = await request.clone().json();

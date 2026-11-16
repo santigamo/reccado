@@ -17,7 +17,10 @@ import { applyMigrations } from "../helpers/migrations";
 
 const testEnv = env as unknown as Env;
 const base = { userId: "dev-local", email: "dev@local", local: true };
-const plain = new McpMailboxFacade(testEnv, { ...base, scopes: new Set(["mail:read", "mail:draft"]) });
+const plain = new McpMailboxFacade(testEnv, {
+	...base,
+	scopes: new Set(["mail:read", "mail:draft"]),
+});
 const sensitive = new McpMailboxFacade(testEnv, {
 	...base,
 	scopes: new Set(["mail:read", "mail:draft", "mail:read:sensitive"]),
@@ -50,7 +53,13 @@ async function mailbox() {
 
 async function ingest(
 	id: string,
-	input: { from: string; subject: string; body: string; extraHeaders?: string; authSecret?: string },
+	input: {
+		from: string;
+		subject: string;
+		body: string;
+		extraHeaders?: string;
+		authSecret?: string;
+	},
 ) {
 	const raw = new TextEncoder().encode(
 		`From: ${input.from}\r\nTo: owner@example.com\r\nSubject: ${input.subject}\r\nMessage-ID: <${crypto.randomUUID()}@t>\r\n${input.extraHeaders ?? ""}Content-Type: text/plain\r\n\r\n${input.body}`,
@@ -84,7 +93,10 @@ async function ingest(
 				r2: testEnv.MAIL_OBJECTS,
 				mailboxId: id,
 				transactionSync: (fn) => state.storage.transactionSync(fn),
-				authMail: { BETTER_AUTH_SECRET: input.authSecret ?? SECRET, MAIL_FROM_ADDRESS: testEnv.MAIL_FROM_ADDRESS },
+				authMail: {
+					BETTER_AUTH_SECRET: input.authSecret ?? SECRET,
+					MAIL_FROM_ADDRESS: testEnv.MAIL_FROM_ADDRESS,
+				},
 			},
 			message,
 		);
@@ -94,14 +106,20 @@ async function ingest(
 				result.messageLocalId,
 			)
 			.toArray()[0];
-		return { id: result.messageLocalId, threadId: row?.thread_id ?? "", kind: row?.sensitive_kind ?? null };
+		return {
+			id: result.messageLocalId,
+			threadId: row?.thread_id ?? "",
+			kind: row?.sensitive_kind ?? null,
+		};
 	});
 }
 
 describe("instance authentication mail is invisible to MCP", () => {
 	it("hides marker-only mail (foreign sender) at ingest in every read path, even with sensitive scope", async () => {
 		const id = await mailbox();
-		const header = (await authMailHeader({ BETTER_AUTH_SECRET: SECRET }, "owner@example.com"))["X-Reccado-Auth"];
+		const header = (await authMailHeader({ BETTER_AUTH_SECRET: SECRET }, "owner@example.com"))[
+			"X-Reccado-Auth"
+		];
 		const hidden = await ingest(id, {
 			from: "relay@elsewhere.test",
 			subject: "zebratoken sign-in",
@@ -158,7 +176,11 @@ describe("instance authentication mail is invisible to MCP", () => {
 
 	it("keeps a normal mail visible next to hidden auth mail", async () => {
 		const id = await mailbox();
-		const normal = await ingest(id, { from: "friend@example.org", subject: "lunch", body: "lunch at noon, giraffeword" });
+		const normal = await ingest(id, {
+			from: "friend@example.org",
+			subject: "lunch",
+			body: "lunch at noon, giraffeword",
+		});
 		await ingest(id, { from: AUTH_SENDER, subject: "code", body: "code 123123" });
 		const threads = await plain.listThreads(id, 20);
 		expect(threads.map((t) => t.id)).toEqual([normal.threadId]);
@@ -166,11 +188,7 @@ describe("instance authentication mail is invisible to MCP", () => {
 	});
 });
 
-async function expectInvisible(
-	id: string,
-	m: { id: string; threadId: string },
-	word: string,
-) {
+async function expectInvisible(id: string, m: { id: string; threadId: string }, word: string) {
 	for (const facade of [plain, sensitive]) {
 		expect(await facade.listThreads(id, 20)).toEqual([]);
 		await expect(facade.readThread(id, m.threadId)).rejects.toThrow("not_found");
@@ -248,7 +266,12 @@ describe("draft ownership (L2)", () => {
 		const human = await stub.fetch("https://mailbox-do/drafts", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ to: ["a@example.com"], subject: "mine", bodyText: "b", idempotencyKey: crypto.randomUUID() }),
+			body: JSON.stringify({
+				to: ["a@example.com"],
+				subject: "mine",
+				bodyText: "b",
+				idempotencyKey: crypto.randomUUID(),
+			}),
 		});
 		const { id: draftId } = (await human.json()) as { id: string };
 		await expect(
@@ -261,7 +284,11 @@ describe("draft ownership (L2)", () => {
 			bodyText: "b",
 			idempotencyKey: crypto.randomUUID(),
 		});
-		await plain.updateDraft(id, own.draft_id, { to: ["z@example.com"], subject: "agent2", bodyText: "b" });
+		await plain.updateDraft(id, own.draft_id, {
+			to: ["z@example.com"],
+			subject: "agent2",
+			bodyText: "b",
+		});
 		expect(await plain.cancelDraft(id, own.draft_id)).toMatchObject({ status: "cancelled" });
 	});
 });

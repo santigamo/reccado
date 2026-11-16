@@ -512,13 +512,29 @@ describe("telegram webhook", () => {
 		await testEnv.INDEX_DB.prepare(
 			`INSERT INTO approvals (token, kind, mailbox_id, draft_id, telegram_user_id, created_at, expires_at, payload_hash, origin)
 			 VALUES (?, 'confirm_send', 'mbx_test', 'draft-1', ?, ?, ?, 'hash', 'mcp')`,
-		).bind("mcp-intent-token", ALLOWED_USER, new Date().toISOString(), new Date(Date.now() + 60_000).toISOString()).run();
-		await post({ update_id: 411, callback_query: {
-			id: "cb-mcp", from: { id: Number(ALLOWED_USER) }, data: "s:mcp-intent-token",
-		} });
+		)
+			.bind(
+				"mcp-intent-token",
+				ALLOWED_USER,
+				new Date().toISOString(),
+				new Date(Date.now() + 60_000).toISOString(),
+			)
+			.run();
+		await post({
+			update_id: 411,
+			callback_query: {
+				id: "cb-mcp",
+				from: { id: Number(ALLOWED_USER) },
+				data: "s:mcp-intent-token",
+			},
+		});
 		expect(calls.map((call) => call.method)).toEqual(["answerCallbackQuery"]);
 		expect(calls[0]?.body.text).toBe("Caducado");
-		expect(await testEnv.INDEX_DB.prepare("SELECT consumed_at FROM approvals WHERE token = ?").bind("mcp-intent-token").first()).toEqual({ consumed_at: null });
+		expect(
+			await testEnv.INDEX_DB.prepare("SELECT consumed_at FROM approvals WHERE token = ?")
+				.bind("mcp-intent-token")
+				.first(),
+		).toEqual({ consumed_at: null });
 	});
 });
 

@@ -105,7 +105,9 @@ export function show(value: unknown): string {
 
 function leafPaths(value: unknown, path: string, out: Array<[string, unknown]>): void {
 	if (Array.isArray(value) && value.some((item) => item && typeof item === "object")) {
-		value.forEach((item, i) => leafPaths(item, path ? `${path}.${i}` : String(i), out));
+		value.forEach((item, i) => {
+			leafPaths(item, path ? `${path}.${i}` : String(i), out);
+		});
 	} else if (value && typeof value === "object" && !Array.isArray(value)) {
 		const entries = Object.entries(value);
 		if (entries.length === 0 && path) out.push([path, value]);

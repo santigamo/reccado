@@ -112,7 +112,12 @@ async function renderUpsert(env: Env, auth: AuthContext, payload: Operation) {
 	const urls = extractUrls(text, html);
 	const owned = (await listDomains(env.INDEX_DB)).map((d) => d.domain.toLowerCase());
 	const warnings: IntentWarning[] = before
-		? [{ code: "template_overwrite", message: "Las claves que usan esta plantilla enviarán el nuevo contenido." }]
+		? [
+				{
+					code: "template_overwrite",
+					message: "Las claves que usan esta plantilla enviarán el nuevo contenido.",
+				},
+			]
 		: [];
 	if (urls.length)
 		fields.push({
@@ -126,7 +131,10 @@ async function renderUpsert(env: Env, auth: AuthContext, payload: Operation) {
 		const host = hostnameOf(url);
 		if (host === null) {
 			if (/^\s*(javascript|data|vbscript):/i.test(url))
-				warnings.push({ code: `unsafe_link_scheme:${url.slice(0, 40)}`, message: `Enlace con esquema peligroso: ${url.slice(0, 80)}` });
+				warnings.push({
+					code: `unsafe_link_scheme:${url.slice(0, 40)}`,
+					message: `Enlace con esquema peligroso: ${url.slice(0, 80)}`,
+				});
 		} else if (!owns(owned, host)) external.add(host);
 	}
 	for (const host of external)
@@ -162,7 +170,10 @@ registerControlPlaneKind("template_upsert", {
 			});
 			return updateTemplate(env, auth, { mailboxId: p.mailboxId, templateId: p.templateId, body });
 		}
-		return createTemplate(env, auth, { mailboxId: p.mailboxId, body: { id: p.templateId, ...body } });
+		return createTemplate(env, auth, {
+			mailboxId: p.mailboxId,
+			body: { id: p.templateId, ...body },
+		});
 	},
 });
 
@@ -185,7 +196,12 @@ registerControlPlaneKind("template_archive", {
 				{ label: "Plantilla", value: row.id },
 				{ label: "Asunto", value: show(row.subject) },
 			],
-			warnings: [{ code: "template_archived", message: "Las claves que usan esta plantilla dejarán de poder enviarla." }],
+			warnings: [
+				{
+					code: "template_archived",
+					message: "Las claves que usan esta plantilla dejarán de poder enviarla.",
+				},
+			],
 		};
 	},
 	execute: async (env, auth, payload) => {

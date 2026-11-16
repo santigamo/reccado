@@ -1,4 +1,8 @@
-import { runInDurableObject, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import {
+	runInDurableObject,
+	createExecutionContext,
+	waitOnExecutionContext,
+} from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { handleAuthRequest } from "#/api/better-auth";
@@ -82,16 +86,24 @@ beforeAll(async () => {
 	);
 	const now = new Date().toISOString();
 	await db
-		.prepare("INSERT INTO runtime_config (key, value, updated_at) VALUES ('deployment.origin', ?, ?)")
+		.prepare(
+			"INSERT INTO runtime_config (key, value, updated_at) VALUES ('deployment.origin', ?, ?)",
+		)
 		.bind(ORIGIN, now)
 		.run();
 	await db
-		.prepare("INSERT INTO runtime_config (key, value, updated_at) VALUES ('telegram.chat_id', ?, ?)")
+		.prepare(
+			"INSERT INTO runtime_config (key, value, updated_at) VALUES ('telegram.chat_id', ?, ?)",
+		)
 		.bind(CHAT, now)
 		.run();
 	// The mailbox DO reads this same isolate env, so the proof secret and the Telegram
 	// settings are set on the shared object for the whole file.
-	for (const key of ["BETTER_AUTH_SECRET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USER_IDS"] as const) {
+	for (const key of [
+		"BETTER_AUTH_SECRET",
+		"TELEGRAM_BOT_TOKEN",
+		"TELEGRAM_ALLOWED_USER_IDS",
+	] as const) {
 		saved[key] = shared[key];
 	}
 	shared.BETTER_AUTH_SECRET = TEST_SECRET;
@@ -131,7 +143,10 @@ async function registerOwner(email: string): Promise<{ userId: string; jar: Jar 
 	);
 	jar.absorb(response);
 	expect(response.status, await response.clone().text()).toBe(200);
-	const user = await db.prepare('SELECT id FROM "user" WHERE email = ?').bind(email).first<{ id: string }>();
+	const user = await db
+		.prepare('SELECT id FROM "user" WHERE email = ?')
+		.bind(email)
+		.first<{ id: string }>();
 	return { userId: user?.id ?? "", jar };
 }
 
@@ -256,7 +271,8 @@ async function sentRows(draftId: string) {
 const ownerAuth = () => ({ userId: owner.userId, email: OWNER_EMAIL, owners: [OWNER_EMAIL] });
 
 describe("telegram notices for MCP approval requests", () => {
-	const legacy = (id: string, hash: string, verb: "ia" | "ix") => `${verb}:${id}:${hash.slice(0, 8)}`;
+	const legacy = (id: string, hash: string, verb: "ia" | "ix") =>
+		`${verb}:${id}:${hash.slice(0, 8)}`;
 
 	it("the old approve/deny callbacks do nothing: Telegram can no longer approve or deny", async () => {
 		const { draft, intent } = await sendIntent("no telegram approval");
@@ -276,7 +292,10 @@ describe("telegram notices for MCP approval requests", () => {
 		await notifyIntentCreated(shared, intent.id);
 		const sent = calls.filter((call) => call.method === "sendMessage");
 		expect(sent).toHaveLength(1);
-		const body = sent[0]!.body as { text: string; reply_markup: { inline_keyboard: Array<Array<{ callback_data?: string; url?: string }>> } };
+		const body = sent[0]!.body as {
+			text: string;
+			reply_markup: { inline_keyboard: Array<Array<{ callback_data?: string; url?: string }>> };
+		};
 		const buttons = body.reply_markup.inline_keyboard.flat();
 		expect(buttons.some((button) => button.callback_data !== undefined)).toBe(false);
 		expect(buttons.map((button) => button.url)).toEqual([`${ORIGIN}/approve/${intent.id}`]);
@@ -292,14 +311,27 @@ describe("telegram notices for MCP approval requests", () => {
 			owner_email: OWNER_EMAIL,
 		});
 		const principal = { tokenSub: owner.userId, oauthClientId: "client" };
-		const direct = await requestControlPlaneChange(shared, ownerAuth(), "mailbox_update", { mailboxId: "mbx_tg_notice", body: { displayName: "Notice" } }, principal);
+		const direct = await requestControlPlaneChange(
+			shared,
+			ownerAuth(),
+			"mailbox_update",
+			{ mailboxId: "mbx_tg_notice", body: { displayName: "Notice" } },
+			principal,
+		);
 		expect(direct.applied?.status).toBe("applied");
 		const calls = stubTelegram();
 		const pendingIntent = await requestControlPlaneChange(
 			shared,
 			ownerAuth(),
 			"api_key_create",
-			{ mailboxId: "mbx_tg_notice", body: { environment: "test", sender: "k@tg-notice.example", scopes: ["transactional:status"] } },
+			{
+				mailboxId: "mbx_tg_notice",
+				body: {
+					environment: "test",
+					sender: "k@tg-notice.example",
+					scopes: ["transactional:status"],
+				},
+			},
 			principal,
 		);
 		expect(pendingIntent.applied).toBeUndefined();
@@ -371,7 +403,10 @@ describe("control plane approval on the web", () => {
 });
 
 describe("web approval route", () => {
-	async function post(path: string, init: { origin?: string | null; cookie?: string; body: unknown }) {
+	async function post(
+		path: string,
+		init: { origin?: string | null; cookie?: string; body: unknown },
+	) {
 		const headers = new Headers({ "content-type": "application/json" });
 		if (init.origin !== null) headers.set("origin", init.origin ?? ORIGIN);
 		if (init.cookie) headers.set("cookie", init.cookie);
@@ -391,7 +426,10 @@ describe("web approval route", () => {
 		const body = { payloadHash: intent.payloadHash };
 
 		expect((await post(path, { body })).status).toBe(401);
-		expect((await post(path, { body, cookie: owner.jar.header(), origin: "https://evil.example" })).status).toBe(403);
+		expect(
+			(await post(path, { body, cookie: owner.jar.header(), origin: "https://evil.example" }))
+				.status,
+		).toBe(403);
 		expect((await post(path, { body, cookie: owner.jar.header(), origin: null })).status).toBe(403);
 		expect((await getIntentStatus(shared, intent.id)).status).toBe("pending");
 

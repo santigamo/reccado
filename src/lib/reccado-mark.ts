@@ -24,5 +24,5 @@ export function reccadoMarkSvg(opts: { tile?: boolean; extra?: string } = {}): s
 	const mark = opts.tile
 		? `<g transform="translate(3.6 3.4) scale(0.775)">${reccadoMarkInner()}</g>`
 		: reccadoMarkInner();
-	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${RECCADO_MARK_VIEWBOX}">${tile}${mark}${opts.extra ?? ""}</svg>`;
+	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${RECCADO_MARK_VIEWBOX}"><title>Reccado</title>${tile}${mark}${opts.extra ?? ""}</svg>`;
 }

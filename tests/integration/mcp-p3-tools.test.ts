@@ -90,7 +90,10 @@ function serverFor(auth: McpAuthContext, toolEnv: Env = testEnv) {
 	const server = new McpServer({ name: "reccado", version: "1.0.0" });
 	registerTools(server, toolEnv, auth, "http://localhost");
 	return server as unknown as {
-		_registeredTools: Record<string, { handler: (args: Record<string, unknown>) => Promise<ToolBody> }>;
+		_registeredTools: Record<
+			string,
+			{ handler: (args: Record<string, unknown>) => Promise<ToolBody> }
+		>;
 	};
 }
 
@@ -265,11 +268,17 @@ describe("MCP P3 tools", () => {
 	it("registers each tool exactly when its required scope is granted", () => {
 		for (const name of TOOL_NAMES) {
 			const needed = TOOL_SCOPES[name];
-			expect(Object.keys(serverFor(actor("with@local", [needed]))._registeredTools), name).toContain(name);
+			expect(
+				Object.keys(serverFor(actor("with@local", [needed]))._registeredTools),
+				name,
+			).toContain(name);
 			// `restore` is visible with any write scope, so removing one scope does not hide it.
 			if (name === "restore") continue;
 			const rest = ALL_SCOPES.filter((scope) => scope !== needed);
-			expect(Object.keys(serverFor(actor("without@local", rest))._registeredTools), name).not.toContain(name);
+			expect(
+				Object.keys(serverFor(actor("without@local", rest))._registeredTools),
+				name,
+			).not.toContain(name);
 		}
 	});
 
@@ -343,9 +352,9 @@ describe("MCP P3 tools", () => {
 				(row) => row.latest_subject,
 			),
 		).toEqual(["Filed note"]);
-		expect(textOf(await callTool(reader, "list_threads", { mailboxId: "mbx_missing", limit: 5 }))).toContain(
-			"not_found",
-		);
+		expect(
+			textOf(await callTool(reader, "list_threads", { mailboxId: "mbx_missing", limit: 5 })),
+		).toContain("not_found");
 		expect(
 			textOf(
 				await callTool(actor("someone-else@local", ["mail:read"]), "list_threads", {
@@ -362,13 +371,27 @@ describe("MCP P3 tools", () => {
 		const ownedB = await mailbox(reader.email);
 		const foreign = await mailbox("someone-else@local");
 		const disabled = await mailbox(reader.email, "disabled");
-		await seedMessage(ownedA, { subject: "Zephyr subject", body: `${token} alpha`, snippet: `${token} alpha` });
-		await seedMessage(ownedB, { subject: "Other box", body: `${token} beta`, snippet: `${token} beta`, receivedAt: "2026-04-02T00:00:00.000Z" });
+		await seedMessage(ownedA, {
+			subject: "Zephyr subject",
+			body: `${token} alpha`,
+			snippet: `${token} alpha`,
+		});
+		await seedMessage(ownedB, {
+			subject: "Other box",
+			body: `${token} beta`,
+			snippet: `${token} beta`,
+			receivedAt: "2026-04-02T00:00:00.000Z",
+		});
 		await seedMessage(foreign, { body: `${token} foreign`, snippet: `${token} foreign` });
 		await seedMessage(disabled, { body: `${token} disabled`, snippet: `${token} disabled` });
-		const one = await callTool(reader, "search_messages", { mailboxId: ownedA, q: token, limit: 10 });
-		const oneRows = (one.structuredContent as { results: Array<{ subject: string; mailbox_id: string }> })
-			.results;
+		const one = await callTool(reader, "search_messages", {
+			mailboxId: ownedA,
+			q: token,
+			limit: 10,
+		});
+		const oneRows = (
+			one.structuredContent as { results: Array<{ subject: string; mailbox_id: string }> }
+		).results;
 		expect(oneRows).toEqual([
 			expect.objectContaining({ subject: "Zephyr subject", mailbox_id: ownedA }),
 		]);
@@ -383,7 +406,9 @@ describe("MCP P3 tools", () => {
 			textOf(await callTool(reader, "search_messages", { mailboxId: foreign, q: token, limit: 5 })),
 		).toContain("not_found");
 		expect(
-			textOf(await callTool(reader, "search_messages", { mailboxId: "mbx_missing", q: token, limit: 5 })),
+			textOf(
+				await callTool(reader, "search_messages", { mailboxId: "mbx_missing", q: token, limit: 5 }),
+			),
 		).toContain("not_found");
 	});
 
@@ -399,7 +424,11 @@ describe("MCP P3 tools", () => {
 				mailboxId: id,
 				messageId: seeded.messageId,
 			});
-			const message = (hidden.structuredContent as { message: { body_text: string; redacted: boolean; sensitive_kind: string } }).message;
+			const message = (
+				hidden.structuredContent as {
+					message: { body_text: string; redacted: boolean; sensitive_kind: string };
+				}
+			).message;
 			expect(message.redacted).toBe(true);
 			expect(message.sensitive_kind).toBeTruthy();
 			expect(message.body_text).not.toContain("123456");
@@ -426,7 +455,9 @@ describe("MCP P3 tools", () => {
 		});
 		const fromHtml = (
 			await callTool(reader, "read_message", { mailboxId: id, messageId: htmlOnly.messageId })
-		).structuredContent as { message: { sensitive_kind: string; redacted: boolean; body_text: string } };
+		).structuredContent as {
+			message: { sensitive_kind: string; redacted: boolean; body_text: string };
+		};
 		expect(fromHtml.message).toMatchObject({ sensitive_kind: "otp", redacted: true });
 		expect(fromHtml.message.body_text).not.toContain("654321");
 		const stored = await seedMessage(id, {
@@ -439,7 +470,9 @@ describe("MCP P3 tools", () => {
 		});
 		const masked = (
 			await callTool(reader, "read_message", { mailboxId: id, messageId: stored.messageId })
-		).structuredContent as { message: { body_text: string; redacted: boolean; sensitive_kind: string } };
+		).structuredContent as {
+			message: { body_text: string; redacted: boolean; sensitive_kind: string };
+		};
 		expect(masked.message.sensitive_kind).toBe("password_reset");
 		expect(masked.message.redacted).toBe(true);
 		expect(masked.message.body_text).not.toContain("999888");
@@ -470,7 +503,12 @@ describe("MCP P3 tools", () => {
 		const result = await callTool(reader, "read_thread", { mailboxId: id, threadId });
 		const messages = (
 			result.structuredContent as {
-				messages: Array<{ message_id: string; body_text: string; redacted: boolean; resource_links: Array<{ uri: string }> }>;
+				messages: Array<{
+					message_id: string;
+					body_text: string;
+					redacted: boolean;
+					resource_links: Array<{ uri: string }>;
+				}>;
 			}
 		).messages;
 		expect(messages.map((row) => row.message_id)).toEqual([older.messageId, newer.messageId]);
@@ -483,22 +521,27 @@ describe("MCP P3 tools", () => {
 		]);
 		expect(result.content.some((part) => part.type === "resource_link")).toBe(true);
 		const raw = await readAuditedResource(testEnv, sensitive, id, newer.messageId);
-		expect(new TextDecoder().decode(Uint8Array.from(atob(raw.blob), (char) => char.charCodeAt(0)))).toBe(
-			"Your code is 123456",
-		);
+		expect(
+			new TextDecoder().decode(Uint8Array.from(atob(raw.blob), (char) => char.charCodeAt(0))),
+		).toBe("Your code is 123456");
 		const file = await readAuditedResource(testEnv, sensitive, id, newer.messageId, attachmentId);
-		expect(new TextDecoder().decode(Uint8Array.from(atob(file.blob), (char) => char.charCodeAt(0)))).toBe(
-			"file-bytes",
-		);
+		expect(
+			new TextDecoder().decode(Uint8Array.from(atob(file.blob), (char) => char.charCodeAt(0))),
+		).toBe("file-bytes");
 		await expect(readAuditedResource(testEnv, reader, id, newer.messageId)).rejects.toThrow(
 			"insufficient_scope: mail:read:sensitive",
 		);
 		await expect(
-			readAuditedResource(testEnv, actor("someone-else@local", ["mail:read", "mail:read:sensitive"]), id, newer.messageId),
+			readAuditedResource(
+				testEnv,
+				actor("someone-else@local", ["mail:read", "mail:read:sensitive"]),
+				id,
+				newer.messageId,
+			),
 		).rejects.toThrow("not_found");
-		await expect(readAuditedResource(testEnv, sensitive, id, newer.messageId, "missing-file")).rejects.toThrow(
-			"not_found",
-		);
+		await expect(
+			readAuditedResource(testEnv, sensitive, id, newer.messageId, "missing-file"),
+		).rejects.toThrow("not_found");
 		const audit = await testEnv.INDEX_DB.prepare(
 			"SELECT payload_json FROM ops_events WHERE event_type = 'mcp.resource_read' AND subject = ? ORDER BY created_at DESC LIMIT 1",
 		)
@@ -509,7 +552,9 @@ describe("MCP P3 tools", () => {
 			textOf(await callTool(reader, "read_thread", { mailboxId: id, threadId: "missing-thread" })),
 		).toContain("not_found");
 		expect(
-			textOf(await callTool(reader, "read_message", { mailboxId: id, messageId: "missing-message" })),
+			textOf(
+				await callTool(reader, "read_message", { mailboxId: id, messageId: "missing-message" }),
+			),
 		).toContain("not_found");
 	});
 
@@ -519,9 +564,15 @@ describe("MCP P3 tools", () => {
 		const bigKey = `test/big-${seeded.messageId}`;
 		await testEnv.MAIL_OBJECTS.put(bigKey, new Uint8Array(5 * 1024 * 1024 + 1));
 		await runInDurableObject(testEnv.MAILBOX_DO.getByName(id), async (_instance, state) => {
-			state.storage.sql.exec("UPDATE messages SET raw_r2_key = ? WHERE id = ?", bigKey, seeded.messageId);
+			state.storage.sql.exec(
+				"UPDATE messages SET raw_r2_key = ? WHERE id = ?",
+				bigKey,
+				seeded.messageId,
+			);
 		});
-		await expect(readAuditedResource(testEnv, reader, id, seeded.messageId)).rejects.toThrow(/too_large/);
+		await expect(readAuditedResource(testEnv, reader, id, seeded.messageId)).rejects.toThrow(
+			/too_large/,
+		);
 	});
 
 	it("saves, updates, threads and cancels drafts without sending", async () => {
@@ -535,9 +586,12 @@ describe("MCP P3 tools", () => {
 			bodyText: "Body",
 			idempotencyKey: key,
 		});
-		const draftId = (created.structuredContent as { draft: { draft_id: string; duplicate: boolean } }).draft
-			.draft_id;
-		expect(created.structuredContent).toMatchObject({ draft: { status: "draft", duplicate: false } });
+		const draftId = (
+			created.structuredContent as { draft: { draft_id: string; duplicate: boolean } }
+		).draft.draft_id;
+		expect(created.structuredContent).toMatchObject({
+			draft: { status: "draft", duplicate: false },
+		});
 		const again = await callTool(drafter, "save_draft", {
 			mailboxId: id,
 			to: ["person@example.com"],
@@ -545,7 +599,9 @@ describe("MCP P3 tools", () => {
 			bodyText: "Body",
 			idempotencyKey: key,
 		});
-		expect(again.structuredContent).toMatchObject({ draft: { draft_id: draftId, duplicate: true } });
+		expect(again.structuredContent).toMatchObject({
+			draft: { draft_id: draftId, duplicate: true },
+		});
 		const updated = await callTool(drafter, "save_draft", {
 			mailboxId: id,
 			draftId,
@@ -566,7 +622,15 @@ describe("MCP P3 tools", () => {
 		const replyId = (reply.structuredContent as { draft: { draft_id: string } }).draft.draft_id;
 		const stored = (await (
 			await testEnv.MAILBOX_DO.getByName(id).fetch(`https://mailbox-do/drafts/${replyId}`)
-		).json()) as { draft: { status: string; origin: string; thread_id: string; parent_message_id: string; subject: string } };
+		).json()) as {
+			draft: {
+				status: string;
+				origin: string;
+				thread_id: string;
+				parent_message_id: string;
+				subject: string;
+			};
+		};
 		expect(stored.draft).toMatchObject({
 			status: "draft",
 			origin: "mcp",
@@ -635,9 +699,9 @@ describe("MCP P3 tools", () => {
 		).toContain("not_found");
 		const cancelled = await callTool(drafter, "cancel_draft", { mailboxId: id, draftId });
 		expect(cancelled.structuredContent).toMatchObject({ draft_id: draftId, status: "cancelled" });
-		expect(textOf(await callTool(drafter, "cancel_draft", { mailboxId: id, draftId: "missing" }))).toContain(
-			"not_found",
-		);
+		expect(
+			textOf(await callTool(drafter, "cancel_draft", { mailboxId: id, draftId: "missing" })),
+		).toContain("not_found");
 		expect(
 			textOf(
 				await callTool(actor("someone-else@local", ["mail:draft"]), "cancel_draft", {
@@ -804,14 +868,16 @@ describe("MCP P3 tools", () => {
 	});
 
 	it("reads health, ops and config without secrets", async () => {
-		expect(JSON.stringify(stripConfigSecrets({ keys: [{ key_hash: "SECRET", displaySuffix: "abcd12" }] }))).not.toContain(
-			"SECRET",
-		);
+		expect(
+			JSON.stringify(
+				stripConfigSecrets({ keys: [{ key_hash: "SECRET", displaySuffix: "abcd12" }] }),
+			),
+		).not.toContain("SECRET");
 		const health = await callTool(admin, "get_health");
 		expect(health.isError, textOf(health)).toBeFalsy();
 		expect(
-			(health.structuredContent as { dependencies: { sendingFeedback: { mode: string } } }).dependencies
-				.sendingFeedback.mode,
+			(health.structuredContent as { dependencies: { sendingFeedback: { mode: string } } })
+				.dependencies.sendingFeedback.mode,
 		).toEqual(expect.any(String));
 		const owned = await mailbox(admin.email);
 		const now = new Date().toISOString();
@@ -881,7 +947,12 @@ describe("MCP P3 tools", () => {
 			offset: 0,
 		});
 		expect(events.structuredContent).toMatchObject({ events: [{ id: "evt-new" }] });
-		const dlq = await callTool(admin, "list_ops", { kind: "dlq", mailboxId: owned, limit: 10, offset: 0 });
+		const dlq = await callTool(admin, "list_ops", {
+			kind: "dlq",
+			mailboxId: owned,
+			limit: 10,
+			offset: 0,
+		});
 		expect(JSON.stringify(dlq.structuredContent)).toContain(`fail-${owned}`);
 		const suppressed = await callTool(admin, "list_ops", {
 			kind: "suppressions",

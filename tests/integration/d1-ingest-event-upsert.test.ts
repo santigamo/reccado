@@ -23,7 +23,11 @@ describe("upsertIngestEvent", () => {
 		const key = `ingest-${crypto.randomUUID()}`;
 		const base = { idempotency_key: key, mailbox_id: "mbx_t", raw_r2_key: "raw/t.eml" };
 		await upsertIngestEvent(env.INDEX_DB, { ...base, message_local_id: null, status: "queued" });
-		await upsertIngestEvent(env.INDEX_DB, { ...base, message_local_id: "msg_1", status: "processed" });
+		await upsertIngestEvent(env.INDEX_DB, {
+			...base,
+			message_local_id: "msg_1",
+			status: "processed",
+		});
 		const row = await env.INDEX_DB.prepare(
 			"SELECT status, message_local_id FROM ingest_events WHERE idempotency_key = ?",
 		)

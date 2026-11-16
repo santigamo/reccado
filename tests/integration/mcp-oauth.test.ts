@@ -288,7 +288,9 @@ describe("CIMD opt-in", () => {
 			expect(token.status).toBe(200);
 			const body = (await token.json()) as { scope: string };
 			// A bare consent (no explicit tick) never grants a high-risk scope (keys:write).
-			expect(body.scope).toBe(requested ? "mail:read mail:draft" : "mail:read mail:draft config:read");
+			expect(body.scope).toBe(
+				requested ? "mail:read mail:draft" : "mail:read mail:draft config:read",
+			);
 		}
 		const rows = await testEnv.INDEX_DB.prepare(
 			"SELECT id FROM ops_events WHERE event_type = 'mcp.client_first_seen' AND subject = ?",
@@ -798,7 +800,8 @@ describe("the /mcp bearer-token perimeter", () => {
 				destructiveHint: false,
 				idempotentHint: true,
 			});
-			for (const tool of tools.slice(8)) expect(tool.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
+			for (const tool of tools.slice(8))
+				expect(tool.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
 			for (const tool of tools) expect(tool.outputSchema).toBeTruthy();
 			const result = await call("tools/call", { name: "list_mailboxes", arguments: {} }, modern);
 			expect(result.result.structuredContent, JSON.stringify(result)).toEqual({ mailboxes: [] });

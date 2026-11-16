@@ -90,7 +90,13 @@ describe("MCP content facade", () => {
 			scopes: new Set([...owner.scopes, "mail:read:sensitive"]),
 		});
 		expect((await sensitive.readMessage(id, messageId)).body_text).toBe(body);
-		expect(new TextDecoder().decode(Uint8Array.from(atob((await sensitive.readResource(id, messageId)).blob), (c) => c.charCodeAt(0)))).toBe(body);
+		expect(
+			new TextDecoder().decode(
+				Uint8Array.from(atob((await sensitive.readResource(id, messageId)).blob), (c) =>
+					c.charCodeAt(0),
+				),
+			),
+		).toBe(body);
 		await expect(
 			new McpMailboxFacade(testEnv, { ...owner, email: "other@example.com" }).readMessage(
 				id,

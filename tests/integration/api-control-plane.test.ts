@@ -574,9 +574,7 @@ describe("POST /api/domains/:domain/provision", () => {
 		};
 		expect(body.sendingDomain).toBe(`notify.${zone}`);
 
-		const states = Object.fromEntries(
-			body.steps.map((step) => [step.name, step.outcome.state]),
-		);
+		const states = Object.fromEntries(body.steps.map((step) => [step.name, step.outcome.state]));
 		expect(states.register_domain).toBe("done");
 		expect(states.email_sending).toBe("done");
 		expect(states.dmarc).toBe("done");

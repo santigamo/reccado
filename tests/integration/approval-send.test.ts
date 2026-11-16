@@ -163,7 +163,11 @@ describe("control-plane approvals", () => {
 			"api_key_create",
 			{
 				mailboxId: "mbx_control_private",
-				body: { environment: "test", sender: "private-control@example.com", scopes: ["transactional:status"] },
+				body: {
+					environment: "test",
+					sender: "private-control@example.com",
+					scopes: ["transactional:status"],
+				},
 			},
 		);
 		expect(intent.applied).toBeUndefined();
@@ -186,46 +190,77 @@ describe("control-plane approvals", () => {
 			.bind(input.primaryAddress)
 			.first<{ mailbox_id: string }>();
 		expect(mailbox).not.toBeNull();
-		const disabled = await requestControlPlaneChange(env, auth, "mailbox_disable", { mailboxId: mailbox!.mailbox_id });
+		const disabled = await requestControlPlaneChange(env, auth, "mailbox_disable", {
+			mailboxId: mailbox!.mailbox_id,
+		});
 		expect(disabled.applied?.status).toBe("applied");
 		expect(
-			await db.prepare("SELECT status FROM mailboxes WHERE mailbox_id = ?").bind(mailbox!.mailbox_id).first(),
+			await db
+				.prepare("SELECT status FROM mailboxes WHERE mailbox_id = ?")
+				.bind(mailbox!.mailbox_id)
+				.first(),
 		).toMatchObject({ status: "disabled" });
 		const snapshot = await db
-			.prepare("SELECT id, payload_json FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ?")
+			.prepare(
+				"SELECT id, payload_json FROM ops_events WHERE event_type = 'admin.before_snapshot' AND subject = ?",
+			)
 			.bind(mailbox!.mailbox_id)
 			.first<{ id: string; payload_json: string }>();
-		expect(JSON.parse(snapshot!.payload_json)).toMatchObject({ status: "active", display_name: "Initial" });
+		expect(JSON.parse(snapshot!.payload_json)).toMatchObject({
+			status: "active",
+			display_name: "Initial",
+		});
 		expect(disabled.applied?.snapshotIds).toContain(snapshot!.id);
 		const event = await db
-			.prepare("SELECT payload_json FROM ops_events WHERE event_type = 'admin.applied' AND subject = 'mailbox_disable'")
+			.prepare(
+				"SELECT payload_json FROM ops_events WHERE event_type = 'admin.applied' AND subject = 'mailbox_disable'",
+			)
 			.first<{ payload_json: string }>();
-		expect(JSON.parse(event!.payload_json)).toMatchObject({ kind: "mailbox_disable", outcome: "applied", approver_user_id: owner.userId });
+		expect(JSON.parse(event!.payload_json)).toMatchObject({
+			kind: "mailbox_disable",
+			outcome: "applied",
+			approver_user_id: owner.userId,
+		});
 		// A non-owner is refused before anything runs.
 		await expect(
 			requestControlPlaneChange(env, { ...auth, email: "other@example.com" }, "mailbox_disable", {
 				mailboxId: mailbox!.mailbox_id,
 			}),
 		).rejects.toBeTruthy();
-		const foreignMailbox = await requestControlPlaneChange(env, auth, "mailbox_disable", { mailboxId: "mbx_not_mine" });
+		const foreignMailbox = await requestControlPlaneChange(env, auth, "mailbox_disable", {
+			mailboxId: "mbx_not_mine",
+		});
 		expect(foreignMailbox.applied).toMatchObject({ status: "failed" });
 		await expect(requestControlPlaneChange(env, auth, "unknown_kind", {})).rejects.toThrow();
 		await expect(
-			requestControlPlaneChange(env, auth, "mailbox_create", [{ primaryAddress: "batch@example.com" }]),
+			requestControlPlaneChange(env, auth, "mailbox_create", [
+				{ primaryAddress: "batch@example.com" },
+			]),
 		).rejects.toThrow();
 	});
 	it("executes an approval once and rejects payload tampering", async () => {
 		const email = "control-approve@example.com";
 		const owner = await registerOwner(email);
 		const auth = { userId: owner.userId, email, owners: [email] };
-		const intent = await requestControlPlaneChange(env, auth, "domain_add", { domain: "control-once.example", zoneId: "z1" });
+		const intent = await requestControlPlaneChange(env, auth, "domain_add", {
+			domain: "control-once.example",
+			zoneId: "z1",
+		});
 		expect(intent.applied).toBeUndefined();
-		const row = () => db.prepare("SELECT id FROM domains WHERE domain = 'control-once.example'").first();
+		const row = () =>
+			db.prepare("SELECT id FROM domains WHERE domain = 'control-once.example'").first();
 		expect(await row()).toBeNull();
-		expect((await webApprove(env, { userId: owner.userId }, { id: intent.id })).status).toBe("executed");
-		expect((await webApprove(env, { userId: owner.userId }, { id: intent.id })).status).toBe("executed");
+		expect((await webApprove(env, { userId: owner.userId }, { id: intent.id })).status).toBe(
+			"executed",
+		);
+		expect((await webApprove(env, { userId: owner.userId }, { id: intent.id })).status).toBe(
+			"executed",
+		);
 		expect(await row()).not.toBeNull();
-		const next = await requestControlPlaneChange(env, auth, "domain_add", { domain: "control-tamper.example", zoneId: "z2" });
+		const next = await requestControlPlaneChange(env, auth, "domain_add", {
+			domain: "control-tamper.example",
+			zoneId: "z2",
+		});
 		const view = await getIntentView(env, next.id, { userId: owner.userId });
 		expect(renderApprovalPage(view)).toContain("control-tamper.example");
 		await db
@@ -233,7 +268,9 @@ describe("control-plane approvals", () => {
 			.bind('{"domain":"evil.example","zoneId":"x"}', next.id)
 			.run();
 		expect((await webApprove(env, { userId: owner.userId }, { id: next.id })).status).toBe("stale");
-		expect(await db.prepare("SELECT id FROM domains WHERE domain = 'evil.example'").first()).toBeNull();
+		expect(
+			await db.prepare("SELECT id FROM domains WHERE domain = 'evil.example'").first(),
+		).toBeNull();
 	});
 });
 
@@ -300,9 +337,18 @@ async function sentRows(draftId: string) {
 describe("mcp send approval", () => {
 	it("replaces an expired pending intent while retaining its expired status", async () => {
 		const draft = await mcpDraft("expired intent");
-		const input = { kind: "send" as const, origin: "mcp" as const, mailboxId: draft.mailboxId, draftId: draft.draftId, payloadHash: draft.payloadHash };
+		const input = {
+			kind: "send" as const,
+			origin: "mcp" as const,
+			mailboxId: draft.mailboxId,
+			draftId: draft.draftId,
+			payloadHash: draft.payloadHash,
+		};
 		const first = await getOrCreatePendingIntent(env as Env, input);
-		await db.prepare("UPDATE approvals SET expires_at = ? WHERE token = ?").bind(new Date(Date.now() - 1000).toISOString(), first.intent.id).run();
+		await db
+			.prepare("UPDATE approvals SET expires_at = ? WHERE token = ?")
+			.bind(new Date(Date.now() - 1000).toISOString(), first.intent.id)
+			.run();
 		const second = await getOrCreatePendingIntent(env as Env, input);
 		expect(second.created).toBe(true);
 		expect(second.intent.id).not.toBe(first.intent.id);
@@ -311,13 +357,44 @@ describe("mcp send approval", () => {
 	it("rejects a tampered requestState at the SDK seam", async () => {
 		const codec = await makeIntentCodec(TEST_SECRET, "sdk-owner");
 		const auth = { userId: "sdk-owner", email: "sdk@example.com", scopes: new Set(["mail:send"]) };
-		const handler = createMcpHandler((context) => {
-			const server = new McpServer({ name: "test", version: "1" }, { requestState: { verify: codec.verify } });
-			registerSendTool(server, env as Env, auth, "http://localhost", { era: context.era, codec });
-			return server;
-		}, { legacy: "stateless" });
+		const handler = createMcpHandler(
+			(context) => {
+				const server = new McpServer(
+					{ name: "test", version: "1" },
+					{ requestState: { verify: codec.verify } },
+				);
+				registerSendTool(server, env as Env, auth, "http://localhost", { era: context.era, codec });
+				return server;
+			},
+			{ legacy: "stateless" },
+		);
 		const state = await codec.mint({ intentId: "intent" }, { mcpReq: {} } as ServerContext);
-		const response = await handler.fetch(new Request("http://localhost/mcp", { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2026-07-28", "mcp-method": "tools/call", "mcp-name": "send" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "send", arguments: { mailboxId: "m", draftId: "d" }, requestState: `${state}tampered`, _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} } } }) }));
+		const response = await handler.fetch(
+			new Request("http://localhost/mcp", {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					accept: "application/json, text/event-stream",
+					"mcp-protocol-version": "2026-07-28",
+					"mcp-method": "tools/call",
+					"mcp-name": "send",
+				},
+				body: JSON.stringify({
+					jsonrpc: "2.0",
+					id: 1,
+					method: "tools/call",
+					params: {
+						name: "send",
+						arguments: { mailboxId: "m", draftId: "d" },
+						requestState: `${state}tampered`,
+						_meta: {
+							"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+							"io.modelcontextprotocol/clientCapabilities": {},
+						},
+					},
+				}),
+			}),
+		);
 		const raw = await response.text();
 		expect(raw).toContain("Invalid or expired requestState");
 		expect(raw).toContain("invalid_request_state");
@@ -325,42 +402,113 @@ describe("mcp send approval", () => {
 	it("enforces scope and draft ownership, and reports legacy pending and stale status", async () => {
 		const email = "legacy-send@example.com";
 		const draft = await mcpDraft("legacy");
-		await db.prepare("UPDATE mailboxes SET owner_email = ? WHERE mailbox_id = ?").bind(email, draft.mailboxId).run();
+		await db
+			.prepare("UPDATE mailboxes SET owner_email = ? WHERE mailbox_id = ?")
+			.bind(email, draft.mailboxId)
+			.run();
 		const codec = await makeIntentCodec(TEST_SECRET, email);
 		const makeHandler = (scopes: string[]) => {
 			const server = new McpServer({ name: "test", version: "1" });
-			registerSendTool(server, env as Env, { userId: email, email, scopes: new Set(scopes) }, ORIGIN, { era: "legacy", codec });
-			return (server as unknown as { _registeredTools: Record<string, { handler: (args: object, ctx: ServerContext) => Promise<Record<string, unknown>> }> })._registeredTools.send?.handler;
+			registerSendTool(
+				server,
+				env as Env,
+				{ userId: email, email, scopes: new Set(scopes) },
+				ORIGIN,
+				{ era: "legacy", codec },
+			);
+			return (
+				server as unknown as {
+					_registeredTools: Record<
+						string,
+						{ handler: (args: object, ctx: ServerContext) => Promise<Record<string, unknown>> }
+					>;
+				}
+			)._registeredTools.send?.handler;
 		};
 		const params = { mailboxId: draft.mailboxId, draftId: draft.draftId };
 		const ctx = { mcpReq: { requestState: () => undefined } } as unknown as ServerContext;
 		// Without mail:send the tool is not even registered (scope-filtered tools/list).
 		expect(makeHandler([])).toBeUndefined();
-		expect(await db.prepare("SELECT token FROM approvals WHERE draft_id = ?").bind(draft.draftId).first()).toBeNull();
+		expect(
+			await db
+				.prepare("SELECT token FROM approvals WHERE draft_id = ?")
+				.bind(draft.draftId)
+				.first(),
+		).toBeNull();
 		const handler = makeHandler(["mail:send"])!;
-		await runInDurableObject(draft.stub, async (_instance, state) => { state.storage.sql.exec("UPDATE outbound_drafts SET origin = 'web' WHERE id = ?", draft.draftId); });
+		await runInDurableObject(draft.stub, async (_instance, state) => {
+			state.storage.sql.exec(
+				"UPDATE outbound_drafts SET origin = 'web' WHERE id = ?",
+				draft.draftId,
+			);
+		});
 		expect(JSON.stringify(await handler(params, ctx))).toContain("draft_not_agent_owned");
-		await runInDurableObject(draft.stub, async (_instance, state) => { state.storage.sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", draft.draftId); });
+		await runInDurableObject(draft.stub, async (_instance, state) => {
+			state.storage.sql.exec(
+				"UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?",
+				draft.draftId,
+			);
+		});
 		const first = await handler(params, ctx);
-		const result = first.structuredContent as { status: string; intentId: string; approvalUrl: string };
-		expect(result).toMatchObject({ status: "pending", approvalUrl: `${ORIGIN}/approve/${result.intentId}` });
-		expect((await handler(params, ctx)).structuredContent).toMatchObject({ intentId: result.intentId });
-		expect((await handler({ ...params, intentId: result.intentId }, ctx)).structuredContent).toMatchObject({ status: "pending" });
-		await draft.stub.fetch(`https://mailbox-do/drafts/${draft.draftId}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ bodyText: "changed" }) });
-		expect((await handler({ ...params, intentId: result.intentId }, ctx)).structuredContent).toMatchObject({ status: "stale" });
+		const result = first.structuredContent as {
+			status: string;
+			intentId: string;
+			approvalUrl: string;
+		};
+		expect(result).toMatchObject({
+			status: "pending",
+			approvalUrl: `${ORIGIN}/approve/${result.intentId}`,
+		});
+		expect((await handler(params, ctx)).structuredContent).toMatchObject({
+			intentId: result.intentId,
+		});
+		expect(
+			(await handler({ ...params, intentId: result.intentId }, ctx)).structuredContent,
+		).toMatchObject({ status: "pending" });
+		await draft.stub.fetch(`https://mailbox-do/drafts/${draft.draftId}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ bodyText: "changed" }),
+		});
+		expect(
+			(await handler({ ...params, intentId: result.intentId }, ctx)).structuredContent,
+		).toMatchObject({ status: "stale" });
 	});
 	it("shares a pending intent across concurrent MCP requests and completes after human approval", async () => {
 		const owner = await registerOwner("mcp-tool-owner@example.com");
 		const draft = await mcpDraft("Tool send");
-		await db.prepare("UPDATE mailboxes SET owner_email = ? WHERE mailbox_id = ?").bind("mcp-tool-owner@example.com", draft.mailboxId).run();
-		const auth = { userId: owner.userId, email: "mcp-tool-owner@example.com", scopes: new Set(["mail:send"]), oauthClientId: "client", tokenSub: owner.userId, tokenJti: "jti" };
+		await db
+			.prepare("UPDATE mailboxes SET owner_email = ? WHERE mailbox_id = ?")
+			.bind("mcp-tool-owner@example.com", draft.mailboxId)
+			.run();
+		const auth = {
+			userId: owner.userId,
+			email: "mcp-tool-owner@example.com",
+			scopes: new Set(["mail:send"]),
+			oauthClientId: "client",
+			tokenSub: owner.userId,
+			tokenJti: "jti",
+		};
 		const codec = await makeIntentCodec(TEST_SECRET, owner.userId);
-		const server = new McpServer({ name: "test", version: "1" }, { requestState: { verify: codec.verify } });
+		const server = new McpServer(
+			{ name: "test", version: "1" },
+			{ requestState: { verify: codec.verify } },
+		);
 		registerSendTool(server, env as Env, auth, ORIGIN, { era: "modern", codec });
-		const handler = (server as unknown as { _registeredTools: Record<string, { handler: (args: object, ctx: ServerContext) => Promise<Record<string, unknown>> }> })._registeredTools.send!.handler;
+		const handler = (
+			server as unknown as {
+				_registeredTools: Record<
+					string,
+					{ handler: (args: object, ctx: ServerContext) => Promise<Record<string, unknown>> }
+				>;
+			}
+		)._registeredTools.send!.handler;
 		const params = { mailboxId: draft.mailboxId, draftId: draft.draftId };
-		const context = (state?: unknown) => ({ mcpReq: { requestState: () => state } }) as unknown as ServerContext;
-		const notify = vi.spyOn(notification, "notifyIntentCreated").mockRejectedValue(new Error("offline"));
+		const context = (state?: unknown) =>
+			({ mcpReq: { requestState: () => state } }) as unknown as ServerContext;
+		const notify = vi
+			.spyOn(notification, "notifyIntentCreated")
+			.mockRejectedValue(new Error("offline"));
 		try {
 			const [a, b] = await Promise.all([handler(params, context()), handler(params, context())]);
 			expect(a.resultType).toBe("input_required");
@@ -375,13 +523,20 @@ describe("mcp send approval", () => {
 			const shared = env as Env;
 			const oldSecret = shared.BETTER_AUTH_SECRET;
 			shared.BETTER_AUTH_SECRET = TEST_SECRET;
-			try { expect((await webApprove(shared, { userId: owner.userId }, { id: first.intentId })).status).toBe("sent"); }
-			finally { shared.BETTER_AUTH_SECRET = oldSecret; }
+			try {
+				expect(
+					(await webApprove(shared, { userId: owner.userId }, { id: first.intentId })).status,
+				).toBe("sent");
+			} finally {
+				shared.BETTER_AUTH_SECRET = oldSecret;
+			}
 			const sent = await handler(params, context(first));
 			expect(sent.structuredContent).toMatchObject({ status: "sent", intentId: first.intentId });
 			expect(await messageCount(draft.stub)).toBe(1);
 			expect(await sentRows(draft.draftId)).toHaveLength(1);
-		} finally { notify.mockRestore(); }
+		} finally {
+			notify.mockRestore();
+		}
 	});
 	it("shows the frozen mail escaped and drops any agent summary", () => {
 		const extracted = fieldsFromSnapshot({
@@ -571,7 +726,9 @@ describe("mcp send approval", () => {
 		} finally {
 			shared.BETTER_AUTH_SECRET = savedSecret;
 		}
-		const winners = [left, right].filter((result) => result.status === "sent" && !result.error && !result.resolved);
+		const winners = [left, right].filter(
+			(result) => result.status === "sent" && !result.error && !result.resolved,
+		);
 		expect(winners).toHaveLength(1);
 		expect(await messageCount(draft.stub)).toBe(1);
 		expect(await sentRows(draft.draftId)).toHaveLength(1);

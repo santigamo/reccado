@@ -38,10 +38,13 @@ export function isAllowedRedirectUri(value: unknown): boolean {
 
 /** Strips control / bidi-override / zero-width characters and caps the length. */
 export function sanitizeClientName(value: string): string {
-	return value
-		.replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g, "")
-		.trim()
-		.slice(0, MAX_CLIENT_NAME_LENGTH);
+	return (
+		value
+			// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters is the point of this sanitiser
+			.replace(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩﻿]/g, "")
+			.trim()
+			.slice(0, MAX_CLIENT_NAME_LENGTH)
+	);
 }
 
 export type RegistrationCheck =
@@ -51,7 +54,11 @@ export type RegistrationCheck =
 /** Validates and normalises a registration body before it reaches the OAuth provider. */
 export function checkRegistrationBody(raw: unknown): RegistrationCheck {
 	if (!raw || typeof raw !== "object" || Array.isArray(raw))
-		return { ok: false, error: "invalid_client_metadata", description: "Body must be a JSON object" };
+		return {
+			ok: false,
+			error: "invalid_client_metadata",
+			description: "Body must be a JSON object",
+		};
 	const body = { ...(raw as Record<string, unknown>) };
 	const uris = body.redirect_uris;
 	if (!Array.isArray(uris) || uris.length === 0 || uris.length > MAX_REDIRECT_URIS)
@@ -65,12 +72,17 @@ export function checkRegistrationBody(raw: unknown): RegistrationCheck {
 			return {
 				ok: false,
 				error: "invalid_redirect_uri",
-				description: "redirect_uris must be https, or http on a loopback host (127.0.0.1, localhost, [::1])",
+				description:
+					"redirect_uris must be https, or http on a loopback host (127.0.0.1, localhost, [::1])",
 			};
 	}
 	if (body.client_name !== undefined) {
 		if (typeof body.client_name !== "string")
-			return { ok: false, error: "invalid_client_metadata", description: "client_name must be a string" };
+			return {
+				ok: false,
+				error: "invalid_client_metadata",
+				description: "client_name must be a string",
+			};
 		body.client_name = sanitizeClientName(body.client_name);
 	}
 	// The provider treats dynamic clients as "web" unless told otherwise and then refuses
