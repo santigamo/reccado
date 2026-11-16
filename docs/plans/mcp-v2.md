@@ -1,6 +1,6 @@
 # MCP v2 — a full-capability, spec-native MCP server
 
-Status: **in progress** (integration branch `feat/mcp-v2`) · Owner: Santi · Created: 2026-11-11 · Last updated: 2026-11-14
+Status: **shipped** (merged to `main` 2026-11-16, live on reccado-dev `e2da106f`) · Owner: Santi · Created: 2026-11-11 · Last updated: 2026-11-16
 
 Test env note: the Vitest pool reads the gitignored `.dev.vars`. Canonical test values:
 `PHASE0_DEBUG_TOKEN`, `MAILBOX_JURISDICTION=none`, a fake `TRANSACTIONAL_API_KEY_PEPPER`, and
@@ -446,6 +446,35 @@ kept as history.
   (no passkey). See `SECURITY.md` ("MCP").
 - **Sources:** MCP spec 2025-11-25 authorization + security best practices; Stripe MCP human
   confirmation; Simon Willison's lethal trifecta; OWASP LLM01.
+
+## 2026-11-16 status: shipped, incidents, open items
+
+Merged to `main` and live (reccado-dev `e2da106f`). Verified live with a real Claude Code
+connection: OAuth login + consent, `list_mailboxes` and `get_health` over `/mcp`.
+
+Incidents fixed after the final-model deploy:
+- **Inbound ingest dead-lettered** (2026-11-15 → 2026-11-16, 6 messages): a stray
+  `template_allowlist_json = excluded.…` line landed in the `ingest_events` upsert instead of the
+  API-key projection upsert, so the conflict path failed. Fixed in `6932ab0` with a regression test.
+  5 messages were already in their mailboxes; the 6th is a duplicate copy of a Google DMARC report
+  whose first copy is stored. New tool `pnpm replay:dlq` (dry-run default) re-ingests DLQ'd inbound
+  mail from R2; `--apply` needs a `CLOUDFLARE_API_TOKEN` with Queues:Edit.
+- **Every `/mcp` call returned 500 (`Jwks failed`)**: token verification fetched our own
+  `/api/auth/jwks` over HTTP, and a Worker cannot subrequest its own route on its custom domain.
+  Tests had mocked that fetch. Fixed in `0b5aa90` (in-process JWKS); the e2e test now makes the
+  self-fetch fail like production.
+
+Open (not blocking):
+- Transcribo templates `app-connected{,-fr,-pt}` not created yet; no Transcribo key allows the
+  existing `-fr`/`-pt` templates nor `subscription-renewal-reminder` (sends of those are rejected
+  `template_not_allowed`). Doable now over MCP with `templates:write` + `keys:write`, no approval.
+- Custom-scheme OAuth redirects (e.g. Cursor `cursor://`) are refused; decide an allow-list if needed.
+- DLQ duplicate DMARC copy (2026-11-16T10:42Z, mbx Transcribo) not re-ingested (needs Queues token).
+- Deferred review items: owner-scoped admin reads (multi-owner only), `list_threads` N+1, pending
+  payload size vs D1 row limit, search as a presence oracle for sensitive codes, session cookie
+  `sameSite=lax`.
+- Process: deploy only from a clean worktree of `main` (another session works uncommitted in the
+  main checkout); deploy `90c7d24a` briefly shipped that session's in-progress `src/styles.css`.
 
 ## Decision log
 
