@@ -15,6 +15,7 @@ import { enqueueTelegramCardRefreshForAction } from "../telegram/cards";
 import { assertMailboxAccess } from "./auth";
 import type { ApiBindings } from "./hono";
 import {
+	bulkActionSchema,
 	confirmSendSchema,
 	createDraftSchema,
 	messageActionSchema,
@@ -28,15 +29,24 @@ import {
 // fall through to the deny); we then re-allow only what mail needs to display:
 // remote/inline images and inline styles. Kept in sync with the iframe `sandbox`
 // attribute on the client (defense in depth — either alone blocks script execution).
-const EMAIL_HTML_CSP = [
-	"default-src 'none'",
-	"img-src https: http: data:",
-	"style-src 'unsafe-inline'",
-	"font-src https: data:",
-	"media-src https: data:",
-	"form-action 'none'",
-	"frame-ancestors 'self'",
-].join("; ");
+//
+// Remote content (images, CSS backgrounds, fonts, media) is blocked unless the
+// reader asked for it (`?images=1`, the "Show images" button): a remote image is
+// how a sender learns that, when and where a message was opened. Inline (data:)
+// images and the message's own attachments (cid:, served from this origin)
+// always show.
+export function emailHtmlCsp(remoteImages: boolean): string {
+	const remote = remoteImages ? " https: http:" : "";
+	return [
+		"default-src 'none'",
+		`img-src 'self' data:${remote}`,
+		"style-src 'unsafe-inline'",
+		`font-src data:${remoteImages ? " https:" : ""}`,
+		`media-src data:${remoteImages ? " https:" : ""}`,
+		"form-action 'none'",
+		"frame-ancestors 'self'",
+	].join("; ");
+}
 
 // Force links inside the (sandboxed) email frame to open in a new tab rather than
 // replacing the framed document. Injected into the existing <head> when present so
@@ -129,6 +139,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const query = threadListQuerySchema.parse({
 			limit: c.req.query("limit"),
 			cursor: c.req.query("cursor"),
+			unread: c.req.query("unread"),
 			q: c.req.query("q"),
 			label: c.req.query("label"),
 			state: c.req.query("state"),
@@ -140,6 +151,8 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		if (query.state) {
 			url.searchParams.set("state", query.state);
 		}
+		if (query.cursor) url.searchParams.set("before", query.cursor);
+		if (query.unread) url.searchParams.set("unread", "true");
 		// Automated reports stay out of every web folder; the reports view asks for them.
 		url.searchParams.set("reports", query.reports ?? "exclude");
 		return stub.fetch(url.toString());
@@ -224,7 +237,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		return new Response(html, {
 			headers: {
 				"content-type": "text/html; charset=utf-8",
-				"content-security-policy": EMAIL_HTML_CSP,
+				"content-security-policy": emailHtmlCsp(c.req.query("images") === "1"),
 				// The one HTML response the app frames itself. The global middleware
 				// leaves this exact value alone for this route only (see api/hono.ts);
 				// every other response keeps DENY. A DENY here conflicts with
@@ -305,6 +318,51 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			});
 		}
 		return response;
+	});
+
+	// Many messages at once: bulk archive / delete / read state on conversations,
+	// an exact undo on messages, or "Mark all as read" on a folder (automated
+	// reports stay out unless the reports view asks). Answers what each changed
+	// message was before, which is what the client's Undo replays.
+	api.post("/api/mailboxes/:mailboxId/bulk-actions", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const body = bulkActionSchema.parse(await c.req.json());
+		const target = body.threadIds
+			? { threadIds: body.threadIds }
+			: body.messageIds
+				? { messageIds: body.messageIds }
+				: {
+						folder: {
+							state: body.folder!.state,
+							reports: body.folder!.reports ?? ("exclude" as const),
+						},
+					};
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		const response = await stub.fetch("https://mailbox-do/bulk-actions", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action: body.action, target }),
+		});
+		if (!response.ok) return response;
+		const result = (await response.json()) as {
+			action: string;
+			changed: Array<{ id: string; thread_id: string; state: string; is_read: number }>;
+		};
+		// Same follow-up as the single-message route: the Telegram cards of the
+		// messages that changed stop claiming their old state. Bounded; a card for
+		// mail older than that is refreshed the next time it is touched.
+		await Promise.all(
+			result.changed.slice(0, 100).map((m) =>
+				enqueueTelegramCardRefreshForAction(c.env, {
+					mailboxId,
+					messageLocalId: m.id,
+					action: body.action,
+				}),
+			),
+		);
+		return c.json(result);
 	});
 
 	api.get("/api/mailboxes/:mailboxId/search", async (c) => {
@@ -396,6 +454,17 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			attemptKey: body.idempotencyKey,
 		});
 		return Response.json(result, { status });
+	});
+
+	// Undo for "Discard draft": your own discarded draft comes back as a draft.
+	api.post("/api/mailboxes/:mailboxId/drafts/:draftId/restore", async (c) => {
+		const auth = c.get("auth")!;
+		const mailboxId = c.req.param("mailboxId");
+		assertMailboxAccess(auth, mailboxId, c.env);
+		const stub = await requireMailboxStub(c.env, mailboxId);
+		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}/restore`, {
+			method: "POST",
+		});
 	});
 
 	api.post("/api/mailboxes/:mailboxId/drafts/:draftId/cancel", async (c) => {

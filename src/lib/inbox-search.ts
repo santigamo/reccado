@@ -6,6 +6,7 @@
  *   /inbox?mailbox=<id>                 one mailbox (scope)
  *   /inbox?folder=approvals|drafts|sent|archive|trash|all|reports
  *   /inbox?q=<text>                     search (in the current scope + folder)
+ *   /inbox?unread=true                  only conversations with something unread
  *   /inbox?folder=approvals&approval=<id>
  *                                       an approval request with no thread (new message,
  *                                       control-plane change) open in the reading pane
@@ -26,12 +27,15 @@ export type InboxSearch = {
 	mailbox?: string;
 	folder?: InboxFolderKey;
 	q?: string;
+	/** "Unread" filter on a threads folder. */
+	unread?: boolean;
 	/** Approval request open in the reading pane (Approvals folder, no thread). */
 	approval?: string;
 	compose?: boolean;
 	/** Mailbox the compose dialog sends from. */
 	from?: string;
 	to?: string;
+	cc?: string;
 	subject?: string;
 	threadId?: string;
 	draftId?: string;
@@ -61,10 +65,12 @@ export function parseInboxSearch(search: Record<string, unknown>): InboxSearch {
 		mailbox: str(search.mailbox),
 		folder: folder === "inbox" ? undefined : folder,
 		q: str(search.q),
+		unread: search.unread === true || search.unread === "true" ? true : undefined,
 		approval: folder === "approvals" ? str(search.approval) : undefined,
 		compose: search.compose === true || search.compose === "true" ? true : undefined,
 		from: str(search.from),
 		to: str(search.to),
+		cc: str(search.cc),
 		subject: str(search.subject),
 		threadId: str(search.threadId),
 		draftId: str(search.draftId),
@@ -73,9 +79,9 @@ export function parseInboxSearch(search: Record<string, unknown>): InboxSearch {
 	};
 }
 
-/** Only the list state (scope, folder, query) — what a thread link should carry. */
+/** Only the list state (scope, folder, query, filter) — what a thread link should carry. */
 export function listSearch(search: InboxSearch): InboxSearch {
-	return { mailbox: search.mailbox, folder: search.folder, q: search.q };
+	return { mailbox: search.mailbox, folder: search.folder, q: search.q, unread: search.unread };
 }
 
 /** Search params with the compose dialog closed. */
@@ -85,6 +91,7 @@ export function withoutCompose(search: InboxSearch): InboxSearch {
 		compose: undefined,
 		from: undefined,
 		to: undefined,
+		cc: undefined,
 		subject: undefined,
 		threadId: undefined,
 		draftId: undefined,

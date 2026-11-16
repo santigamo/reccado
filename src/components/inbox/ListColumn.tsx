@@ -1,23 +1,33 @@
 import { Link } from "@tanstack/react-router";
 import {
 	AlertTriangle,
+	Archive,
+	ArchiveRestore,
 	Check,
+	CheckCheck,
 	FileChartColumn,
 	FileText,
 	Inbox,
 	KeyRound,
 	Loader2,
+	Mail,
+	MailOpen,
+	Minus,
+	MoreHorizontal,
+	PanelLeftClose,
 	RefreshCw,
 	SearchX,
 	ShieldCheck,
 	Trash2,
 	X,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useRef } from "react";
 import { isThreadUnread, ThreadListItem } from "#/components/mail/ThreadListItem";
 import { Avatar } from "#/components/ui/Avatar";
+import { Button } from "#/components/ui/Button";
 import { CenteredSpinner, EmptyState, ErrorState, InlineNotice } from "#/components/ui/Feedback";
 import { IconButton } from "#/components/ui/IconButton";
+import { Menu } from "#/components/ui/Menu";
 import { MailboxTag, Pill } from "#/components/ui/Pill";
 import {
 	approvalTitle,
@@ -43,9 +53,18 @@ import {
 	type UnifiedDraft,
 	type UnifiedThreadRow,
 } from "#/lib/use-unified-mail";
-import { useInbox } from "./inbox-context";
+import { rowKey, useInbox } from "./inbox-context";
 
 type ResourceState<T> = { data: T; loading: boolean; error: string | null; refetch: () => void };
+
+type PagedResource<T> = ResourceState<T> & {
+	loadMore: () => void;
+	loadingMore: boolean;
+	loadMoreError: string | null;
+};
+
+/** Scroll position of each list, kept across opening a conversation and coming back. */
+const scrollMemory = new Map<string, number>();
 
 function ListFrame({
 	heading,
@@ -54,6 +73,11 @@ function ListFrame({
 	children,
 	notice,
 	headingNote,
+	leading,
+	trailing,
+	bar,
+	scrollRef,
+	onScroll,
 }: {
 	heading: string;
 	/** Shown after the heading instead of the scope ("oldest first"). */
@@ -62,26 +86,97 @@ function ListFrame({
 	onRefresh?: () => void;
 	children: ReactNode;
 	notice?: ReactNode;
+	/** Before the heading (the select-all checkbox). */
+	leading?: ReactNode;
+	/** After the heading, before Refresh (filters, the list menu). */
+	trailing?: ReactNode;
+	/** Replaces the whole header row (the selection bar). */
+	bar?: ReactNode;
+	scrollRef?: React.Ref<HTMLDivElement>;
+	onScroll?: () => void;
 }) {
 	return (
 		<section
 			aria-label={`${heading} · ${scopeLabel}`}
 			className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-t-card border border-b-0 border-border-card bg-panel"
 		>
-			<div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-border-card pr-3 pl-5">
-				<h2 className="m-0 min-w-0 flex-1 truncate text-sender font-normal tracking-[-0.01em] text-text-muted">
-					{heading} <span className="text-text-faint">· {headingNote ?? scopeLabel}</span>
-				</h2>
-				{onRefresh ? (
-					<IconButton title="Refresh" size="sm" onClick={onRefresh}>
-						<RefreshCw />
-					</IconButton>
-				) : null}
-			</div>
+			{bar ?? (
+				<div
+					className={cn(
+						"flex h-12 shrink-0 items-center gap-1.5 border-b border-border-card pr-3",
+						leading ? "pl-[27px]" : "pl-5",
+					)}
+				>
+					{leading}
+					<h2
+						className={cn(
+							"m-0 min-w-0 flex-1 truncate text-sender font-normal tracking-[-0.01em] text-text-muted",
+							leading && "pl-1",
+						)}
+						title={`${heading} · ${headingNote ?? scopeLabel}`}
+					>
+						{heading} <span className="text-text-faint">· {headingNote ?? scopeLabel}</span>
+					</h2>
+					{trailing}
+					{onRefresh ? (
+						<IconButton title="Refresh" size="sm" onClick={onRefresh}>
+							<RefreshCw />
+						</IconButton>
+					) : null}
+				</div>
+			)}
 			{notice}
-			<div className="app-scroll min-h-0 flex-1 overflow-y-auto">{children}</div>
+			<div
+				ref={scrollRef}
+				onScroll={onScroll}
+				className="app-scroll min-h-0 flex-1 overflow-y-auto"
+			>
+				{children}
+			</div>
 		</section>
 	);
+}
+
+/** Square checkbox drawn like the rows' (checked, mixed, or empty). */
+function SelectBox({
+	state,
+	label,
+	onClick,
+}: {
+	state: "on" | "off" | "mixed";
+	label: string;
+	onClick: () => void;
+}) {
+	return (
+		// biome-ignore lint/a11y/useSemanticElements: drawn to match the rows; role and aria-checked carry the semantics.
+		<button
+			type="button"
+			role="checkbox"
+			aria-checked={state === "mixed" ? "mixed" : state === "on"}
+			aria-label={label}
+			title={label}
+			onClick={onClick}
+			className="-ml-[7px] flex size-8 shrink-0 items-center justify-center rounded-full outline-none hover:bg-hover focus-visible:shadow-[0_0_0_2px_color-mix(in_srgb,var(--color-brand)_55%,transparent)]"
+		>
+			<span
+				aria-hidden="true"
+				className={cn(
+					"flex size-[18px] items-center justify-center rounded-[5px] border-[1.5px]",
+					state === "off" ? "border-[#9AA3B0] bg-panel" : "border-brand bg-brand text-white",
+				)}
+			>
+				{state === "on" ? <Check className="size-3" strokeWidth={3} /> : null}
+				{state === "mixed" ? <Minus className="size-3" strokeWidth={3} /> : null}
+			</span>
+		</button>
+	);
+}
+
+/** True when a key press belongs to a field, not to the list shortcuts. */
+function typingInto(target: EventTarget | null): boolean {
+	const el = target as HTMLElement | null;
+	if (!el) return false;
+	return el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName);
 }
 
 function FailedNotice({ failed, onRetry }: { failed: string[]; onRetry: () => void }) {
@@ -109,29 +204,178 @@ export function ThreadsList({
 	resource,
 	selected,
 	query,
+	unreadOnly,
+	onToggleUnread,
+	onMarkAllRead,
 	onAction,
+	onSelectionAction,
 }: {
 	heading: string;
 	scopeLabel: string;
-	resource: ResourceState<Unified<UnifiedThreadRow>>;
+	resource: PagedResource<Unified<UnifiedThreadRow>>;
 	selected?: { mailboxId: string; threadId: string };
 	query?: string;
+	/** The Unread filter is on. */
+	unreadOnly: boolean;
+	onToggleUnread: () => void;
+	onMarkAllRead: () => void;
 	onAction: (row: UnifiedThreadRow, action: MessageAction) => void;
+	onSelectionAction: (action: MessageAction) => void;
 }) {
-	const { folder, colorOf, mailboxById, approvals, search, noMailYet, folderTotal } = useInbox();
-	const { data, loading, error, refetch } = resource;
+	const {
+		folder,
+		colorOf,
+		mailboxById,
+		approvals,
+		search,
+		noMailYet,
+		selection,
+		toggleSelected,
+		setSelection,
+		searchEverywhere,
+		layout,
+	} = useInbox();
+	const { data, loading, error, refetch, loadMore, loadingMore, loadMoreError } = resource;
 	const folderState = folder.kind === "threads" ? folder.state : null;
+	const scrollRef = useRef<HTMLDivElement>(null);
+	const sentinelRef = useRef<HTMLDivElement>(null);
+	const memoryKey = `${search.mailbox ?? ""}|${search.folder ?? "inbox"}|${query ?? ""}|${unreadOnly}`;
+	const keys = data.items.map((row) => rowKey(row.mailbox_id, row.id));
+	const selectedCount = keys.filter((k) => selection.has(k)).length;
+	const selecting = selection.size > 0;
+	const restorable = folderState === "archive" || folderState === "trash";
+
+	// Come back to where you were: the list's scroll survives opening a
+	// conversation (and the phone layout hiding the list), and the open row
+	// stays in view as j/k / next / previous move through the list.
+	const selectedKey = selected ? rowKey(selected.mailboxId, selected.threadId) : null;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: closing a conversation (selectedKey) is when a phone shows the list again.
+	useLayoutEffect(() => {
+		const box = scrollRef.current;
+		if (!box || loading) return;
+		const saved = scrollMemory.get(memoryKey);
+		if (saved !== undefined && box.scrollTop === 0 && box.offsetParent !== null)
+			box.scrollTop = saved;
+	}, [memoryKey, loading, selectedKey]);
+	useEffect(() => {
+		if (!selectedKey) return;
+		const box = scrollRef.current;
+		if (!box || box.offsetParent === null) return;
+		box.querySelector(`[data-row-key="${CSS.escape(selectedKey)}"]`)?.scrollIntoView({
+			block: "nearest",
+		});
+	}, [selectedKey]);
+
+	// Infinite scroll, with a button as the fallback.
+	const hasMore = data.truncated && !query;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a longer list re-arms the observer (the sentinel may still be in view).
+	useEffect(() => {
+		const box = scrollRef.current;
+		const sentinel = sentinelRef.current;
+		if (!box || !sentinel || !hasMore || loadMoreError) return;
+		const observer = new IntersectionObserver(
+			(entries) => {
+				if (entries.some((e) => e.isIntersecting)) loadMore();
+			},
+			{ root: box, rootMargin: "400px 0px" },
+		);
+		observer.observe(sentinel);
+		return () => observer.disconnect();
+	}, [hasMore, loadMore, loadMoreError, data.items.length]);
+
+	// List keyboard (no conversation open): j/k move, x select, e / # act on the
+	// selection or the focused row, Shift+I / Shift+U read state, Esc clears.
+	const keysRef = useRef<(event: KeyboardEvent) => void>(() => {});
+	keysRef.current = (event) => {
+		if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+		if (typingInto(event.target) || search.compose || document.querySelector('[role="dialog"]'))
+			return;
+		const box = scrollRef.current;
+		if (!box || box.offsetParent === null) return;
+		const links = Array.from(box.querySelectorAll<HTMLAnchorElement>("[data-thread-link]"));
+		const focused = links.findIndex((a) => a.closest("li")?.contains(document.activeElement));
+		const focusedKey =
+			focused >= 0 ? (links[focused]!.closest("li")?.getAttribute("data-row-key") ?? null) : null;
+		const key = event.key;
+		if (key === "Escape" && selecting) {
+			setSelection([]);
+		} else if (selected) {
+			return; // The open conversation owns the other keys.
+		} else if (key === "j" || key === "k") {
+			const next =
+				links[
+					focused < 0
+						? 0
+						: Math.min(links.length - 1, Math.max(0, focused + (key === "j" ? 1 : -1)))
+				];
+			next?.focus();
+			next?.scrollIntoView({ block: "nearest" });
+		} else if (key === "x" && focusedKey) {
+			toggleSelected(focusedKey);
+		} else if (
+			(key === "e" || key === "#" || key === "I" || key === "U") &&
+			(selecting || focusedKey)
+		) {
+			const action: MessageAction =
+				key === "e"
+					? restorable
+						? "restore_inbox"
+						: "archive"
+					: key === "#"
+						? "trash"
+						: key === "I"
+							? "mark_read"
+							: "mark_unread";
+			if (key === "#" && folderState === "trash") return;
+			if (selecting) onSelectionAction(action);
+			else {
+				const row = data.items.find((r) => rowKey(r.mailbox_id, r.id) === focusedKey);
+				if (row) {
+					// Keep the keyboard place: the next row takes the focus.
+					if (action !== "mark_read" && action !== "mark_unread") {
+						(links[focused + 1] ?? links[focused - 1])?.focus();
+					}
+					onAction(row, action);
+				}
+			}
+		} else return;
+		event.preventDefault();
+	};
+	useEffect(() => {
+		const onKey = (event: KeyboardEvent) => keysRef.current(event);
+		document.addEventListener("keydown", onKey);
+		return () => document.removeEventListener("keydown", onKey);
+	}, []);
 
 	let body: ReactNode;
 	if (loading) body = <CenteredSpinner label="Loading conversations…" />;
 	else if (error)
 		body = <ErrorState message={`Could not load mail (${error}).`} onRetry={refetch} />;
 	else if (data.items.length === 0) {
+		const everywhere = Boolean(search.mailbox) || folder.key !== "all";
 		body = query ? (
 			<EmptyState
 				icon={<SearchX />}
 				title="No matches"
-				hint={`Nothing in ${heading.toLowerCase()} matches “${query}”.`}
+				hint={`Nothing in ${heading.replace(/^Results in /, "")} of ${scopeLabel} matches “${query}”${unreadOnly ? " and is unread" : ""}.`}
+				action={
+					everywhere ? (
+						<Button variant="secondary" size="sm" onClick={searchEverywhere}>
+							Search all mail in every mailbox
+						</Button>
+					) : undefined
+				}
+			/>
+		) : unreadOnly ? (
+			<EmptyState
+				icon={<CheckCheck />}
+				className="justify-start pt-24"
+				title="No unread conversations"
+				action={
+					<Button variant="secondary" size="sm" onClick={onToggleUnread}>
+						Show all
+					</Button>
+				}
 			/>
 		) : folder.key === "reports" ? (
 			<EmptyState
@@ -161,12 +405,13 @@ export function ThreadsList({
 	} else {
 		body = (
 			<>
-				<ul className="m-0 list-none p-0">
+				<ul className="m-0 list-none p-0" aria-label={heading}>
 					{data.items.map((row) => {
 						const mailbox = mailboxById(row.mailbox_id);
+						const key = rowKey(row.mailbox_id, row.id);
 						return (
 							<ThreadListItem
-								key={`${row.mailbox_id}:${row.id}`}
+								key={key}
 								thread={row}
 								mailboxId={row.mailbox_id}
 								search={search}
@@ -175,6 +420,9 @@ export function ThreadsList({
 								selected={selected?.mailboxId === row.mailbox_id && selected.threadId === row.id}
 								awaitingApproval={approvalsForThread(approvals, row.mailbox_id, row.id).length > 0}
 								folderState={folderState}
+								checked={selection.has(key)}
+								selecting={selecting}
+								onCheck={(range) => toggleSelected(key, range)}
 								onArchive={() => onAction(row, "archive")}
 								onTrash={() => onAction(row, "trash")}
 								onRestore={() => onAction(row, "restore_inbox")}
@@ -185,22 +433,153 @@ export function ThreadsList({
 						);
 					})}
 				</ul>
-				{data.truncated ? (
-					<p className="m-0 px-5 py-4 text-center text-label text-text-muted">
-						{folderTotal !== null && folderTotal > data.items.length
-							? `Showing the latest ${formatCount(data.items.length)} of ${formatCount(folderTotal)} conversations. Search to find older mail.`
-							: "Showing the latest conversations of each mailbox. Search to find older mail."}
+				{hasMore ? (
+					<div ref={sentinelRef} className="flex justify-center px-5 py-4">
+						{loadMoreError ? (
+							<p className="m-0 text-center text-label text-danger">
+								Could not load older conversations.{" "}
+								<button type="button" className="font-medium underline" onClick={loadMore}>
+									Retry
+								</button>
+							</p>
+						) : (
+							<Button variant="secondary" size="sm" onClick={loadMore} disabled={loadingMore}>
+								{loadingMore ? "Loading…" : "Load older conversations"}
+							</Button>
+						)}
+					</div>
+				) : data.items.length > 8 && !query ? (
+					<p className="m-0 px-5 py-4 text-center text-label text-text-faint">
+						That's everything{unreadOnly ? " unread" : ""} in {heading.toLowerCase()}.
 					</p>
 				) : null}
 			</>
 		);
 	}
 
+	const allState = selectedCount === 0 ? "off" : selectedCount === keys.length ? "on" : "mixed";
+	const selectAll = () => setSelection(allState === "on" ? [] : keys);
+	const selectionBar = selecting ? (
+		<div
+			role="toolbar"
+			aria-label="Selected conversations"
+			className="flex h-12 shrink-0 items-center gap-1 border-b border-border-card bg-row-current pr-2 pl-[27px]"
+		>
+			<SelectBox
+				state={allState}
+				label={allState === "on" ? "Clear selection" : "Select all in view"}
+				onClick={selectAll}
+			/>
+			<span
+				aria-live="polite"
+				className="min-w-0 flex-1 truncate pl-1 text-body font-medium text-ink"
+			>
+				{formatCount(selection.size)} selected
+			</span>
+			{restorable ? (
+				<IconButton
+					title="Move to inbox"
+					size="sm"
+					onClick={() => onSelectionAction("restore_inbox")}
+				>
+					<ArchiveRestore />
+				</IconButton>
+			) : (
+				<IconButton
+					title="Archive (e)"
+					aria-label="Archive"
+					size="sm"
+					onClick={() => onSelectionAction("archive")}
+				>
+					<Archive />
+				</IconButton>
+			)}
+			{folderState !== "trash" ? (
+				<IconButton
+					title="Delete (#)"
+					aria-label="Delete"
+					size="sm"
+					onClick={() => onSelectionAction("trash")}
+				>
+					<Trash2 />
+				</IconButton>
+			) : null}
+			<IconButton title="Mark as read" size="sm" onClick={() => onSelectionAction("mark_read")}>
+				<MailOpen />
+			</IconButton>
+			<IconButton title="Mark as unread" size="sm" onClick={() => onSelectionAction("mark_unread")}>
+				<Mail />
+			</IconButton>
+			<IconButton
+				title="Clear selection (Esc)"
+				aria-label="Clear selection"
+				size="sm"
+				onClick={() => setSelection([])}
+			>
+				<X />
+			</IconButton>
+		</div>
+	) : undefined;
+
 	return (
 		<ListFrame
 			heading={heading}
 			scopeLabel={scopeLabel}
 			onRefresh={refetch}
+			scrollRef={scrollRef}
+			onScroll={() => {
+				const box = scrollRef.current;
+				if (box && box.offsetParent !== null) scrollMemory.set(memoryKey, box.scrollTop);
+			}}
+			bar={selectionBar}
+			leading={
+				data.items.length > 0 ? (
+					<SelectBox state="off" label="Select all in view" onClick={selectAll} />
+				) : undefined
+			}
+			trailing={
+				<>
+					<button
+						type="button"
+						aria-pressed={unreadOnly}
+						onClick={onToggleUnread}
+						title={unreadOnly ? "Show all conversations" : "Show only unread conversations"}
+						className={cn(
+							"inline-flex h-7 shrink-0 items-center rounded-pill px-2.5 text-label font-medium",
+							unreadOnly
+								? "bg-brand text-white hover:bg-brand-hover"
+								: "text-text-muted hover:bg-hover hover:text-text",
+						)}
+					>
+						Unread
+					</button>
+					<Menu
+						label="List actions"
+						align="end"
+						triggerClassName="inline-flex h-7 w-7 items-center justify-center rounded-control text-icon hover:bg-hover hover:text-text [&_svg]:size-4"
+						trigger={<MoreHorizontal />}
+						items={[
+							{
+								key: "read-all",
+								label: "Mark all as read",
+								icon: <CheckCheck />,
+								onSelect: onMarkAllRead,
+							},
+						]}
+					/>
+					{selected ? (
+						<IconButton
+							title="Hide the list (])"
+							aria-label="Hide the list"
+							size="sm"
+							className="max-[719px]:hidden"
+							onClick={layout.toggleList}
+						>
+							<PanelLeftClose />
+						</IconButton>
+					) : null}
+				</>
+			}
 			notice={!loading && !error ? <FailedNotice failed={data.failed} onRetry={refetch} /> : null}
 		>
 			{body}

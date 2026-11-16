@@ -1,11 +1,11 @@
 import { Link } from "@tanstack/react-router";
-import { Archive, ArchiveRestore, Mail, MailOpen, Paperclip, Trash2 } from "lucide-react";
-import type { ReactElement } from "react";
+import { Archive, ArchiveRestore, Check, Mail, MailOpen, Paperclip, Trash2 } from "lucide-react";
+import type { MouseEvent, ReactElement } from "react";
 import { Avatar } from "#/components/ui/Avatar";
 import { IconButton } from "#/components/ui/IconButton";
 import { MailboxTag, Pill } from "#/components/ui/Pill";
 import { cn } from "#/lib/cn";
-import { formatListDate } from "#/lib/dates";
+import { formatFullDate, formatListDate } from "#/lib/dates";
 import { type InboxSearch, listSearch } from "#/lib/inbox-search";
 import {
 	displayName,
@@ -91,6 +91,9 @@ export function ThreadListItem({
 	onTrash,
 	onRestore,
 	onToggleRead,
+	checked = false,
+	selecting = false,
+	onCheck,
 }: {
 	thread: ThreadRow;
 	/** Owning mailbox: the row links to /inbox/<mailboxId>/<threadId>. */
@@ -108,6 +111,12 @@ export function ThreadListItem({
 	onTrash: () => void;
 	onRestore: () => void;
 	onToggleRead: () => void;
+	/** In the selection. */
+	checked?: boolean;
+	/** Some row is selected: every checkbox shows, not only on hover. */
+	selecting?: boolean;
+	/** Toggle selection; `range` for shift-click. Omit to hide the checkbox. */
+	onCheck?: (range: boolean) => void;
 }): ReactElement {
 	// Gmail: a conversation is unread while any of its messages is.
 	const isUnread = isThreadUnread(thread);
@@ -128,15 +137,40 @@ export function ThreadListItem({
 		? parseAddressList(thread.latest_to_json).join(", ") || thread.latest_from
 		: thread.latest_from;
 
+	const showCheck = Boolean(onCheck) && (checked || selecting);
+	// Selecting text in a row (to copy a subject) is not a click on it.
+	function onLinkClick(event: MouseEvent<HTMLAnchorElement>) {
+		const selection = typeof window !== "undefined" ? window.getSelection() : null;
+		if (
+			selection &&
+			!selection.isCollapsed &&
+			selection.toString().trim() &&
+			selection.anchorNode &&
+			event.currentTarget.contains(selection.anchorNode)
+		) {
+			event.preventDefault();
+			return;
+		}
+		// While selecting, a click on a row adds it (Gmail on phones); modifier
+		// clicks keep the browser's open-in-new-tab.
+		if (selecting && onCheck && !event.metaKey && !event.ctrlKey && event.button === 0) {
+			event.preventDefault();
+			onCheck(event.shiftKey);
+		}
+	}
+
 	return (
 		<li
+			data-row-key={`${mailboxId}:${thread.id}`}
 			className={cn(
 				"group relative flex border-b border-border-card",
-				selected
+				checked
 					? "bg-row-current"
-					: isUnread
-						? "bg-panel hover:bg-[#FAFBFC]"
-						: "bg-row-read hover:bg-row-read-hover",
+					: selected
+						? "bg-row-current"
+						: isUnread
+							? "bg-panel hover:bg-[#FAFBFC]"
+							: "bg-row-read hover:bg-row-read-hover",
 			)}
 			style={{ boxShadow: `inset ${selected ? 4 : 3}px 0 0 ${color.css}` }}
 		>
@@ -145,10 +179,23 @@ export function ThreadListItem({
 				params={{ mailboxId, threadId: thread.id }}
 				search={listSearch(search)}
 				aria-current={selected ? "true" : undefined}
+				data-thread-link=""
+				onClick={onLinkClick}
 				className="flex min-w-0 flex-1 items-start gap-3 pt-4 pr-5 pb-3.5 pl-[11px] text-left no-underline outline-none focus-visible:shadow-[inset_0_0_0_2px_color-mix(in_srgb,var(--color-brand)_55%,transparent)]"
 			>
 				<UnreadDot unread={isUnread} className="-mr-1 h-5" />
-				<Avatar from={face.from} name={face.name} size="md" />
+				<Avatar
+					from={face.from}
+					name={face.name}
+					size="md"
+					className={cn(
+						onCheck && "transition-opacity",
+						showCheck
+							? "opacity-0"
+							: onCheck &&
+									"pointer-fine:group-hover:opacity-0 group-has-[[data-row-check]:focus-visible]:opacity-0",
+					)}
+				/>
 				<div className="flex min-w-0 flex-1 flex-col gap-0.5">
 					<div className="flex items-center gap-1.5">
 						<span
@@ -178,14 +225,16 @@ export function ThreadListItem({
 						) : null}
 						<span className="min-w-2 flex-1" />
 						{isUnread ? <span className="sr-only">Unread.</span> : null}
-						<span
+						<time
+							dateTime={thread.latest_received_at}
+							title={formatFullDate(thread.latest_received_at)}
 							className={cn(
 								"shrink-0 text-label leading-5 transition-opacity group-focus-within:opacity-0 group-hover:opacity-0",
 								isUnread ? "font-semibold text-ink" : "text-text-muted",
 							)}
 						>
 							{formatListDate(thread.latest_received_at)}
-						</span>
+						</time>
 					</div>
 					<p
 						className={cn(
@@ -208,6 +257,34 @@ export function ThreadListItem({
 					</div>
 				</div>
 			</Link>
+
+			{onCheck ? (
+				// biome-ignore lint/a11y/useSemanticElements: drawn over the avatar (Gmail); role and aria-checked carry the semantics.
+				<button
+					type="button"
+					role="checkbox"
+					aria-checked={checked}
+					aria-label={`Select conversation: ${subject}`}
+					data-row-check=""
+					onClick={(event) => onCheck(event.shiftKey)}
+					className={cn(
+						"absolute top-4 left-[27px] flex size-8 items-center justify-center rounded-full outline-none transition-opacity focus-visible:shadow-[0_0_0_2px_color-mix(in_srgb,var(--color-brand)_55%,transparent)]",
+						showCheck
+							? "opacity-100"
+							: "opacity-0 focus-visible:opacity-100 pointer-fine:group-hover:opacity-100",
+					)}
+				>
+					<span
+						aria-hidden="true"
+						className={cn(
+							"flex size-[18px] items-center justify-center rounded-[5px] border-[1.5px]",
+							checked ? "border-brand bg-brand text-white" : "border-[#9AA3B0] bg-panel",
+						)}
+					>
+						{checked ? <Check className="size-3" strokeWidth={3} /> : null}
+					</span>
+				</button>
+			) : null}
 
 			<div className="pointer-events-none absolute top-3 right-3 flex items-center gap-0.5 rounded-control border border-border-card bg-panel opacity-0 shadow-card transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
 				{isRestorable ? (

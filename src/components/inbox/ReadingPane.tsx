@@ -10,8 +10,13 @@ import {
 	FileCode2,
 	Forward,
 	Mail,
+	Maximize2,
+	Minimize2,
 	MoreHorizontal,
+	PanelLeftOpen,
+	Printer,
 	Reply,
+	ReplyAll,
 	Trash2,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
@@ -22,20 +27,26 @@ import { CenteredSpinner, EmptyState, ErrorState } from "#/components/ui/Feedbac
 import { IconButton } from "#/components/ui/IconButton";
 import { Menu } from "#/components/ui/Menu";
 import { Pill } from "#/components/ui/Pill";
+import { useToast } from "#/components/ui/Toast";
 import { cn } from "#/lib/cn";
 import {
 	cancelDraft,
 	type Draft,
-	extractEmail,
 	fetchDrafts,
 	type Mailbox,
 	type Message,
 	type MessageAction,
-	moveThread,
-	parseAddressList,
 	rawMessageUrl,
+	restoreDraft,
 } from "#/lib/mail";
 import { tint } from "#/lib/mailbox-color";
+import {
+	forwardSubject,
+	type ReplyMode,
+	replyRecipients,
+	replySubject,
+	replyTarget,
+} from "#/lib/reply";
 import { approvalsForThread } from "#/lib/use-approvals";
 import { useAsyncResource, useThread } from "#/lib/use-mail";
 import { formatCount } from "#/lib/use-unified-mail";
@@ -230,15 +241,6 @@ function typingInto(target: EventTarget | null): boolean {
 	);
 }
 
-/** Reply targets the last inbound message; falls back to the latest one. */
-function findReplyTarget(messages: Message[]): Message | undefined {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const m = messages[i];
-		if (m && m.direction === "inbound") return m;
-	}
-	return messages.at(-1);
-}
-
 /** An open conversation: toolbar, tinted header, messages, approval slots. */
 export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadId: string }) {
 	const inbox = useInbox();
@@ -254,7 +256,13 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 		approvals,
 		setThreadRead,
 		guessThreadRead,
+		moveThreads,
+		markThreadsRead,
+		ownAddresses,
+		layout,
 	} = inbox;
+	const wide = layout.mailboxesFolded && layout.listFolded;
+	const toast = useToast();
 	const { data, loading, error, refetch } = useThread(mailboxId, threadId);
 	const draftsRes = useAsyncResource<Draft[]>(() => fetchDrafts(mailboxId), [], [mailboxId]);
 	const color = colorOf(mailboxId);
@@ -342,44 +350,54 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 		setUnfolded(false);
 	}, [threadId]);
 
-	/** Apply to every message, then move on: to the neighbour, or back to the list. */
-	async function act(action: MessageAction, then: "next" | "close") {
-		await moveThread(mailboxId, threadId, action);
-		const target = then === "next" ? (next ?? prev) : undefined;
+	/**
+	 * Move the conversation, then move on at once: to the neighbour, or back to
+	 * the list. The toast that follows carries Undo; a failure says so.
+	 */
+	function act(action: MessageAction) {
+		const target = next ?? prev;
 		if (target) openThread(target.mailbox_id, target.id);
 		else closeThread();
-		refresh();
+		void moveThreads([{ mailboxId, threadId }], action);
 	}
 
-	function reply() {
-		if (ownReplyDraft) {
+	function markUnread() {
+		closeThread();
+		void markThreadsRead([{ mailboxId, threadId, messageIds: messages.map((m) => m.id) }], false);
+	}
+
+	// Who answers: Reply / Reply all target the newest message someone else sent
+	// (its Reply-To first), or a given message from its own menu.
+	const replyTo = replyTarget(messages);
+	const replyAllAdds = replyTo
+		? replyRecipients(replyTo, "reply_all", ownAddresses).cc.length > 0 ||
+			replyRecipients(replyTo, "reply_all", ownAddresses).to.length > 1
+		: false;
+
+	function reply(mode: ReplyMode = "reply", message: Message | undefined = replyTo) {
+		if (ownReplyDraft && message === replyTo) {
 			openCompose({ from: mailboxId, draftId: ownReplyDraft.id });
 			return;
 		}
-		const target = findReplyTarget(messages);
-		const subject = target?.subject ?? "";
-		// Replying to your own last message follows up with the same people.
-		const to =
-			target?.direction === "outbound"
-				? parseAddressList(target.to_json).join(", ")
-				: extractEmail(target?.from_addr);
+		if (!message) return;
+		const { to, cc } = replyRecipients(message, mode, ownAddresses);
 		openCompose({
 			from: mailboxId,
 			threadId,
-			to,
-			subject: /^re:/i.test(subject) ? subject : `Re: ${subject}`,
-			quote: target?.id,
+			to: to.join(", "),
+			cc: cc.length > 0 ? cc.join(", ") : undefined,
+			subject: replySubject(message.subject ?? messages[0]?.subject),
+			quote: message.id,
 			mode: "reply",
 		});
 	}
 
-	function forward() {
-		const subject = latest?.subject ?? "";
+	function forward(message: Message | undefined = latest) {
 		openCompose({
 			from: mailboxId,
 			threadId,
-			subject: /^fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`,
-			quote: latest?.id,
+			subject: forwardSubject(message?.subject ?? messages[0]?.subject),
+			quote: message?.id,
 			mode: "forward",
 		});
 	}
@@ -396,9 +414,11 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 		else if (key === "j" && next) openThread(next.mailbox_id, next.id);
 		else if (key === "k" && prev) openThread(prev.mailbox_id, prev.id);
 		else if (!data) return;
-		else if (key === "e") void act(isRestorable ? "restore_inbox" : "archive", "next");
-		else if (key === "#" && state !== "trash") void act("trash", "next");
+		else if (key === "e") act(isRestorable ? "restore_inbox" : "archive");
+		else if (key === "#" && state !== "trash") act("trash");
+		else if (key === "U") markUnread();
 		else if (key === "r" && threadApprovals.length === 0) reply();
+		else if (key === "a" && threadApprovals.length === 0) reply("reply_all");
 		else if (key === "f" && threadApprovals.length === 0) forward();
 		else return;
 		event.preventDefault();
@@ -414,33 +434,40 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 			<IconButton title="Back to list" className="min-[720px]:hidden" onClick={closeThread}>
 				<ArrowLeft />
 			</IconButton>
+			{layout.listFolded ? (
+				<IconButton
+					title="Show the list (])"
+					aria-label="Show the list"
+					className="max-[719px]:hidden"
+					onClick={layout.toggleList}
+				>
+					<PanelLeftOpen />
+				</IconButton>
+			) : null}
 			{data ? (
 				<>
 					{isRestorable ? (
-						<IconButton title="Move to inbox" onClick={() => void act("restore_inbox", "next")}>
+						<IconButton
+							title="Move to inbox (e)"
+							aria-label="Move to inbox"
+							onClick={() => act("restore_inbox")}
+						>
 							<ArchiveRestore />
 						</IconButton>
 					) : (
-						<IconButton title="Archive" onClick={() => void act("archive", "next")}>
+						<IconButton title="Archive (e)" aria-label="Archive" onClick={() => act("archive")}>
 							<Archive />
 						</IconButton>
 					)}
 					{state !== "trash" ? (
-						<IconButton title="Delete" onClick={() => void act("trash", "next")}>
+						<IconButton title="Delete (#)" aria-label="Delete" onClick={() => act("trash")}>
 							<Trash2 />
 						</IconButton>
 					) : null}
 					<IconButton
-						title="Mark as unread"
-						onClick={() => {
-							void setThreadRead(
-								mailboxId,
-								threadId,
-								false,
-								messages.map((m) => m.id),
-							);
-							closeThread();
-						}}
+						title="Mark as unread (Shift+U)"
+						aria-label="Mark as unread"
+						onClick={markUnread}
 					>
 						<Mail />
 					</IconButton>
@@ -449,8 +476,20 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 						triggerClassName="inline-flex h-8 w-8 items-center justify-center rounded-control text-icon hover:bg-hover hover:text-text [&_svg]:size-[17px]"
 						trigger={<MoreHorizontal />}
 						items={[
-							{ key: "reply", label: "Reply", icon: <Reply />, onSelect: reply },
-							{ key: "forward", label: "Forward", icon: <Forward />, onSelect: forward },
+							{ key: "reply", label: "Reply", icon: <Reply />, onSelect: () => reply() },
+							{
+								key: "reply-all",
+								label: "Reply all",
+								icon: <ReplyAll />,
+								onSelect: () => reply("reply_all"),
+							},
+							{ key: "forward", label: "Forward", icon: <Forward />, onSelect: () => forward() },
+							{
+								key: "print",
+								label: "Print",
+								icon: <Printer />,
+								onSelect: () => window.print(),
+							},
 							...(latest
 								? [
 										{
@@ -466,6 +505,16 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 				</>
 			) : null}
 			<div className="flex-1" />
+			<IconButton
+				title={wide ? "Show the columns again" : "Read wider (hide mailboxes and list)"}
+				aria-label={wide ? "Show the columns again" : "Read wider"}
+				aria-pressed={wide}
+				size="sm"
+				className="max-[719px]:hidden"
+				onClick={layout.toggleWide}
+			>
+				{wide ? <Minimize2 /> : <Maximize2 />}
+			</IconButton>
 			{index >= 0 ? (
 				<span className="text-label text-text-muted tabular-nums">
 					{formatCount(index + 1)} of {formatCount(Math.max(folderTotal ?? 0, threads.length))}
@@ -517,7 +566,7 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 		const hidden = foldTo - foldFrom + 1;
 		const fold = !unfolded && hidden >= FOLD_AFTER;
 		content = (
-			<div ref={scrollRef} className="app-scroll min-h-0 flex-1 overflow-y-auto">
+			<div ref={scrollRef} data-print-area="" className="app-scroll min-h-0 flex-1 overflow-y-auto">
 				<header
 					className="flex flex-col gap-2 border-b px-4 pt-5 pb-[18px] sm:px-7"
 					style={{ backgroundColor: tint(color, 7), borderBottomColor: tint(color, 16) }}
@@ -541,9 +590,31 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 						draft={draft}
 						onOpen={() => openCompose({ from: mailboxId, draftId: draft.id })}
 						onDiscard={async () => {
-							await cancelDraft(mailboxId, draft.id).catch(() => undefined);
-							draftsRes.refetch();
-							refresh();
+							try {
+								await cancelDraft(mailboxId, draft.id);
+							} catch {
+								toast.show({ tone: "danger", message: "Could not discard the draft. Try again." });
+								return;
+							} finally {
+								draftsRes.refetch();
+								refresh();
+							}
+							toast.show({
+								message: "Draft discarded",
+								action:
+									draft.origin === "mcp"
+										? undefined
+										: {
+												label: "Undo",
+												onClick: async () => {
+													await restoreDraft(mailboxId, draft.id).catch(() =>
+														toast.show({ tone: "danger", message: "Could not restore the draft." }),
+													);
+													draftsRes.refetch();
+													refresh();
+												},
+											},
+							});
 						}}
 					/>
 				))}
@@ -576,6 +647,12 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 								mailboxId={mailboxId}
 								defaultOpen={openAt(i)}
 								isNew={isNew(message)}
+								ownName={mailbox?.display_name ?? null}
+								onReply={threadApprovals.length === 0 ? (mode) => reply(mode, message) : undefined}
+								onForward={threadApprovals.length === 0 ? () => forward(message) : undefined}
+								onMarkUnread={() =>
+									void markThreadsRead([{ mailboxId, threadId, messageIds: [message.id] }], false)
+								}
 							/>
 						</div>
 					);
@@ -597,16 +674,32 @@ export function ThreadView({ mailboxId, threadId }: { mailboxId: string; threadI
 				<div className="flex h-16 shrink-0 items-center gap-2 border-t border-[#ECECEC] bg-panel pr-6 pl-5 shadow-sticky max-sm:px-3 pointer-coarse:h-[72px]">
 					<Button
 						variant="primary"
-						onClick={reply}
-						className="pr-4 pl-3.5"
+						onClick={() => reply()}
+						className="pr-4 pl-3.5 max-sm:px-3"
 						title={ownReplyDraft ? "Continue your draft (r)" : "Reply (r)"}
 					>
 						<Reply />
 						{ownReplyDraft ? "Continue draft" : "Reply"}
 					</Button>
-					<Button variant="secondary" onClick={forward} className="pr-[15px] pl-[13px]">
+					{replyAllAdds && !ownReplyDraft ? (
+						<Button
+							variant="secondary"
+							onClick={() => reply("reply_all")}
+							className="pr-[15px] pl-[13px] max-sm:px-3"
+							title="Reply all (a)"
+						>
+							<ReplyAll />
+							<span className="max-[420px]:sr-only">Reply all</span>
+						</Button>
+					) : null}
+					<Button
+						variant="secondary"
+						onClick={() => forward()}
+						className="pr-[15px] pl-[13px] max-sm:px-3"
+						title="Forward (f)"
+					>
 						<Forward />
-						Forward
+						<span className="max-[420px]:sr-only">Forward</span>
 					</Button>
 					<span className="min-w-0 flex-1" />
 					<span className="flex min-w-0 items-center gap-[7px] text-label text-text-muted">

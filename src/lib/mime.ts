@@ -9,6 +9,8 @@ export type ParsedEmail = {
 	to: string[];
 	cc: string[];
 	bcc: string[];
+	/** Reply-To addresses, lowercased (empty when the header is absent). */
+	replyTo: string[];
 	subject: string | null;
 	date: string | null;
 	messageId: string | null;
@@ -58,6 +60,7 @@ export async function parseMimeBytes(rawBytes: Uint8Array): Promise<ParsedEmail>
 		to: (email.to ?? []).map(mapAddr).filter(Boolean),
 		cc: (email.cc ?? []).map(mapAddr).filter(Boolean),
 		bcc: (email.bcc ?? []).map(mapAddr).filter(Boolean),
+		replyTo: replyToAddresses(email.replyTo),
 		subject: email.subject ?? null,
 		date: email.date ?? null,
 		messageId: email.messageId ?? null,
@@ -73,6 +76,62 @@ export async function parseMimeBytes(rawBytes: Uint8Array): Promise<ParsedEmail>
 			contentId: attachment.contentId ?? null,
 			related: attachment.related ?? false,
 		})),
+	};
+}
+
+const SIMPLE_ADDRESS = /^[^\s@<>",;]+@[^\s@<>",;]+\.[^\s@<>",;]+$/;
+
+/** Most Reply-To addresses kept: the header is the sender's free choice. */
+export const MAX_REPLY_TO = 10;
+
+/**
+ * Reply-To as plain lowercased addresses: groups flattened, anything that is
+ * not a plain address dropped, duplicates removed, capped.
+ */
+export function replyToAddresses(
+	list: ReadonlyArray<{ address?: string; group?: Array<{ address?: string }> }> | null | undefined,
+): string[] {
+	const out: string[] = [];
+	for (const entry of list ?? []) {
+		const members = entry.group ?? [entry];
+		for (const member of members) {
+			const address = member.address?.trim().toLowerCase();
+			if (!address || !SIMPLE_ADDRESS.test(address) || out.includes(address)) continue;
+			out.push(address);
+			if (out.length >= MAX_REPLY_TO) return out;
+		}
+	}
+	return out;
+}
+
+/**
+ * The header block of a raw message, read from its first bytes: everything up
+ * to the first empty line (or all of it when the slice ends first). Enough for
+ * a header-only parse without reading the body.
+ */
+export function headerBlock(head: Uint8Array): Uint8Array {
+	for (let i = 0; i < head.length - 1; i++) {
+		if (head[i] === 10 && head[i + 1] === 10) return head.subarray(0, i + 1);
+		if (head[i] === 10 && head[i + 1] === 13 && head[i + 2] === 10) return head.subarray(0, i + 1);
+	}
+	return head;
+}
+
+/**
+ * From display name and Reply-To from a header block alone (see headerBlock).
+ * Both unsanitised as to the name: callers pass it through sanitizeDisplayName.
+ */
+export async function parseHeaderFields(
+	headers: Uint8Array,
+): Promise<{ fromAddress: string | null; fromName: string | null; replyTo: string[] }> {
+	const bytes = new Uint8Array(headers.length + 4);
+	bytes.set(headers);
+	bytes.set([13, 10, 13, 10], headers.length);
+	const email = await new PostalMime().parse(bytes);
+	return {
+		fromAddress: email.from?.address?.toLowerCase() ?? null,
+		fromName: email.from?.name || null,
+		replyTo: replyToAddresses(email.replyTo),
 	};
 }
 

@@ -1,20 +1,25 @@
 import { createFileRoute, Link, Outlet, useNavigate, useParams } from "@tanstack/react-router";
 import { Globe, Plus } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FolderBar } from "#/components/inbox/FolderBar";
 import {
 	type ComposePrefill,
 	InboxContext,
 	type InboxContextValue,
+	rowKey,
+	type ThreadRef,
 } from "#/components/inbox/inbox-context";
 import { ApprovalsList, DraftsList, ThreadsList } from "#/components/inbox/ListColumn";
-import { MailboxColumn } from "#/components/inbox/MailboxColumn";
+import { MailboxColumn, MailboxRail } from "#/components/inbox/MailboxColumn";
 import { ScopeSwitcher } from "#/components/inbox/ScopeSwitcher";
 import { SearchField } from "#/components/inbox/SearchField";
+import { ShortcutsDialog } from "#/components/inbox/ShortcutsDialog";
+import { useThreadActions } from "#/components/inbox/use-thread-actions";
 import { ComposeModal } from "#/components/mail/ComposeModal";
 import { AppShell } from "#/components/shell/AppShell";
 import { buttonClassName } from "#/components/ui/Button";
 import { CenteredSpinner, EmptyState, ErrorState } from "#/components/ui/Feedback";
+import { ToastProvider, useToast } from "#/components/ui/Toast";
 import { cn } from "#/lib/cn";
 import {
 	FOLDER_LABELS,
@@ -25,13 +30,16 @@ import {
 	parseInboxSearch,
 	withoutCompose,
 } from "#/lib/inbox-search";
-import { cancelDraft, FOLDERS, type MessageAction, moveThread } from "#/lib/mail";
+import { cancelDraft, FOLDERS, type MessageAction, restoreDraft } from "#/lib/mail";
 import { useMailboxColors } from "#/lib/mailbox-color";
 import { useAgentStatus } from "#/lib/use-agent-status";
 import { type PendingApproval, usePendingApprovals } from "#/lib/use-approvals";
+import { useDocumentBadge } from "#/lib/use-document-badge";
+import { useInboxLayout } from "#/lib/use-inbox-layout";
 import {
 	type MailSocketEvent,
 	MailSyncProvider,
+	useAsyncResource,
 	useMailboxes,
 	useMailboxSocket,
 } from "#/lib/use-mail";
@@ -99,17 +107,33 @@ function InboxLayout() {
 
 	return (
 		<MailSyncProvider token={syncToken}>
-			<InboxScreen
-				search={search}
-				openId={openId}
-				refresh={refresh}
-				onSocketEvent={onSocketEvent}
-				drawerOpen={drawerOpen}
-				setDrawerOpen={setDrawerOpen}
-				navigate={navigate}
-			/>
+			<ToastProvider>
+				<InboxScreen
+					search={search}
+					openId={openId}
+					refresh={refresh}
+					onSocketEvent={onSocketEvent}
+					drawerOpen={drawerOpen}
+					setDrawerOpen={setDrawerOpen}
+					navigate={navigate}
+				/>
+			</ToastProvider>
 		</MailSyncProvider>
 	);
+}
+
+/** Every address of the owner's: mailbox addresses plus aliases (never a reply-all recipient). */
+async function fetchAliasAddresses(): Promise<string[]> {
+	try {
+		const res = await fetch("/api/aliases");
+		if (!res.ok) return [];
+		const data = (await res.json()) as { aliases?: Array<{ alias_address?: string }> };
+		return (data.aliases ?? [])
+			.map((a) => String(a.alias_address ?? "").toLowerCase())
+			.filter(Boolean);
+	} catch {
+		return [];
+	}
 }
 
 type Navigate = ReturnType<typeof useNavigate>;
@@ -145,16 +169,19 @@ function InboxScreen({
 	const folderKey: InboxFolderKey = search.folder ?? "inbox";
 	const q = search.q;
 
+	const unreadOnly = folder.kind === "threads" && Boolean(search.unread);
 	const threads = useUnifiedThreads(
 		folder.kind === "threads" ? scopeIds : [],
 		folder.kind === "threads" ? folder : THREADS_FOLDER,
 		q,
+		unreadOnly,
 	);
 	const drafts = useUnifiedDrafts(folder.kind === "drafts" ? scopeIds : []);
 	// Empty Inbox: is it a brand-new mailbox (nothing in All mail either)?
 	const inboxEmpty =
 		folderKey === "inbox" &&
 		!q &&
+		!unreadOnly &&
 		!threads.loading &&
 		!threads.error &&
 		threads.data.items.length === 0;
@@ -178,6 +205,18 @@ function InboxScreen({
 		),
 	});
 	const { applyCounts } = readState;
+	const toast = useToast();
+	const actions = useThreadActions({
+		folder,
+		list: threads,
+		refresh,
+		setManyRead: readState.setManyRead,
+	});
+	const aliases = useAsyncResource<string[]>(fetchAliasAddresses, [], []);
+	const ownAddresses = useMemo(
+		() => [...new Set([...mailboxes.map((m) => m.primary_address.toLowerCase()), ...aliases.data])],
+		[mailboxes, aliases.data],
+	);
 	const summary = useMemo(() => {
 		const byMailbox: typeof rawSummary.data.byMailbox = {};
 		for (const [id, value] of Object.entries(rawSummary.data.byMailbox)) {
@@ -186,10 +225,65 @@ function InboxScreen({
 		}
 		return { ...rawSummary, data: { ...rawSummary.data, byMailbox } };
 	}, [rawSummary, applyCounts]);
-	const listResource = useMemo(
-		() => ({ ...threads, data: { ...threads.data, items: readState.rows } }),
-		[threads, readState.rows],
+	// Rows a move just took out of this folder are gone at once (see use-thread-actions).
+	const visibleRows = useMemo(
+		() =>
+			actions.hidden.size === 0
+				? readState.rows
+				: readState.rows.filter((r) => !actions.hidden.has(rowKey(r.mailbox_id, r.id))),
+		[readState.rows, actions.hidden],
 	);
+	const listResource = useMemo(
+		() => ({ ...threads, data: { ...threads.data, items: visibleRows } }),
+		[threads, visibleRows],
+	);
+
+	// Selection (checkboxes, x, shift-click). A different list starts empty.
+	const [selection, setSelectionState] = useState<ReadonlySet<string>>(() => new Set());
+	const anchorRef = useRef<string | null>(null);
+	const listKey = `${search.mailbox ?? ""}|${folderKey}|${q ?? ""}|${unreadOnly}`;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a different list clears the selection.
+	useEffect(() => {
+		setSelectionState(new Set());
+		anchorRef.current = null;
+	}, [listKey]);
+	// Rows that left the list leave the selection too.
+	useEffect(() => {
+		setSelectionState((prev) => {
+			if (prev.size === 0) return prev;
+			const present = new Set(visibleRows.map((r) => rowKey(r.mailbox_id, r.id)));
+			const next = new Set([...prev].filter((k) => present.has(k)));
+			return next.size === prev.size ? prev : next;
+		});
+	}, [visibleRows]);
+	const toggleSelected = useCallback(
+		(key: string, range = false) => {
+			const keys = visibleRows.map((r) => rowKey(r.mailbox_id, r.id));
+			// Read now: the updater runs later, after the anchor moves to `key`.
+			const anchor = anchorRef.current;
+			setSelectionState((prev) => {
+				const next = new Set(prev);
+				if (range && anchor && keys.includes(anchor) && keys.includes(key)) {
+					const [a, b] = [keys.indexOf(anchor), keys.indexOf(key)].sort((x, y) => x - y);
+					const on = !prev.has(key);
+					for (const k of keys.slice(a!, b! + 1)) {
+						if (on) next.add(k);
+						else next.delete(k);
+					}
+				} else if (next.has(key)) {
+					next.delete(key);
+				} else {
+					next.add(key);
+				}
+				return next;
+			});
+			anchorRef.current = key;
+		},
+		[visibleRows],
+	);
+	const setSelection = useCallback((keys: Iterable<string>) => {
+		setSelectionState(new Set(keys));
+	}, []);
 	const agent = useAgentStatus();
 
 	const scopedApprovals = useMemo(
@@ -276,6 +370,7 @@ function InboxScreen({
 					compose: true,
 					from: prefill?.from ?? prev.mailbox,
 					to: prefill?.to,
+					cc: prefill?.cc,
 					subject: prefill?.subject,
 					threadId: prefill?.threadId,
 					draftId: prefill?.draftId,
@@ -324,35 +419,83 @@ function InboxScreen({
 		[navigate, search],
 	);
 
-	const { setThreadRead } = readState;
-	const onThreadAction = useCallback(
-		async (row: UnifiedThreadRow, action: MessageAction) => {
+	const { move, markRead, markAllRead } = actions;
+	/** One action on conversations: read state, or a move that leaves the open one. */
+	const runAction = useCallback(
+		async (refs: ThreadRef[], action: MessageAction) => {
 			if (action === "mark_read" || action === "mark_unread") {
-				await setThreadRead(row.mailbox_id, row.id, action === "mark_read");
+				await markRead(refs, action === "mark_read", action === "mark_unread" || refs.length > 1);
 				return;
 			}
-			try {
-				await moveThread(row.mailbox_id, row.id, action);
-			} finally {
-				if (openId?.mailboxId === row.mailbox_id && openId.threadId === row.id) {
-					closeThread();
-				}
-				refresh();
-			}
+			const closing =
+				openId &&
+				refs.some((r) => r.mailboxId === openId.mailboxId && r.threadId === openId.threadId);
+			if (closing) closeThread();
+			await move(refs, action);
 		},
-		[refresh, openId, closeThread, setThreadRead],
+		[markRead, move, openId, closeThread],
+	);
+	const onThreadAction = useCallback(
+		(row: UnifiedThreadRow, action: MessageAction) =>
+			runAction([{ mailboxId: row.mailbox_id, threadId: row.id }], action),
+		[runAction],
+	);
+	const onSelectionAction = useCallback(
+		async (action: MessageAction) => {
+			const refs = [...selection].map((key) => {
+				const at = key.indexOf(":");
+				return { mailboxId: key.slice(0, at), threadId: key.slice(at + 1) };
+			});
+			setSelectionState(new Set());
+			await runAction(refs, action);
+		},
+		[selection, runAction],
+	);
+	const onMarkAllRead = useCallback(
+		() => void markAllRead(scopeIds, visibleRows),
+		[markAllRead, scopeIds, visibleRows],
 	);
 
 	const onDiscardDraft = useCallback(
 		async (draft: UnifiedDraft) => {
 			try {
 				await cancelDraft(draft.mailbox_id, draft.id);
+			} catch {
+				toast.show({ tone: "danger", message: "Could not discard the draft. Try again." });
+				return;
 			} finally {
 				refresh();
 			}
+			toast.show({
+				message: "Draft discarded",
+				action:
+					draft.origin === "mcp"
+						? undefined
+						: {
+								label: "Undo",
+								onClick: async () => {
+									try {
+										await restoreDraft(draft.mailbox_id, draft.id);
+									} catch {
+										toast.show({ tone: "danger", message: "Could not restore the draft." });
+									} finally {
+										refresh();
+									}
+								},
+							},
+			});
 		},
-		[refresh],
+		[refresh, toast],
 	);
+
+	const searchEverywhere = useCallback(() => {
+		navigate({ to: "/inbox", search: { folder: "all", q: search.q } });
+	}, [navigate, search.q]);
+
+	const layout = useInboxLayout();
+	// The list folds only while a conversation is open: with nothing open it is
+	// the only way to pick one.
+	const listFolded = layout.listFolded && Boolean(openId);
 
 	const ctx: InboxContextValue = {
 		mailboxes,
@@ -360,7 +503,7 @@ function InboxScreen({
 		colorOf,
 		search,
 		folder,
-		threads: readState.rows,
+		threads: visibleRows,
 		folderTotal: !q && folderCounts ? folderCounts.threads : null,
 		noMailYet,
 		agent,
@@ -376,6 +519,14 @@ function InboxScreen({
 		openCompose,
 		setThreadRead: readState.setThreadRead,
 		guessThreadRead: readState.guess,
+		moveThreads: move,
+		markThreadsRead: markRead,
+		ownAddresses,
+		selection,
+		toggleSelected,
+		setSelection,
+		searchEverywhere,
+		layout,
 	};
 
 	const scopeMailbox = search.mailbox ? mailboxById(search.mailbox) : undefined;
@@ -392,6 +543,9 @@ function InboxScreen({
 			const n = threads.data.items.length;
 			subtitle = `${formatCount(n)} ${n === 1 ? "result" : "results"}`;
 		}
+	} else if (folder.kind === "threads" && unreadOnly && folderCounts) {
+		const n = folderCounts.unread;
+		subtitle = n > 0 ? `${formatCount(n)} unread` : "All read";
 	} else if (folder.kind === "threads" && folderCounts) {
 		// What still needs reading, not the size of the folder. Sent mail has no
 		// unread state, so it counts conversations instead.
@@ -408,6 +562,34 @@ function InboxScreen({
 	} else if (folder.kind === "approvals") {
 		subtitle = `${formatCount(scopedApprovals.length)} awaiting you`;
 	}
+
+	// The tab: "(3) Inbox — Reccado", with a dot on the icon while anything is unread.
+	useDocumentBadge(
+		q ? `Search: ${q}` : FOLDER_LABELS[folderKey],
+		scopeCounts ? scopeCounts.inbox.unread : null,
+	);
+
+	// Anywhere in the inbox: c compose, ? shortcuts (/ and ⌘K live in the search field).
+	const [shortcutsOpen, setShortcutsOpen] = useState(false);
+	const globalKeys = useRef<(event: KeyboardEvent) => void>(() => {});
+	globalKeys.current = (event) => {
+		if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+		const target = event.target as HTMLElement | null;
+		if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)))
+			return;
+		if (search.compose || document.querySelector('[role="dialog"]')) return;
+		if (event.key === "c") openCompose();
+		else if (event.key === "[") layout.toggleMailboxes();
+		else if (event.key === "]") layout.toggleList();
+		else if (event.key === "?") setShortcutsOpen(true);
+		else return;
+		event.preventDefault();
+	};
+	useEffect(() => {
+		const onKey = (event: KeyboardEvent) => globalKeys.current(event);
+		document.addEventListener("keydown", onKey);
+		return () => document.removeEventListener("keydown", onKey);
+	}, []);
 
 	const mailboxColumnProps = {
 		mailboxes,
@@ -487,16 +669,42 @@ function InboxScreen({
 					resource={listResource}
 					selected={openId}
 					query={q}
+					unreadOnly={unreadOnly}
+					onToggleUnread={() =>
+						navigate({
+							to: "/inbox",
+							search: { ...listSearch(search), unread: unreadOnly ? undefined : true },
+						})
+					}
+					onMarkAllRead={onMarkAllRead}
 					onAction={(row, action) => void onThreadAction(row, action)}
+					onSelectionAction={(action) => void onSelectionAction(action)}
 				/>
 			);
 		body = (
 			<>
-				<MailboxColumn {...mailboxColumnProps} className="hidden lg:flex" />
+				{layout.mailboxesFolded ? (
+					<MailboxRail
+						mailboxes={mailboxes}
+						search={search}
+						colorOf={colorOf}
+						unreadOf={unreadOf}
+						totalUnread={totalUnread}
+						onExpand={layout.toggleMailboxes}
+						className="hidden lg:flex"
+					/>
+				) : (
+					<MailboxColumn
+						{...mailboxColumnProps}
+						onCollapse={layout.toggleMailboxes}
+						className="hidden lg:flex"
+					/>
+				)}
 				<div
 					className={cn(
 						"flex min-h-0 w-full shrink-0 flex-col min-[720px]:w-[340px] xl:w-[436px]",
 						(openId || search.approval) && "max-[719px]:hidden",
+						listFolded && "min-[720px]:hidden",
 					)}
 				>
 					{list}
@@ -598,11 +806,12 @@ function InboxScreen({
 
 			{search.compose ? (
 				<ComposeModal
-					key={`${search.from ?? ""}|${search.draftId ?? ""}|${search.threadId ?? ""}|${search.quote ?? ""}|${search.mode ?? ""}`}
+					key={`${search.from ?? ""}|${search.draftId ?? ""}|${search.threadId ?? ""}|${search.quote ?? ""}|${search.mode ?? ""}|${search.cc ?? ""}`}
 					mailboxes={mailboxes}
 					defaultMailboxId={search.from ?? search.mailbox}
 					prefill={{
 						to: search.to,
+						cc: search.cc,
 						subject: search.subject,
 						threadId: search.threadId,
 						draftId: search.draftId,
@@ -610,9 +819,47 @@ function InboxScreen({
 						mode: search.mode,
 					}}
 					onClose={closeCompose}
-					onSent={refresh}
+					onSent={(sent) => {
+						refresh();
+						if (!sent) return;
+						const { mailboxId, threadId } = sent;
+						toast.show({
+							message: "Message sent",
+							action: threadId
+								? { label: "View message", onClick: () => openThread(mailboxId, threadId) }
+								: undefined,
+						});
+					}}
+					onDraftSaved={(saved) =>
+						toast.show({
+							message: "Draft saved",
+							action: {
+								label: "Open",
+								onClick: () => openCompose({ from: saved.mailboxId, draftId: saved.draftId }),
+							},
+						})
+					}
+					onDiscarded={(discarded) =>
+						toast.show({
+							message: "Draft discarded",
+							action: {
+								label: "Undo",
+								onClick: async () => {
+									try {
+										await restoreDraft(discarded.mailboxId, discarded.draftId);
+										openCompose({ from: discarded.mailboxId, draftId: discarded.draftId });
+									} catch {
+										toast.show({ tone: "danger", message: "Could not restore the draft." });
+									} finally {
+										refresh();
+									}
+								},
+							},
+						})
+					}
 				/>
 			) : null}
+			{shortcutsOpen ? <ShortcutsDialog onClose={() => setShortcutsOpen(false)} /> : null}
 		</InboxContext.Provider>
 	);
 }

@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS messages (
   -- JSON {"lowercased address": "sanitised name"} for the To/Cc recipients that
   -- had a name; NULL when none did (and for rows stored before v10).
   recipient_names_json TEXT,
+  -- Reply-To as a JSON address list ('[]' when the header was absent). NULL for
+  -- rows stored before v12; filled lazily, per thread, when one is opened.
+  reply_to_json TEXT,
   subject TEXT,
   snippet TEXT,
   date_header TEXT,

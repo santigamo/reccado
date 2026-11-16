@@ -33,6 +33,11 @@ type Resource<T> = {
  */
 const MailSyncContext = createContext(0);
 
+/** The current revalidation token (for resources that manage their own loading). */
+export function useMailSyncToken(): number {
+	return useContext(MailSyncContext);
+}
+
 export function MailSyncProvider({ token, children }: { token: number; children: ReactNode }) {
 	return createElement(MailSyncContext.Provider, { value: token }, children);
 }

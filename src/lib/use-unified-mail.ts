@@ -7,21 +7,20 @@
  * Partial failure is surfaced, not hidden: rows from the mailboxes that
  * answered are shown and `failed` lists the ones that did not.
  */
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-	byLatestActivity,
 	type Draft,
 	type Folder,
 	type FolderCounts,
-	type FolderMail,
 	fetchCounts,
 	fetchDrafts,
 	fetchThreads,
 	type MailboxCounts,
-	type MessageState,
 	searchThreads,
 	type ThreadRow,
 } from "./mail";
-import { useAsyncResource } from "./use-mail";
+import { type MailboxPage, mergePages, pageCursor } from "./thread-paging";
+import { useAsyncResource, useMailSyncToken } from "./use-mail";
 
 /** Page size per mailbox for the list. The API caps `limit` at 100. */
 export const THREADS_PER_MAILBOX = 50;
@@ -33,11 +32,10 @@ export type Unified<T> = {
 	items: T[];
 	/** Mailbox ids whose request failed. */
 	failed: string[];
-	/** True when at least one mailbox returned a full page (more exist server-side). */
+	/** More rows exist than are shown (older pages not loaded yet). */
 	truncated: boolean;
 };
 
-const EMPTY_THREADS: Unified<UnifiedThreadRow> = { items: [], failed: [], truncated: false };
 const EMPTY_DRAFTS: Unified<UnifiedDraft> = { items: [], failed: [], truncated: false };
 
 // Collapse identical concurrent requests (several resources ask for the same
@@ -62,64 +60,221 @@ function dedupe<T>(key: string, run: () => Promise<T>): Promise<T> {
 	return p;
 }
 
-function threadsFor(
-	mailboxId: string,
-	state: Exclude<MessageState, "draft"> | null,
-	limit: number,
-	mail: FolderMail | undefined,
-): Promise<ThreadRow[]> {
-	return dedupe(`threads|${mailboxId}|${state ?? "all"}|${limit}|${mail ?? "people"}`, () =>
-		fetchThreads(mailboxId, { state, limit, mail }),
-	);
-}
+type ThreadQuery = {
+	folder: Folder;
+	q: string | undefined;
+	unread: boolean;
+};
 
-async function loadUnifiedThreads(
-	mailboxIds: readonly string[],
-	folder: Folder,
-	q: string | undefined,
-): Promise<Unified<UnifiedThreadRow>> {
-	const query = q?.trim();
-	const results = await Promise.allSettled(
-		mailboxIds.map(async (mailboxId) => {
-			const rows = query
-				? await searchThreads(mailboxId, query, {
-						state: folder.state,
-						limit: THREADS_PER_MAILBOX,
-						mail: folder.mail,
-					})
-				: await threadsFor(mailboxId, folder.state, THREADS_PER_MAILBOX, folder.mail);
-			return rows.map((row) => ({ ...row, mailbox_id: mailboxId }));
+/** One page of a mailbox's list, newest first, after `cursor`; `hasMore` read off one extra row. */
+async function threadPage(
+	mailboxId: string,
+	query: ThreadQuery,
+	cursor: string | undefined,
+): Promise<{ items: ThreadRow[]; hasMore: boolean }> {
+	const { folder, unread } = query;
+	const key = `threads|${mailboxId}|${folder.state ?? "all"}|${folder.mail ?? "people"}|${unread}|${cursor ?? ""}`;
+	const rows = await dedupe(key, () =>
+		fetchThreads(mailboxId, {
+			state: folder.state,
+			mail: folder.mail,
+			limit: THREADS_PER_MAILBOX + 1,
+			cursor,
+			unread,
 		}),
 	);
-	const items: UnifiedThreadRow[] = [];
-	const failed: string[] = [];
-	let truncated = false;
-	results.forEach((r, i) => {
-		if (r.status === "fulfilled") {
-			items.push(...r.value);
-			if (!query && r.value.length >= THREADS_PER_MAILBOX) truncated = true;
-		} else {
-			failed.push(mailboxIds[i]!);
-		}
-	});
-	if (failed.length === mailboxIds.length && failed.length > 0) {
-		const first = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
-		throw first.reason instanceof Error ? first.reason : new Error("Could not load mail");
-	}
-	items.sort(byLatestActivity);
-	return { items, failed, truncated };
+	return { items: rows.slice(0, THREADS_PER_MAILBOX), hasMore: rows.length > THREADS_PER_MAILBOX };
 }
 
-/** Threads of one folder across `mailboxIds`, newest first (search when `q` is set). */
-export function useUnifiedThreads(mailboxIds: readonly string[], folder: Folder, q?: string) {
-	return useAsyncResource<Unified<UnifiedThreadRow>>(
-		() =>
-			mailboxIds.length === 0
-				? Promise.resolve(EMPTY_THREADS)
-				: loadUnifiedThreads(mailboxIds, folder, q),
-		EMPTY_THREADS,
-		[mailboxIds.join(","), folder.key, q ?? ""],
+/**
+ * A mailbox's list from the top, at least `want` rows deep when it has them (a
+ * refresh reloads as far as the person had scrolled). Search has no pages: it
+ * answers its best matches once.
+ */
+async function loadMailboxPages(
+	mailboxId: string,
+	query: ThreadQuery,
+	want: number,
+): Promise<MailboxPage<ThreadRow>> {
+	const text = query.q?.trim();
+	if (text) {
+		const rows = await searchThreads(mailboxId, text, {
+			state: query.folder.state,
+			limit: THREADS_PER_MAILBOX,
+			mail: query.folder.mail,
+		});
+		const items = query.unread ? rows.filter((r) => r.unread_count > 0) : rows;
+		return { mailboxId, items, hasMore: false };
+	}
+	const items: ThreadRow[] = [];
+	let hasMore = true;
+	while (hasMore && (items.length === 0 || items.length < want)) {
+		const last = items.at(-1);
+		const page = await threadPage(mailboxId, query, last ? pageCursor(last) : undefined);
+		items.push(...page.items);
+		hasMore = page.hasMore;
+		if (page.items.length === 0) break;
+	}
+	return { mailboxId, items, hasMore };
+}
+
+type PagedState = {
+	pages: Array<MailboxPage<ThreadRow>>;
+	failed: string[];
+};
+
+const EMPTY_PAGED: PagedState = { pages: [], failed: [] };
+
+export type ThreadsResource = {
+	data: Unified<UnifiedThreadRow>;
+	loading: boolean;
+	error: string | null;
+	refetch: () => void;
+	appliedRun: number;
+	startedRuns: () => number;
+	/** Load the next rows of the merged list (no-op while one is loading or at the end). */
+	loadMore: () => void;
+	loadingMore: boolean;
+	/** The last "load more" failed (the rows on screen stay). */
+	loadMoreError: string | null;
+};
+
+/**
+ * Threads of one folder across `mailboxIds`, newest first, paged (search when
+ * `q` is set). Each mailbox pages on its own and the merged list only shows
+ * rows no mailbox can still precede (see thread-paging.ts). A refresh (new
+ * mail, an action) reloads every mailbox as deep as it had been loaded, so the
+ * list never shrinks under the reader.
+ */
+export function useUnifiedThreads(
+	mailboxIds: readonly string[],
+	folder: Folder,
+	q?: string,
+	unread = false,
+): ThreadsResource {
+	const [state, setState] = useState<PagedState>(EMPTY_PAGED);
+	const [loading, setLoading] = useState(true);
+	const [error, setError] = useState<string | null>(null);
+	const [nonce, setNonce] = useState(0);
+	const [appliedRun, setAppliedRun] = useState(0);
+	const [loadingMore, setLoadingMore] = useState(false);
+	const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+	const runRef = useRef(0);
+	const stateRef = useRef(state);
+	stateRef.current = state;
+	const loadingMoreRef = useRef(false);
+	const syncToken = useMailSyncToken();
+	const query: ThreadQuery = { folder, q, unread };
+	const queryRef = useRef(query);
+	queryRef.current = query;
+	const idsRef = useRef(mailboxIds);
+	idsRef.current = mailboxIds;
+	const depsKey = JSON.stringify([mailboxIds.join(","), folder.key, q ?? "", unread]);
+	const lastDepsKeyRef = useRef<string | null>(null);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: `nonce` and `syncToken` are deliberate re-run triggers; the query is read via refs keyed by depsKey.
+	useEffect(() => {
+		let alive = true;
+		const reset = lastDepsKeyRef.current !== depsKey;
+		if (reset) {
+			lastDepsKeyRef.current = depsKey;
+			setState(EMPTY_PAGED);
+			setLoading(true);
+			setLoadMoreError(null);
+		}
+		setError(null);
+		const run = ++runRef.current;
+		const ids = idsRef.current;
+		const deep = new Map(
+			reset ? [] : stateRef.current.pages.map((p) => [p.mailboxId, p.items.length] as const),
+		);
+		(async () => {
+			if (ids.length === 0) return EMPTY_PAGED;
+			const results = await Promise.allSettled(
+				ids.map((id) => loadMailboxPages(id, queryRef.current, deep.get(id) ?? 0)),
+			);
+			const pages: Array<MailboxPage<ThreadRow>> = [];
+			const failed: string[] = [];
+			results.forEach((r, i) => {
+				if (r.status === "fulfilled") pages.push(r.value);
+				else failed.push(ids[i]!);
+			});
+			if (failed.length === ids.length) {
+				const first = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+				throw first.reason instanceof Error ? first.reason : new Error("Could not load mail");
+			}
+			return { pages, failed };
+		})()
+			.then((result) => {
+				if (!alive) return;
+				setState(result);
+				setAppliedRun(run);
+			})
+			.catch((err: unknown) => {
+				if (alive) setError(err instanceof Error ? err.message : "Something went wrong");
+			})
+			.finally(() => {
+				if (alive) setLoading(false);
+			});
+		return () => {
+			alive = false;
+		};
+	}, [depsKey, nonce, syncToken]);
+
+	const merged = useMemo(() => mergePages(state.pages), [state.pages]);
+
+	const loadMore = useCallback(() => {
+		if (loadingMoreRef.current) return;
+		const startRun = runRef.current;
+		loadingMoreRef.current = true;
+		setLoadingMore(true);
+		setLoadMoreError(null);
+		(async () => {
+			let pages = stateRef.current.pages;
+			const shownBefore = mergePages(pages).items.length;
+			// Keep going until a page's worth of rows is showable, or the end.
+			for (let round = 0; round < 6; round++) {
+				const { next, items } = mergePages(pages);
+				if (!next || items.length - shownBefore >= THREADS_PER_MAILBOX) break;
+				const current = pages.find((p) => p.mailboxId === next)!;
+				const last = current.items.at(-1);
+				const page = await threadPage(next, queryRef.current, last ? pageCursor(last) : undefined);
+				pages = pages.map((p) =>
+					p.mailboxId === next
+						? { ...p, items: [...p.items, ...page.items], hasMore: page.hasMore }
+						: p,
+				);
+			}
+			// A refresh that started meanwhile reloads from the top: keep its answer.
+			if (runRef.current !== startRun) return;
+			setState((prev) => ({ ...prev, pages }));
+		})()
+			.catch((err: unknown) => {
+				setLoadMoreError(err instanceof Error ? err.message : "Could not load more");
+			})
+			.finally(() => {
+				loadingMoreRef.current = false;
+				setLoadingMore(false);
+			});
+	}, []);
+
+	const data = useMemo<Unified<UnifiedThreadRow>>(
+		() => ({ items: merged.items, failed: state.failed, truncated: merged.hasMore }),
+		[merged, state.failed],
 	);
+	const refetch = useCallback(() => setNonce((n) => n + 1), []);
+	const startedRuns = useCallback(() => runRef.current, []);
+	return {
+		data,
+		loading,
+		error,
+		refetch,
+		appliedRun,
+		startedRuns,
+		loadMore,
+		loadingMore,
+		loadMoreError,
+	};
 }
 
 async function loadUnifiedDrafts(mailboxIds: readonly string[]): Promise<Unified<UnifiedDraft>> {

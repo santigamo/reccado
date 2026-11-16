@@ -5,7 +5,8 @@ import { cn } from "#/lib/cn";
 /**
  * Header search pill. Types locally and commits to the URL after a short pause
  * (searching fans out to every mailbox in scope, so not on every keystroke).
- * ⌘K / Ctrl+K focuses it from anywhere; Esc clears and blurs.
+ * ⌘K / Ctrl+K (or "/" outside a field) focuses it from anywhere; Esc clears
+ * the search — back to the folder as it was — and blurs.
  */
 export function SearchField({
 	value,
@@ -38,10 +39,28 @@ export function SearchField({
 
 	useEffect(() => {
 		function onKeyDown(event: KeyboardEvent) {
-			if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+			const input = inputRef.current;
+			// Only the copy of the field that is on screen (phones keep a second one).
+			if (!input || input.offsetParent === null) return;
+			const target = event.target as HTMLElement | null;
+			const typing =
+				!!target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
+			const slash =
+				event.key === "/" &&
+				!typing &&
+				!event.metaKey &&
+				!event.ctrlKey &&
+				!event.altKey &&
+				!document.querySelector('[role="dialog"]');
+			// ⌘K inside a dialog belongs to it (the compose editor's "Link").
+			const commandK =
+				(event.metaKey || event.ctrlKey) &&
+				event.key.toLowerCase() === "k" &&
+				!document.querySelector('[role="dialog"]');
+			if (slash || commandK) {
 				event.preventDefault();
-				inputRef.current?.focus();
-				inputRef.current?.select();
+				input.focus();
+				input.select();
 			}
 		}
 		window.addEventListener("keydown", onKeyDown);

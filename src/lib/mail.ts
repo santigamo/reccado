@@ -81,6 +81,8 @@ export type Message = {
 	bcc_json: string; // JSON string[]
 	/** JSON {"lowercased address": "name"} for named To/Cc recipients, or null. */
 	recipient_names_json?: string | null;
+	/** JSON string[] of Reply-To addresses ("[]" when none); null/absent when not known yet. */
+	reply_to_json?: string | null;
 	subject: string | null;
 	snippet: string | null;
 	date_header: string | null;
@@ -192,11 +194,21 @@ export async function fetchMailboxes(): Promise<Mailbox[]> {
 
 export async function fetchThreads(
 	mailboxId: string,
-	opts: { state?: Exclude<MessageState, "draft"> | null; limit?: number; mail?: FolderMail } = {},
+	opts: {
+		state?: Exclude<MessageState, "draft"> | null;
+		limit?: number;
+		mail?: FolderMail;
+		/** Start after this row (`<latest_received_at>|<id>`, see thread-paging.ts). */
+		cursor?: string;
+		/** Only conversations with something unread. */
+		unread?: boolean;
+	} = {},
 ): Promise<ThreadRow[]> {
 	const params = new URLSearchParams({ limit: String(opts.limit ?? 50) });
 	if (opts.state) params.set("state", opts.state);
 	if (opts.mail === "reports") params.set("reports", "only");
+	if (opts.cursor) params.set("cursor", opts.cursor);
+	if (opts.unread) params.set("unread", "true");
 	const data = await json<{ threads: ThreadRow[] }>(
 		await fetch(`${base(mailboxId)}/threads?${params.toString()}`),
 	);
@@ -232,30 +244,84 @@ export async function runMessageAction(
 	if (!res.ok) throw new Error(`Action failed (HTTP ${res.status})`);
 }
 
-/** Apply an action to every message in a thread (folder moves are per-message). */
+/** A message a bulk action changed, as it was before (what Undo restores). */
+export type ChangedMessage = { id: string; thread_id: string; state: string; is_read: number };
+
+export type BulkTarget =
+	| { threadIds: string[] }
+	| { messageIds: string[] }
+	| { folder: { state: Exclude<MessageState, "draft"> | null; reports?: "only" } };
+
+/**
+ * One action on many messages of a mailbox in one request: whole conversations,
+ * exact messages, or every unread message of a folder (mark_read only).
+ * Answers which messages changed and what they were before.
+ */
+export async function runBulkAction(
+	mailboxId: string,
+	action: MessageAction,
+	target: BulkTarget,
+): Promise<ChangedMessage[]> {
+	const data = await json<{ changed: ChangedMessage[] }>(
+		await fetch(`${base(mailboxId)}/bulk-actions`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ action, ...target }),
+		}),
+	);
+	return data.changed ?? [];
+}
+
+/** Apply an action to the given messages (folder moves are per-message). */
 export async function runThreadAction(
 	mailboxId: string,
 	messageIds: string[],
 	action: MessageAction,
-): Promise<void> {
-	await Promise.all(messageIds.map((id) => runMessageAction(mailboxId, id, action)));
+): Promise<ChangedMessage[]> {
+	const changed: ChangedMessage[] = [];
+	for (let i = 0; i < messageIds.length; i += 1000) {
+		changed.push(
+			...(await runBulkAction(mailboxId, action, { messageIds: messageIds.slice(i, i + 1000) })),
+		);
+	}
+	return changed;
 }
 
 /**
- * Move a whole thread to a folder from a context (e.g. a list row) that only
- * knows the thread id: resolve its messages, then apply the action to each.
+ * Move whole conversations (by id) to a folder, or set their read state, in one
+ * request per hundred. Returns what changed, for Undo.
  */
+export async function moveThreads(
+	mailboxId: string,
+	threadIds: string[],
+	action: MessageAction,
+): Promise<ChangedMessage[]> {
+	const changed: ChangedMessage[] = [];
+	for (let i = 0; i < threadIds.length; i += 100) {
+		changed.push(
+			...(await runBulkAction(mailboxId, action, { threadIds: threadIds.slice(i, i + 100) })),
+		);
+	}
+	return changed;
+}
+
+/** Move one conversation (by id). Returns what changed, for Undo. */
 export async function moveThread(
 	mailboxId: string,
 	threadId: string,
 	action: MessageAction,
-): Promise<void> {
-	const { messages } = await fetchThread(mailboxId, threadId);
-	await runThreadAction(
-		mailboxId,
-		messages.map((m) => m.id),
-		action,
-	);
+): Promise<ChangedMessage[]> {
+	return moveThreads(mailboxId, [threadId], action);
+}
+
+/** "Mark all as read" for a folder of one mailbox. */
+export async function markFolderRead(
+	mailboxId: string,
+	folder: { state: Exclude<MessageState, "draft"> | null; mail?: FolderMail },
+): Promise<ChangedMessage[]> {
+	return runBulkAction(mailboxId, "mark_read", {
+		folder: { state: folder.state, ...(folder.mail === "reports" ? { reports: "only" } : {}) },
+	});
 }
 
 export async function fetchDrafts(mailboxId: string): Promise<Draft[]> {
@@ -314,6 +380,14 @@ export async function cancelDraft(mailboxId: string, draftId: string): Promise<v
 	if (!res.ok) throw new Error(`Could not discard draft (HTTP ${res.status})`);
 }
 
+/** Undo a discard: your own discarded draft becomes a draft again. */
+export async function restoreDraft(mailboxId: string, draftId: string): Promise<void> {
+	const res = await fetch(`${base(mailboxId)}/drafts/${encodeURIComponent(draftId)}/restore`, {
+		method: "POST",
+	});
+	if (!res.ok) throw new Error(`Could not restore the draft (HTTP ${res.status})`);
+}
+
 /**
  * One-click send: the backend keeps the draft -> request-send -> confirm-send
  * state machine (the human-confirmation gate for agent-initiated sends), so the
@@ -323,7 +397,7 @@ export async function sendDraft(
 	mailboxId: string,
 	draftId: string,
 	idempotencyKey: string,
-): Promise<{ sent: boolean; reason?: string }> {
+): Promise<{ sent: boolean; reason?: string; threadId?: string }> {
 	const reqRes = await fetch(
 		`${base(mailboxId)}/drafts/${encodeURIComponent(draftId)}/request-send`,
 		{ method: "POST" },
@@ -334,9 +408,22 @@ export async function sendDraft(
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({ idempotencyKey }),
 	});
-	const data = (await res.json()) as { sent?: boolean; duplicate?: boolean; reason?: string };
-	if (res.ok && (data.sent || data.duplicate)) return { sent: true };
-	return { sent: false, reason: data.reason ?? `HTTP ${res.status}` };
+	let data: {
+		sent?: boolean;
+		duplicate?: boolean;
+		reason?: string;
+		error?: string;
+		threadId?: string;
+	};
+	try {
+		data = (await res.json()) as typeof data;
+	} catch {
+		data = {};
+	}
+	if (res.ok && (data.sent || data.duplicate)) {
+		return { sent: true, ...(data.threadId ? { threadId: data.threadId } : {}) };
+	}
+	return { sent: false, reason: data.reason ?? data.error ?? `HTTP ${res.status}` };
 }
 
 export type FolderCounts = { threads: number; unread: number; messages: number };

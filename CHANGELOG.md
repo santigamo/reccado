@@ -11,6 +11,40 @@ package.
 
 ### Added
 
+- **Mail-client conventions in the web inbox (2026-11-16).** *Who.* Your own messages say
+  "me" / the mailbox display name instead of the mailbox local part; mail stored before names
+  were kept gets its sender name (and Reply-To) from its own raw headers in R2 the first time
+  its conversation is opened — inbound rows of that thread only, newest 20, first 64 KB of each,
+  sanitised with `display-name.ts`, written once (`src/do/mailbox-web.ts`). *Reply.* Reply
+  answers the newest inbound message's Reply-To (else its sender); Reply all (button, menu, `a`)
+  adds its other To/Cc minus every mailbox address and alias; one `Re:` / `Fwd:`, never doubled;
+  Reply / Reply all / Forward / Mark as unread per message from its menu (`src/lib/reply.ts`).
+  *Lists.* Row checkboxes (hover, or tap the avatar), select all in view, shift-click ranges, a
+  selection bar with archive / delete / move to inbox / read / unread; an "Unread" filter
+  (`?unread=true`) and "Mark all as read" for the folder in scope; "load older" + infinite scroll
+  that pages each mailbox by keyset cursor and merges them without ever placing older mail above
+  newer unloaded mail (`src/lib/thread-paging.ts`); scroll position kept when coming back from a
+  conversation, the open row kept in view; selecting text in a row no longer opens it;
+  full timestamp on hover. *Undo.* Archive, delete, move to inbox, mark unread, mark all read
+  and discarding your own draft show a toast with Undo that replays exactly the messages that
+  changed; failed actions roll back and say so. *Browser.* "(3) Inbox — Reccado" tab title and an
+  unread dot on the favicon. *Search.* Empty results say where it searched and offer "Search all
+  mail in every mailbox"; `/` focuses search. *Compose.* Invalid addresses are named before
+  sending; empty subject/body asks first; ⌘/Ctrl+Enter sends; Esc/close keeps your changes as a
+  draft (or asks when there is no recipient to save one for); discarding an unsaved message asks;
+  "Message sent · View message" toast; a full-screen toggle (remembered for the session; phones
+  are always full screen). *Reading.* Remote images are blocked by default (`img-src 'self'
+  data:`) with "Show images" / "Always from <sender>" (this browser), quoted history in HTML
+  replies folded behind "···", a details expander (From, Reply-To, To, Cc, date, subject), and
+  Print. *Layout.* The mailbox column folds into a rail of mailbox dots (`[`), the list folds while
+  a conversation is open (`]`), "Read wider" folds both; remembered per browser. *Keyboard.* `a`,
+  `c`, `/`, `x`, `?` (shortcuts sheet), Shift+I / Shift+U, list j/k/e/# when no conversation is
+  open. Backend: mailbox DO schema v12 adds nullable `messages.reply_to_json` (stored at ingest);
+  `GET …/threads` takes `cursor` and `unread=true`; new `POST /api/mailboxes/:id/bulk-actions`
+  (threads, messages, or a folder's unread → reports what each message was) and
+  `POST …/drafts/:id/restore` (your own discarded drafts only, never an agent's);
+  `…/messages/:id/html?images=1` opts into remote content.
+
 - **DMARC aggregate reports kept out of the web inbox; read state you can see (2026-11-16).**
   *Reports.* Inbound mail is classified at ingest (`src/lib/automated-mail.ts`) as
   `automated_kind = 'dmarc_report'` only on structural signals: the RFC 7489 subject

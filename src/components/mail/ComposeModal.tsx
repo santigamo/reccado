@@ -1,4 +1,4 @@
-import { ChevronDown, Lock, Send, Trash2, X } from "lucide-react";
+import { ChevronDown, Lock, Maximize2, Minimize2, Send, Trash2, X } from "lucide-react";
 import {
 	type KeyboardEvent,
 	type ReactElement,
@@ -13,6 +13,7 @@ import { Button } from "#/components/ui/Button";
 import { Dialog } from "#/components/ui/Dialog";
 import { IconButton } from "#/components/ui/IconButton";
 import { Menu } from "#/components/ui/Menu";
+import { cn } from "#/lib/cn";
 import {
 	cancelDraft,
 	createDraft,
@@ -32,6 +33,8 @@ import { RichTextEditor, type RichTextEditorHandle } from "./RichTextEditor";
 
 export type ComposePrefill = {
 	to?: string;
+	/** Reply all: everyone else on the message answered. */
+	cc?: string;
 	subject?: string;
 	threadId?: string;
 	draftId?: string;
@@ -39,6 +42,25 @@ export type ComposePrefill = {
 	quote?: string;
 	mode?: "reply" | "forward";
 };
+
+const FULL_SCREEN_KEY = "reccado.compose.fullScreen";
+
+/** Full-screen compose, remembered for this browser session (storage may be blocked). */
+function readFullScreen(): boolean {
+	try {
+		return window.sessionStorage.getItem(FULL_SCREEN_KEY) === "1";
+	} catch {
+		return false;
+	}
+}
+
+function rememberFullScreen(value: boolean): void {
+	try {
+		window.sessionStorage.setItem(FULL_SCREEN_KEY, value ? "1" : "0");
+	} catch {
+		// Not remembered; still applied.
+	}
+}
 
 /** Autosave this long after the last edit. */
 const AUTOSAVE_MS = 1500;
@@ -55,7 +77,17 @@ function explainReason(reason: string | undefined): string {
 	if (reason === "approval_required") {
 		return "This draft was written by an agent. It can only be sent through your approval link.";
 	}
+	if (reason === "too_many_recipients") return "too many recipients.";
+	if (reason === "intent_stale") return "the draft changed while sending. Try again.";
 	return reason ?? "unknown error";
+}
+
+/** A question in the footer before something irreversible ("Send without a subject?"). */
+type Confirm = { text: string; confirmLabel: string; cancelLabel?: string; onConfirm: () => void };
+
+/** Addresses that would not be accepted, in the order typed. */
+export function invalidAddresses(addresses: readonly string[]): string[] {
+	return addresses.filter((a) => !EMAIL.test(a));
 }
 
 /** "a@x.com, b@y.com; c@z.com" -> ["a@x.com", "b@y.com", "c@z.com"]. */
@@ -110,12 +142,19 @@ export function ComposeModal({
 	prefill,
 	onClose,
 	onSent,
+	onDraftSaved,
+	onDiscarded,
 }: {
 	mailboxes: Mailbox[];
 	defaultMailboxId: string | undefined;
 	prefill: ComposePrefill;
 	onClose: () => void;
-	onSent?: () => void;
+	/** After a send (with where it went), or after a change that lists should reload (none). */
+	onSent?: (sent?: { mailboxId: string; threadId: string | null }) => void;
+	/** Closing kept the message as a draft. */
+	onDraftSaved?: (saved: { mailboxId: string; draftId: string }) => void;
+	/** Your own draft was discarded (it can be restored). */
+	onDiscarded?: (discarded: { mailboxId: string; draftId: string }) => void;
 }): ReactElement {
 	const pinned = Boolean(prefill.threadId || prefill.draftId);
 	const [mailboxId, setMailboxId] = useState<string>(
@@ -123,11 +162,11 @@ export function ComposeModal({
 	);
 	const [to, setTo] = useState<string[]>(() => splitAddresses(prefill.to ?? ""));
 	const [toDraft, setToDraft] = useState("");
-	const [cc, setCc] = useState<string[]>([]);
+	const [cc, setCc] = useState<string[]>(() => splitAddresses(prefill.cc ?? ""));
 	const [ccDraft, setCcDraft] = useState("");
 	const [bcc, setBcc] = useState<string[]>([]);
 	const [bccDraft, setBccDraft] = useState("");
-	const [showCc, setShowCc] = useState(false);
+	const [showCc, setShowCc] = useState(Boolean(prefill.cc));
 	const [showBcc, setShowBcc] = useState(false);
 	const [subject, setSubject] = useState(prefill.subject ?? "");
 	// The editor's HTML as last reported; sanitised into the payload on save.
@@ -148,6 +187,11 @@ export function ComposeModal({
 	const [busy, setBusy] = useState(false);
 	const [status, setStatus] = useState<Status | null>(null);
 	const [agentDraft, setAgentDraft] = useState(false);
+	const [confirm, setConfirm] = useState<Confirm | null>(null);
+	// The dialog only renders in the browser (portal after mount), so reading here is safe.
+	const [fullScreen, setFullScreen] = useState(() =>
+		typeof window === "undefined" ? false : readFullScreen(),
+	);
 	const [saved, setSaved] = useState(false);
 	const toRef = useRef<HTMLInputElement>(null);
 	const editorRef = useRef<RichTextEditorHandle>(null);
@@ -157,7 +201,13 @@ export function ComposeModal({
 
 	// What is already persisted (or prefilled): differs from the fields => unsaved input.
 	const [savedSnapshot, setSavedSnapshot] = useState<string>(() =>
-		snapshotOf(splitAddresses(prefill.to ?? ""), [], [], prefill.subject ?? "", ""),
+		snapshotOf(
+			splitAddresses(prefill.to ?? ""),
+			splitAddresses(prefill.cc ?? ""),
+			[],
+			prefill.subject ?? "",
+			"",
+		),
 	);
 
 	// Pick a default once the mailbox list arrives (deep link before load).
@@ -347,6 +397,7 @@ export function ComposeModal({
 	});
 
 	function validate(payload: DraftPayload): boolean {
+		setConfirm(null);
 		if (!mailboxId) {
 			setStatus({ text: "Pick a mailbox to send from.", error: true });
 			return false;
@@ -356,8 +407,22 @@ export function ComposeModal({
 			toRef.current?.focus();
 			return false;
 		}
+		const bad = invalidAddresses([...payload.to, ...(payload.cc ?? []), ...(payload.bcc ?? [])]);
+		if (bad.length > 0) {
+			setStatus({
+				text:
+					bad.length === 1
+						? `“${bad[0]}” is not a valid email address.`
+						: `These are not valid email addresses: ${bad.join(", ")}.`,
+				error: true,
+			});
+			return false;
+		}
 		return true;
 	}
+
+	/** Something worth keeping was typed (or a draft exists). */
+	const hasWork = dirty || Boolean(draftId);
 
 	async function handleSaveDraft() {
 		const payload = buildPayload();
@@ -380,9 +445,28 @@ export function ComposeModal({
 
 	// One click. The backend still runs draft -> request-send -> confirm-send;
 	// a person is composing here, so the UI walks the chain for them.
-	async function handleSend() {
+	async function handleSend(checked = false) {
+		if (busy) return;
 		const payload = buildPayload();
 		if (!validate(payload)) return;
+		if (!checked) {
+			const noSubject = !subject.trim();
+			const noBody = !payload.bodyText?.trim();
+			if (noSubject || noBody) {
+				setConfirm({
+					text:
+						noSubject && noBody
+							? "This message has no subject and no text."
+							: noSubject
+								? "This message has no subject."
+								: "This message has no text.",
+					confirmLabel: "Send anyway",
+					cancelLabel: "Keep editing",
+					onConfirm: () => void handleSend(true),
+				});
+				return;
+			}
+		}
 		setBusy(true);
 		setStatus({ text: "Sending…" });
 		try {
@@ -392,9 +476,9 @@ export function ComposeModal({
 			if (result.sent) {
 				setStatus({ text: "Sent." });
 				setIdempotencyKey(crypto.randomUUID());
-				onSent?.();
-				// Brief pause so "Sent." is visible before the dialog closes.
-				window.setTimeout(onClose, 500);
+				// The toast says "Message sent · View message"; the dialog goes now.
+				onSent?.({ mailboxId, threadId: result.threadId ?? threadId ?? null });
+				onClose();
 			} else {
 				setStatus({ text: `Not sent: ${explainReason(result.reason)}`, error: true });
 			}
@@ -405,18 +489,108 @@ export function ComposeModal({
 		}
 	}
 
-	async function handleDiscard() {
+	async function discardNow() {
+		setConfirm(null);
 		setBusy(true);
+		const id = draftIdRef.current;
 		try {
-			if (draftId) await cancelDraft(mailboxId, draftId);
+			// Let an autosave in flight land first, or it could recreate the draft.
+			await saveChain.current.catch(() => undefined);
+			const current = draftIdRef.current ?? id;
+			if (current) {
+				await cancelDraft(mailboxId, current);
+				if (!agentDraft) onDiscarded?.({ mailboxId, draftId: current });
+			}
 		} catch {
-			// best effort — still close below
-		} finally {
 			setBusy(false);
+			setStatus({ text: "Could not discard the draft. Try again.", error: true });
+			return;
+		}
+		setBusy(false);
+		onSent?.();
+		onClose();
+	}
+
+	// Discard: a saved draft goes at once (Undo in the toast brings it back); a
+	// message that was never saved can't be brought back, so it asks first.
+	function handleDiscard() {
+		if (draftIdRef.current && !agentDraft) {
+			void discardNow();
+			return;
+		}
+		if (!hasWork) {
+			onClose();
+			return;
+		}
+		setConfirm({
+			text: agentDraft ? "Discard the agent's draft?" : "Discard this message? It was never saved.",
+			confirmLabel: "Discard",
+			cancelLabel: "Keep",
+			onConfirm: () => void discardNow(),
+		});
+	}
+
+	// Esc, ×, or clicking outside: nothing is lost. Changes are saved as a draft
+	// first (when there is someone to send to); what can't be saved asks.
+	async function requestClose() {
+		if (busy) return;
+		if (!dirty) {
+			onClose();
+			return;
+		}
+		if (agentDraft) {
+			setConfirm({
+				text: "Close without saving your edits? The agent's draft stays as it was.",
+				confirmLabel: "Close",
+				cancelLabel: "Keep editing",
+				onConfirm: onClose,
+			});
+			return;
+		}
+		const payload = buildPayload();
+		const recipients = [...payload.to, ...(payload.cc ?? []), ...(payload.bcc ?? [])];
+		if (payload.to.length === 0 || invalidAddresses(recipients).length > 0) {
+			setConfirm({
+				text:
+					payload.to.length === 0
+						? "Without a recipient this message can't be kept as a draft."
+						: "A recipient is not a valid address, so this can't be kept as a draft.",
+				confirmLabel: "Discard",
+				cancelLabel: "Keep editing",
+				onConfirm: () => void discardNow(),
+			});
+			return;
+		}
+		setBusy(true);
+		setStatus({ text: "Saving…" });
+		try {
+			const id = await ensureDraft(payload);
 			onSent?.();
 			onClose();
+			onDraftSaved?.({ mailboxId, draftId: id });
+		} catch (err) {
+			setBusy(false);
+			setStatus({
+				text: `Could not save the draft (${err instanceof Error ? err.message : "error"}). Your text is still here.`,
+				error: true,
+			});
 		}
 	}
+
+	// ⌘/Ctrl+Enter sends from anywhere in the dialog.
+	const sendKeyRef = useRef<(event: globalThis.KeyboardEvent) => void>(() => {});
+	sendKeyRef.current = (event) => {
+		if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && !event.defaultPrevented) {
+			event.preventDefault();
+			if (confirm) confirm.onConfirm();
+			else void handleSend();
+		}
+	};
+	useEffect(() => {
+		const onKey = (event: globalThis.KeyboardEvent) => sendKeyRef.current(event);
+		document.addEventListener("keydown", onKey, true);
+		return () => document.removeEventListener("keydown", onKey, true);
+	}, []);
 
 	const title = prefill.draftId
 		? "Draft"
@@ -436,16 +610,27 @@ export function ComposeModal({
 	else if (saved || draftId) headerState = "Draft saved";
 
 	// Footer note: errors and progress first, then the agent-draft rule, then the default.
-	const note: ReactNode =
-		status && status.text !== "Saving…" ? (
-			<span role="status" className={status.error ? "text-danger" : undefined}>
-				{status.text}
+	const note: ReactNode = confirm ? (
+		<span role="alert" className="flex flex-wrap items-center gap-x-3 gap-y-1 text-text">
+			<span>{confirm.text}</span>
+			<span className="flex gap-1.5">
+				<Button size="sm" variant="primary" onClick={confirm.onConfirm} data-autofocus>
+					{confirm.confirmLabel}
+				</Button>
+				<Button size="sm" variant="secondary" onClick={() => setConfirm(null)}>
+					{confirm.cancelLabel ?? "Cancel"}
+				</Button>
 			</span>
-		) : agentDraft ? (
-			explainReason("approval_required")
-		) : (
-			"You are sending this yourself, so it goes out right away"
-		);
+		</span>
+	) : status && status.text !== "Saving…" ? (
+		<span role="status" className={status.error ? "text-danger" : undefined}>
+			{status.text}
+		</span>
+	) : agentDraft ? (
+		explainReason("approval_required")
+	) : (
+		"You are sending this yourself, so it goes out right away"
+	);
 
 	const chip = (
 		<span
@@ -466,18 +651,36 @@ export function ComposeModal({
 
 	return (
 		<Dialog
-			onClose={onClose}
+			onClose={() => void requestClose()}
 			title={title}
 			size="lg"
-			dismissible={!dirty && !busy}
+			dismissible={!busy}
 			initialFocusRef={prefill.to ? undefined : toRef}
+			// Phones: always the whole screen. Desktop: the full-screen toggle.
+			className={cn(
+				"max-sm:h-[100dvh] max-sm:max-h-[100dvh] max-sm:rounded-none",
+				fullScreen && "sm:h-full sm:max-h-full sm:max-w-none",
+			)}
 			headerClassName="items-center pt-[18px] pr-5 pb-3.5 pl-7 max-sm:pl-5"
 			headerAside={
-				headerState ? (
-					<span aria-live="polite" className="shrink-0 pr-1.5 text-label text-text-muted">
-						{headerState}
-					</span>
-				) : null
+				<>
+					{headerState ? (
+						<span aria-live="polite" className="shrink-0 pr-1.5 text-label text-text-muted">
+							{headerState}
+						</span>
+					) : null}
+					<IconButton
+						title={fullScreen ? "Exit full screen" : "Full screen"}
+						aria-pressed={fullScreen}
+						className="max-sm:hidden"
+						onClick={() => {
+							setFullScreen(!fullScreen);
+							rememberFullScreen(!fullScreen);
+						}}
+					>
+						{fullScreen ? <Minimize2 /> : <Maximize2 />}
+					</IconButton>
+				</>
 			}
 			bodyClassName="flex flex-col p-0"
 			footerClassName="gap-2.5 px-5"
@@ -485,8 +688,9 @@ export function ComposeModal({
 				<>
 					<Button
 						variant="primary"
-						onClick={handleSend}
+						onClick={() => void handleSend()}
 						disabled={busy || !mailboxId}
+						title="Send (⌘/Ctrl + Enter)"
 						className="pr-[18px] pl-3.5"
 					>
 						<Send />

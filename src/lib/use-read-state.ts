@@ -9,7 +9,13 @@
  * reached the mailbox answers with the old state, and is simply outvoted.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { type MailboxCounts, type MessageAction, moveThread, runThreadAction } from "./mail";
+import {
+	type ChangedMessage,
+	type MailboxCounts,
+	type MessageAction,
+	moveThreads,
+	runThreadAction,
+} from "./mail";
 import { forgetInflight, type UnifiedThreadRow } from "./use-unified-mail";
 
 type Run = { appliedRun: number; startedRuns: () => number };
@@ -121,43 +127,79 @@ export function useReadState({
 	);
 
 	/**
-	 * Mark a conversation read or unread: the guess at once, then the write
-	 * (`messageIds` when known, else every message of the thread), then a reload
-	 * that cannot reuse a request from before the write.
+	 * Mark conversations read or unread: the guesses at once, then the writes
+	 * (`messageIds` when known for a single conversation, else every message of
+	 * each conversation, one request per mailbox), then a reload that cannot
+	 * reuse a request from before the write. Resolves to what changed (for Undo);
+	 * rejects after rolling the guesses back when a write fails.
 	 */
-	const setThreadRead = useCallback(
-		async (mailboxId: string, threadId: string, read: boolean, messageIds?: string[]) => {
-			guess(mailboxId, threadId, read);
+	const setManyRead = useCallback(
+		async (
+			items: ReadonlyArray<{ mailboxId: string; threadId: string; messageIds?: string[] }>,
+			read: boolean,
+			/** Writes something else than these conversations (e.g. a whole folder). */
+			write?: () => Promise<ChangedMessage[]>,
+		): Promise<ChangedMessage[]> => {
+			for (const item of items) guess(item.mailboxId, item.threadId, read);
 			const action: MessageAction = read ? "mark_read" : "mark_unread";
-			const key = keyOf(mailboxId, threadId);
+			const keys = items.map((item) => keyOf(item.mailboxId, item.threadId));
+			const byMailbox = new Map<string, { threads: string[]; messages: string[] }>();
+			for (const item of items) {
+				const group = byMailbox.get(item.mailboxId) ?? { threads: [], messages: [] };
+				if (item.messageIds) group.messages.push(...item.messageIds);
+				else group.threads.push(item.threadId);
+				byMailbox.set(item.mailboxId, group);
+			}
 			try {
-				if (messageIds) {
-					if (messageIds.length > 0) await runThreadAction(mailboxId, messageIds, action);
-				} else {
-					await moveThread(mailboxId, threadId, action);
+				const changed: ChangedMessage[] = write ? await write() : [];
+				for (const [mailboxId, group] of write ? [] : byMailbox) {
+					if (group.messages.length > 0) {
+						changed.push(...(await runThreadAction(mailboxId, group.messages, action)));
+					}
+					if (group.threads.length > 0) {
+						changed.push(...(await moveThreads(mailboxId, group.threads, action)));
+					}
 				}
 				forgetInflight();
 				const { list: l, counts: c } = runsRef.current;
 				const listAfter = l.startedRuns();
 				const countsAfter = c.startedRuns();
-				setGuesses((prev) =>
-					prev[key] && prev[key].read === read
-						? { ...prev, [key]: { ...prev[key], listAfter, countsAfter } }
-						: prev,
-				);
-			} catch {
-				// The write failed: drop the guess and show what the server has.
 				setGuesses((prev) => {
-					if (!prev[key]) return prev;
-					const { [key]: _dropped, ...rest } = prev;
-					return rest;
+					const next = { ...prev };
+					for (const key of keys) {
+						if (next[key] && next[key].read === read) {
+							next[key] = { ...next[key], listAfter, countsAfter };
+						}
+					}
+					return next;
+				});
+				return changed;
+			} catch (error) {
+				// The write failed: drop the guesses and show what the server has.
+				setGuesses((prev) => {
+					const next = { ...prev };
+					for (const key of keys) delete next[key];
+					return next;
 				});
 				forgetInflight();
+				throw error;
 			} finally {
 				refresh();
 			}
 		},
 		[guess, refresh],
+	);
+
+	/** One conversation; see setManyRead. Never rejects (a failure rolls back). */
+	const setThreadRead = useCallback(
+		async (mailboxId: string, threadId: string, read: boolean, messageIds?: string[]) => {
+			try {
+				await setManyRead([{ mailboxId, threadId, messageIds }], read);
+			} catch {
+				// Rolled back in setManyRead.
+			}
+		},
+		[setManyRead],
 	);
 
 	const applyRows = useMemo(() => {
@@ -193,5 +235,5 @@ export function useReadState({
 		[guesses],
 	);
 
-	return { rows: applyRows, applyCounts, guess, setThreadRead, isRead };
+	return { rows: applyRows, applyCounts, guess, setThreadRead, setManyRead, isRead };
 }

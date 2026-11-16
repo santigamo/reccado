@@ -1,8 +1,22 @@
-import { Download, File, FileImage, FileSpreadsheet, FileText } from "lucide-react";
+import {
+	ChevronDown,
+	Download,
+	File,
+	FileImage,
+	FileSpreadsheet,
+	FileText,
+	Forward,
+	ImageOff,
+	Mail,
+	MoreHorizontal,
+	Reply,
+	ReplyAll,
+} from "lucide-react";
 import type { ReactElement } from "react";
 import { useEffect, useRef, useState } from "react";
 import { UnreadDot } from "#/components/mail/ThreadListItem";
 import { Avatar } from "#/components/ui/Avatar";
+import { Menu } from "#/components/ui/Menu";
 import { Pill } from "#/components/ui/Pill";
 import { isPreviewableImage } from "#/lib/attachment-preview";
 import { cn } from "#/lib/cn";
@@ -38,16 +52,76 @@ import { linkifySegments } from "#/lib/rich-text";
  * If the frame cannot be read after loading (blocked, or an error page), the
  * message falls back to its text part rather than showing an empty box.
  */
+/** Where a reply's quoted history starts in a rendered email, if anywhere. */
+const QUOTE_SELECTORS = [
+	".gmail_quote",
+	"blockquote[type='cite']",
+	".moz-cite-prefix",
+	"#divRplyFwdMsg",
+	"#appendonsend",
+	".yahoo_quoted",
+];
+
+/**
+ * The quoted history of a reply: the first known quote container, else a
+ * trailing blockquote (with its "On …, X wrote:" line). Only when something
+ * else is left to read above it.
+ */
+function findQuote(doc: Document): HTMLElement[] {
+	const body = doc.body;
+	if (!body) return [];
+	let start: Element | null = null;
+	for (const selector of QUOTE_SELECTORS) {
+		const found = body.querySelector(selector);
+		if (
+			found &&
+			(!start || found.compareDocumentPosition(start) & Node.DOCUMENT_POSITION_FOLLOWING)
+		)
+			start = found;
+	}
+	if (!start) {
+		const last = [...body.children].reverse().find((el) => el.textContent?.trim());
+		if (last?.tagName === "BLOCKQUOTE") {
+			const before = last.previousElementSibling;
+			start = before && /wrote:\s*$/i.test(before.textContent ?? "") ? before : last;
+		}
+	}
+	if (!start) return [];
+	// The quote and everything after it at the same level.
+	const parts: HTMLElement[] = [];
+	for (let el: Element | null = start; el; el = el.nextElementSibling)
+		parts.push(el as HTMLElement);
+	const quoted = parts.reduce((n, el) => n + (el.textContent?.trim().length ?? 0), 0);
+	const total = body.textContent?.trim().length ?? 0;
+	return total - quoted > 0 ? parts : [];
+}
+
+/** Remote content the CSP held back: images, CSS backgrounds. */
+function hasRemoteContent(doc: Document): boolean {
+	for (const img of doc.querySelectorAll("img")) {
+		const src = img.getAttribute("src") ?? img.getAttribute("srcset") ?? "";
+		if (/^\s*(https?:)?\/\//i.test(src)) return true;
+	}
+	return /url\(\s*['"]?\s*(https?:)?\/\//i.test(doc.documentElement?.innerHTML ?? "");
+}
+
 function EmailHtmlBody({
 	src,
 	fallback,
+	onRemoteContent,
 }: {
 	src: string;
 	fallback: ReactElement | null;
+	/** Told after loading whether the message has remote content (blocked or shown). */
+	onRemoteContent?: (has: boolean) => void;
 }): ReactElement {
 	const ref = useRef<HTMLIFrameElement>(null);
 	const [height, setHeight] = useState(120);
 	const [failed, setFailed] = useState(false);
+	const [quote, setQuote] = useState<HTMLElement[]>([]);
+	const [showQuote, setShowQuote] = useState(false);
+	const remoteRef = useRef(onRemoteContent);
+	remoteRef.current = onRemoteContent;
 
 	useEffect(() => {
 		const iframe = ref.current;
@@ -78,6 +152,19 @@ function EmailHtmlBody({
 				setFailed(true);
 				return;
 			}
+			try {
+				const doc = iframe.contentDocument;
+				if (doc) {
+					remoteRef.current?.(hasRemoteContent(doc));
+					// Gmail's "···": a reply's quoted history starts folded.
+					const parts = findQuote(doc);
+					for (const el of parts) el.style.display = "none";
+					setQuote(parts);
+					setShowQuote(false);
+				}
+			} catch {
+				// best effort
+			}
 			measure();
 			try {
 				const body = iframe.contentDocument?.body;
@@ -99,15 +186,50 @@ function EmailHtmlBody({
 
 	if (failed && fallback) return fallback;
 	return (
-		<iframe
-			ref={ref}
-			src={src}
-			title="Email content"
-			sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-			referrerPolicy="no-referrer"
-			className="block w-full rounded-control bg-white"
-			style={{ height, border: 0 }}
-		/>
+		<>
+			<iframe
+				ref={ref}
+				src={src}
+				title="Email content"
+				sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+				referrerPolicy="no-referrer"
+				className="block w-full rounded-control bg-white"
+				style={{ height, border: 0 }}
+			/>
+			{quote.length > 0 ? (
+				<QuoteToggle
+					open={showQuote}
+					onToggle={() => {
+						const next = !showQuote;
+						for (const el of quote) el.style.display = next ? "" : "none";
+						setShowQuote(next);
+						const doc = ref.current?.contentDocument;
+						if (doc) {
+							setHeight(
+								Math.max(doc.documentElement?.scrollHeight ?? 0, doc.body?.scrollHeight ?? 0) ||
+									height,
+							);
+						}
+					}}
+				/>
+			) : null}
+		</>
+	);
+}
+
+/** The "···" under a reply that shows or hides the quoted history. */
+function QuoteToggle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+	return (
+		<button
+			type="button"
+			aria-expanded={open}
+			aria-label={open ? "Hide quoted text" : "Show quoted text"}
+			title={open ? "Hide quoted text" : "Show quoted text"}
+			onClick={onToggle}
+			className="mt-2 inline-flex h-4 items-center rounded-[4px] bg-pill px-1.5 text-[11px] leading-none font-semibold tracking-widest text-text-muted hover:bg-hover hover:text-text"
+		>
+			···
+		</button>
 	);
 }
 
@@ -126,15 +248,7 @@ function PlainTextBody({ text }: { text: string }): ReactElement {
 			</p>
 			{quoted ? (
 				<>
-					<button
-						type="button"
-						aria-expanded={showQuote}
-						title={showQuote ? "Hide quoted text" : "Show quoted text"}
-						onClick={() => setShowQuote((v) => !v)}
-						className="mt-2 inline-flex h-4 items-center rounded-[4px] bg-pill px-1.5 text-[11px] leading-none font-semibold tracking-widest text-text-muted hover:bg-hover hover:text-text"
-					>
-						···
-					</button>
+					<QuoteToggle open={showQuote} onToggle={() => setShowQuote((v) => !v)} />
 					{showQuote ? (
 						<p className="m-0 mt-2 whitespace-pre-wrap text-text-muted [overflow-wrap:anywhere]">
 							<Linkified text={quoted} />
@@ -193,6 +307,29 @@ function FileIcon({ att }: { att: Attachment }) {
 	return <File />;
 }
 
+const TRUSTED_KEY = "reccado.showImagesFrom";
+
+/** Senders whose images you chose to always show (this browser only). */
+function trustedSenders(): string[] {
+	try {
+		const parsed = JSON.parse(window.localStorage.getItem(TRUSTED_KEY) ?? "[]") as unknown;
+		return Array.isArray(parsed) ? parsed.map(String) : [];
+	} catch {
+		return [];
+	}
+}
+
+function trustSender(address: string): void {
+	try {
+		const list = trustedSenders();
+		if (!list.includes(address)) {
+			window.localStorage.setItem(TRUSTED_KEY, JSON.stringify([...list, address].slice(-500)));
+		}
+	} catch {
+		// Storage unavailable: this message still shows its images.
+	}
+}
+
 /**
  * One message inside an open thread (Paper "Inbox — Reading, no approval"):
  * avatar, sender and time, the address line with "View original", the body,
@@ -209,18 +346,39 @@ export function MessageItem({
 	mailboxId,
 	defaultOpen,
 	isNew,
+	ownName,
+	onReply,
+	onForward,
+	onMarkUnread,
 }: {
 	message: Message & { attachments?: Attachment[] };
 	mailboxId: string;
 	defaultOpen: boolean;
 	/** Unread, or was when the conversation opened. Defaults to `is_read === 0`. */
 	isNew?: boolean;
+	/** The mailbox's display name: how your own messages are labelled ("me" without one). */
+	ownName?: string | null;
+	/** Reply / reply all to this message (omit to hide, e.g. while an approval is open). */
+	onReply?: (mode: "reply" | "reply_all") => void;
+	onForward?: () => void;
+	/** Mark just this message unread. */
+	onMarkUnread?: () => void;
 }): ReactElement {
 	const [open, setOpen] = useState(defaultOpen);
+	const [details, setDetails] = useState(false);
+	const [remote, setRemote] = useState(false);
 	const isOutbound = message.direction === "outbound";
 	const isUnread = isNew ?? message.is_read === 0;
 	const senderAddress = extractEmail(message.from_addr);
-	const senderName = displayName(message.from_addr, message.from_name);
+	// Your own messages say who you are, not the mailbox's local part.
+	const senderName = isOutbound
+		? ownName?.trim() || "me"
+		: displayName(message.from_addr, message.from_name);
+	const [showImages, setShowImages] = useState(
+		() =>
+			isOutbound ||
+			(typeof window !== "undefined" && trustedSenders().includes(senderAddress.toLowerCase())),
+	);
 
 	if (!open) {
 		const preview =
@@ -252,7 +410,7 @@ export function MessageItem({
 						)}
 						title={senderAddress}
 					>
-						{isOutbound ? "You" : senderName}
+						{senderName}
 					</span>
 					{isOutbound ? (
 						<Pill tone="neutral" className="h-[18px] px-1.75">
@@ -285,6 +443,36 @@ export function MessageItem({
 	const recipientNames = parseAddressNames(message.recipient_names_json);
 	const toList = parseAddressList(message.to_json).map((a) => recipientLabel(a, recipientNames));
 	const ccList = parseAddressList(message.cc_json).map((a) => recipientLabel(a, recipientNames));
+	const replyToList = parseAddressList(message.reply_to_json);
+	const fromFull =
+		senderName && senderName !== senderAddress && senderName !== "me"
+			? `${senderName} <${senderAddress}>`
+			: senderAddress;
+	const menuItems = [
+		...(onReply
+			? [
+					{ key: "reply", label: "Reply", icon: <Reply />, onSelect: () => onReply("reply") },
+					{
+						key: "reply-all",
+						label: "Reply all",
+						icon: <ReplyAll />,
+						onSelect: () => onReply("reply_all"),
+					},
+				]
+			: []),
+		...(onForward
+			? [{ key: "forward", label: "Forward", icon: <Forward />, onSelect: onForward }]
+			: []),
+		...(onMarkUnread && !isOutbound
+			? [{ key: "unread", label: "Mark as unread", icon: <Mail />, onSelect: onMarkUnread }]
+			: []),
+		{
+			key: "raw",
+			label: "View original",
+			icon: <FileText />,
+			href: rawMessageUrl(mailboxId, message.id),
+		},
+	];
 	const attachments = message.attachments ?? [];
 	const images = attachments.filter((att) => isPreviewableImage(att.content_type));
 
@@ -328,27 +516,82 @@ export function MessageItem({
 						{formatDayTime(message.received_at)}
 					</time>
 				</button>
-				<p className="m-0 text-label text-text-muted [overflow-wrap:anywhere]">
-					{/* The real address, always: the name above is the sender's own claim. */}
-					{senderAddress}
-					{toList.length > 0 ? ` · to ${toList.join(", ")}` : null}
-					{ccList.length > 0 ? ` · cc ${ccList.join(", ")}` : null}
-					{" · "}
-					<a
-						href={rawMessageUrl(mailboxId, message.id)}
-						target="_blank"
-						rel="noreferrer"
-						className="whitespace-nowrap text-text underline decoration-1 hover:text-ink"
-					>
-						View original
-					</a>
-				</p>
+				<div className="flex items-start gap-1">
+					<p className="m-0 min-w-0 flex-1 text-label text-text-muted [overflow-wrap:anywhere]">
+						{/* The real address, always: the name above is the sender's own claim. */}
+						{senderAddress}
+						{toList.length > 0 ? ` · to ${toList.join(", ")}` : null}
+						{ccList.length > 0 ? ` · cc ${ccList.join(", ")}` : null}{" "}
+						<button
+							type="button"
+							aria-expanded={details}
+							onClick={() => setDetails((v) => !v)}
+							className="inline-flex items-center gap-0.5 rounded-[4px] align-middle text-text-muted hover:text-text"
+							title={details ? "Hide details" : "Show details"}
+						>
+							<span className="sr-only">{details ? "Hide details" : "Show details"}</span>
+							<ChevronDown
+								aria-hidden="true"
+								className={cn("size-3.5 transition-transform", details && "rotate-180")}
+							/>
+						</button>
+					</p>
+					<Menu
+						label="Message actions"
+						align="end"
+						triggerClassName="-mt-1 inline-flex size-7 shrink-0 items-center justify-center rounded-control text-icon hover:bg-hover hover:text-text [&_svg]:size-4"
+						trigger={<MoreHorizontal />}
+						items={menuItems}
+					/>
+				</div>
+				{details ? (
+					<dl className="m-0 mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-control bg-content px-3 py-2.5 text-label">
+						<DetailRow label="From" value={fromFull} />
+						{replyToList.length > 0 ? (
+							<DetailRow label="Reply-To" value={replyToList.join(", ")} />
+						) : null}
+						{toList.length > 0 ? <DetailRow label="To" value={toList.join(", ")} /> : null}
+						{ccList.length > 0 ? <DetailRow label="Cc" value={ccList.join(", ")} /> : null}
+						<DetailRow label="Date" value={formatFullDate(message.received_at)} />
+						<DetailRow label="Subject" value={message.subject ?? "(no subject)"} />
+					</dl>
+				) : null}
+
+				{message.body_html_r2_key && remote && !showImages ? (
+					<div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-control bg-content px-3 py-2 text-label text-text-muted">
+						<ImageOff aria-hidden="true" className="size-4 shrink-0 text-icon" />
+						<span className="min-w-0 flex-1">
+							Images are hidden so the sender can't tell you opened this.
+						</span>
+						<span className="flex gap-3">
+							<button
+								type="button"
+								className="font-medium text-text underline decoration-1 hover:text-ink"
+								onClick={() => setShowImages(true)}
+							>
+								Show images
+							</button>
+							<button
+								type="button"
+								className="font-medium text-text underline decoration-1 hover:text-ink"
+								onClick={() => {
+									trustSender(senderAddress.toLowerCase());
+									setShowImages(true);
+								}}
+							>
+								Always from {senderAddress}
+							</button>
+						</span>
+					</div>
+				) : null}
 
 				<div className="pt-3.5">
 					{message.body_html_r2_key ? (
 						<EmailHtmlBody
-							src={messageHtmlUrl(mailboxId, message.id)}
+							key={showImages ? "images" : "text"}
+							src={`${messageHtmlUrl(mailboxId, message.id)}${showImages ? "?images=1" : ""}`}
 							fallback={message.body_text ? <PlainTextBody text={message.body_text} /> : null}
+							onRemoteContent={setRemote}
 						/>
 					) : message.body_text ? (
 						<PlainTextBody text={message.body_text} />
@@ -408,5 +651,14 @@ export function MessageItem({
 				) : null}
 			</div>
 		</article>
+	);
+}
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+	return (
+		<>
+			<dt className="text-text-muted">{label}</dt>
+			<dd className="m-0 min-w-0 text-text [overflow-wrap:anywhere]">{value}</dd>
+		</>
 	);
 }

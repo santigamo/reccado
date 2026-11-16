@@ -1,6 +1,6 @@
 import { createContext, useContext } from "react";
 import type { InboxFolder, InboxSearch } from "#/lib/inbox-search";
-import type { Mailbox } from "#/lib/mail";
+import type { Mailbox, MessageAction } from "#/lib/mail";
 import type { MailboxColor } from "#/lib/mailbox-color";
 import type { AgentStatus } from "#/lib/use-agent-status";
 import type { ApprovalItem, PendingApproval } from "#/lib/use-approvals";
@@ -9,6 +9,7 @@ import type { UnifiedThreadRow } from "#/lib/use-unified-mail";
 export type ComposePrefill = {
 	from?: string;
 	to?: string;
+	cc?: string;
 	subject?: string;
 	threadId?: string;
 	draftId?: string;
@@ -63,7 +64,39 @@ export type InboxContextValue = {
 	) => Promise<void>;
 	/** Show a conversation as read/unread now, before anything is written. */
 	guessThreadRead: (mailboxId: string, threadId: string, read: boolean) => void;
+	/**
+	 * Archive / delete / move to inbox: the rows leave at once, a toast offers
+	 * Undo, a failure puts them back. Resolves true when written.
+	 */
+	moveThreads: (refs: ThreadRef[], action: MessageAction) => Promise<boolean>;
+	/** Read / unread with an Undo toast (when `announce`), rolled back on failure. */
+	markThreadsRead: (
+		items: Array<ThreadRef & { messageIds?: string[] }>,
+		read: boolean,
+		announce?: boolean,
+	) => Promise<boolean>;
+	/** Every address of the owner (mailboxes and aliases), lowercased: never a reply-all recipient. */
+	ownAddresses: string[];
+	/** Selected conversations of the list ("<mailboxId>:<threadId>"). */
+	selection: ReadonlySet<string>;
+	/** Toggle one row; `range` selects from the last toggled row to this one (shift-click). */
+	toggleSelected: (key: string, range?: boolean) => void;
+	setSelection: (keys: Iterable<string>) => void;
+	/** Search the current query in every mailbox and every folder. */
+	searchEverywhere: () => void;
+	/** Folded columns (persisted per browser) and their toggles. */
+	layout: {
+		mailboxesFolded: boolean;
+		listFolded: boolean;
+		toggleMailboxes: () => void;
+		toggleList: () => void;
+		toggleWide: () => void;
+	};
 };
+
+export type ThreadRef = { mailboxId: string; threadId: string };
+
+export const rowKey = (mailboxId: string, threadId: string) => `${mailboxId}:${threadId}`;
 
 export const InboxContext = createContext<InboxContextValue | null>(null);
 

@@ -35,12 +35,19 @@ import {
 	type WebSocketAttachment,
 } from "./mailbox-realtime";
 import { MAILBOX_SCHEMA_SQL } from "./mailbox-schema";
+import {
+	applyBulkAction,
+	type BulkAction,
+	type BulkTarget,
+	backfillHeaderFields,
+	restoreDraft,
+} from "./mailbox-web";
 
 type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 11;
+const MAILBOX_SCHEMA_VERSION = 12;
 
 export type DraftOrigin = "web" | "telegram" | "mcp";
 
@@ -245,6 +252,19 @@ function reportsClause(alias: string, reports: ReportsFilter | undefined): strin
 	return "";
 }
 
+/** Where a page of the thread list ends: its last row's sort key. */
+export type ThreadListCursor = { receivedAt: string; id: string };
+
+/** `<latest_received_at>|<thread id>`, as the client sends back from the last row. */
+export function parseThreadListCursor(
+	value: string | null | undefined,
+): ThreadListCursor | undefined {
+	if (!value) return undefined;
+	const at = value.lastIndexOf("|");
+	if (at <= 0 || at === value.length - 1) return undefined;
+	return { receivedAt: value.slice(0, at), id: value.slice(at + 1) };
+}
+
 export type ThreadListRow = Record<string, unknown> & {
 	id: string;
 	message_count: number;
@@ -265,13 +285,18 @@ export function listThreads(
 	state?: ThreadListState,
 	unread?: boolean,
 	reports?: ReportsFilter,
+	before?: ThreadListCursor,
 ): ThreadListRow[] {
 	const visible = (alias: string) => visibleClause(alias, state, reports);
 	const folderFilter = state
 		? `WHERE EXISTS (SELECT 1 FROM messages f WHERE f.thread_id = t.id AND f.state = ?${reportsClause("f", reports)})`
 		: "";
-	const unreadFilter =
-		unread === undefined ? "" : unread ? "WHERE unread_count > 0" : "WHERE unread_count = 0";
+	const outer: string[] = [];
+	if (unread !== undefined) outer.push(unread ? "unread_count > 0" : "unread_count = 0");
+	// Keyset paging on the list order: strictly after the last row of the
+	// previous page, so a page never repeats or skips a conversation.
+	if (before) outer.push("(latest_received_at < ? OR (latest_received_at = ? AND id < ?))");
+	const unreadFilter = outer.length ? `WHERE ${outer.join(" AND ")}` : "";
 	const rows = sql
 		.exec(
 			`SELECT * FROM (
@@ -288,6 +313,7 @@ export function listThreads(
        ORDER BY latest_received_at DESC, id DESC
        LIMIT ?`,
 			...(state ? [state] : []),
+			...(before ? [before.receivedAt, before.receivedAt, before.id] : []),
 			limit,
 		)
 		.toArray() as Array<Record<string, SqlStorageValue>>;
@@ -522,7 +548,7 @@ function getBodyHtmlR2Key(sql: SqlStorage, messageId: string | undefined): strin
 	return row?.body_html_r2_key ?? null;
 }
 
-function applyMessageAction(sql: SqlStorage, messageId: string | undefined, action: string) {
+export function applyMessageAction(sql: SqlStorage, messageId: string | undefined, action: string) {
 	if (!messageId) throw new Error("messageId required");
 	const now = new Date().toISOString();
 	if (action === "mark_read") {
@@ -1466,6 +1492,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				});
 			}
 		}
+		// v12: Reply-To, kept so Reply answers where the sender asked. Nullable and
+		// not backfilled here: a NULL row is filled from its raw headers in R2 the
+		// first time its thread is opened (backfillHeaderFields, bounded per open).
+		if (currentVersion < 12) {
+			const columns = this.columnNames("messages");
+			this.addColumnIfMissing("messages", columns, "reply_to_json", "TEXT");
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -1657,6 +1690,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 					state,
 					url.searchParams.has("unread") ? url.searchParams.get("unread") === "true" : undefined,
 					parseReportsFilter(url.searchParams.get("reports")),
+					parseThreadListCursor(url.searchParams.get("before")),
 				),
 			});
 		}
@@ -1665,6 +1699,17 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 		if (url.pathname.startsWith("/threads/") && request.method === "GET") {
 			const threadId = url.pathname.split("/")[2];
+			// Older rows get their sender name and Reply-To from their own raw
+			// headers, once, the first time their conversation is opened.
+			if (threadId) {
+				try {
+					await backfillHeaderFields(this.ctx.storage.sql, this.env.MAIL_OBJECTS, threadId);
+				} catch (error) {
+					console.error("mailbox.header_backfill_failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
 			// getThread already returns { thread, messages }; return it flat so the
 			// client reads data.messages / data.thread directly (not data.thread.messages).
 			return Response.json(this.getThread(threadId));
@@ -1687,6 +1732,23 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const messageId = url.pathname.split("/")[2];
 			const body = (await request.json()) as { action: string };
 			return Response.json(this.applyMessageAction(messageId, body.action));
+		}
+		if (url.pathname === "/bulk-actions" && request.method === "POST") {
+			const body = (await request.json()) as { action: BulkAction; target: BulkTarget };
+			const sql = this.ctx.storage.sql;
+			return Response.json(
+				applyBulkAction(
+					sql,
+					(fn) => this.ctx.storage.transactionSync(fn),
+					(messageId, action) => applyMessageAction(sql, messageId, action),
+					body.action,
+					body.target,
+				),
+			);
+		}
+		if (url.pathname.match(/^\/drafts\/[^/]+\/restore$/) && request.method === "POST") {
+			const result = restoreDraft(this.ctx.storage.sql, url.pathname.split("/")[2]);
+			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname === "/drafts" && request.method === "GET") {
 			return Response.json({ drafts: this.listDrafts() });
@@ -2538,8 +2600,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		state?: ThreadListState,
 		unread?: boolean,
 		reports?: ReportsFilter,
+		before?: ThreadListCursor,
 	) {
-		return listThreads(this.ctx.storage.sql, limit, state, unread, reports);
+		return listThreads(this.ctx.storage.sql, limit, state, unread, reports, before);
 	}
 
 	private getThread(threadId: string | undefined) {

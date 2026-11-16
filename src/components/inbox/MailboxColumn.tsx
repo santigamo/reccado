@@ -1,5 +1,6 @@
 import { Link } from "@tanstack/react-router";
-import { Layers, Plus } from "lucide-react";
+import { Layers, PanelLeftClose, PanelLeftOpen, Plus } from "lucide-react";
+import { IconButton } from "#/components/ui/IconButton";
 import { StatusDot } from "#/components/ui/StatusDot";
 import { cn } from "#/lib/cn";
 import type { InboxSearch } from "#/lib/inbox-search";
@@ -51,6 +52,7 @@ export function MailboxColumn({
 	totalUnread,
 	pendingApprovals,
 	onNavigate,
+	onCollapse,
 	className,
 }: {
 	mailboxes: Mailbox[];
@@ -61,6 +63,8 @@ export function MailboxColumn({
 	pendingApprovals: number;
 	/** Called after a selection (closes the drawer on narrow screens). */
 	onNavigate?: () => void;
+	/** Fold the column into a rail (desktop). */
+	onCollapse?: () => void;
 	className?: string;
 }) {
 	const scope = search.mailbox;
@@ -71,27 +75,39 @@ export function MailboxColumn({
 			aria-label="Mailboxes"
 			className={cn("flex w-[216px] shrink-0 flex-col gap-0.5 pt-1", className)}
 		>
-			<Link
-				to="/inbox"
-				search={{ folder: search.folder }}
-				onClick={onNavigate}
-				aria-current={!scope ? "page" : undefined}
-				className={cn(
-					rowBase,
-					"h-9 px-2.5",
-					!scope
-						? "border border-border-card bg-panel font-medium text-text shadow-card"
-						: "text-text hover:bg-hover",
-				)}
-			>
-				<Layers aria-hidden="true" className="size-4 shrink-0 text-[#1F1F1F]" />
-				<span
-					className={cn("min-w-0 flex-1 truncate", totalUnread > 0 && "font-semibold text-ink")}
+			<div className="flex shrink-0 items-center gap-1">
+				<Link
+					to="/inbox"
+					search={{ folder: search.folder }}
+					onClick={onNavigate}
+					aria-current={!scope ? "page" : undefined}
+					className={cn(
+						rowBase,
+						"h-9 min-w-0 flex-1 px-2.5",
+						!scope
+							? "border border-border-card bg-panel font-medium text-text shadow-card"
+							: "text-text hover:bg-hover",
+					)}
 				>
-					All mailboxes
-				</span>
-				<UnreadCount count={totalUnread} />
-			</Link>
+					<Layers aria-hidden="true" className="size-4 shrink-0 text-[#1F1F1F]" />
+					<span
+						className={cn("min-w-0 flex-1 truncate", totalUnread > 0 && "font-semibold text-ink")}
+					>
+						All mailboxes
+					</span>
+					<UnreadCount count={totalUnread} />
+				</Link>
+				{onCollapse ? (
+					<IconButton
+						title="Hide mailboxes ([)"
+						aria-label="Hide mailboxes"
+						size="sm"
+						onClick={onCollapse}
+					>
+						<PanelLeftClose />
+					</IconButton>
+				) : null}
+			</div>
 
 			<div className="app-scroll -mr-2 flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-2">
 				{groups.map((group) => (
@@ -174,6 +190,86 @@ export function MailboxColumn({
 					</Link>
 				</div>
 			) : null}
+		</nav>
+	);
+}
+
+/**
+ * The mailbox column folded (desktop): a thin rail with the way back, All
+ * mailboxes, and one dot per mailbox in its colour (a ring when it has unread
+ * mail). Same links as the column, so scope still switches from here.
+ */
+export function MailboxRail({
+	mailboxes,
+	search,
+	colorOf,
+	unreadOf,
+	totalUnread,
+	onExpand,
+	className,
+}: {
+	mailboxes: Mailbox[];
+	search: InboxSearch;
+	colorOf: (id: string) => MailboxColor;
+	unreadOf: (id: string) => number;
+	totalUnread: number;
+	onExpand: () => void;
+	className?: string;
+}) {
+	const scope = search.mailbox;
+	const cell =
+		"flex size-8 shrink-0 items-center justify-center rounded-[10px] no-underline hover:bg-hover";
+	return (
+		<nav
+			aria-label="Mailboxes"
+			className={cn("w-9 shrink-0 flex-col items-center gap-1 pt-1", className)}
+		>
+			<IconButton title="Show mailboxes ([)" aria-label="Show mailboxes" onClick={onExpand}>
+				<PanelLeftOpen />
+			</IconButton>
+			<Link
+				to="/inbox"
+				search={{ folder: search.folder }}
+				aria-current={!scope ? "page" : undefined}
+				title={
+					totalUnread > 0 ? `All mailboxes · ${formatCount(totalUnread)} unread` : "All mailboxes"
+				}
+				className={cn(cell, !scope && "border border-border-card bg-panel shadow-card")}
+			>
+				<Layers aria-hidden="true" className="size-4 text-[#1F1F1F]" />
+				<span className="sr-only">All mailboxes</span>
+			</Link>
+			<div className="app-scroll flex min-h-0 flex-col items-center gap-1 overflow-y-auto">
+				{sortMailboxesForColor(mailboxes).map((m) => {
+					const active = scope === m.mailbox_id;
+					const unread = unreadOf(m.mailbox_id);
+					const color = colorOf(m.mailbox_id).css;
+					return (
+						<Link
+							key={m.mailbox_id}
+							to="/inbox"
+							search={{ mailbox: m.mailbox_id, folder: search.folder }}
+							aria-current={active ? "page" : undefined}
+							title={`${m.primary_address}${unread > 0 ? ` · ${formatCount(unread)} unread` : ""}`}
+							className={cn(cell, active && "border border-border-card bg-panel shadow-card")}
+						>
+							<span
+								aria-hidden="true"
+								className="size-2.5 rounded-full"
+								style={{
+									background: color,
+									boxShadow:
+										unread > 0 ? `0 0 0 2px var(--color-content), 0 0 0 3.5px ${color}` : undefined,
+								}}
+							/>
+							<span className="sr-only">
+								{m.primary_address}
+								{unread > 0 ? `, ${formatCount(unread)} unread` : ""}
+							</span>
+						</Link>
+					);
+				})}
+			</div>
 		</nav>
 	);
 }

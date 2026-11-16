@@ -105,6 +105,31 @@ export const messageActionSchema = z.object({
 	action: z.enum(["mark_read", "mark_unread", "archive", "trash", "restore_inbox"]),
 });
 
+/**
+ * One action on many messages of a mailbox: whole conversations (bulk archive,
+ * delete, read state), exact messages (undo), or every unread message of a
+ * folder (mark all as read; read state only). Exactly one target.
+ */
+export const bulkActionSchema = z
+	.object({
+		action: z.enum(["mark_read", "mark_unread", "archive", "trash", "restore_inbox"]),
+		threadIds: z.array(z.string().min(1).max(200)).min(1).max(100).optional(),
+		messageIds: z.array(z.string().min(1).max(200)).min(1).max(1000).optional(),
+		folder: z
+			.object({
+				state: z.enum(["inbox", "archive", "trash", "sent"]).nullable(),
+				reports: z.enum(["only"]).optional(),
+			})
+			.optional(),
+	})
+	.refine(
+		(b) => [b.threadIds, b.messageIds, b.folder].filter((t) => t !== undefined).length === 1,
+		{ message: "Give exactly one of threadIds, messageIds or folder" },
+	)
+	.refine((b) => !b.folder || b.action === "mark_read", {
+		message: "A whole folder can only be marked read",
+	});
+
 export const createDraftSchema = z.object({
 	to: z.array(z.string().email()).min(1),
 	cc: z.array(z.string().email()).optional(),
@@ -140,8 +165,11 @@ export const searchQuerySchema = z.object({
 });
 
 export const threadListQuerySchema = z.object({
-	limit: z.coerce.number().int().min(1).max(100).default(25),
-	cursor: z.string().optional(),
+	limit: z.coerce.number().int().min(1).max(101).default(25),
+	/** `<latest_received_at>|<thread id>` of the previous page's last row. */
+	cursor: z.string().max(200).optional(),
+	/** Only conversations with something unread ("Unread" filter). */
+	unread: z.enum(["true"]).optional(),
 	q: z.string().optional(),
 	label: z.string().optional(),
 	// Folder filter. `draft` is excluded — drafts live in outbound_drafts, not messages.

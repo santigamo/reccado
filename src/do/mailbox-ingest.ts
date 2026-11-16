@@ -365,6 +365,9 @@ export async function ingestInboundEmail(
 	// leaves both null: the row then renders the address, as every older row does.
 	let fromName: string | null = null;
 	let recipientNamesJson: string | null = null;
+	// Reply-To, as a JSON address list ("[]" when absent). NULL only on rows stored
+	// before it was kept; those are filled lazily when their thread is opened.
+	let replyToJson: string | null = null;
 	// Kept as arrays, not JSON: thread resolution needs the addresses themselves.
 	let toAddresses: string[] = [message.recipient];
 	let ccAddresses: string[] = [];
@@ -388,6 +391,7 @@ export async function ingestInboundEmail(
 		fromName = sanitizeDisplayName(parsed.fromName, fromAddr);
 		const recipientNames = sanitizeAddressNames(parsed.recipientNames);
 		recipientNamesJson = recipientNames ? JSON.stringify(recipientNames) : null;
+		replyToJson = JSON.stringify(parsed.replyTo);
 		toAddresses = parsed.to.length ? parsed.to : [message.recipient];
 		ccAddresses = parsed.cc;
 		inReplyTo = normalizeMessageId(parsed.inReplyTo) ?? inReplyTo;
@@ -522,9 +526,9 @@ export async function ingestInboundEmail(
 			ctx.sql.exec(
 				`INSERT INTO messages
          (id, idempotency_key, thread_id, rfc_message_id, in_reply_to, references_json, direction, state,
-          from_addr, from_name, to_json, cc_json, bcc_json, recipient_names_json, subject, snippet, date_header, received_at, raw_r2_key,
+          from_addr, from_name, to_json, cc_json, bcc_json, recipient_names_json, reply_to_json, subject, snippet, date_header, received_at, raw_r2_key,
           raw_sha256, raw_size, body_text, body_html_r2_key, sensitive_kind, sensitive_classified, automated_kind, parse_status, has_attachments, is_read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'parsed', ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, 'inbound', 'inbox', ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'parsed', ?, ?, ?, ?)`,
 				messageLocalId,
 				message.idempotencyKey,
 				threadId,
@@ -536,6 +540,7 @@ export async function ingestInboundEmail(
 				toJson,
 				ccJson,
 				recipientNamesJson,
+				replyToJson,
 				subject,
 				snippet,
 				message.headers.date,

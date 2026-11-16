@@ -122,6 +122,18 @@ describe("GET /messages/:id/html framing", () => {
 		expect(csp).toContain("default-src 'none'");
 		expect(csp).toContain("form-action 'none'");
 		expect(csp).not.toContain("script-src");
+		// Remote images are a read receipt: blocked until the reader asks.
+		expect(csp).toContain("img-src 'self' data:;");
+		expect(csp).not.toMatch(/https?:/);
+		const shown = await fetchWorker(
+			new Request(
+				`http://localhost/api/mailboxes/${mailboxId}/messages/${messageId}/html?images=1`,
+			),
+		);
+		expect(shown.headers.get("content-security-policy")).toContain(
+			"img-src 'self' data: https: http:",
+		);
+		await shown.text();
 
 		const html = await response.text();
 		expect(html).toContain('target="_blank"');
