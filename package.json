@@ -69,6 +69,7 @@
 		"smoke:email:local": "tsx scripts/smoke-email-local.ts",
 		"verify:cf": "tsx scripts/verify-cloudflare-bindings.ts",
 		"reingest:mailbox": "tsx scripts/reingest-mailbox.ts",
+		"replay:dlq": "tsx scripts/replay-dlq.ts",
 		"verify:mailbox-rebuild": "tsx scripts/verify-mailbox-rebuild.ts",
 		"d1:migrate:local": "wrangler d1 migrations apply INDEX_DB --local",
 		"d1:migrate:dev": "sh -c 'wrangler d1 migrations apply \"${D1_DB_NAME_DEV:-inbox-mcp-index-dev-eu}\" --remote --env dev'",

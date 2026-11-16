@@ -655,6 +655,28 @@ still a manual Cloudflare operation plus an operator validation pass.
 If you cannot prove replay safety, do not replay. Keep the payload for investigation and treat the
 issue as unresolved.
 
+### Replaying dead inbound mail: `pnpm replay:dlq`
+
+For the inbound queue only. The tombstone keeps `mailboxId`, `rawR2Key`, `rawSha256` and the
+recipient domain but not the recipient, sender or headers, so the script rebuilds each
+`email.received.v1` payload from the raw MIME in R2 (recipient from Delivered-To / X-Original-To /
+To matched against the mailbox's primary address and active aliases, sender from Return-Path else
+From, `receivedAt` from the timestamp in the raw key), validates it against the production schema and
+pushes it onto the inbound queue. Idempotency stays the consumer's: the key is rebuilt with
+`inboundIdempotencyKey`.
+
+```sh
+pnpm replay:dlq --env dev --since 2026-11-14T00:00:00Z            # dry run (default), read-only
+pnpm replay:dlq --env dev --since ... --until ... --mailbox mbx_...
+CLOUDFLARE_API_TOKEN=... pnpm replay:dlq --env dev --since ... --apply   # Queues:Edit token
+```
+
+The dry run prints one row per dead message (date, mailbox, subject, `PUSH` or `SKIP — reason`).
+Skipped: R2 object missing, sha256 mismatch, `ingest_events` already `processed` for the key, or
+`message_index` already holding that `raw_sha256` for the mailbox. `--apply` pushes oldest first,
+one at a time, and polls `message_index` for up to 30 s per message. Fix the cause first; bodies are
+never printed.
+
 ## Operator session from the terminal
 
 `pnpm operator` gives an operator (or an agent acting for one) an authenticated `/api/*` session
