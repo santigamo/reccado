@@ -107,16 +107,23 @@ function hasRemoteContent(doc: Document): boolean {
 	return /url\(\s*['"]?\s*(https?:)?\/\//i.test(doc.documentElement?.innerHTML ?? "");
 }
 
-function EmailHtmlBody({
+export function EmailHtmlBody({
 	src,
 	fallback,
 	onRemoteContent,
+	foldQuote = true,
+	title = "Email content",
 }: {
 	src: string;
 	fallback: ReactElement | null;
 	/** Told after loading whether the message has remote content (blocked or shown). */
 	onRemoteContent?: (has: boolean) => void;
+	/** Fold a reply's quoted history behind "···" (default). Off shows everything. */
+	foldQuote?: boolean;
+	title?: string;
 }): ReactElement {
+	const foldRef = useRef(foldQuote);
+	foldRef.current = foldQuote;
 	const ref = useRef<HTMLIFrameElement>(null);
 	const [height, setHeight] = useState(120);
 	const [failed, setFailed] = useState(false);
@@ -158,8 +165,9 @@ function EmailHtmlBody({
 				const doc = iframe.contentDocument;
 				if (doc) {
 					remoteRef.current?.(hasRemoteContent(doc));
-					// Gmail's "···": a reply's quoted history starts folded.
-					const parts = findQuote(doc);
+					// Gmail's "···": a reply's quoted history starts folded (not when
+					// the whole body is under review, as on an approval).
+					const parts = foldRef.current ? findQuote(doc) : [];
 					for (const el of parts) el.style.display = "none";
 					setQuote(parts);
 					setShowQuote(false);
@@ -192,7 +200,7 @@ function EmailHtmlBody({
 			<iframe
 				ref={ref}
 				src={src}
-				title="Email content"
+				title={title}
 				sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
 				referrerPolicy="no-referrer"
 				className="block w-full rounded-control bg-white"

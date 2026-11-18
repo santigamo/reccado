@@ -1,6 +1,7 @@
 import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { OUTGOING_FONT_STYLE, wrapOutgoingHtml } from "#/lib/rich-text";
 import { confirmSendDraft } from "../helpers/armed-confirm";
 
 /**
@@ -141,6 +142,87 @@ describe("confirmSendDraft stores the sent copy's body", () => {
 		const html = await stub.fetch(`https://mailbox-do/messages/${stored.id}/html`);
 		expect(html.status).toBe(200);
 		expect(await html.text()).toBe("<p>Hola, <b>html</b>.</p>");
+	});
+
+	it("sends the HTML part inside the typography container, without touching the frozen payload or the sent copy", async () => {
+		const sent: Array<{ html?: string; text?: string }> = [];
+		const capturing = {
+			send: async (message: { html?: string; text?: string }) => {
+				sent.push(message);
+				return { messageId: "<wrapped@cloudflare.email>" };
+			},
+		} as unknown as Env["EMAIL"];
+		const bodyHtml =
+			'<p>Hola <strong>Ana</strong></p><div>On Mon, x wrote:</div><blockquote style="margin: 0 0 0 0.8ex; border-left: 1px solid #cccccc; padding-left: 1ex"><div>antes</div></blockquote>';
+		const stub = testEnv.MAILBOX_DO.getByName("mbx-sent-body-wrapped");
+		const stored = await runInDurableObject(stub, async (_instance, state) => {
+			const draftId = seedDraft(state, { bodyText: "Hola Ana", bodyHtml });
+			await confirmSendDraft(
+				{
+					sql: state.storage.sql,
+					transactionSync: (fn) => state.storage.transactionSync(fn),
+					email: capturing,
+					fromAddress: "hello@imsanti.dev",
+					replyToAddress: null,
+					r2: testEnv.MAIL_OBJECTS,
+					mailboxId: "mbx-sent-body-wrapped",
+				},
+				draftId,
+				`attempt-${draftId}`,
+			);
+			const intent = state.storage.sql
+				.exec<{ value: string }>(
+					"SELECT value FROM mailbox_meta WHERE key = ?",
+					`send_intent:${draftId}`,
+				)
+				.toArray()[0];
+			const draft = state.storage.sql
+				.exec<{ body_html: string }>("SELECT body_html FROM outbound_drafts WHERE id = ?", draftId)
+				.toArray()[0];
+			return { copy: readSentCopy(state), intent, draft };
+		});
+
+		// On the wire: one container, the body (quoted history included) unchanged inside it.
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.html).toBe(wrapOutgoingHtml(bodyHtml));
+		expect(sent[0]?.html).toBe(`<div style="${OUTGOING_FONT_STYLE}">${bodyHtml}</div>`);
+		expect(sent[0]?.text).toBe("Hola Ana");
+		// The draft and the frozen snapshot (what payload_hash covers) keep the body as written.
+		expect(stored.draft?.body_html).toBe(bodyHtml);
+		expect(stored.intent).toBeDefined();
+		const frozen = JSON.parse(stored.intent!.value) as { snapshot: { html: string } };
+		expect(frozen.snapshot.html).toBe(bodyHtml);
+		// The sent copy is stored as written too (its own frame styles it; quote folding still sees the blockquote).
+		const html = await stub.fetch(`https://mailbox-do/messages/${stored.copy.id}/html`);
+		expect(await html.text()).toBe(bodyHtml);
+	});
+
+	it("sends no HTML part at all for a text-only draft", async () => {
+		const sent: Array<{ html?: string }> = [];
+		const capturing = {
+			send: async (message: { html?: string }) => {
+				sent.push(message);
+				return { messageId: "<text-only@cloudflare.email>" };
+			},
+		} as unknown as Env["EMAIL"];
+		await withMailbox("mbx-sent-body-text-only", async (_instance, state) => {
+			for (const bodyHtml of [null, ""]) {
+				const draftId = seedDraft(state, { bodyText: "solo texto", bodyHtml });
+				await confirmSendDraft(
+					{
+						sql: state.storage.sql,
+						transactionSync: (fn) => state.storage.transactionSync(fn),
+						email: capturing,
+						fromAddress: "hello@imsanti.dev",
+						replyToAddress: null,
+					},
+					draftId,
+					`attempt-${draftId}`,
+				);
+			}
+		});
+		expect(sent).toHaveLength(2);
+		for (const message of sent) expect(message.html).toBeUndefined();
 	});
 
 	it("keeps the text body and still records the send when the R2 write fails", async () => {

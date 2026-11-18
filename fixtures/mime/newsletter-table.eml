@@ -1,0 +1,72 @@
+From: Weekly Digest <digest@news.example.org>
+To: test@example.com
+Subject: Your weekly digest
+Message-ID: <newsletter-table@news.example.org>
+Date: Mon, 16 Nov 2026 09:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="digest"
+
+--digest
+Content-Type: text/plain; charset=utf-8
+
+Your weekly digest
+
+Three things worth reading this week.
+
+Read more: https://news.example.org/a
+
+--digest
+Content-Type: text/html; charset=utf-8
+
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Your weekly digest</title>
+<style type="text/css">
+body { margin: 0; padding: 0; background-color: #f4f4f4; }
+table { border-collapse: collapse; }
+.headline { font-family: Georgia, serif; font-size: 24px; color: #111111; }
+</style>
+</head>
+<body bgcolor="#f4f4f4">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f4f4">
+<tr>
+<td align="center">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff">
+<tr><td height="24" style="font-size:0;line-height:0;">&nbsp;</td></tr>
+<tr>
+<td style="padding:0 32px;"><img src="https://news.example.org/logo.png" width="120" height="32" alt="Digest" border="0" style="display:block;" /></td>
+</tr>
+<tr><td height="10">&nbsp;</td></tr>
+<tr><td><img src="https://news.example.org/spacer.gif" width="1" height="1" alt="" /></td></tr>
+<tr>
+<td class="headline" style="padding:0 32px;">Your weekly digest</td>
+</tr>
+<tr>
+<td style="padding:8px 32px;font-family:Arial,Helvetica,sans-serif;font-size:16px;color:#333333;">Three things worth reading this week.</td>
+</tr>
+<tr>
+<td style="padding:8px 32px;">Unstyled cell text: no font, size or line-height of its own.</td>
+</tr>
+<tr>
+<td style="padding:16px 32px;">
+<table role="presentation" cellpadding="0" cellspacing="0" border="0">
+<tr>
+<td bgcolor="#0b57d0" style="border-radius:4px;padding:10px 18px;"><a href="https://news.example.org/a" style="color:#ffffff;font-family:Arial,sans-serif;font-size:14px;line-height:20px;text-decoration:none;">Read more</a></td>
+</tr>
+</table>
+</td>
+</tr>
+<tr><td height="32" style="font-size:32px;line-height:32px;">&nbsp;</td></tr>
+<tr>
+<td style="padding:0 32px 24px;font-family:Arial,sans-serif;font-size:0.75rem;color:#888888;">You get this because you subscribed. <a href="https://news.example.org/unsubscribe" style="color:#888888;">Unsubscribe</a></td>
+</tr>
+</table>
+</td>
+</tr>
+</table>
+</body>
+</html>
+--digest--

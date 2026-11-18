@@ -22,6 +22,7 @@ import {
 	PrimaryButton,
 	SecondaryButton,
 } from "#/components/auth/primitives";
+import { EmailHtmlBody } from "#/components/mail/MessageItem";
 import { cn } from "#/lib/cn";
 
 type ApprovalField = { label: string; value: string; format?: "text" | "pre" | "list" };
@@ -74,6 +75,12 @@ export const Route = createFileRoute("/approve/$id")({
 	head: () => ({ meta: [{ title: "Approval · Reccado" }] }),
 	component: ApprovePage,
 });
+
+/** The rendered HTML part of a pending send, tied to the hash this page approves. */
+function approvalHtmlSrc(id: string, payloadHash: string | null): string | null {
+	if (!payloadHash) return null;
+	return `/api/approvals/${encodeURIComponent(id)}/html?hash=${encodeURIComponent(payloadHash)}`;
+}
 
 /** Subtitle under the pending title. The email one is shorter on a phone. */
 function pendingSubtitle(kind: string): { full: string; short: string } {
@@ -320,7 +327,10 @@ function ApprovePage(): ReactElement {
 
 					<div className="order-3 sm:order-2">
 						{view.kind === "send" ? (
-							<EmailPreview fields={view.fields} />
+							<EmailPreview
+								fields={view.fields}
+								htmlSrc={approvalHtmlSrc(view.id, view.payloadHash)}
+							/>
 						) : view.fields.length > 0 ? (
 							<FieldTable fields={view.fields} />
 						) : (
@@ -595,7 +605,14 @@ function FieldTable({
  * attachment hashes, when present, below it. Every field the server sent is
  * shown somewhere.
  */
-function EmailPreview({ fields }: { fields: ApprovalField[] }): ReactElement {
+function EmailPreview({
+	fields,
+	htmlSrc,
+}: {
+	fields: ApprovalField[];
+	/** The rendered HTML part, bound to the payload hash this page approves. */
+	htmlSrc: string | null;
+}): ReactElement {
 	const BODY = new Set(["Mensaje", "HTML", "Adjuntos"]);
 	const headers = fields.filter((field) => !BODY.has(field.label));
 	const message = fields.find((field) => field.label === "Mensaje");
@@ -622,8 +639,34 @@ function EmailPreview({ fields }: { fields: ApprovalField[] }): ReactElement {
 					</div>
 				))}
 			</dl>
-			<div className="px-[18px] pb-[18px] pt-4">
-				<h2 className="sr-only">Message</h2>
+			{html && htmlSrc ? (
+				<div className="flex flex-col gap-2 px-[18px] pb-[18px] pt-4">
+					<Eyebrow as="h2">
+						Formatted version · as it will be sent, link targets in brackets
+					</Eyebrow>
+					<EmailHtmlBody
+						src={htmlSrc}
+						title="Formatted version of the message"
+						foldQuote={false}
+						fallback={
+							<p className="text-[13px] leading-5 text-text-muted">
+								The formatted version could not be shown. Its source is below.
+							</p>
+						}
+					/>
+				</div>
+			) : null}
+			<div
+				className={cn(
+					"px-[18px] pb-[18px] pt-4",
+					html && htmlSrc && "flex flex-col gap-2 border-t border-border pt-3.5",
+				)}
+			>
+				{html && htmlSrc ? (
+					<Eyebrow as="h2">Plain-text version</Eyebrow>
+				) : (
+					<h2 className="sr-only">Message</h2>
+				)}
 				{message?.value ? (
 					<p className="whitespace-pre-wrap text-[14px] leading-[22px] tracking-[-0.005em] text-text">
 						{message.value}
@@ -633,10 +676,14 @@ function EmailPreview({ fields }: { fields: ApprovalField[] }): ReactElement {
 				)}
 			</div>
 			{html && (
-				<div className="flex flex-col gap-2 border-t border-border px-[18px] py-3.5">
-					<Eyebrow as="h2">HTML version · source, not rendered</Eyebrow>
-					<FieldValue field={{ ...html, format: "pre" }} />
-				</div>
+				<details className="flex flex-col gap-2 border-t border-border px-[18px] py-3.5">
+					<summary className="cursor-pointer select-none">
+						<Eyebrow as="span">HTML source</Eyebrow>
+					</summary>
+					<div className="mt-2">
+						<FieldValue field={{ ...html, format: "pre" }} />
+					</div>
+				</details>
 			)}
 			{attachments && (
 				<div className="flex flex-col gap-2 border-t border-border px-[18px] py-3.5">

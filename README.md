@@ -4,7 +4,7 @@
 
 <h3>The edge-native inbox — self-hosted email on Cloudflare, for your own domains</h3>
 
-<p>Receive, store, thread, search and send email from your own domains, running <strong>entirely on Cloudflare</strong> (Workers · Durable Objects · R2 · D1 · Queues) — with an <strong>MCP endpoint</strong> for agents (read/search/draft, no send) and a <strong>transactional REST API</strong> for programmatic outbound mail behind scoped API keys.</p>
+<p>Receive, store, thread, search and send email from your own domains, running <strong>entirely on Cloudflare</strong> (Workers · Durable Objects · R2 · D1 · Queues) — with an <strong>MCP endpoint</strong> for agents (read/search/draft; sends only with your approval) and a <strong>transactional REST API</strong> for programmatic outbound mail behind scoped API keys.</p>
 
 [![CI](https://github.com/santigamo/reccado/actions/workflows/ci.yml/badge.svg)](https://github.com/santigamo/reccado/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-F38020.svg)](./LICENSE)
@@ -530,6 +530,15 @@ read mail (OTP and reset links are redacted), save and cancel drafts, mark/archi
 and read health, ops and configuration. Extra scopes unlock the rest: `mail:send`,
 `mail:read:sensitive`, `mailboxes:write`, `templates:write`, `routing:write`, `domains:write`,
 `keys:write`, `suppressions:write`. It can never touch the owner registry.
+
+**Agents can write formatted mail.** `save_draft` takes the body either as `bodyText` (plain) or as
+`bodyMarkdown`: paragraphs and line breaks, `**bold**`, `*italic*`, `` `code` `` and fenced code
+blocks, `[links](https://…)` (http/https/mailto only), `-`/`1.` lists, `#` headings (a bold line),
+`>` quotes and `---` rules. The server renders it once into a sanitised HTML part and a matching
+plain-text part (links as `text (url)`); raw HTML in the Markdown is escaped, never passed through.
+With `mail:send`, the `send` tool asks you to approve that exact message: the approval page shows the
+formatted version as it will go out, with every link's target written next to it, and the HTML is
+part of the frozen payload the approval is bound to.
 
 **Connect a client the standard way** — one URL, then a browser login. No setup step on your side:
 

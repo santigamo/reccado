@@ -12,7 +12,7 @@ import {
 } from "../lib/attachment-limits";
 import { isPreviewableImage } from "../lib/attachment-preview";
 import { sha256Hex } from "../lib/crypto";
-import { injectIntoHead, prepareEmailHtml } from "../lib/email-html";
+import { EMAIL_BASE_STYLE, injectIntoHead, prepareEmailHtml } from "../lib/email-html";
 import { AppError } from "../lib/errors";
 import { sanitizeOwnerHtml } from "../lib/html-sanitize";
 import { mailboxStub } from "../lib/mailbox-stub";
@@ -51,7 +51,8 @@ export function emailHtmlCsp(remoteImages: boolean): string {
 		"default-src 'none'",
 		`img-src 'self' data:${remote}`,
 		"style-src 'unsafe-inline'",
-		`font-src data:${remoteImages ? " https:" : ""}`,
+		// 'self': the copy of Inter the base style loads (lib/email-html.ts).
+		`font-src 'self' data:${remoteImages ? " https:" : ""}`,
 		`media-src data:${remoteImages ? " https:" : ""}`,
 		"form-action 'none'",
 		"frame-ancestors 'self'",
@@ -61,8 +62,38 @@ export function emailHtmlCsp(remoteImages: boolean): string {
 // Force links inside the (sandboxed) email frame to open in a new tab rather than
 // replacing the framed document. The sender's own <base> was removed by
 // prepareEmailHtml; this one only sets `target`, never `href`.
-function injectBaseTarget(html: string): string {
-	return injectIntoHead(html, '<base target="_blank" rel="noopener noreferrer">');
+function injectBaseTarget(html: string, extra = ""): string {
+	return injectIntoHead(
+		html,
+		`<base target="_blank" rel="noopener noreferrer">${EMAIL_BASE_STYLE}${extra}`,
+	);
+}
+
+/**
+ * A body already through prepareEmailHtml, as the response the app frames:
+ * strict CSP, framable by this origin only, never cached. `extraHead` is
+ * trusted markup of ours added after the base style.
+ */
+export function framedEmailResponse(
+	prepared: string,
+	remoteImages: boolean,
+	extraHead = "",
+): Response {
+	return new Response(injectBaseTarget(prepared, extraHead), {
+		headers: {
+			"content-type": "text/html; charset=utf-8",
+			"content-security-policy": emailHtmlCsp(remoteImages),
+			// The HTML responses the app frames itself. The global middleware leaves
+			// this exact value alone for these routes only (see api/hono.ts); every
+			// other response keeps DENY. A DENY here conflicts with frame-ancestors
+			// 'self', and browsers that honour X-Frame-Options over CSP then show an
+			// empty frame instead of the message.
+			"x-frame-options": "SAMEORIGIN",
+			"x-content-type-options": "nosniff",
+			"referrer-policy": "no-referrer",
+			"cache-control": "private, no-store",
+		},
+	});
 }
 
 /**
@@ -218,22 +249,7 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 			// <script>). Nothing unvetted is served: the client shows the text part.
 			return c.json({ error: "html_unrenderable" }, 422);
 		}
-		const html = injectBaseTarget(prepared);
-		return new Response(html, {
-			headers: {
-				"content-type": "text/html; charset=utf-8",
-				"content-security-policy": emailHtmlCsp(remoteImages),
-				// The one HTML response the app frames itself. The global middleware
-				// leaves this exact value alone for this route only (see api/hono.ts);
-				// every other response keeps DENY. A DENY here conflicts with
-				// frame-ancestors 'self', and browsers that honour X-Frame-Options over
-				// CSP then show an empty frame instead of the message.
-				"x-frame-options": "SAMEORIGIN",
-				"x-content-type-options": "nosniff",
-				"referrer-policy": "no-referrer",
-				"cache-control": "private, no-store",
-			},
-		});
+		return framedEmailResponse(prepared, remoteImages);
 	});
 
 	api.get("/api/mailboxes/:mailboxId/messages/:messageId/attachments/:attachmentId", async (c) => {

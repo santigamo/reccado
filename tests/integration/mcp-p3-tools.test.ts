@@ -735,6 +735,114 @@ describe("MCP P3 tools", () => {
 		);
 	});
 
+	it("saves Markdown as a sanitised HTML part plus a matching text part, and needs exactly one body", async () => {
+		// Its own identity: save_draft is rate limited per caller per minute.
+		const drafter = actor("markdown-drafter@local", ["mail:read", "mail:draft"]);
+		const id = await mailbox(drafter.email);
+		const stub = testEnv.MAILBOX_DO.getByName(id);
+		const draftOf = async (draftId: string) =>
+			(
+				(await (await stub.fetch(`https://mailbox-do/drafts/${draftId}`)).json()) as {
+					draft: { body_text: string | null; body_html: string | null; origin: string };
+				}
+			).draft;
+
+		// Discoverable: the tool says formatted mail exists and how to write it.
+		const registered = serverFor(drafter)._registeredTools.save_draft as unknown as {
+			description?: string;
+		};
+		expect(registered.description).toContain("bodyMarkdown");
+		expect(registered.description).toContain("send");
+		expect(registered.description).not.toContain("via the UI");
+
+		const created = await callTool(drafter, "save_draft", {
+			mailboxId: id,
+			to: ["person@example.com"],
+			subject: "Formatted",
+			bodyMarkdown:
+				"Hi **Ana**,\n\n- see [the doc](https://example.com/doc)\n- [bad](javascript:alert(1))\n\n<img src=x onerror=alert(1)>",
+			idempotencyKey: crypto.randomUUID(),
+		});
+		expect(created.isError).toBeFalsy();
+		const draftId = (created.structuredContent as { draft: { draft_id: string } }).draft.draft_id;
+		const formatted = await draftOf(draftId);
+		expect(formatted.origin).toBe("mcp");
+		expect(formatted.body_html).toBe(
+			'<p>Hi <strong>Ana</strong>,</p>\n<ul>\n<li>see <a href="https://example.com/doc" target="_blank" rel="noopener noreferrer">the doc</a></li>\n<li>[bad](javascript:alert(1))</li>\n</ul>\n<p>&lt;img src=x onerror=alert(1)&gt;</p>',
+		);
+		expect(formatted.body_text).toBe(
+			"Hi Ana,\n\n- see the doc (https://example.com/doc)\n- [bad](javascript:alert(1))\n\n<img src=x onerror=alert(1)>",
+		);
+
+		// Updating with plain text drops the earlier HTML: the two parts never disagree.
+		const toText = await callTool(drafter, "save_draft", {
+			mailboxId: id,
+			draftId,
+			to: ["person@example.com"],
+			subject: "Formatted",
+			bodyText: "Just text now.",
+		});
+		expect(toText.isError).toBeFalsy();
+		expect(await draftOf(draftId)).toMatchObject({ body_text: "Just text now.", body_html: "" });
+
+		// And back to Markdown on the update path.
+		const toMarkdown = await callTool(drafter, "save_draft", {
+			mailboxId: id,
+			draftId,
+			to: ["person@example.com"],
+			subject: "Formatted",
+			bodyMarkdown: "*Again*",
+		});
+		expect(toMarkdown.isError).toBeFalsy();
+		expect(await draftOf(draftId)).toMatchObject({
+			body_text: "Again",
+			body_html: "<p><em>Again</em></p>",
+		});
+
+		// A plain-text create stores no HTML at all, as before.
+		const plain = await callTool(drafter, "save_draft", {
+			mailboxId: id,
+			to: ["person@example.com"],
+			subject: "Plain",
+			bodyText: "**not markdown**",
+			idempotencyKey: crypto.randomUUID(),
+		});
+		const plainId = (plain.structuredContent as { draft: { draft_id: string } }).draft.draft_id;
+		expect(await draftOf(plainId)).toMatchObject({
+			body_text: "**not markdown**",
+			body_html: null,
+		});
+
+		// Exactly one of the two bodies.
+		for (const body of [
+			{},
+			{ bodyText: "a", bodyMarkdown: "b" },
+			{ bodyText: "", bodyMarkdown: "" },
+		]) {
+			const refused = await callTool(drafter, "save_draft", {
+				mailboxId: id,
+				to: ["person@example.com"],
+				subject: "Nope",
+				...body,
+				idempotencyKey: crypto.randomUUID(),
+			});
+			expect(refused.isError).toBe(true);
+			expect(textOf(refused)).toContain(
+				"validation_error: Give exactly one of bodyText or bodyMarkdown.",
+			);
+		}
+		const refusedUpdate = await callTool(drafter, "save_draft", {
+			mailboxId: id,
+			draftId,
+			to: ["person@example.com"],
+			subject: "Nope",
+			bodyText: "a",
+			bodyMarkdown: "b",
+		});
+		expect(textOf(refusedUpdate)).toContain("Give exactly one of bodyText or bodyMarkdown");
+		expect(await draftOf(draftId)).toMatchObject({ body_text: "Again" });
+	});
+
 	it("applies recoverable message actions and stops before a missing id", async () => {
 		const id = await mailbox(drafter.email);
 		const first = await seedMessage(id, { body: "one", isRead: 0, fts: false });

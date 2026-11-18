@@ -1,6 +1,8 @@
 import { getMailboxForOwner, listMailboxesByOwner } from "../db/d1";
 import { isInstanceAuthSender } from "../lib/auth-mail";
+import { sanitizeOwnerHtml } from "../lib/html-sanitize";
 import { mailboxStub } from "../lib/mailbox-stub";
+import { renderMarkdown } from "../lib/markdown";
 import {
 	redactSensitive,
 	type SensitiveKind,
@@ -12,6 +14,29 @@ import { assertScope, type McpAuthContext } from "./scopes";
 import type { McpDraftResult, McpMessageDto, McpSearchResult, McpThread } from "./types";
 
 const MCP_MAX_BODY_CHARS = 10_000;
+
+/** What an agent may write a draft body as: exactly one of the two. */
+export type McpDraftBody = { bodyText?: string; bodyMarkdown?: string };
+
+/**
+ * The stored bodies for an agent's draft. Plain text stays text-only (an
+ * update clears any HTML a previous Markdown version left, so the two parts
+ * never disagree). Markdown is rendered once into both parts: the HTML goes
+ * through the same owner sanitiser as the web composer's, the text is the
+ * Markdown's own plain rendering — never one derived from the other.
+ */
+export async function mcpDraftBodies(
+	body: McpDraftBody,
+): Promise<{ bodyText: string; bodyHtml: string | null }> {
+	const hasText = typeof body.bodyText === "string" && body.bodyText.length > 0;
+	const hasMarkdown = typeof body.bodyMarkdown === "string" && body.bodyMarkdown.length > 0;
+	if (hasText === hasMarkdown) throw new Error("validation_error");
+	if (hasText) return { bodyText: body.bodyText!, bodyHtml: null };
+	const rendered = renderMarkdown(body.bodyMarkdown!);
+	const bodyHtml = await sanitizeOwnerHtml(rendered.html);
+	if (!rendered.text.trim() || !bodyHtml) throw new Error("validation_error");
+	return { bodyText: rendered.text, bodyHtml };
+}
 
 type RawThread = {
 	id: string;
@@ -367,15 +392,15 @@ export class McpMailboxFacade {
 
 	async createDraft(
 		mailboxId: string,
-		params: {
+		params: McpDraftBody & {
 			to: string[];
 			subject: string;
-			bodyText: string;
 			threadId?: string;
 			inReplyToMessageId?: string;
 			idempotencyKey: string;
 		},
 	): Promise<McpDraftResult> {
+		const bodies = await mcpDraftBodies(params);
 		const stub = await this.resolveMailbox(mailboxId);
 		if (Boolean(params.threadId) !== Boolean(params.inReplyToMessageId))
 			throw new Error("validation_error");
@@ -398,7 +423,8 @@ export class McpMailboxFacade {
 			body: JSON.stringify({
 				to: filteredTo,
 				subject: params.subject,
-				bodyText: params.bodyText,
+				bodyText: bodies.bodyText,
+				...(bodies.bodyHtml ? { bodyHtml: bodies.bodyHtml } : {}),
 				threadId: params.threadId ?? null,
 				parentMessageId: params.inReplyToMessageId ?? null,
 				origin: "mcp",
@@ -425,8 +451,9 @@ export class McpMailboxFacade {
 	async updateDraft(
 		mailboxId: string,
 		draftId: string,
-		params: { to: string[]; subject: string; bodyText: string },
+		params: McpDraftBody & { to: string[]; subject: string },
 	): Promise<McpDraftResult> {
+		const bodies = await mcpDraftBodies(params);
 		const stub = await this.resolveMailbox(mailboxId);
 		await this.assertAgentDraft(stub, draftId);
 		const mailbox = await getMailboxForOwner(this.env.INDEX_DB, mailboxId, this.auth.email);
@@ -437,7 +464,15 @@ export class McpMailboxFacade {
 		const response = await stub.fetch(`https://mailbox-do/drafts/${encodeURIComponent(draftId)}`, {
 			method: "PATCH",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ ...params, to, allowedStatuses: ["draft"], origin: "mcp" }),
+			body: JSON.stringify({
+				to,
+				subject: params.subject,
+				bodyText: bodies.bodyText,
+				// "" clears an earlier Markdown version's HTML: a text update is text-only.
+				bodyHtml: bodies.bodyHtml ?? "",
+				allowedStatuses: ["draft"],
+				origin: "mcp",
+			}),
 		});
 		if (!response.ok) throw await draftMutationError(response);
 		return { draft_id: draftId, status: "draft", duplicate: false };

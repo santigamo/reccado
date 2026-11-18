@@ -158,7 +158,10 @@ flowchart LR
 ## Outbound Email Flow
 
 1. A user or authorized MCP/agent action creates a draft (an MCP draft is permanently
-   `origin='mcp'`; the `send` tool only creates an approval intent, never sends).
+   `origin='mcp'`; the `send` tool only creates an approval intent, never sends). An agent writes
+   the body as plain text or as Markdown (`save_draft` `bodyMarkdown`); Markdown is rendered in
+   the worker into a sanitised HTML part and a plain-text part from the same parse
+   (`src/lib/markdown.ts`), and both are in the frozen payload the owner approves.
 2. The mailbox Durable Object stores the draft and approval state.
 3. Agent-created drafts require explicit human approval before sending.
 4. On approval, the Durable Object records an outbox attempt with an idempotency key.

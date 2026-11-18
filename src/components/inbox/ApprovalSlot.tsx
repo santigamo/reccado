@@ -1,5 +1,6 @@
 import { AlertTriangle, Check, ExternalLink, Lock, X } from "lucide-react";
 import { type ReactNode, useState } from "react";
+import { EmailHtmlBody } from "#/components/mail/MessageItem";
 import { BrandMark } from "#/components/shell/AppShell";
 import { Button, buttonClassName } from "#/components/ui/Button";
 import { StatusDot } from "#/components/ui/StatusDot";
@@ -129,14 +130,32 @@ export function SendApprovalCard({ approval }: { approval: PendingApproval }) {
 					</div>
 					<Warnings warnings={approval.warnings} />
 					<div className="px-[18px] pt-3.5 pb-4">
+						{html && approval.payloadHash ? (
+							<>
+								<p className="m-0 mb-2 text-meta font-medium text-text-muted">
+									Formatted version · as it will be sent, link targets in brackets
+								</p>
+								<EmailHtmlBody
+									src={`/api/approvals/${encodeURIComponent(approval.id)}/html?hash=${encodeURIComponent(approval.payloadHash)}`}
+									title="Formatted version of the message"
+									foldQuote={false}
+									fallback={
+										<p className="m-0 text-label text-text-muted">
+											The formatted version could not be shown. Its source is below.
+										</p>
+									}
+								/>
+								<p className="m-0 mt-3.5 mb-2 text-meta font-medium text-text-muted">
+									Plain-text version
+								</p>
+							</>
+						) : null}
 						<p className="m-0 whitespace-pre-wrap break-words text-body leading-[22px] tracking-[-0.005em] text-text">
 							{send.text || <span className="text-text-muted">(no text body)</span>}
 						</p>
 						{html ? (
 							<details className="mt-3 text-label text-text-muted">
-								<summary className="cursor-pointer select-none">
-									HTML version (shown as source)
-								</summary>
+								<summary className="cursor-pointer select-none">HTML source</summary>
 								<pre className="mt-2 max-h-80 overflow-auto rounded-control bg-content p-2 font-mono text-meta whitespace-pre-wrap break-words text-text">
 									{html}
 								</pre>
