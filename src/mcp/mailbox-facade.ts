@@ -73,8 +73,12 @@ function isMessageAction(action: string): action is TelegramCardAction {
 
 async function draftMutationError(response: Response): Promise<Error> {
 	const body = (await response.json().catch(() => null)) as {
+		error?: string;
 		currentStatus?: string | null;
 	} | null;
+	// The owner took the draft over (or it was never the agent's): no longer ours.
+	if (response.status === 409 && body?.error === "draft_not_agent_owned")
+		return new Error("draft_not_agent_owned");
 	if (response.status === 409)
 		return new Error(body?.currentStatus ? "draft_not_editable" : "not_found");
 	if (response.status === 404) return new Error("not_found");
@@ -287,7 +291,11 @@ export class McpMailboxFacade {
 		return msg.sensitive_kind === "instance_auth" || isInstanceAuthSender(this.env, msg.from_addr);
 	}
 
-	/** The draft must have been created by an agent (origin 'mcp'); human drafts are off limits. */
+	/**
+	 * The draft must still be the agent's (origin 'mcp'): human drafts, and agent
+	 * drafts the owner has since edited (taken over), are off limits. The mailbox
+	 * DO checks this again atomically with the write.
+	 */
 	private async assertAgentDraft(stub: DurableObjectStub, draftId: string): Promise<void> {
 		const response = await stub.fetch(`https://mailbox-do/drafts/${encodeURIComponent(draftId)}`);
 		if (!response.ok) throw new Error("not_found");
@@ -434,6 +442,8 @@ export class McpMailboxFacade {
 		});
 		if (!response.ok) {
 			if (response.status === 400) throw new Error("validation_error");
+			// A retried key that names a draft the owner wrote or took over.
+			if (response.status === 409) throw new Error("draft_not_agent_owned");
 			throw new Error("internal_error");
 		}
 		const result = (await response.json()) as {
@@ -486,7 +496,12 @@ export class McpMailboxFacade {
 			{
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ allowedStatuses: ["draft", "pending_confirmation"] }),
+				// requester "mcp": the DO re-checks, atomically with the write, that the
+				// draft is still the agent's (the owner may have taken it over since).
+				body: JSON.stringify({
+					allowedStatuses: ["draft", "pending_confirmation"],
+					requester: "mcp",
+				}),
 			},
 		);
 		if (!response.ok) throw await draftMutationError(response);

@@ -198,6 +198,67 @@ export async function verifyMcpApprovalProof(
 	return timingSafeEqual(expected.sig, input.sig);
 }
 
+/**
+ * Proof that the owner, with the owner web session on this origin, pressed Send
+ * on a draft in the browser. Minted only by the web confirm-send route after the
+ * session was re-read with the cookie cache off and the Origin matched; the MCP
+ * facade has no code path that calls the signer. The mailbox DO accepts it in
+ * place of an approval for an agent-written draft, and only when `fingerprint`
+ * (the draft content the browser displayed, see `draftContentFingerprint` in the
+ * mailbox DO) equals the content about to be sent. A different domain tag
+ * ("owner-web-send.v1") keeps it from ever verifying as an approval proof.
+ */
+export type OwnerWebSendProof = {
+	fingerprint: string;
+	exp: number;
+	sig: string;
+};
+
+function ownerWebSendMessage(input: {
+	mailboxId: string;
+	draftId: string;
+	idempotencyKey: string;
+	fingerprint: string;
+	exp: number;
+}): string {
+	return [
+		"owner-web-send.v1",
+		input.mailboxId,
+		input.draftId,
+		input.idempotencyKey,
+		input.fingerprint,
+		String(input.exp),
+	].join("\n");
+}
+
+export async function signOwnerWebSendProof(
+	secret: string,
+	input: {
+		mailboxId: string;
+		draftId: string;
+		idempotencyKey: string;
+		fingerprint: string;
+		exp: number;
+	},
+): Promise<OwnerWebSendProof> {
+	const mac = await hmacSha256(secret, ownerWebSendMessage(input));
+	return { fingerprint: input.fingerprint, exp: input.exp, sig: base64url(mac) };
+}
+
+export async function verifyOwnerWebSendProof(
+	secret: string,
+	input: OwnerWebSendProof & { mailboxId: string; draftId: string; idempotencyKey: string },
+	now = Date.now(),
+): Promise<boolean> {
+	if (!Number.isFinite(input.exp) || input.exp <= now || input.exp > now + 2 * PROOF_TTL_MS) {
+		return false;
+	}
+	if (typeof input.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(input.fingerprint))
+		return false;
+	const expected = await signOwnerWebSendProof(secret, input);
+	return timingSafeEqual(expected.sig, input.sig ?? "");
+}
+
 export function buildApprovalUrl(origin: string, intentId: string): string | null {
 	const url = new URL(`/approve/${encodeURIComponent(intentId)}`, origin);
 	if (url.origin !== origin || (url.protocol !== "https:" && url.hostname !== "localhost")) {
@@ -315,6 +376,37 @@ export async function getOrCreatePendingIntent(
 		intent: { id: row.token, expiresAt: row.expires_at, payloadHash: row.payload_hash },
 		created,
 	};
+}
+
+/**
+ * The owner acted on the draft themselves (took it over by editing it, or sent
+ * it directly from the web): any send request still pending for it is consumed
+ * without a decision, so it can never be approved afterwards and reads "stale".
+ * Best effort and idempotent; the mailbox DO already refuses such a request on
+ * its own (the frozen intent is stale or the draft is no longer open).
+ */
+export async function supersedePendingSendApprovals(
+	env: Env,
+	input: { mailboxId: string; draftId: string; reason: "owner_takeover" | "owner_direct_send" },
+): Promise<string[]> {
+	const now = new Date().toISOString();
+	const result = await env.INDEX_DB.prepare(
+		`UPDATE approvals SET consumed_at = ?
+		 WHERE kind = 'send' AND mailbox_id = ? AND draft_id = ? AND consumed_at IS NULL AND decision IS NULL
+		 RETURNING token`,
+	)
+		.bind(now, input.mailboxId, input.draftId)
+		.all<{ token: string }>()
+		.catch(() => null);
+	const tokens = (result?.results ?? []).map((row) => row.token);
+	for (const token of tokens)
+		await recordEvent(env, token, "approval.superseded", {
+			kind: "send",
+			mailboxId: input.mailboxId,
+			draftId: input.draftId,
+			reason: input.reason,
+		});
+	return tokens;
 }
 
 async function recordEvent(
@@ -576,6 +668,11 @@ export async function getIntentStatus(
 	if (new Date(row.expires_at).getTime() <= Date.now()) {
 		await recordEvent(env, row.token, "approval.expired", { kind: row.kind });
 		return { status: "expired", send: sendOutcome(send), deliveryFeedback };
+	}
+	// Consumed without a decision: superseded by the owner (they took the draft
+	// over, or sent it themselves from the web). Never approvable again.
+	if (row.kind === "send" && row.consumed_at) {
+		return { status: "stale", send: null, deliveryFeedback };
 	}
 	if (
 		row.kind === "send" &&

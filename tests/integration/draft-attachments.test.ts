@@ -264,13 +264,12 @@ describe("uploading files to a draft", () => {
 		expect(await draftObjects(mailboxId, second)).toHaveLength(1);
 	});
 
-	it("never attaches files to an agent's draft", async () => {
+	it("never attaches files to a draft that is still the agent's", async () => {
 		const mailboxId = await newMailbox();
 		const draftId = await createDraft(mailboxId);
-		await testEnv.MAILBOX_DO.getByName(mailboxId).fetch(`https://mailbox-do/drafts/${draftId}`, {
-			method: "PATCH",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ origin: "mcp" }),
+		// An agent can no longer claim an owner draft, so mark it as the agent's directly.
+		await runInDurableObject(testEnv.MAILBOX_DO.getByName(mailboxId), async (_instance, state) => {
+			state.storage.sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", draftId);
 		});
 		const response = await upload(mailboxId, draftId, "a.pdf", PDF);
 		expect(response.status).toBe(409);

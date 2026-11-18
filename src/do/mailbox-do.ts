@@ -4,7 +4,9 @@ import type { InboundEmailQueueMessage, MailboxIngestResult } from "../cloudflar
 import {
 	approvalProofSecret,
 	type McpApprovalProof,
+	type OwnerWebSendProof,
 	verifyMcpApprovalProof,
+	verifyOwnerWebSendProof,
 } from "../lib/approvals";
 import { classifyAutomatedMail } from "../lib/automated-mail";
 import { sha256Hex } from "../lib/crypto";
@@ -669,14 +671,16 @@ function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 		if (result.rowsWritten === 0) {
 			// Duplicate — fetch and return the existing draft.
 			const existing = sql
-				.exec<{ id: string }>(
-					"SELECT id FROM outbound_drafts WHERE idempotency_key = ?",
+				.exec<{ id: string; origin: string }>(
+					"SELECT id, origin FROM outbound_drafts WHERE idempotency_key = ?",
 					idempotencyKey,
 				)
 				.toArray()[0];
 			if (existing) {
-				if (origin === "mcp")
-					sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", existing.id);
+				// A retry never changes who owns the draft: an agent replaying a key
+				// cannot claim a draft the owner wrote or took over.
+				if (origin === "mcp" && existing.origin !== "mcp")
+					return { error: "draft_not_agent_owned" as const };
 				return { id: existing.id, status: "draft", duplicate: true };
 			}
 			// Unexpected: zero rows written but no existing draft. Treat as internal error.
@@ -708,9 +712,15 @@ function createDraft(sql: SqlStorage, body: Record<string, unknown>) {
 	return { id, status: "draft" };
 }
 
+/**
+ * Who is editing: "mcp" is the agent (only its own drafts), "web" is the owner
+ * with the web session (an edit takes an agent's draft over), and no origin is
+ * any other internal caller (the Telegram bridge), which never changes who owns
+ * a draft.
+ */
 function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<string, unknown>) {
 	if (!draftId) throw new Error("draftId required");
-	const origin = requestedDraftOrigin(body.origin);
+	const editor = body.origin === undefined ? null : requestedDraftOrigin(body.origin);
 	const now = new Date().toISOString();
 	const allowed =
 		Array.isArray(body.allowedStatuses) && body.allowedStatuses.every((s) => typeof s === "string")
@@ -720,7 +730,26 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 	if (allowed && (!existing || !allowed.includes(String(existing.status))))
 		return { error: "draft_not_editable", currentStatus: existing?.status ?? null };
 	if (!existing) throw new Error("draft not found");
-	if (origin === "mcp") sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", draftId);
+	// Checked here, atomically with the write, not only by the MCP facade's read
+	// before it: an owner takeover landing in between must win.
+	if (editor === "mcp" && existing.origin !== "mcp")
+		return { error: "draft_not_agent_owned", currentStatus: null };
+	// The owner saving an agent's draft from the web makes it theirs: from now on
+	// the agent cannot change or cancel it, and any send request frozen from the
+	// agent's version stops being approvable even when the text is unchanged.
+	const takenOver =
+		editor === "web" &&
+		existing.origin === "mcp" &&
+		(existing.status === "draft" || existing.status === "pending_confirmation");
+	if (takenOver) {
+		sql.exec("UPDATE outbound_drafts SET origin = 'web' WHERE id = ?", draftId);
+		if (existing.status === "pending_confirmation")
+			sql.exec(
+				"UPDATE mailbox_meta SET value = 'stale', updated_at = ? WHERE key = ?",
+				now,
+				`intent_stale:${draftId}`,
+			);
+	}
 	const changed =
 		JSON.stringify(body.to ?? JSON.parse(String(existing.to_json))) !== existing.to_json ||
 		JSON.stringify(body.cc ?? JSON.parse(String(existing.cc_json))) !== existing.cc_json ||
@@ -751,7 +780,66 @@ function updateDraft(sql: SqlStorage, draftId: string | undefined, body: Record<
 	);
 	if (allowed && !updated.rowsWritten)
 		return { error: "draft_not_editable", currentStatus: existing.status };
-	return { id: draftId, status: "draft" };
+	return { id: draftId, status: "draft", ...(takenOver ? { takenOver: true } : {}) };
+}
+
+/** The draft-owned fields a content fingerprint covers (see draftContentFingerprint). */
+type DraftContent = {
+	threadId: string | null;
+	parentMessageId: string | null;
+	to: string[];
+	cc: string[];
+	bcc: string[];
+	subject: string;
+	text: string | null;
+	html: string | null;
+	attachments: unknown[];
+};
+
+function draftContent(sql: SqlStorage, draftId: string): DraftContent {
+	const draft = sql
+		.exec<SendDraft>("SELECT * FROM outbound_drafts WHERE id = ?", draftId)
+		.toArray()[0];
+	if (!draft) throw new Error("draft not found");
+	return {
+		threadId: draft.thread_id,
+		parentMessageId: draft.parent_message_id ?? null,
+		to: JSON.parse(draft.to_json) as string[],
+		cc: JSON.parse(draft.cc_json) as string[],
+		bcc: JSON.parse(draft.bcc_json) as string[],
+		subject: draft.subject,
+		text: draft.body_text,
+		html: draft.body_html,
+		attachments: snapshotAttachments(sql, draftId),
+	};
+}
+
+/**
+ * What the owner was shown, as one hash: every field of the send snapshot that
+ * the draft itself holds (recipients, subject, both bodies, files, the message it
+ * answers). The rest of the snapshot is derived from the mailbox (From/Reply-To)
+ * or the thread (In-Reply-To/References) and is not something an agent can edit.
+ * Served with the draft (GET /drafts/:id) and computed again from the frozen
+ * intent at confirm-send, so the two only match when what goes out is exactly
+ * what the browser displayed. Exported for tests.
+ */
+export async function draftContentFingerprint(content: DraftContent): Promise<string> {
+	return sha256Hex(
+		new TextEncoder().encode(
+			JSON.stringify([
+				"draft-content.v1",
+				content.threadId,
+				content.parentMessageId,
+				content.to,
+				content.cc,
+				content.bcc,
+				content.subject,
+				content.text,
+				content.html,
+				content.attachments,
+			]),
+		),
+	);
 }
 
 export async function requestSendDraft(
@@ -759,13 +847,20 @@ export async function requestSendDraft(
 	draftId: string | undefined,
 	identity: SenderIdentity,
 	replaceStale = false,
+	requester?: "mcp",
 ) {
 	if (!draftId) throw new Error("draftId required");
 	const now = new Date().toISOString();
 	const row = sql
-		.exec<{ status: string }>("SELECT status FROM outbound_drafts WHERE id = ?", draftId)
+		.exec<{ status: string; origin: string }>(
+			"SELECT status, origin FROM outbound_drafts WHERE id = ?",
+			draftId,
+		)
 		.toArray()[0];
 	if (!row) throw new Error("draft not found");
+	// The agent may only ask to send its own draft; one the owner took over is not.
+	if (requester === "mcp" && row.origin !== "mcp")
+		return { id: draftId, status: row.status, error: "draft_not_agent_owned" };
 	const key = `send_intent:${draftId}`;
 	const existing = sql
 		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", key)
@@ -788,9 +883,14 @@ export async function requestSendDraft(
 	const payload_hash = await sha256Hex(new TextEncoder().encode(serialized));
 	// No await between the recheck and writes: another request or edit cannot slip in.
 	const current = sql
-		.exec<{ status: string }>("SELECT status FROM outbound_drafts WHERE id = ?", draftId)
+		.exec<{ status: string; origin: string }>(
+			"SELECT status, origin FROM outbound_drafts WHERE id = ?",
+			draftId,
+		)
 		.toArray()[0];
 	if (!current) throw new Error("draft not found");
+	if (requester === "mcp" && current.origin !== "mcp")
+		return { id: draftId, status: current.status, error: "draft_not_agent_owned" };
 	const raced = sql
 		.exec<{ value: string }>("SELECT value FROM mailbox_meta WHERE key = ?", key)
 		.toArray()[0];
@@ -1028,6 +1128,7 @@ export async function confirmSendDraft(
 	idempotencyKey: string,
 	expectedPayloadHash?: string,
 	approvalProof?: McpApprovalProof | null,
+	ownerProof?: OwnerWebSendProof | null,
 ): Promise<Record<string, unknown>> {
 	if (!draftId) throw new Error("draftId required");
 	let draft = ctx.sql
@@ -1037,7 +1138,33 @@ export async function confirmSendDraft(
 	const origin = ctx.sql
 		.exec<{ origin: string }>("SELECT origin FROM outbound_drafts WHERE id = ?", draftId)
 		.toArray()[0]?.origin;
-	if (origin === "mcp") {
+	// The owner pressing Send in the web on what the browser showed them. Verified
+	// first: a proof that does not check out is a refusal, never a fallback.
+	let shownFingerprint: string | null = null;
+	if (ownerProof) {
+		const secret = ctx.approvalProofSecret;
+		const ownerOk =
+			Boolean(secret) &&
+			Boolean(ctx.mailboxId) &&
+			(await verifyOwnerWebSendProof(secret as string, {
+				fingerprint: ownerProof.fingerprint,
+				exp: ownerProof.exp,
+				sig: ownerProof.sig,
+				mailboxId: ctx.mailboxId ?? "",
+				draftId,
+				idempotencyKey,
+			}));
+		if (!ownerOk) {
+			return { id: draftId, status: draft.status, sent: false, error: "approval_required" };
+		}
+		shownFingerprint = ownerProof.fingerprint;
+	}
+	let approvedByOwnerInWeb = false;
+	if (origin === "mcp" && shownFingerprint) {
+		// An agent's draft, sent by the owner directly: allowed, bound below to the
+		// content they were shown (draft_changed otherwise).
+		approvedByOwnerInWeb = true;
+	} else if (origin === "mcp") {
 		const secret = ctx.approvalProofSecret;
 		const proofOk =
 			Boolean(secret) &&
@@ -1122,6 +1249,24 @@ export async function confirmSendDraft(
 		(await sha256Hex(new TextEncoder().encode(serialized))) !== intent.payload_hash
 	)
 		return stale();
+	// The frozen snapshot is what would go out; the check below (no await after
+	// it) proves the draft still equals it. So comparing the browser's
+	// fingerprint against the frozen content is comparing it against the send.
+	if (shownFingerprint !== null) {
+		const frozenFingerprint = await draftContentFingerprint({
+			threadId: intent.snapshot.threadId,
+			parentMessageId: intent.snapshot.parentMessageId,
+			to: intent.snapshot.to,
+			cc: intent.snapshot.cc,
+			bcc: intent.snapshot.bcc,
+			subject: intent.snapshot.subject,
+			text: intent.snapshot.text,
+			html: intent.snapshot.html,
+			attachments: intent.snapshot.attachments,
+		});
+		if (frozenFingerprint !== shownFingerprint)
+			return { id: draftId, status: draft.status, sent: false, error: "draft_changed" };
+	}
 	const staleMarker = ctx.sql
 		.exec<{ value: string }>(
 			"SELECT value FROM mailbox_meta WHERE key = ?",
@@ -1133,6 +1278,14 @@ export async function confirmSendDraft(
 		.toArray()[0];
 	if (!current || current.status !== "pending_confirmation")
 		return { id: draftId, status: current?.status ?? "missing", sent: false, duplicate: true };
+	// Ownership only ever moves from the agent to the owner, but re-read it here
+	// anyway, with the content check, after the last await: an agent draft never
+	// goes out without either the approval proof or the owner's own send.
+	const currentOrigin = ctx.sql
+		.exec<{ origin: string }>("SELECT origin FROM outbound_drafts WHERE id = ?", draftId)
+		.toArray()[0]?.origin;
+	if (currentOrigin === "mcp" && origin !== "mcp")
+		return { id: draftId, status: current.status, sent: false, error: "approval_required" };
 	try {
 		if (
 			staleMarker?.value !== "active" ||
@@ -1449,22 +1602,36 @@ export async function confirmSendDraft(
 		rawR2Key,
 		rawSha256,
 		hasAttachments,
+		// An agent's draft that went out because the owner sent it from the web
+		// (not through an approval): the worker records it as such.
+		...(approvedByOwnerInWeb ? { ownerSentAgentDraft: true } : {}),
 	};
 }
 
-function cancelDraft(sql: SqlStorage, draftId: string | undefined, allowed?: string[]) {
+/** `requester: "mcp"` is the agent: it may only cancel a draft that is still its own. */
+function cancelDraft(
+	sql: SqlStorage,
+	draftId: string | undefined,
+	allowed?: string[],
+	requester?: "mcp",
+) {
 	if (!draftId) throw new Error("draftId required");
 	const now = new Date().toISOString();
 	const updated = sql.exec(
-		`UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?${allowed ? ` AND status IN (${allowed.map(() => "?").join(",") || "NULL"})` : ""}`,
+		`UPDATE outbound_drafts SET status = 'cancelled', updated_at = ? WHERE id = ?${allowed ? ` AND status IN (${allowed.map(() => "?").join(",") || "NULL"})` : ""}${requester === "mcp" ? " AND origin = 'mcp'" : ""}`,
 		now,
 		draftId,
 		...(allowed ?? []),
 	);
-	if (allowed && !updated.rowsWritten) {
+	if ((allowed || requester) && !updated.rowsWritten) {
 		const current = sql
-			.exec<{ status: string }>("SELECT status FROM outbound_drafts WHERE id = ?", draftId)
+			.exec<{ status: string; origin: string }>(
+				"SELECT status, origin FROM outbound_drafts WHERE id = ?",
+				draftId,
+			)
 			.toArray()[0];
+		if (current && requester === "mcp" && current.origin !== "mcp")
+			return { error: "draft_not_agent_owned", currentStatus: null };
 		return { error: "draft_not_editable", currentStatus: current?.status ?? null };
 	}
 	return { id: draftId, status: "cancelled" };
@@ -1878,11 +2045,18 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+$/) && request.method === "GET") {
 			const draftId = url.pathname.split("/")[2];
-			return Response.json({ draft: this.getDraft(draftId) });
+			// Read in the same synchronous step as the row, so the fingerprint always
+			// describes exactly the draft returned next to it.
+			const draft = this.getDraft(draftId);
+			const content = draftContent(this.ctx.storage.sql, draftId as string);
+			return Response.json({
+				draft: { ...draft, content_fingerprint: await draftContentFingerprint(content) },
+			});
 		}
 		if (url.pathname === "/drafts" && request.method === "POST") {
 			const body = await request.json();
-			return Response.json(this.createDraft(body as Record<string, unknown>), { status: 201 });
+			const result = this.createDraft(body as Record<string, unknown>);
+			return Response.json(result, { status: "error" in result ? 409 : 201 });
 		}
 		if (url.pathname.match(/^\/drafts\/[^/]+$/) && request.method === "PATCH") {
 			const draftId = url.pathname.split("/")[2];
@@ -1897,6 +2071,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 						mailboxAddress?: string | null;
 						displayName?: string | null;
 						replaceStale?: boolean;
+						requester?: string;
 					})
 				: {};
 			return Response.json(
@@ -1905,6 +2080,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 					body.mailboxAddress,
 					body.displayName,
 					body.replaceStale,
+					body.requester === "mcp" ? "mcp" : undefined,
 				),
 			);
 		}
@@ -1937,6 +2113,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				displayName?: string | null;
 				expectedPayloadHash?: string;
 				approvalProof?: McpApprovalProof | null;
+				ownerProof?: OwnerWebSendProof | null;
 			};
 			const result = await this.confirmSendDraft(
 				draftId,
@@ -1945,6 +2122,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				body.displayName,
 				body.expectedPayloadHash,
 				body.approvalProof,
+				body.ownerProof,
 			);
 			// Ambiguous provider outcomes are business-level, not transport-level errors.
 			// Return 200 so the caller's confirmDraftSend reaches the "ambiguous" branch
@@ -1955,6 +2133,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				"error" in result && !isAmbiguous
 					? result.error === "intent_stale" ||
 						result.error === "approval_required" ||
+						result.error === "draft_changed" ||
 						result.error === "attachment_missing" ||
 						result.error === "attachment_changed"
 						? 409
@@ -1969,14 +2148,18 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (url.pathname.match(/^\/drafts\/[^/]+\/cancel$/) && request.method === "POST") {
 			const draftId = url.pathname.split("/")[2];
 			const body = request.headers.get("content-type")?.includes("application/json")
-				? ((await request.json()) as { allowedStatuses?: unknown })
+				? ((await request.json()) as { allowedStatuses?: unknown; requester?: unknown })
 				: {};
 			const allowed =
 				Array.isArray(body.allowedStatuses) &&
 				body.allowedStatuses.every((s) => typeof s === "string")
 					? (body.allowedStatuses as string[])
 					: undefined;
-			const result = await this.cancelDraft(draftId, allowed);
+			const result = await this.cancelDraft(
+				draftId,
+				allowed,
+				body.requester === "mcp" ? "mcp" : undefined,
+			);
 			return Response.json(result, { status: "error" in result ? 409 : 200 });
 		}
 		if (url.pathname === "/export-index" && request.method === "GET") {
@@ -2863,6 +3046,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		mailboxAddress?: string | null,
 		displayName?: string | null,
 		replaceStale?: boolean,
+		requester?: "mcp",
 	) {
 		const identity = resolveReplyIdentity(
 			this.env,
@@ -2871,7 +3055,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			this.resolveMailboxAddress(mailboxAddress),
 			this.resolveMailboxDisplayName(displayName),
 		);
-		return requestSendDraft(this.ctx.storage.sql, draftId, identity, replaceStale);
+		return requestSendDraft(this.ctx.storage.sql, draftId, identity, replaceStale, requester);
 	}
 
 	/**
@@ -2929,6 +3113,7 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		displayName?: string | null,
 		expectedPayloadHash?: string,
 		approvalProof?: McpApprovalProof | null,
+		ownerProof?: OwnerWebSendProof | null,
 	): Promise<Record<string, unknown>> {
 		const identity = resolveReplyIdentity(
 			this.env,
@@ -2953,11 +3138,12 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			idempotencyKey,
 			expectedPayloadHash,
 			approvalProof,
+			ownerProof,
 		);
 	}
 
-	private async cancelDraft(draftId: string | undefined, allowed?: string[]) {
-		const result = cancelDraft(this.ctx.storage.sql, draftId, allowed);
+	private async cancelDraft(draftId: string | undefined, allowed?: string[], requester?: "mcp") {
+		const result = cancelDraft(this.ctx.storage.sql, draftId, allowed, requester);
 		// Uploaded files outlive a discard for the Undo window, then a job deletes
 		// them unless the draft was restored.
 		if (!("error" in result) && draftId) {

@@ -165,9 +165,11 @@ export type AttachmentEditError = {
 
 /**
  * May the owner change this draft's files right now? Only an open draft
- * (draft / pending_confirmation), not mid-send, and never an agent's draft: its
- * approval page shows the frozen text, not files, so an attachment added from the
- * web would ride along on an approval that never showed it.
+ * (draft / pending_confirmation), not mid-send, and not a draft that is still the
+ * agent's: its approval page shows the frozen text, not files, so an attachment
+ * added from the web would ride along on an approval that never showed it. The
+ * owner saves the draft first (the web PATCH takes it over, origin 'web'); from
+ * then on it is an owner draft and takes files like any other.
  */
 function editable(sql: SqlStorage, draftId: string): AttachmentEditError | null {
 	const draft = sql
