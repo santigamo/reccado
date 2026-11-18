@@ -36,10 +36,12 @@ export const BLOCKED_REMOTE_MARKER = '<meta name="reccado-remote-blocked" conten
  * ours included): without them the frame falls back to the browser's serif at
  * 16px. Injected first in <head> and wrapped in `:where()` (zero specificity),
  * so any rule or attribute the message carries wins. Only system fonts: the
- * frame's CSP allows no remote font.
+ * frame's CSP allows no remote font. Deliberately nothing about images or
+ * tables: a rule here would also beat HTML sizing attributes (spacer GIFs,
+ * fixed-width columns) and break table-built mail.
  */
 export const EMAIL_BASE_STYLE =
-	"<style>:where(html){font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;overflow-wrap:anywhere}:where(body){margin:0;padding:4px 0}:where(img){max-width:100%;height:auto}</style>";
+	"<style>:where(html){font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;overflow-wrap:break-word}:where(body){margin:0;padding:4px 0}</style>";
 
 const ALWAYS_REMOVED = [
 	"script",
