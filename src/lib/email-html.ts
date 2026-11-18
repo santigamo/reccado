@@ -48,14 +48,21 @@ function interFace(subset: "latin" | "latin-ext", style: "normal" | "italic"): s
  * Defaults for mail that sets no typography of its own (plain rich-text mail,
  * ours included): without them the frame falls back to the browser's serif at
  * 16px. Injected first in <head> and wrapped in `:where()` (zero specificity),
- * so any rule or attribute the message carries wins. Inter comes from this
- * origin (variable, latin + latin-ext, upright and italic; the frame's CSP
- * allows `font-src 'self'`); other scripts fall through to the system stack.
- * Deliberately nothing about images or tables: a rule here would also beat
- * HTML sizing attributes (spacer GIFs, fixed-width columns) and break
- * table-built mail.
+ * so any rule or attribute the message carries wins. Typography only:
+ *
+ *  - Inter comes from this origin (variable, latin + latin-ext, upright and
+ *    italic; the frame's CSP allows `font-src 'self'`); other scripts fall
+ *    through to the system stack.
+ *  - Size and line-height sit on <body>, not <html>, so `rem` keeps meaning the
+ *    browser's 16px and mail sized in rem renders as designed.
+ *  - Tables get `line-height: normal` back: a unitless 1.55 inherited into
+ *    table-built mail would stretch every cell that sets a font size but no
+ *    line-height, and pad `&nbsp;` spacer cells. Quirks-mode mail already
+ *    resets tables to the UA defaults; this makes standards mode agree.
+ *  - Nothing about images or table sizing: a rule here would also beat HTML
+ *    sizing attributes (spacer GIFs, fixed-width columns).
  */
-export const EMAIL_BASE_STYLE = `<style>${interFace("latin", "normal")}${interFace("latin", "italic")}${interFace("latin-ext", "normal")}${interFace("latin-ext", "italic")}:where(html){font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;overflow-wrap:break-word}:where(body){margin:0;padding:4px 0}</style>`;
+export const EMAIL_BASE_STYLE = `<style>${interFace("latin", "normal")}${interFace("latin", "italic")}${interFace("latin-ext", "normal")}${interFace("latin-ext", "italic")}:where(html){font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;-webkit-font-smoothing:antialiased;overflow-wrap:break-word}:where(body){margin:0;padding:4px 0;font-size:14px;line-height:1.55}:where(table){line-height:normal}</style>`;
 
 /**
  * For the approval preview only: every link's real target written out after
@@ -260,5 +267,9 @@ export function injectIntoHead(html: string, markup: string): string {
 	if (/<head(\s[^>]*)?>/i.test(html)) return html.replace(/(<head(\s[^>]*)?>)/i, `$1${markup}`);
 	if (/<html(\s[^>]*)?>/i.test(html))
 		return html.replace(/(<html(\s[^>]*)?>)/i, `$1<head>${markup}</head>`);
+	// Never ahead of a doctype: anything before it switches the frame to quirks
+	// mode, which changes how table-built mail lays out.
+	const doctype = /^\s*<!doctype[^>]*>/i.exec(html);
+	if (doctype) return `${doctype[0]}${markup}${html.slice(doctype[0].length)}`;
 	return `${markup}${html}`;
 }

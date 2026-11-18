@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	EMAIL_BASE_STYLE,
 	INTER_FONT_PATH,
+	injectIntoHead,
 	isRemoteUrl,
 	neutralizeRemoteCss,
 	prepareEmailHtml,
@@ -121,6 +122,27 @@ describe("neutralizeRemoteCss", () => {
 
 describe("EMAIL_BASE_STYLE", () => {
 	const css = EMAIL_BASE_STYLE.replace(/^<style>|<\/style>$/g, "");
+	const rules = css.replace(/@font-face\{[^}]*\}/g, "");
+
+	it("is typography only, every selector at zero specificity", () => {
+		const selectors = [...rules.matchAll(/([^{}]+)\{[^}]*\}/g)].map((m) => m[1]!.trim());
+		expect(selectors).toEqual([":where(html)", ":where(body)", ":where(table)"]);
+		// Nothing that would beat a sizing attribute or restyle images.
+		expect(rules).not.toMatch(/[{;](width|height|display|max-width|min-width):/);
+		expect(rules).not.toContain("img");
+	});
+
+	it("keeps rem at the browser's 16px: size and line-height live on body, not html", () => {
+		const html = /:where\(html\)\{([^}]*)\}/.exec(rules)?.[1] ?? "";
+		const body = /:where\(body\)\{([^}]*)\}/.exec(rules)?.[1] ?? "";
+		expect(html).not.toMatch(/font-size|line-height/);
+		expect(body).toContain("font-size:14px");
+		expect(body).toContain("line-height:1.55");
+	});
+
+	it("gives tables their default line-height back, so table-built mail is not stretched", () => {
+		expect(rules).toContain(":where(table){line-height:normal}");
+	});
 
 	it("loads Inter from this origin only: latin and latin-ext, upright and italic", () => {
 		const faces = [...css.matchAll(/@font-face\{([^}]*)\}/g)].map((m) => m[1]!);
@@ -140,5 +162,23 @@ describe("EMAIL_BASE_STYLE", () => {
 			expect(face).toMatch(/unicode-range:U\+/);
 		}
 		expect(EMAIL_BASE_STYLE).not.toMatch(/https?:|\/\//);
+	});
+});
+
+describe("injectIntoHead", () => {
+	it("opens an existing head, or creates one inside <html>", () => {
+		expect(injectIntoHead("<html><head><title>t</title></head></html>", "X")).toBe(
+			"<html><head>X<title>t</title></head></html>",
+		);
+		expect(injectIntoHead("<!DOCTYPE html><html lang=en><body>b</body></html>", "X")).toBe(
+			"<!DOCTYPE html><html lang=en><head>X</head><body>b</body></html>",
+		);
+	});
+
+	it("never puts anything ahead of a doctype (that would flip the frame to quirks mode)", () => {
+		expect(injectIntoHead("<!DOCTYPE html><table><tr><td>x</td></tr></table>", "X")).toBe(
+			"<!DOCTYPE html>X<table><tr><td>x</td></tr></table>",
+		);
+		expect(injectIntoHead("<p>fragment</p>", "X")).toBe("X<p>fragment</p>");
 	});
 });

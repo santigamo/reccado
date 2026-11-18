@@ -10,6 +10,7 @@ import worker, { withHtmlSecurityHeaders } from "#/server";
 import migrationInitial from "../../migrations/d1/0001_initial.sql?raw";
 import migrationMessageIndex from "../../migrations/d1/0002_message_index.sql?raw";
 import migrationMailboxOwner from "../../migrations/d1/0003_mailbox_owner.sql?raw";
+import newsletterTableEml from "../../fixtures/mime/newsletter-table.eml?raw";
 import { splitSqlStatements } from "../helpers/migrations";
 
 /**
@@ -187,6 +188,45 @@ describe("GET /messages/:id/html framing", () => {
 			expect(html).not.toMatch(/fonts\.(googleapis|gstatic)\.com/);
 			if (!query) expect(html).not.toContain("t.example");
 		}
+	});
+
+	it("serves table-built mail with its doctype first and its own markup and CSS untouched", async () => {
+		const mailboxId = "mbx_html_route_newsletter";
+		await createMailbox(mailboxId, "html-route-newsletter@example.com");
+		const messageId = await ingestRaw(
+			mailboxId,
+			newsletterTableEml as string,
+			"newsletter-table@news.example.org",
+		);
+		const response = await fetchWorker(
+			new Request(`http://localhost/api/mailboxes/${mailboxId}/messages/${messageId}/html`),
+		);
+		expect(response.status).toBe(200);
+		const html = await response.text();
+		// Still the first thing in the document: the frame keeps the mail's own
+		// rendering mode (almost-standards for XHTML Transitional), as in a mail client.
+		expect(html.trimStart()).toMatch(
+			/^<!DOCTYPE html PUBLIC "-\/\/W3C\/\/DTD XHTML 1\.0 Transitional/,
+		);
+		// Our defaults open the sender's <head>, ahead of the sender's own CSS.
+		const head = html.indexOf("<head>");
+		expect(html.indexOf(EMAIL_BASE_STYLE)).toBeGreaterThan(head);
+		expect(html.indexOf(EMAIL_BASE_STYLE)).toBeLessThan(html.indexOf(".headline"));
+		// Layout attributes and inline sizes reach the frame exactly as sent.
+		for (const kept of [
+			'<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff">',
+			'<td height="24" style="font-size:0;line-height:0;">&nbsp;</td>',
+			'<td height="10">&nbsp;</td>',
+			'<td height="32" style="font-size:32px;line-height:32px;">&nbsp;</td>',
+			"font-size:0.75rem",
+			".headline { font-family: Georgia, serif; font-size: 24px; color: #111111; }",
+		]) {
+			expect(html).toContain(kept);
+		}
+		// Images off by default: remote logo and spacer held back, sizes kept.
+		expect(html).toContain(
+			'<img width="1" height="1" alt="" data-blocked-src="https://news.example.org/spacer.gif" />',
+		);
 	});
 
 	it("answers markup the parser refuses with an error the client falls back from", async () => {
