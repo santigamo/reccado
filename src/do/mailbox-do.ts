@@ -21,6 +21,7 @@ import {
 } from "../lib/outbound-attachments";
 import { stripQuotedText } from "../lib/quoted-text";
 import { bodyHtmlR2Key } from "../lib/r2-keys";
+import { wrapOutgoingHtml } from "../lib/rich-text";
 import {
 	resolveDeliveredAlias,
 	resolveSenderIdentity,
@@ -1265,8 +1266,11 @@ export async function confirmSendDraft(
 			replyTo: snapshot.identity.replyTo ?? undefined,
 			subject: draft.subject,
 			text: draft.body_text ?? undefined,
-			// "" is a draft whose rich body was emptied: a text-only send.
-			html: draft.body_html || undefined,
+			// "" is a draft whose rich body was emptied: a text-only send. The
+			// typography container is added here, after approval and only on the wire:
+			// it is a fixed function of the frozen HTML, so payload_hash (taken over the
+			// unwrapped snapshot) still says exactly what the owner approved.
+			html: draft.body_html ? wrapOutgoingHtml(draft.body_html) : undefined,
 			...(Object.keys(outboundHeaders).length > 0 ? { headers: outboundHeaders } : {}),
 			...(loadedAttachments.length > 0
 				? { attachments: providerAttachments(loadedAttachments) }
@@ -1309,7 +1313,10 @@ export async function confirmSendDraft(
 	const messageLocalId = crypto.randomUUID();
 	const rawR2Key = `sent/${draftId}`;
 	// The viewer renders body_html_r2_key first and body_text second, so the sent
-	// copy has to carry the same bodies the recipient got. HTML goes to R2 under
+	// copy has to carry the same bodies the recipient got. The HTML is stored as
+	// written, without the wire-only typography container (wrapOutgoingHtml): the
+	// inbox frame gives it its own defaults, and its quote folding looks at the
+	// body's top-level elements, which a container would hide. HTML goes to R2 under
 	// the key an inbound message would use (it is served by the same sandboxed
 	// /html route). The mail has already left by now, so a failed R2 write must not
 	// turn a delivered send into an error: the copy keeps its text body instead.

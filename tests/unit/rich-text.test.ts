@@ -4,9 +4,11 @@ import { splitQuotedText, stripQuotedText } from "#/lib/quoted-text";
 import {
 	htmlToPlainText,
 	linkifySegments,
+	OUTGOING_FONT_STYLE,
 	plainTextToEditorHtml,
 	safeHref,
 	sanitizeStyle,
+	wrapOutgoingHtml,
 } from "#/lib/rich-text";
 import { buildParticipants, participantLabel, recipientsLabel } from "#/lib/thread-summary";
 
@@ -230,5 +232,23 @@ describe("thread participants", () => {
 				"noor@haddad.dev": "Noor Haddad",
 			}),
 		).toBe("To: Noor, rico");
+	});
+});
+
+describe("wrapOutgoingHtml", () => {
+	it("puts the body in one container with an explicit sans-serif stack, size and line-height", () => {
+		const out = wrapOutgoingHtml("<p>Hi</p>");
+		expect(out).toBe(`<div style="${OUTGOING_FONT_STYLE}"><p>Hi</p></div>`);
+		expect(OUTGOING_FONT_STYLE).toMatch(/font-family: [^;]*Arial, sans-serif/);
+		expect(OUTGOING_FONT_STYLE).toContain("font-size: 14px");
+		expect(OUTGOING_FONT_STYLE).toContain("line-height: 1.5");
+		// No web font (Outlook falls back to Times for one it cannot load) and no colour.
+		expect(OUTGOING_FONT_STYLE).not.toMatch(/Inter|color/);
+	});
+
+	it("is deterministic and never wraps twice", () => {
+		const once = wrapOutgoingHtml("<p>a</p><blockquote>quoted</blockquote>");
+		expect(wrapOutgoingHtml("<p>a</p><blockquote>quoted</blockquote>")).toBe(once);
+		expect(wrapOutgoingHtml(once)).toBe(once);
 	});
 });

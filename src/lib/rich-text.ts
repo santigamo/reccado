@@ -340,6 +340,32 @@ export function htmlToPlainText(html: string): string {
 		.replace(/^\n+|\n+$/g, "");
 }
 
+/**
+ * Typography the outgoing HTML part declares for itself, so a recipient's
+ * client does not fall back to its own default (Times New Roman in Outlook).
+ * System fonts only, no web font: Outlook desktop falls back to Times when a
+ * stack leads with a font it cannot load. No colour, so dark-mode clients keep
+ * adapting the text.
+ */
+export const OUTGOING_FONT_STYLE =
+	"font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; font-size: 14px; line-height: 1.5";
+
+const OUTGOING_OPEN = `<div style="${OUTGOING_FONT_STYLE}">`;
+
+/**
+ * The HTML part as it goes on the wire: the stored body inside one container
+ * carrying OUTGOING_FONT_STYLE as inline style (no <style> block: several
+ * clients drop those). Applied only when the message is handed to the
+ * provider — drafts, the frozen send payload and its hash keep the body as
+ * written — and idempotent, so a body that already starts with it is not
+ * wrapped twice. A quoted history keeps its own inline styles; it only
+ * inherits the font where it set none.
+ */
+export function wrapOutgoingHtml(html: string): string {
+	if (html.startsWith(OUTGOING_OPEN)) return html;
+	return `${OUTGOING_OPEN}${html}</div>`;
+}
+
 function escapeHtml(value: string): string {
 	return value
 		.replace(/&/g, "&amp;")
