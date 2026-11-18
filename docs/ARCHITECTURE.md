@@ -157,13 +157,18 @@ flowchart LR
 
 ## Outbound Email Flow
 
-1. A user or authorized MCP/agent action creates a draft (an MCP draft is permanently
-   `origin='mcp'`; the `send` tool only creates an approval intent, never sends). An agent writes
+1. A user or authorized MCP/agent action creates a draft (an MCP draft is `origin='mcp'` until
+   the owner edits it in the web, which takes it over as `origin='web'`; the `send` tool only
+   creates an approval intent, never sends). An agent writes
    the body as plain text or as Markdown (`save_draft` `bodyMarkdown`); Markdown is rendered in
    the worker into a sanitised HTML part and a plain-text part from the same parse
    (`src/lib/markdown.ts`), and both are in the frozen payload the owner approves.
 2. The mailbox Durable Object stores the draft and approval state.
-3. Agent-created drafts require explicit human approval before sending.
+3. Agent-created drafts never go out on the agent's word: the agent can never send; an
+   agent-initiated send needs the hash-bound approval; the owner may send an agent-written draft
+   directly with the owner web session, bound to the content they were shown (the web confirm-send
+   carries the draft's `content_fingerprint`, the DO answers `draft_changed` on any difference);
+   never from Telegram.
 4. On approval, the Durable Object records an outbox attempt with an idempotency key.
 5. Simple sends call the `send_email` binding under DO/API control.
 6. Long sends with waits, retries, or policy checks use a Workflow and write results back to
@@ -191,7 +196,10 @@ provider returned.
   without the owner's approval (owner web session, on `/approve/:id` or in the inbox approvals pane;
   secret-revealing kinds on `/approve/:id` only) bound to the exact payload, for sends and the
   irreversible / exfiltrating control-plane kinds; other control-plane writes apply directly with their narrow scope
-  and a before-snapshot (`restore` undoes them).
+  and a before-snapshot (`restore` undoes them). The owner, in turn, may send an agent-written
+  draft directly from the web composer (owner web session, bound to the content they were shown,
+  `owner-web-send.v1` proof minted only by the web confirm-send route) or edit it, which takes it
+  over from the agent; never from Telegram. Any human action outranks the agent's.
 - Prompt-injection defenses wrap every email-to-agent path.
 - Cloudflare API tokens for domain provisioning are narrow and environment-scoped.
 - Secrets live in Cloudflare bindings or deployment secrets, not source files.

@@ -538,7 +538,11 @@ blocks, `[links](https://…)` (http/https/mailto only), `-`/`1.` lists, `#` hea
 plain-text part (links as `text (url)`); raw HTML in the Markdown is escaped, never passed through.
 With `mail:send`, the `send` tool asks you to approve that exact message: the approval page shows the
 formatted version as it will go out, with every link's target written next to it, and the HTML is
-part of the frozen payload the approval is bound to.
+part of the frozen payload the approval is bound to. You can also skip the request: open the
+agent's draft in your inbox and press Send yourself (it goes out exactly as you see it; if the
+agent changes it after you opened it, nothing is sent and you are asked to review it again), or
+edit it, which makes it your draft. The agent itself can never send, and Telegram cannot send an
+agent's draft.
 
 **Connect a client the standard way** — one URL, then a browser login. No setup step on your side:
 

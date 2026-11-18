@@ -29,7 +29,7 @@ export function registerSendTool(
 		"send",
 		{
 			description:
-				"Request human approval to send an agent-created draft (from save_draft), or check an existing intent. The owner reviews the exact message, formatted version included, and nothing is sent unless they approve it; you can never approve it yourself.",
+				"Request human approval to send an agent-created draft (from save_draft), or check an existing intent. The owner reviews the exact message, formatted version included, and nothing is sent unless they approve it; you can never send or approve it yourself. The owner may instead send the saved draft themselves from their web inbox: the request then reads stale and the draft is already sent. A draft the owner edited is theirs and answers draft_not_agent_owned.",
 			inputSchema: z.object({
 				mailboxId: z.string().min(1),
 				draftId: z.string().min(1),
@@ -102,6 +102,8 @@ export function registerSendTool(
 					body: JSON.stringify({
 						mailboxAddress: mailbox.primary_address,
 						displayName: mailbox.display_name,
+						// Re-checked atomically in the DO: a draft the owner took over is not the agent's to send.
+						requester: "mcp",
 					}),
 				});
 				if (!requested.ok) throw new Error("request_send_failed");

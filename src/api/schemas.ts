@@ -179,6 +179,15 @@ export const draftAttachmentsFromMessageSchema = z.object({
 
 export const confirmSendSchema = z.object({
 	idempotencyKey: z.string().min(1),
+	/**
+	 * The `content_fingerprint` of the draft as the browser displayed it. Required
+	 * to send an agent-written draft directly (the mailbox DO refuses one without
+	 * it). Whenever it is present, whoever wrote the draft, what goes out must match it.
+	 */
+	draftFingerprint: z
+		.string()
+		.regex(/^[a-f0-9]{64}$/)
+		.optional(),
 });
 
 /**

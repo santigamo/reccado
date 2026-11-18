@@ -123,8 +123,14 @@ export type Draft = {
 	body_text: string | null;
 	body_html: string | null;
 	status: "draft" | "pending_confirmation" | "sent" | "cancelled";
-	/** Who created it: "mcp" drafts can only be sent through an owner approval. */
+	/**
+	 * Who owns it: "mcp" is still the agent's. The agent can only ask for an
+	 * approval; the owner may send it directly from here, bound to
+	 * `content_fingerprint`, or edit it, which makes it theirs ("web").
+	 */
 	origin?: "web" | "telegram" | "mcp";
+	/** Hash of the content as served (GET /drafts/:id); a direct send of an agent draft carries it back. */
+	content_fingerprint?: string;
 	/** Files on the draft (GET /drafts/:id). */
 	attachments?: DraftAttachment[];
 	/** How many files (GET /drafts list rows). */
@@ -545,7 +551,7 @@ export function attachmentErrorText(code: string | undefined): string {
 		case "attachment_empty":
 			return "File is empty";
 		case "agent_draft_attachments":
-			return "Agent drafts can't take files";
+			return "Save the agent's draft first, then add files";
 		case "draft_not_editable":
 			return "The draft can no longer be changed";
 		case "send_in_progress":
@@ -651,11 +657,16 @@ export async function restoreDraft(mailboxId: string, draftId: string): Promise<
  * One-click send: the backend keeps the draft -> request-send -> confirm-send
  * state machine (the human-confirmation gate for agent-initiated sends), so the
  * UI walks the whole chain in one call since a person is composing here.
+ *
+ * `fingerprint`: sending an agent's draft as it is, the `content_fingerprint` it
+ * was loaded with. The server sends only if the draft still has exactly that
+ * content, and answers `draft_changed` otherwise.
  */
 export async function sendDraft(
 	mailboxId: string,
 	draftId: string,
 	idempotencyKey: string,
+	fingerprint?: string,
 ): Promise<{ sent: boolean; reason?: string; threadId?: string }> {
 	const reqRes = await fetch(
 		`${base(mailboxId)}/drafts/${encodeURIComponent(draftId)}/request-send`,
@@ -665,7 +676,10 @@ export async function sendDraft(
 	const res = await fetch(`${base(mailboxId)}/drafts/${encodeURIComponent(draftId)}/confirm-send`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ idempotencyKey }),
+		body: JSON.stringify({
+			idempotencyKey,
+			...(fingerprint ? { draftFingerprint: fingerprint } : {}),
+		}),
 	});
 	let data: {
 		sent?: boolean;

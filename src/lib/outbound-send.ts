@@ -9,7 +9,14 @@ import {
 	upsertMessageIndex,
 } from "../db/d1";
 import { enqueueTelegramCardRefresh } from "../telegram/cards";
-import { approvalProofSecret, type McpApprovalProof, signMcpApprovalProof } from "./approvals";
+import {
+	approvalProofSecret,
+	type McpApprovalProof,
+	type OwnerWebSendProof,
+	signMcpApprovalProof,
+	signOwnerWebSendProof,
+	supersedePendingSendApprovals,
+} from "./approvals";
 import { AppError } from "./errors";
 import { outboundSendIdempotencyKey } from "./idempotency";
 import { mailboxStub } from "./mailbox-stub";
@@ -47,6 +54,7 @@ type DoSendResult = {
 	hasAttachments?: boolean;
 	reason?: string;
 	error?: string;
+	ownerSentAgentDraft?: boolean;
 };
 
 export async function confirmDraftSend(
@@ -60,7 +68,7 @@ export async function confirmDraftSend(
 		/**
 		 * Set only by the approval service after it has consumed the intent with a
 		 * passkey. The web and Telegram callers leave this unset; an `mcp` draft
-		 * then cannot send.
+		 * then cannot send, except from the web with `ownerWebSend` below.
 		 */
 		approval?: {
 			intentId: string;
@@ -69,10 +77,22 @@ export async function confirmDraftSend(
 			tokenSub?: string | null;
 			tokenJti?: string | null;
 		};
+		/**
+		 * Set only by the web confirm-send route, after it re-read the owner session
+		 * (cookie cache off) and matched the Origin: the owner pressed Send on the
+		 * content whose fingerprint the browser carries. It lets the owner send an
+		 * agent-written draft directly; the DO still refuses unless that exact
+		 * content is what goes out. Telegram and the approval service never set it.
+		 */
+		ownerWebSend?: { fingerprint: string; actor: string };
 	},
 ): Promise<ConfirmDraftSendResult> {
 	const { mailboxId, draftId, attemptKey, approvalMode } = input;
 	let approvalProof: McpApprovalProof | null = null;
+	let ownerProof: OwnerWebSendProof | null = null;
+	if (input.ownerWebSend && input.approval) {
+		return { status: 409, body: { id: draftId, sent: false, error: "approval_required" } };
+	}
 	if (input.approval) {
 		if (!input.expectedPayloadHash || input.expectedPayloadHash !== input.approval.payloadHash) {
 			return { status: 409, body: { id: draftId, sent: false, error: "approval_required" } };
@@ -105,6 +125,19 @@ export async function confirmDraftSend(
 	const stub = mailboxStub(env, mailboxId);
 
 	const idempotencyKey = outboundSendIdempotencyKey(draftId, attemptKey);
+	if (input.ownerWebSend) {
+		const secret = approvalProofSecret(env);
+		if (!secret || !/^[a-f0-9]{64}$/.test(input.ownerWebSend.fingerprint)) {
+			return { status: 409, body: { id: draftId, sent: false, error: "approval_required" } };
+		}
+		ownerProof = await signOwnerWebSendProof(secret, {
+			mailboxId,
+			draftId,
+			idempotencyKey,
+			fingerprint: input.ownerWebSend.fingerprint,
+			exp: Date.now() + 60_000,
+		});
+	}
 	const existingSend = await getOutboundSendByIdempotency(env.INDEX_DB, idempotencyKey);
 	if (existingSend?.status === "sent") {
 		return {
@@ -185,6 +218,9 @@ export async function confirmDraftSend(
 			draftId,
 			idempotencyKey,
 			approvalMode: approvalMode ?? "human_confirmed",
+			// Which gate let it through: the hash-bound approval, or the owner's own
+			// web send bound to the content the browser showed.
+			channel: input.approval ? "mcp_approval" : input.ownerWebSend ? "owner_web" : null,
 		}),
 	}).catch(() => {
 		// Ops event failures must not block sending.
@@ -204,6 +240,7 @@ export async function confirmDraftSend(
 				displayName: mailbox.display_name,
 				expectedPayloadHash: input.expectedPayloadHash,
 				approvalProof,
+				ownerProof,
 			}),
 		});
 	} catch (error) {
@@ -269,6 +306,33 @@ export async function confirmDraftSend(
 				threadId: result.threadId,
 				status: "replied",
 			});
+		}
+		if (result.ownerSentAgentDraft) {
+			// The owner sent an agent's draft themselves, from the web, without an
+			// approval: recorded apart from an approval send, with what bound it.
+			await insertOpsEvent(env.INDEX_DB, {
+				id: crypto.randomUUID(),
+				event_type: "send.owner_direct_agent_draft",
+				severity: "info",
+				subject: mailboxId,
+				payload_json: JSON.stringify({
+					draftId,
+					idempotencyKey,
+					channel: "owner_web",
+					actor: input.ownerWebSend?.actor ?? null,
+					contentFingerprint: input.ownerWebSend?.fingerprint ?? null,
+				}),
+			}).catch(() => undefined);
+		}
+		// Sent outside an approval: whatever send request is still pending for this
+		// draft can never be approved now. The DO would refuse it anyway (the draft
+		// is sent); this makes the request read as superseded instead of pending.
+		if (!input.approval) {
+			await supersedePendingSendApprovals(env, {
+				mailboxId,
+				draftId,
+				reason: "owner_direct_send",
+			}).catch(() => undefined);
 		}
 	} else if (result.error === "ambiguous") {
 		// Ambiguous provider outcome — the provider may have accepted the message.

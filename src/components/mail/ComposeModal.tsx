@@ -78,7 +78,7 @@ type Status = {
 /** Server reasons that need a human explanation instead of a code. */
 function explainReason(reason: string | undefined): string {
 	if (reason === "approval_required") {
-		return "This draft was written by an agent. It can only be sent through your approval link.";
+		return "the agent's draft could not be confirmed as the one on your screen. Close it, open it again and send.";
 	}
 	if (reason === "too_many_recipients") return "too many recipients.";
 	if (reason === "intent_stale") return "the draft changed while sending. Try again.";
@@ -192,7 +192,12 @@ export function ComposeModal({
 	const [idempotencyKey, setIdempotencyKey] = useState(() => crypto.randomUUID());
 	const [busy, setBusy] = useState(false);
 	const [status, setStatus] = useState<Status | null>(null);
+	// Still the agent's draft (origin "mcp"). The owner can send it as it is, bound
+	// to `fingerprint` (the content as loaded), or edit it, which makes it theirs.
 	const [agentDraft, setAgentDraft] = useState(false);
+	const [fingerprint, setFingerprint] = useState<string | null>(null);
+	// Bumped to load the draft again (the agent changed it after it was opened).
+	const [reloadTick, setReloadTick] = useState(0);
 	const [confirm, setConfirm] = useState<Confirm | null>(null);
 	// The dialog only renders in the browser (portal after mount), so reading here is safe.
 	const [fullScreen, setFullScreen] = useState(() =>
@@ -230,7 +235,7 @@ export function ComposeModal({
 		if (!prefill.draftId || !mailboxId) return;
 		let alive = true;
 		setBusy(true);
-		setStatus({ text: "Loading draft…" });
+		if (reloadTick === 0) setStatus({ text: "Loading draft…" });
 		fetchDraft(mailboxId, prefill.draftId)
 			.then((draft) => {
 				if (!alive) return;
@@ -254,8 +259,10 @@ export function ComposeModal({
 				setSavedSnapshot(snapshotOf(loadedTo, loadedCc, loadedBcc, draft.subject ?? "", html));
 				setSaved(true);
 				setAgentDraft(draft.origin === "mcp");
+				setFingerprint(draft.content_fingerprint ?? null);
 				files.load(draft.attachments ?? []);
-				setStatus(null);
+				// A reload after "the agent changed it" keeps that message on screen.
+				if (reloadTick === 0) setStatus(null);
 			})
 			.catch((err: unknown) => {
 				if (!alive) return;
@@ -270,7 +277,7 @@ export function ComposeModal({
 		return () => {
 			alive = false;
 		};
-	}, [prefill.draftId, mailboxId, setDraftId, files.load]);
+	}, [prefill.draftId, mailboxId, setDraftId, files.load, reloadTick]);
 
 	// Reply / forward: the original goes below the cursor, as Gmail does it. Fetched
 	// here (not passed in the URL) and reduced to the compose allowlist first.
@@ -386,8 +393,9 @@ export function ComposeModal({
 	}
 
 	// Autosave, Gmail style: shortly after you stop typing, once there is someone
-	// to send to. Never for an agent's draft — editing one voids its approval, and
-	// that has to be a decision, not a side effect of looking at it.
+	// to send to. Never for an agent's draft — saving one takes it over from the
+	// agent and voids any approval request, and that has to be a decision (Save
+	// draft, Send, adding a file), not a side effect of looking at it.
 	const autosaveRef = useRef<() => void>(() => {});
 	autosaveRef.current = () => {
 		if (!dirty || busy || agentDraft || !mailboxId || !quoteReady) return;
@@ -422,15 +430,37 @@ export function ComposeModal({
 
 	function attach(list: readonly File[]) {
 		if (list.length === 0) return;
-		if (agentDraft) {
-			setStatus({ text: "Files can't be added to a draft written by the agent.", error: true });
-			return;
-		}
 		const refused = files.addFiles(list);
 		setStatus(refused ? { text: refused, error: true } : null);
+		// Adding a file is an edit: an agent's draft is saved as the owner's first
+		// (files only go on a draft that is no longer the agent's), then they upload.
+		if (agentDraft) {
+			void takeOver().catch((err: unknown) =>
+				setStatus({
+					text: err instanceof Error ? err.message : "Could not save the draft.",
+					error: true,
+				}),
+			);
+			return;
+		}
 		// Without a draft yet, save one now (when there is a valid recipient) rather
 		// than after the autosave delay. Next tick: the queued files are in state.
 		if (!draftIdRef.current) window.setTimeout(() => autosaveRef.current(), 0);
+	}
+
+	/**
+	 * Saves the agent's draft as it is in the editor, which makes it the owner's
+	 * (the server flips its origin and supersedes any approval request). From here
+	 * on it is an ordinary draft: autosave, files, and Send without a fingerprint.
+	 */
+	async function takeOver(): Promise<string | null> {
+		const payload = buildPayload();
+		if (!validate(payload)) return null;
+		const id = await ensureDraft(payload);
+		markSaved();
+		setAgentDraft(false);
+		setFingerprint(null);
+		return id;
 	}
 
 	function onDrop(event: DragEvent<HTMLDivElement>) {
@@ -497,6 +527,9 @@ export function ComposeModal({
 		try {
 			const id = await ensureDraft(payload);
 			markSaved();
+			// Saved from here, an agent's draft is now the owner's.
+			setAgentDraft(false);
+			setFingerprint(null);
 			setStatus(null);
 			await settleFiles(id);
 		} catch (err) {
@@ -540,16 +573,44 @@ export function ComposeModal({
 		setBusy(true);
 		setStatus({ text: "Sending…" });
 		try {
-			const id = await ensureDraft(payload);
-			markSaved();
-			if (!(await settleFiles(id))) return;
-			const result = await sendDraft(mailboxId, id, idempotencyKey);
+			// An agent's draft sent as it is: not saved again (that would rewrite the
+			// agent's formatting through the editor and take it over for nothing), but
+			// sent bound to the content it was loaded with. Edited, it is saved first,
+			// which makes it the owner's, and goes out like any other draft.
+			const asLoaded = agentDraft && !dirty && fingerprint;
+			let id: string;
+			if (asLoaded && draftIdRef.current) {
+				id = draftIdRef.current;
+			} else {
+				id = await ensureDraft(payload);
+				markSaved();
+				if (agentDraft) {
+					setAgentDraft(false);
+					setFingerprint(null);
+				}
+				if (!(await settleFiles(id))) return;
+			}
+			const result = await sendDraft(
+				mailboxId,
+				id,
+				idempotencyKey,
+				asLoaded ? fingerprint : undefined,
+			);
 			if (result.sent) {
 				setStatus({ text: "Sent." });
 				setIdempotencyKey(crypto.randomUUID());
 				// The toast says "Message sent · View message"; the dialog goes now.
 				onSent?.({ mailboxId, threadId: result.threadId ?? threadId ?? null });
 				onClose();
+			} else if (result.reason === "draft_changed") {
+				// The agent edited it between opening and Send: nothing went out. Show
+				// the current version, to be read again before sending.
+				setStatus({
+					text: "The agent changed this draft after you opened it. Review it again before sending.",
+					error: true,
+				});
+				setIdempotencyKey(crypto.randomUUID());
+				setReloadTick((tick) => tick + 1);
 			} else {
 				setStatus({ text: `Not sent: ${explainReason(result.reason)}`, error: true });
 			}
@@ -713,7 +774,7 @@ export function ComposeModal({
 			{status.text}
 		</span>
 	) : agentDraft ? (
-		explainReason("approval_required")
+		"Written by the agent. Send sends exactly what you see; editing makes it yours"
 	) : (
 		"You are sending this yourself, so it goes out right away"
 	);
@@ -786,9 +847,9 @@ export function ComposeModal({
 						Save draft
 					</Button>
 					<IconButton
-						title={agentDraft ? "Files can't be added to an agent's draft" : "Attach files"}
+						title="Attach files"
 						onClick={() => fileInputRef.current?.click()}
-						disabled={busy || agentDraft}
+						disabled={busy}
 						className="size-9"
 					>
 						<Paperclip />
@@ -824,10 +885,10 @@ export function ComposeModal({
 			<div
 				className="relative flex min-h-0 flex-1 flex-col"
 				onDragEnter={(e) => {
-					if (e.dataTransfer.types.includes("Files") && !agentDraft) setDragging(true);
+					if (e.dataTransfer.types.includes("Files")) setDragging(true);
 				}}
 				onDragOver={(e) => {
-					if (e.dataTransfer.types.includes("Files") && !agentDraft) e.preventDefault();
+					if (e.dataTransfer.types.includes("Files")) e.preventDefault();
 				}}
 				onDragLeave={(e) => {
 					if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false);
