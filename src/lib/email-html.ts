@@ -31,6 +31,16 @@
 /** Present in a served body when this pass held remote content back. */
 export const BLOCKED_REMOTE_MARKER = '<meta name="reccado-remote-blocked" content="1">';
 
+/**
+ * Defaults for mail that sets no typography of its own (plain rich-text mail,
+ * ours included): without them the frame falls back to the browser's serif at
+ * 16px. Injected first in <head> and wrapped in `:where()` (zero specificity),
+ * so any rule or attribute the message carries wins. Only system fonts: the
+ * frame's CSP allows no remote font.
+ */
+export const EMAIL_BASE_STYLE =
+	"<style>:where(html){font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;overflow-wrap:anywhere}:where(body){margin:0;padding:4px 0}:where(img){max-width:100%;height:auto}</style>";
+
 const ALWAYS_REMOVED = [
 	"script",
 	"noscript",

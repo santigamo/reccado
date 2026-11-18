@@ -12,7 +12,7 @@ import {
 } from "../lib/attachment-limits";
 import { isPreviewableImage } from "../lib/attachment-preview";
 import { sha256Hex } from "../lib/crypto";
-import { injectIntoHead, prepareEmailHtml } from "../lib/email-html";
+import { EMAIL_BASE_STYLE, injectIntoHead, prepareEmailHtml } from "../lib/email-html";
 import { AppError } from "../lib/errors";
 import { sanitizeOwnerHtml } from "../lib/html-sanitize";
 import { mailboxStub } from "../lib/mailbox-stub";
@@ -62,7 +62,10 @@ export function emailHtmlCsp(remoteImages: boolean): string {
 // replacing the framed document. The sender's own <base> was removed by
 // prepareEmailHtml; this one only sets `target`, never `href`.
 function injectBaseTarget(html: string): string {
-	return injectIntoHead(html, '<base target="_blank" rel="noopener noreferrer">');
+	return injectIntoHead(
+		html,
+		`<base target="_blank" rel="noopener noreferrer">${EMAIL_BASE_STYLE}`,
+	);
 }
 
 /**

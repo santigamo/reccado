@@ -175,6 +175,8 @@ describe("GET /messages/:id/html framing", () => {
 			const html = await response.text();
 			expect(html).not.toMatch(/refresh|unsafe-url|<link|<base href/i);
 			expect(html).toContain('<base target="_blank" rel="noopener noreferrer">');
+			// Typography defaults come first, at zero specificity, so the mail's own CSS wins.
+			expect(html).toContain("<style>:where(html){font-family:Inter");
 			if (!query) expect(html).not.toContain("t.example");
 		}
 	});
