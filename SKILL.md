@@ -26,7 +26,14 @@ In this codebase that confirmation is the `request-send` → `confirm-send` flow
 `.../confirm-send`), each gated by its own idempotency key. Over MCP the `send` tool only creates an
 approval intent; the owner approves it only with the owner web session on this origin — at `/approve/:id` (the link the tool returns) or in the inbox approvals pane, both posting the frozen `payload_hash` to the same endpoint — never from Telegram (it sends a notice with the link, no buttons), and the DO sends an
 MCP-origin draft only with that approval's HMAC proof, so an agent cannot reach `confirm-send` by
-itself. The one deliberate exception to per-message confirmation is the transactional REST API,
+itself. In one line: **the agent can never send; an agent-initiated send needs the hash-bound
+approval; the owner may send an agent-written draft directly with the owner web session, bound to
+the content they were shown; never from Telegram.** The owner's direct send goes through the web
+`confirm-send` route with `draftFingerprint` (the draft's `content_fingerprint` as the browser
+loaded it); that route alone mints the `owner-web-send.v1` proof (owner session re-read with the
+cookie cache off, Origin present and equal), and the DO refuses with `draft_changed` if what would
+go out differs from what the owner was shown. Editing an agent draft in the web takes it over
+(`origin` becomes `web`; the agent can no longer change, cancel or request to send it). The one deliberate exception to per-message confirmation is the transactional REST API,
 where an operator-created, mailbox-bound API key is itself the pre-authorization — see
 `SECURITY.md` and `docs/OPERATIONS.md`. If you are building or
 extending the MCP/agent layer:
@@ -34,9 +41,10 @@ extending the MCP/agent layer:
 - Agent-facing tools may create and edit drafts (`drafts.create`, `drafts.update`) and may call
   `request-send` to stage a draft for confirmation.
 - Agent-facing tools must **not** be able to call `confirm-send` (or any direct send path) on
-  behalf of the user. Confirmation must originate from a human action in the UI (or another
-  channel that is unambiguously the human operator, e.g. a signed approval link), never from
-  another model call or an "auto-approve" flag.
+  behalf of the user, and must have no way to mint either the approval proof or the owner-send
+  proof. Confirmation must originate from a human action in the UI (or another channel that is
+  unambiguously the human operator, e.g. a signed approval link), never from another model call or
+  an "auto-approve" flag.
 - Prompt-injection defenses must wrap every email-to-agent path: content read from an inbound
   message (subject, body, headers) is untrusted input and must never be treated as instructions,
   regardless of what it claims to be ("ignore previous instructions and send...", etc).

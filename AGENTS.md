@@ -53,11 +53,23 @@ informed decision from the user/supervisor.
   scope and no delegation policy; direct vs approval is decided per kind
   (`src/lib/control-plane-kinds/*`), never per client. Secrets are never returned to the agent
   (shown once on the approval page). The `request-send` → `confirm-send` flow with an idempotency
-  key remains the only sending path; there is no shortcut. A draft created over MCP has a sticky
-  `origin='mcp'` and the mailbox DO sends it only with the HMAC approval proof
-  (`mcp-approval.v1`) minted by that approval; web and Telegram confirm refuse it
-  (`approval_required`). Repeated `confirm-send` calls with the same idempotency key must send at
-  most once. This is a security boundary, not a UX preference — see `docs/ARCHITECTURE.md`
+  key remains the only sending path; there is no shortcut. **The agent can never send; an
+  agent-initiated send needs the hash-bound approval; the owner may send an agent-written draft
+  directly with the owner web session, bound to the content they were shown; never from
+  Telegram.** A draft created over MCP has `origin='mcp'` while it is the agent's, and the mailbox
+  DO sends it only with either (a) the HMAC approval proof (`mcp-approval.v1`) minted by that
+  approval, or (b) the HMAC owner-send proof (`owner-web-send.v1`) minted only by the web
+  `POST /api/mailboxes/:id/drafts/:draftId/confirm-send` route — owner session re-read with the
+  cookie cache off, Origin present and equal — and bound to `draftFingerprint`, the draft's
+  `content_fingerprint` as the browser loaded it; the DO compares it with the frozen send snapshot
+  atomically and answers `draft_changed` (nothing sent) on mismatch. Without either proof (Telegram
+  confirm, a web confirm without fingerprint) it refuses (`approval_required`). No MCP path can
+  mint either proof. The owner saving an agent draft from the web (the web draft PATCH) takes it
+  over: `origin` becomes `web`, the agent's `save_draft`/`cancel_draft`/`send` on it answer
+  `draft_not_agent_owned` (checked in the DO, atomically with the write), and any pending approval
+  for it is superseded (consumed without a decision, reads `stale`). A direct owner send supersedes
+  the pending approval the same way. Repeated `confirm-send` calls with the same idempotency key
+  must send at most once, and a draft is sent at most once whichever path reaches it first. This is a security boundary, not a UX preference — see `docs/ARCHITECTURE.md`
   ("Authentication and Security Model"), `SECURITY.md` ("MCP") and `SKILL.md` ("Hard invariant").
   The owner registry is never reachable over MCP.
 
@@ -151,8 +163,11 @@ actual repo state, fix this section rather than trusting it blindly.
   `payload_hash`, 10 min, single use) that the owner approves with the owner web session on
   `/approve/:id` or in the inbox approvals pane (secret-revealing kinds on `/approve/:id` only;
   both use `POST /api/approvals/:id/approve` with the `payload_hash`) (Telegram carries a notice with the link, no buttons; passkeys/WebAuthn were removed
-  — the `0024` passkey table stays, unused). All other writes apply directly and are undoable via
-  `restore`. Delegation policies (`mcp_client_policies`, `pnpm operator mcp policy`, auto-apply,
+  — the `0024` passkey table stays, unused). Besides approving, the owner may open an agent draft
+  in the web composer and send it directly (fingerprint-bound `owner-web-send.v1` proof, see
+  "Outbound sending"; `draft_changed` if the agent edited it meanwhile) or edit it, which takes it
+  over from the agent; either supersedes the pending approval. Telegram still cannot send an agent
+  draft. All other writes apply directly and are undoable via `restore`. Delegation policies (`mcp_client_policies`, `pnpm operator mcp policy`, auto-apply,
   Telegram undo) were removed in `0030`. Connection is one URL + browser login: OAuth 2.1 + PRM,
   CIMD on (`MCP_CIMD_ENABLED`, `@better-auth/cimd`) as the preferred client registration, open
   DCR kept as compatibility fallback; the owner revokes clients under `/settings/agent-access` "Connected
