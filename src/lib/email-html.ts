@@ -31,17 +31,31 @@
 /** Present in a served body when this pass held remote content back. */
 export const BLOCKED_REMOTE_MARKER = '<meta name="reccado-remote-blocked" content="1">';
 
+/** Where the worker serves its own copy of Inter (public/fonts/inter, OFL). */
+export const INTER_FONT_PATH = "/fonts/inter";
+
+const LATIN_RANGE =
+	"U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD";
+const LATIN_EXT_RANGE =
+	"U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF";
+
+function interFace(subset: "latin" | "latin-ext", style: "normal" | "italic"): string {
+	const range = subset === "latin" ? LATIN_RANGE : LATIN_EXT_RANGE;
+	return `@font-face{font-family:Inter;font-style:${style};font-weight:100 900;font-display:swap;src:url(${INTER_FONT_PATH}/inter-${subset}-wght-${style}.woff2) format("woff2");unicode-range:${range}}`;
+}
+
 /**
  * Defaults for mail that sets no typography of its own (plain rich-text mail,
  * ours included): without them the frame falls back to the browser's serif at
  * 16px. Injected first in <head> and wrapped in `:where()` (zero specificity),
- * so any rule or attribute the message carries wins. Only system fonts: the
- * frame's CSP allows no remote font. Deliberately nothing about images or
- * tables: a rule here would also beat HTML sizing attributes (spacer GIFs,
- * fixed-width columns) and break table-built mail.
+ * so any rule or attribute the message carries wins. Inter comes from this
+ * origin (variable, latin + latin-ext, upright and italic; the frame's CSP
+ * allows `font-src 'self'`); other scripts fall through to the system stack.
+ * Deliberately nothing about images or tables: a rule here would also beat
+ * HTML sizing attributes (spacer GIFs, fixed-width columns) and break
+ * table-built mail.
  */
-export const EMAIL_BASE_STYLE =
-	"<style>:where(html){font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;overflow-wrap:break-word}:where(body){margin:0;padding:4px 0}</style>";
+export const EMAIL_BASE_STYLE = `<style>${interFace("latin", "normal")}${interFace("latin", "italic")}${interFace("latin-ext", "normal")}${interFace("latin-ext", "italic")}:where(html){font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;overflow-wrap:break-word}:where(body){margin:0;padding:4px 0}</style>`;
 
 /**
  * For the approval preview only: every link's real target written out after

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { isRemoteUrl, neutralizeRemoteCss, prepareEmailHtml } from "#/lib/email-html";
+import {
+	EMAIL_BASE_STYLE,
+	INTER_FONT_PATH,
+	isRemoteUrl,
+	neutralizeRemoteCss,
+	prepareEmailHtml,
+} from "#/lib/email-html";
 
 /**
  * A sender-controlled body, prepared for the inbox frame: nothing in it may
@@ -110,5 +116,29 @@ describe("neutralizeRemoteCss", () => {
 		expect(isRemoteUrl("/a")).toBe(false);
 		expect(isRemoteUrl("data:x")).toBe(false);
 		expect(isRemoteUrl("cid:x")).toBe(false);
+	});
+});
+
+describe("EMAIL_BASE_STYLE", () => {
+	const css = EMAIL_BASE_STYLE.replace(/^<style>|<\/style>$/g, "");
+
+	it("loads Inter from this origin only: latin and latin-ext, upright and italic", () => {
+		const faces = [...css.matchAll(/@font-face\{([^}]*)\}/g)].map((m) => m[1]!);
+		expect(faces).toHaveLength(4);
+		const urls = faces.map((face) => /src:url\(([^)]+)\)/.exec(face)?.[1]);
+		expect(urls.sort()).toEqual(
+			[
+				"inter-latin-ext-wght-italic.woff2",
+				"inter-latin-ext-wght-normal.woff2",
+				"inter-latin-wght-italic.woff2",
+				"inter-latin-wght-normal.woff2",
+			].map((file) => `${INTER_FONT_PATH}/${file}`),
+		);
+		for (const face of faces) {
+			expect(face).toContain("font-family:Inter");
+			expect(face).toContain("font-weight:100 900");
+			expect(face).toMatch(/unicode-range:U\+/);
+		}
+		expect(EMAIL_BASE_STYLE).not.toMatch(/https?:|\/\//);
 	});
 });

@@ -51,7 +51,8 @@ export function emailHtmlCsp(remoteImages: boolean): string {
 		"default-src 'none'",
 		`img-src 'self' data:${remote}`,
 		"style-src 'unsafe-inline'",
-		`font-src data:${remoteImages ? " https:" : ""}`,
+		// 'self': the copy of Inter the base style loads (lib/email-html.ts).
+		`font-src 'self' data:${remoteImages ? " https:" : ""}`,
 		`media-src data:${remoteImages ? " https:" : ""}`,
 		"form-action 'none'",
 		"frame-ancestors 'self'",

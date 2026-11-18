@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { InboundEmailQueueMessage } from "#/cloudflare/types";
 import { sha256Hex } from "#/lib/crypto";
+import { EMAIL_BASE_STYLE } from "#/lib/email-html";
 import { inboundIdempotencyKey } from "#/lib/idempotency";
 import { rawEmailR2Key } from "#/lib/r2-keys";
 import worker, { withHtmlSecurityHeaders } from "#/server";
@@ -124,6 +125,8 @@ describe("GET /messages/:id/html framing", () => {
 		expect(csp).not.toContain("script-src");
 		// Remote images are a read receipt: blocked until the reader asks.
 		expect(csp).toContain("img-src 'self' data:;");
+		// Fonts: this origin's own copy of Inter, inline data:, nothing remote.
+		expect(csp).toContain("font-src 'self' data:;");
 		expect(csp).not.toMatch(/https?:/);
 		const shown = await fetchWorker(
 			new Request(
@@ -133,6 +136,7 @@ describe("GET /messages/:id/html framing", () => {
 		expect(shown.headers.get("content-security-policy")).toContain(
 			"img-src 'self' data: https: http:",
 		);
+		expect(shown.headers.get("content-security-policy")).toContain("font-src 'self' data: https:");
 		expect(await shown.text()).toContain('src="https://example.org/remote.png"');
 
 		const html = await response.text();
@@ -176,7 +180,11 @@ describe("GET /messages/:id/html framing", () => {
 			expect(html).not.toMatch(/refresh|unsafe-url|<link|<base href/i);
 			expect(html).toContain('<base target="_blank" rel="noopener noreferrer">');
 			// Typography defaults come first, at zero specificity, so the mail's own CSS wins.
-			expect(html).toContain("<style>:where(html){font-family:Inter");
+			expect(html).toContain(EMAIL_BASE_STYLE);
+			expect(html).toContain(":where(html){font-family:Inter");
+			// Inter is this origin's own copy, never a remote one.
+			expect(html).toContain("src:url(/fonts/inter/inter-latin-wght-normal.woff2)");
+			expect(html).not.toMatch(/fonts\.(googleapis|gstatic)\.com/);
 			if (!query) expect(html).not.toContain("t.example");
 		}
 	});
