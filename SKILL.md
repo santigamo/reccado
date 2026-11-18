@@ -268,7 +268,12 @@ rule to a destination outside the owner's domains, `api_key_create|rotate|scopes
 `/approve/:id` URL and the owner approves it there with the web session (API-key secrets are shown
 once on that page, never to the agent). Every other write applies directly with its scope, keeps a
 before-snapshot and is undoable with `restore`. One operation per call. An agent must never try to
-approve, replay or bypass that step, and the owner registry is not reachable over MCP. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
+approve, replay or bypass that step, and the owner registry is not reachable over MCP.
+`save_draft` takes `bodyText` (plain) or `bodyMarkdown` (exactly one): the Markdown subset —
+paragraphs, bold/italic, inline and fenced code, http(s)/mailto links, lists, headings, quotes, rules —
+is rendered server-side into a sanitised HTML part and a plain-text part from the same source; raw
+HTML is escaped. The HTML is part of the frozen send payload (`payload_hash`) and is shown rendered,
+with link targets, on the approval page. `pnpm setup:mcp-claim --env <env> --owner <you@example.com> [--apply]` backfills
 `mailboxes.owner_email` for pre-existing mailboxes so the owner-scoped MCP lookups can serve them.
 
 ## Verification checklist

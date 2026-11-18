@@ -29,7 +29,7 @@ export function registerSendTool(
 		"send",
 		{
 			description:
-				"Request human approval to send an agent-created draft, or check an existing intent.",
+				"Request human approval to send an agent-created draft (from save_draft), or check an existing intent. The owner reviews the exact message, formatted version included, and nothing is sent unless they approve it; you can never approve it yourself.",
 			inputSchema: z.object({
 				mailboxId: z.string().min(1),
 				draftId: z.string().min(1),
