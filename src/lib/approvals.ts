@@ -37,6 +37,7 @@ import { domainFromAddress } from "./email-headers";
 import { getSendingFeedbackStatus } from "./feedback-liveness";
 import { mailboxStub } from "./mailbox-stub";
 import { confirmDraftSend } from "./outbound-send";
+import { wrapOutgoingHtml } from "./rich-text";
 import { classifySensitive } from "./sensitive-mail";
 
 export { registerControlPlaneKind, requestControlPlaneChange } from "./control-plane-intents";
@@ -604,6 +605,34 @@ export async function getIntentViewWithSnapshot(
 	actor: { userId: string },
 ): Promise<{ view: IntentView; frozen: FrozenSend | null }> {
 	return buildView(env, id, actor.userId);
+}
+
+/**
+ * The HTML part of a send request exactly as it would leave, for the owner to
+ * see rendered (in the same sandboxed frame as a received message). Only for a
+ * snapshot that is still the one the request was frozen with: a stale or
+ * swapped draft has no preview. `expectedHash`, when given, must equal the
+ * request's payload_hash, so a page renders the body of the very payload it
+ * will POST back for approval. Null when there is nothing to show; the caller
+ * answers 404. The body comes back unprepared: the route runs it through
+ * prepareEmailHtml like any framed mail.
+ */
+export async function approvalPreviewHtml(
+	env: Env,
+	id: string,
+	userId: string,
+	expectedHash?: string | null,
+): Promise<string | null> {
+	const row = await getApproval(env.INDEX_DB, id);
+	if (row?.kind !== "send" || !row.mailbox_id || !row.draft_id || !row.payload_hash) return null;
+	// Multi-owner safety, as on approve: only the owner whose token created it.
+	if (row.token_sub && row.token_sub !== userId) return null;
+	if (expectedHash && !timingSafeEqual(expectedHash, row.payload_hash)) return null;
+	const frozen = await readFrozen(env, row.mailbox_id, row.draft_id).catch(() => null);
+	if (!frozen || frozen.stale || frozen.payloadHash !== row.payload_hash) return null;
+	const html = frozen.snapshot.html;
+	if (typeof html !== "string" || !html) return null;
+	return wrapOutgoingHtml(html);
 }
 
 /**

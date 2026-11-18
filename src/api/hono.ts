@@ -64,8 +64,12 @@ async function checkIndexDbHealth(indexDb: D1Database): Promise<IndexDbHealth> {
 	}
 }
 
-/** The one API response the app frames: GET /api/mailboxes/:id/messages/:messageId/html. */
-const MESSAGE_HTML_PATH = /^\/api\/mailboxes\/[^/]+\/messages\/[^/]+\/html$/;
+/**
+ * The API responses the app frames: a message's HTML body
+ * (GET /api/mailboxes/:id/messages/:messageId/html) and a send request's HTML
+ * part under review (GET /api/approvals/:id/html).
+ */
+const MESSAGE_HTML_PATH = /^\/api\/(?:mailboxes\/[^/]+\/messages\/[^/]+|approvals\/[^/]+)\/html$/;
 
 export function createApiApp(): Hono<ApiBindings> {
 	const api = new Hono<ApiBindings>();
@@ -81,9 +85,9 @@ export function createApiApp(): Hono<ApiBindings> {
 		}
 		const headers = new Headers(c.res.headers);
 		headers.set("X-Content-Type-Options", "nosniff");
-		// DENY everywhere, with one exception: a message's HTML body, which the
-		// inbox itself frames (sandboxed) and which declares SAMEORIGIN to match its
-		// CSP frame-ancestors 'self'. Pages that ask for decisions (/approve/:id and
+		// DENY everywhere, with two exceptions: a message's HTML body and a send
+		// request's HTML preview, which the app itself frames (sandboxed) and which
+		// declare SAMEORIGIN to match their CSP frame-ancestors 'self'. Pages that ask for decisions (/approve/:id and
 		// /inbox, whose approvals pane approves too; /login, /consent) are not served
 		// by this app: server.ts withHtmlSecurityHeaders gives them their own DENY,
 		// frame-ancestors 'none' and frame-src 'self' (plus no-referrer on /approve

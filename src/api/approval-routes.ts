@@ -29,6 +29,30 @@ export function registerApprovalRoutes(api: Hono<ApiBindings>): void {
 		return json(view, 200);
 	});
 
+	// A send request's HTML part, rendered for review the way a received message
+	// is: through prepareEmailHtml (remote content held back), under the strict
+	// email-frame CSP, framable by this origin only. Every link's target is
+	// written next to it. `?hash=` binds the preview to the payload the page will
+	// approve; anything stale, swapped or not a send is a 404.
+	api.get("/api/approvals/:id/html", async (c) => {
+		const auth = await owner(c.req.raw, c.env);
+		if (auth instanceof Response) return auth;
+		const { approvalPreviewHtml } = await import("../lib/approvals");
+		const hash = c.req.query("hash") ?? null;
+		if (hash !== null && !/^[a-f0-9]{64}$/.test(hash)) return json({ error: "invalid_hash" }, 400);
+		const html = await approvalPreviewHtml(c.env, c.req.param("id"), auth.userId, hash);
+		if (html === null) return json({ error: "html_not_found" }, 404);
+		const { LINK_TARGETS_STYLE, prepareEmailHtml } = await import("../lib/email-html");
+		const { framedEmailResponse } = await import("./mailbox-routes");
+		let prepared: string;
+		try {
+			prepared = await prepareEmailHtml(html, new Map(), false);
+		} catch {
+			return json({ error: "html_unrenderable" }, 422);
+		}
+		return framedEmailResponse(prepared, false, LINK_TARGETS_STYLE);
+	});
+
 	api.get("/api/approvals/:id/status", async (c) => {
 		const auth = await owner(c.req.raw, c.env);
 		if (auth instanceof Response) return auth;

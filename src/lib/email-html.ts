@@ -43,6 +43,16 @@ export const BLOCKED_REMOTE_MARKER = '<meta name="reccado-remote-blocked" conten
 export const EMAIL_BASE_STYLE =
 	"<style>:where(html){font-family:Inter,ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased;overflow-wrap:break-word}:where(body){margin:0;padding:4px 0}</style>";
 
+/**
+ * For the approval preview only: every link's real target written out after
+ * it, so the owner approves where a link goes and not only what it says. Our
+ * own rule, after the message's markup; `!important` and its own colours so the
+ * body's inline styles (colour/background are on the owner allowlist) cannot
+ * hide it.
+ */
+export const LINK_TARGETS_STYLE =
+	'<style>a[href]::after{content:" (" attr(href) ")" !important;display:inline !important;color:#5f6368 !important;background:#ffffff !important;font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace !important;font-weight:400 !important;font-style:normal !important;text-decoration:none !important;word-break:break-all !important;visibility:visible !important}</style>';
+
 const ALWAYS_REMOVED = [
 	"script",
 	"noscript",

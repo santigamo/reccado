@@ -12,8 +12,13 @@ import {
 	getIntentStatus,
 	getOrCreatePendingIntent,
 	getIntentView,
+	readFrozen,
 	requestControlPlaneChange,
 } from "#/lib/approvals";
+import { sha256Hex } from "#/lib/crypto";
+import { LINK_TARGETS_STYLE } from "#/lib/email-html";
+import { OUTGOING_FONT_STYLE } from "#/lib/rich-text";
+import { McpMailboxFacade } from "../../src/mcp/mailbox-facade";
 import { confirmDraftSend } from "#/lib/outbound-send";
 import { renderApprovalPage } from "#/components/approval-page";
 import worker from "../../src/server";
@@ -788,5 +793,119 @@ describe("mcp send approval", () => {
 		expect(deniedResult.status).toBe("denied");
 		expect(await messageCount(deniedDraft.stub)).toBe(0);
 		expect((await getIntentStatus(env, "does-not-exist")).status).toBe("expired");
+	});
+
+	it("binds a Markdown draft's HTML into payload_hash, previews exactly it, and refuses it once changed", async () => {
+		const email = "markdown-hash@example.com";
+		const owner = await registerOwner(email);
+		const mailboxId = `mbx_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+		const address = `${mailboxId}@imsanti.dev`;
+		await insertMailbox(db, {
+			mailbox_id: mailboxId,
+			primary_address: address,
+			display_name: "Owner",
+			status: "active",
+			owner_email: email,
+		});
+		const facade = new McpMailboxFacade(env as Env, {
+			userId: owner.userId,
+			email,
+			scopes: new Set(["mail:read", "mail:draft"]),
+		});
+		const { draft_id: draftId } = await facade.createDraft(mailboxId, {
+			to: ["stranger@example.net"],
+			subject: "Formatted",
+			bodyMarkdown:
+				"Hi **Ana**,\n\nSee [the doc](https://example.com/doc).\n\n<script>x()</script>",
+			idempotencyKey: crypto.randomUUID(),
+		});
+		const stub = env.MAILBOX_DO.getByName(mailboxId);
+		const stored = (await (await stub.fetch(`https://mailbox-do/drafts/${draftId}`)).json()) as {
+			draft: { body_html: string; body_text: string; origin: string };
+		};
+		expect(stored.draft.origin).toBe("mcp");
+		expect(stored.draft.body_html).toContain("<strong>Ana</strong>");
+		expect(stored.draft.body_html).toContain('<a href="https://example.com/doc"');
+		expect(stored.draft.body_html).not.toContain("<script");
+		expect(stored.draft.body_text).toBe(
+			"Hi Ana,\n\nSee the doc (https://example.com/doc).\n\n<script>x()</script>",
+		);
+
+		const armed = await stub.fetch(`https://mailbox-do/drafts/${draftId}/request-send`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ mailboxAddress: address, displayName: "Owner" }),
+		});
+		const { payload_hash: payloadHash } = (await armed.json()) as { payload_hash: string };
+		expect(payloadHash).toMatch(/^[a-f0-9]{64}$/);
+
+		// The frozen payload carries the HTML, and the hash is over that payload:
+		// the same snapshot with any other HTML hashes differently.
+		const frozen = await readFrozen(env as Env, mailboxId, draftId);
+		expect(frozen?.payloadHash).toBe(payloadHash);
+		expect(frozen?.snapshot.html).toBe(stored.draft.body_html);
+		const hashOf = async (snapshot: unknown) =>
+			sha256Hex(new TextEncoder().encode(JSON.stringify(snapshot)));
+		expect(await hashOf(frozen?.snapshot)).toBe(payloadHash);
+		expect(
+			await hashOf({
+				...frozen?.snapshot,
+				html: '<p>Hi <a href="https://evil.example">Ana</a></p>',
+			}),
+		).not.toBe(payloadHash);
+
+		const intent = await createIntent(env, {
+			kind: "send",
+			origin: "mcp",
+			mailboxId,
+			draftId,
+			payloadHash,
+			tokenSub: owner.userId,
+		});
+		const view = await getIntentView(env, intent.id, { userId: owner.userId });
+		expect(view.fields.find((field) => field.label === "HTML")?.value).toBe(stored.draft.body_html);
+
+		const preview = (hash: string | null) =>
+			worker.fetch(
+				new Request(`${ORIGIN}/api/approvals/${intent.id}/html${hash ? `?hash=${hash}` : ""}`, {
+					headers: { cookie: owner.jar.header() },
+				}),
+				authEnv(),
+				createExecutionContext(),
+			);
+		const shown = await preview(payloadHash);
+		expect(shown.status).toBe(200);
+		expect(shown.headers.get("x-frame-options")).toBe("SAMEORIGIN");
+		const csp = shown.headers.get("content-security-policy") ?? "";
+		expect(csp).toContain("default-src 'none'");
+		expect(csp).toContain("frame-ancestors 'self'");
+		expect(csp).not.toContain("script-src");
+		const body = await shown.text();
+		// What goes on the wire: the frozen HTML inside the typography container…
+		expect(body).toContain(`<div style="${OUTGOING_FONT_STYLE}"><p>Hi <strong>Ana</strong>`);
+		// …with every link's target written out for the owner.
+		expect(body).toContain(LINK_TARGETS_STYLE);
+		expect(body).not.toContain("<script");
+		// A different hash, or none for a stranger, shows nothing.
+		expect((await preview("0".repeat(64))).status).toBe(404);
+		const anonymous = await worker.fetch(
+			new Request(`${ORIGIN}/api/approvals/${intent.id}/html`),
+			authEnv(),
+			createExecutionContext(),
+		);
+		expect(anonymous.status).toBe(401);
+
+		// The HTML alone changes after the request was frozen: the request goes
+		// stale, the preview disappears, and approving the shown hash sends nothing.
+		const edited = await stub.fetch(`https://mailbox-do/drafts/${draftId}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ bodyHtml: '<p>Hi <a href="https://evil.example">Ana</a></p>' }),
+		});
+		expect(edited.ok).toBe(true);
+		expect((await preview(payloadHash)).status).toBe(404);
+		const result = await webApprove(env, { userId: owner.userId }, { id: intent.id, payloadHash });
+		expect(result.error).toBe("stale");
+		expect(await messageCount(stub)).toBe(0);
 	});
 });
