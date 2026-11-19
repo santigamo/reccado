@@ -138,10 +138,35 @@ const cardRefreshObjectSchema = z.object({
 export const telegramCardRefreshQueueMessageSchema: z.ZodType<TelegramCardRefreshQueueMessage> =
 	cardRefreshObjectSchema;
 
-export type NotifyQueueMessage = InboundNotificationQueueMessage | TelegramCardRefreshQueueMessage;
+/**
+ * "Make this approval's Telegram notice show its current state."
+ *
+ * Carries the id and nothing else: the notice is re-rendered from the approvals
+ * row when the message is consumed, so a delayed copy (the one timed for the
+ * expiry) can never print a state that was true when it was queued.
+ */
+export type TelegramApprovalNoticeQueueMessage = {
+	schemaVersion: 1;
+	eventType: "telegram.approval_notice.v1";
+	notice: { approvalId: string; compact: boolean };
+};
 
-/** What the notify consumer accepts: a new card, or an edit to one already sent. */
+const approvalNoticeObjectSchema = z.object({
+	schemaVersion: z.literal(1),
+	eventType: z.literal("telegram.approval_notice.v1"),
+	notice: z.object({
+		approvalId: z.string().min(1).max(200),
+		compact: z.boolean(),
+	}),
+});
+
+export type NotifyQueueMessage =
+	| InboundNotificationQueueMessage
+	| TelegramCardRefreshQueueMessage
+	| TelegramApprovalNoticeQueueMessage;
+
+/** What the notify consumer accepts: a new card, an edit to one, or an approval notice sync. */
 export const notifyQueueMessageSchema: z.ZodType<NotifyQueueMessage> = z.discriminatedUnion(
 	"eventType",
-	[inboundNotificationObjectSchema, cardRefreshObjectSchema],
+	[inboundNotificationObjectSchema, cardRefreshObjectSchema, approvalNoticeObjectSchema],
 );

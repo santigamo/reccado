@@ -7,6 +7,7 @@
  */
 
 import { mailboxStub } from "../lib/mailbox-stub";
+import type { SensitivityFacts } from "./sensitive";
 
 /** What the DO stores about one file that travelled with an email. */
 export type MailboxAttachment = {
@@ -26,7 +27,7 @@ export type MailboxMessage = {
 	body_text: string | null;
 	/** Always present in the DO's answer; empty for mail that carried none. */
 	attachments?: MailboxAttachment[];
-};
+} & SensitivityFacts;
 
 /** Exactly the verbs the DO implements; anything else is a typo, not a feature. */
 export type MailboxMessageAction =
@@ -50,6 +51,30 @@ export async function fetchMailboxMessage(
 	// sender — the one field a reply cannot be built without — is the real check.
 	const payload = (await response.json()) as { message?: Partial<MailboxMessage> };
 	return payload.message?.from_addr ? (payload.message as MailboxMessage) : null;
+}
+
+/**
+ * The message, or null when the DO could not be read.
+ *
+ * Best effort for the same reason as the attachment list below: it feeds a card,
+ * and an unreachable Durable Object must cost the card detail, never the card.
+ * Callers that print content treat null as "unknown" (see telegram/sensitive.ts).
+ */
+export async function inspectMailboxMessage(
+	env: Env,
+	mailboxId: string,
+	messageLocalId: string,
+): Promise<MailboxMessage | null> {
+	try {
+		return await fetchMailboxMessage(env, mailboxId, messageLocalId);
+	} catch (error) {
+		console.warn("telegram.message_unavailable", {
+			mailboxId,
+			messageLocalId,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return null;
+	}
 }
 
 /**
@@ -93,6 +118,30 @@ export async function applyMailboxMessageAction(
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify({ action: input.action }),
+	});
+	return response.ok;
+}
+
+/**
+ * Applies one triage verb to a whole conversation, the way the web does.
+ *
+ * The same DO route the web's conversation actions call (`/bulk-actions` with a
+ * thread target, scope "live"), so archiving from a card and archiving from the
+ * inbox leave the thread in the same state -- not one message archived and the
+ * rest of the conversation still in the inbox.
+ */
+export async function applyMailboxThreadAction(
+	env: Env,
+	input: { mailboxId: string; threadId: string; action: MailboxMessageAction },
+): Promise<boolean> {
+	const stub = mailboxStub(env, input.mailboxId);
+	const response = await stub.fetch("https://mailbox-do/bulk-actions", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			action: input.action,
+			target: { threadIds: [input.threadId], scope: "live" },
+		}),
 	});
 	return response.ok;
 }

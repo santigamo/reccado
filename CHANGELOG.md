@@ -11,6 +11,26 @@ package.
 
 ### Added
 
+- **Telegram bridge UX and sensitive-mail masking (2026-11-17).** *Security:* every Telegram
+  surface (new card, restated card, search hit, digest line, `/unread`, "Leer completo",
+  "Adjuntos") asks `src/telegram/sensitive.ts`, which reads the mailbox DO's own classification
+  (`messages.sensitive_kind`) and withholds the excerpt and file names of one-time codes,
+  reset and magic links, masks codes/digit runs in their subject, and refuses the body and
+  files; this instance's own sign-in/reset mail is hidden by stored `instance_auth` kind, auth
+  sender or template subject, whichever matches. Unclassified rows are classified from their
+  stored text, HTML-only/failed-parse rows are treated as sensitive, and an unreadable DO falls
+  back to classifying the D1 subject + snippet. *Cards:* Archivar and a new Leído button act on
+  the whole conversation (the DO's `/bulk-actions` thread target, as the web) and restate every
+  card of the thread; archived cards keep "↗ Abrir"; a new message in a carded thread is posted
+  as a reply to the previous card, which loses its action buttons ("hay un correo más
+  reciente…"). *Approval notices:* delivered through the notify queue, in the mailbox's topic
+  when there is one, with a short summary, the expiry time and the URL only as the button;
+  edited in place to Aprobado / Denegado / Caducado (web decision queues a sync; a delayed queue
+  message timed past `expires_at`; hourly sweep as backstop). Still link-only. D1 migration
+  `0031_telegram_approval_notices`. *Commands:* `/help` lists the commands (ids stay on `/id`),
+  unknown `/commands` answer "Comando desconocido" and never become reply drafts, new
+  `/approvals` and `/unread`; the menu and the handlers are one list.
+
 - **Delete forever and Empty trash (2026-11-16).** The first permanent deletion in the mail client,
   and only from the Trash. *Web.* In Trash, "Delete forever" replaces Delete for the selected
   conversations, a row and the open conversation (`#` too), and an "Empty trash" bar/menu item acts

@@ -1,6 +1,4 @@
 import { getMailbox, insertOpsEvent, insertTelegramLink } from "../db/d1";
-import { buildApprovalUrl, getIntentCard } from "../lib/approvals";
-import { getRuntimeConfig, RUNTIME_CONFIG_KEYS } from "../db/runtime-config";
 import {
 	claimTelegramTopic,
 	forgetTelegramTopic,
@@ -15,12 +13,11 @@ import {
 	type TelegramConfig,
 	type TelegramMessage,
 } from "./api";
+import { announceApproval } from "./approval-notices";
 import { chatSupportsTopics, resolveTelegramChatId } from "./binding";
-import { inboundNotificationKeyboard } from "./cards";
-import { renderInboundNotification, telegramEscape } from "./format";
-import { intentCardKeyboard, renderIntentCardText } from "./intent-cards";
-import { isFirstContact } from "./index-rows";
-import { fetchMailboxAttachments } from "./messages";
+import { buildCardContent, inboundNotificationKeyboard, restateCard } from "./cards";
+import { renderInboundNotification } from "./format";
+import { findCardForThread } from "./links";
 import { flushTelegramDigest, isQuietNow, isSenderMuted, retainNotification } from "./noise";
 
 /** Coalescing only shortens the notice text; every approval request still gets its own notice and link. */
@@ -28,10 +25,15 @@ export const INTENT_NOTIFY_COALESCE_MS = 60_000;
 
 /**
  * Notifies the owner of an MCP approval request (send or critical control-plane kind): a
- * server-rendered summary (warnings first) and the `/approve/:id` link. No approve/deny buttons;
- * direct (non-critical) changes never reach this function.
+ * server-rendered summary (warnings first), the expiry time and the `/approve/:id` link as
+ * the notice's one button. No approve/deny buttons; direct (non-critical) changes never
+ * reach this function.
+ *
+ * Only queues: the notice is sent, retried and later edited (approved / denied / expired)
+ * by the notify consumer -- see telegram/approval-notices.ts.
  */
 export async function notifyIntentCreated(env: Env, intentId: string): Promise<void> {
+	if (!readTelegramConfig(env)) return;
 	const principal = await env.INDEX_DB.prepare(
 		"SELECT token_sub, created_at FROM approvals WHERE token = ?",
 	)
@@ -51,18 +53,7 @@ export async function notifyIntentCreated(env: Env, intentId: string): Promise<v
 			.catch(() => null);
 		coalesced = Boolean(earlier);
 	}
-	const config = readTelegramConfig(env);
-	const chatId = await resolveTelegramChatId(env);
-	const origin = await getRuntimeConfig(env.INDEX_DB, RUNTIME_CONFIG_KEYS.deploymentOrigin);
-	if (!config || !chatId || !origin) return;
-	const url = buildApprovalUrl(origin, intentId);
-	if (!url) return;
-	const view = await getIntentCard(env, intentId);
-	await sendMessage(config, {
-		chatId,
-		text: `${renderIntentCardText(view, { compact: coalesced })}\n${telegramEscape(url)}`,
-		replyMarkup: intentCardKeyboard(url),
-	});
+	await announceApproval(env, { approvalId: intentId, compact: coalesced });
 }
 
 export type InboundNotificationInput = {
@@ -121,6 +112,7 @@ export async function sendToMailboxTopic(
 		topicId: number | null;
 		text: string;
 		replyMarkup?: Record<string, unknown>;
+		replyToMessageId?: number | null;
 	},
 ): Promise<TelegramMessage> {
 	return sendMessage(config, {
@@ -128,6 +120,7 @@ export async function sendToMailboxTopic(
 		text: input.text,
 		messageThreadId: input.topicId,
 		replyMarkup: input.replyMarkup,
+		replyToMessageId: input.replyToMessageId ?? null,
 	});
 }
 
@@ -276,31 +269,20 @@ export async function deliverInboundNotification(
 
 	// Two extra reads, both earned. The badge is one indexed lookup and is the
 	// single most useful thing a card can say about an address that receives cold
-	// mail; the filenames are one Durable Object round trip taken only for the
-	// minority of mail that carries files, and a failure degrades the card to the
-	// old boolean rather than costing the notification.
-	const [firstContact, attachments] = await Promise.all([
-		isFirstContact(env.INDEX_DB, {
-			fromAddr: input.fromAddr,
-			messageLocalId: input.messageLocalId,
-		}),
-		input.hasAttachments
-			? fetchMailboxAttachments(env, input.mailboxId, input.messageLocalId)
-			: Promise.resolve(null),
-	]);
-
-	const text = renderInboundNotification({
-		fromAddr: input.fromAddr,
+	// mail; the Durable Object round trip answers the filenames and, above all,
+	// whether this mail may be printed at all (one-time codes and the like, see
+	// telegram/sensitive.ts). A DO that does not answer degrades the card to the
+	// old boolean and a classifier run on the snippet, never costs the notification.
+	const content = await buildCardContent(env, {
+		mailboxId: input.mailboxId,
+		messageLocalId: input.messageLocalId,
 		mailboxAddress: input.mailboxAddress,
+		fromAddr: input.fromAddr,
 		subject: input.subject,
 		snippet: input.snippet,
 		hasAttachments: input.hasAttachments,
-		attachments: attachments?.map((attachment) => ({
-			filename: attachment.filename,
-			size: attachment.size,
-		})),
-		firstContact,
 	});
+	const text = renderInboundNotification(content);
 	// The card carries what can be done with the mail, not just what it says: most
 	// email is dispatched rather than answered, and a card with no buttons made
 	// Telegram useful only for the minority that needs a sentence back.
@@ -309,12 +291,35 @@ export async function deliverInboundNotification(
 		threadId: input.threadId,
 		fromAddr: input.fromAddr,
 		hasAttachments: input.hasAttachments,
+		sensitive: content.sensitive ?? false,
 	});
 
+	// The conversation's previous card, read before this one exists. A new message
+	// in a thread that already has a card is posted as a reply to it, so the chat
+	// shows the conversation as one, and the old card is told it is no longer the
+	// one to act on. A redelivery of this same message is not a "previous card".
+	const previous = await findCardForThread(env.INDEX_DB, {
+		chatId,
+		mailboxId: input.mailboxId,
+		threadId: input.threadId,
+	});
+	const previousCard =
+		previous && previous.message_local_id !== input.messageLocalId ? previous : null;
+
 	let topicId = await resolveTopicId(config, env, input, chatId);
+	// Only within the same topic: a reply across topics is not something Telegram
+	// renders as a reply, and the previous card may be a search hit posted elsewhere.
+	const replyTo = (topic: number | null) =>
+		previousCard && (previousCard.topic_id ?? null) === topic ? previousCard.message_id : null;
 	let sent: TelegramMessage;
 	try {
-		sent = await sendToMailboxTopic(config, { chatId, topicId, text, replyMarkup });
+		sent = await sendToMailboxTopic(config, {
+			chatId,
+			topicId,
+			text,
+			replyMarkup,
+			replyToMessageId: replyTo(topicId),
+		});
 	} catch (error) {
 		// The operator deleted the topic. Nothing here is broken -- deleting a topic
 		// is a normal thing to do -- but the stored id is now a dead address, and
@@ -339,7 +344,13 @@ export async function deliverInboundNotification(
 		// looping on it would burn the chat's rate-limit budget instead of the
 		// queue's backoff.
 		topicId = await resolveTopicId(config, env, input, chatId, stale?.topic_name ?? null);
-		sent = await sendToMailboxTopic(config, { chatId, topicId, text, replyMarkup });
+		sent = await sendToMailboxTopic(config, {
+			chatId,
+			topicId,
+			text,
+			replyMarkup,
+			replyToMessageId: replyTo(topicId),
+		});
 	}
 	// Inside the retried path on purpose: without this row a reply typed in
 	// Telegram resolves to no thread and is dropped, and a card the operator sees
@@ -352,5 +363,19 @@ export async function deliverInboundNotification(
 		message_local_id: input.messageLocalId,
 		topic_id: topicId,
 	});
+	// After the link exists, because that row is what makes the older card count as
+	// superseded when it is redrawn. Best effort and never thrown: the new card is
+	// already out, and a redelivery to fix a cosmetic edit would post it twice.
+	if (previousCard) {
+		try {
+			await restateCard(env, config, { link: previousCard, status: null });
+		} catch (error) {
+			console.warn("telegram.supersede_failed", {
+				chatId,
+				messageId: previousCard.message_id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
 	return { status: "sent" };
 }

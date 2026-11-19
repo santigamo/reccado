@@ -24,6 +24,7 @@ import {
 import { resolveTelegramChatId } from "./binding";
 import { renderNightDigest } from "./format";
 import { listMailIndexRows } from "./index-rows";
+import { safeSubject, sensitivityOfIndexedMail } from "./sensitive";
 
 const nowIso = () => new Date().toISOString();
 
@@ -347,18 +348,22 @@ async function sendDigest(
 ): Promise<void> {
 	// Subjects are re-read rather than retained, so the summary and the card it
 	// expands into can never disagree about the same email.
+	const shown = rows.slice(0, DIGEST_BUTTON_LIMIT);
 	const subjects = new Map<string, string | null>();
 	const byMailbox = new Map<string, string[]>();
-	for (const row of rows) {
+	for (const row of shown) {
 		byMailbox.set(row.mailbox_id, [...(byMailbox.get(row.mailbox_id) ?? []), row.message_local_id]);
 	}
 	for (const [mailboxId, ids] of byMailbox) {
 		for (const indexed of await listMailIndexRows(env.INDEX_DB, mailboxId, ids)) {
-			subjects.set(`${mailboxId}/${indexed.message_local_id}`, indexed.subject);
+			// A subject can carry the code itself ("Your code is 123456"), so each
+			// line is asked the same question a card is: one DO read per shown line,
+			// at most DIGEST_BUTTON_LIMIT of them.
+			const kind = await sensitivityOfIndexedMail(env, indexed);
+			subjects.set(`${mailboxId}/${indexed.message_local_id}`, safeSubject(indexed.subject, kind));
 		}
 	}
 
-	const shown = rows.slice(0, DIGEST_BUTTON_LIMIT);
 	const text = renderNightDigest({
 		total: rows.length,
 		items: shown.map((row) => ({

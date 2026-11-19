@@ -29,6 +29,72 @@ export async function findCardForMessage(
 		.first<TelegramLinkRow>();
 }
 
+/** How many cards one conversation action restates; older ones are long scrolled past. */
+const THREAD_CARDS_LIMIT = 8;
+
+/**
+ * Every card of a conversation in this chat, newest first, one row per Telegram
+ * message. For the actions that apply to the whole thread (archive, mark read):
+ * each card of it has to stop offering a decision that was just made.
+ */
+export async function listCardsForThread(
+	db: D1Database,
+	input: { chatId: string; mailboxId: string; threadId: string },
+): Promise<TelegramLinkRow[]> {
+	const result = await db
+		.prepare(
+			`SELECT * FROM telegram_links
+       WHERE chat_id = ? AND mailbox_id = ? AND thread_id = ?
+       ORDER BY created_at DESC LIMIT ?`,
+		)
+		.bind(input.chatId, input.mailboxId, input.threadId, THREAD_CARDS_LIMIT * 2)
+		.all<TelegramLinkRow>();
+	const seen = new Set<number>();
+	const cards: TelegramLinkRow[] = [];
+	for (const row of result.results ?? []) {
+		if (seen.has(row.message_id)) continue;
+		seen.add(row.message_id);
+		cards.push(row);
+		if (cards.length >= THREAD_CARDS_LIMIT) break;
+	}
+	return cards;
+}
+
+/**
+ * Has a newer message of this card's conversation been carded in this chat?
+ *
+ * Computed, not stored: "newer" is a fact about message_index (arrival time),
+ * and a card posted later for an *older* message -- a search hit, a digest item
+ * -- must not supersede the real newest one. Asked at draw time, so every
+ * restatement of an old card keeps saying it is old.
+ */
+export async function isCardSuperseded(
+	db: D1Database,
+	input: { chatId: string; mailboxId: string; threadId: string; messageLocalId: string },
+): Promise<boolean> {
+	const row = await db
+		.prepare(
+			`SELECT 1 AS hit FROM telegram_links l
+       JOIN message_index m
+         ON m.mailbox_id = l.mailbox_id AND m.message_local_id = l.message_local_id
+       WHERE l.chat_id = ? AND l.mailbox_id = ? AND l.thread_id = ? AND l.message_local_id <> ?
+         AND m.received_at > (
+           SELECT received_at FROM message_index WHERE mailbox_id = ? AND message_local_id = ?
+         )
+       LIMIT 1`,
+		)
+		.bind(
+			input.chatId,
+			input.mailboxId,
+			input.threadId,
+			input.messageLocalId,
+			input.mailboxId,
+			input.messageLocalId,
+		)
+		.first<{ hit: number }>();
+	return row !== null;
+}
+
 /**
  * The newest card of a conversation, for the events that know the thread and not
  * the message: a reply confirmed on the web answers a thread, and the card worth

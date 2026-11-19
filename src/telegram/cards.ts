@@ -42,13 +42,21 @@ import {
 	type TelegramCardStatus,
 } from "./format";
 import { getMailIndexRow, isFirstContact, type MailIndexRow } from "./index-rows";
-import { findCardForMessage, findCardForThread } from "./links";
+import {
+	findCardForMessage,
+	findCardForThread,
+	isCardSuperseded,
+	listCardsForThread,
+} from "./links";
 import {
 	applyMailboxMessageAction,
-	fetchMailboxAttachments,
+	applyMailboxThreadAction,
 	fetchMailboxMessage,
+	inspectMailboxMessage,
+	type MailboxMessage,
 } from "./messages";
 import { getRetainedItem, isSenderMuted, toggleSenderMute } from "./noise";
+import { SENSITIVE_REFUSAL, safeSubject, telegramSensitivity } from "./sensitive";
 
 /**
  * The whole callback protocol: a version and a verb, two bytes of payload.
@@ -89,33 +97,48 @@ function inboundCardKeyboard(input: {
 	origin: string | null;
 	muted: boolean;
 	hasAttachments: boolean;
+	status: TelegramCardStatus | null;
+	sensitive: boolean;
+	superseded: boolean;
 }): TelegramInlineButton[][] {
-	const buttons: TelegramInlineButton[] = [
-		{ text: "📥 Archivar", callback_data: `${CARD_CALLBACK_PREFIX}a` },
-		{ text: "📄 Leer completo", callback_data: `${CARD_CALLBACK_PREFIX}x` },
-	];
 	// No origin means nobody has ever reached this deployment over its public
 	// hostname, so there is no URL to offer. A button pointing at a guess would be
 	// a broken link on every card until someone noticed.
-	if (input.origin) {
-		buttons.push({
-			text: "↗ Abrir",
-			url: `${input.origin}/inbox/${input.mailboxId}/${input.threadId}`,
-		});
+	const open: TelegramInlineButton | null = input.origin
+		? { text: "↗ Abrir", url: `${input.origin}/inbox/${input.mailboxId}/${input.threadId}` }
+		: null;
+	// A closed card (archived, trashed) or one a newer card of its conversation
+	// replaced keeps exactly one button: the way to the thread on the web. Every
+	// other button would be a second decision about one already made, or a
+	// decision better made on the newest card.
+	if ((input.status && CLOSED_STATUSES.has(input.status)) || input.superseded) {
+		return open ? [[open]] : [];
 	}
-	// Second row, and deliberately quieter than the first: these two answer
-	// questions about the sender and the payload rather than about the mail's
-	// state, and neither should sit a thumb-width from Archivar.
-	const secondary: TelegramInlineButton[] = [
-		{
-			text: input.muted ? "🔔 Reactivar" : "🔕 Silenciar",
-			callback_data: `${CARD_CALLBACK_PREFIX}m`,
-		},
+	// First row: the conversation's state. Archivar and Leído act on the whole
+	// thread, as the web does; Leído disappears once the card says it is read.
+	const primary: TelegramInlineButton[] = [
+		{ text: "📥 Archivar", callback_data: `${CARD_CALLBACK_PREFIX}a` },
 	];
-	if (input.hasAttachments) {
+	if (input.status !== "read") {
+		primary.push({ text: "✓ Leído", callback_data: `${CARD_CALLBACK_PREFIX}r` });
+	}
+	if (open) primary.push(open);
+	// Second row, and deliberately quieter than the first: these answer questions
+	// about this one email's content and its sender rather than about the
+	// conversation's state. A sensitive email offers neither its body nor its
+	// files here -- that is a web-only read (see telegram/sensitive.ts).
+	const secondary: TelegramInlineButton[] = [];
+	if (!input.sensitive) {
+		secondary.push({ text: "📄 Leer completo", callback_data: `${CARD_CALLBACK_PREFIX}x` });
+	}
+	secondary.push({
+		text: input.muted ? "🔔 Reactivar" : "🔕 Silenciar",
+		callback_data: `${CARD_CALLBACK_PREFIX}m`,
+	});
+	if (input.hasAttachments && !input.sensitive) {
 		secondary.push({ text: "📎 Adjuntos", callback_data: `${CARD_CALLBACK_PREFIX}f` });
 	}
-	return [buttons, secondary];
+	return [primary, secondary];
 }
 
 /**
@@ -131,15 +154,14 @@ export type CardKeyboardInput = {
 	fromAddr: string;
 	hasAttachments: boolean;
 	status: TelegramCardStatus | null;
+	sensitive: boolean;
+	superseded?: boolean;
 };
 
 async function cardKeyboardFor(
 	env: Env,
 	input: CardKeyboardInput,
 ): Promise<Record<string, unknown> | undefined> {
-	if (input.status && CLOSED_STATUSES.has(input.status)) {
-		return undefined;
-	}
 	// Both reads are indexed single-row lookups, and both have to happen at draw
 	// time rather than at delivery time: the mute button is a toggle, so a card
 	// restated after a press must come back with the opposite label or the operator
@@ -148,7 +170,14 @@ async function cardKeyboardFor(
 		getRuntimeConfig(env.INDEX_DB, RUNTIME_CONFIG_KEYS.deploymentOrigin),
 		isSenderMuted(env.INDEX_DB, input.fromAddr),
 	]);
-	return inlineKeyboard(inboundCardKeyboard({ ...input, origin, muted }));
+	const rows = inboundCardKeyboard({
+		...input,
+		superseded: input.superseded ?? false,
+		origin,
+		muted,
+	});
+	// An omitted reply_markup is what drops a keyboard on edit.
+	return rows.length > 0 ? inlineKeyboard(rows) : undefined;
 }
 
 /** The buttons a freshly delivered card carries. */
@@ -201,26 +230,66 @@ export async function cardContentFor(env: Env, row: MailIndexRow): Promise<Inbou
 		firstRecipient(row.to_json) ??
 		(await getMailbox(env.INDEX_DB, row.mailbox_id))?.primary_address ??
 		row.mailbox_id;
-	const [attachments, firstContact] = await Promise.all([
-		row.has_attachments === 1
-			? fetchMailboxAttachments(env, row.mailbox_id, row.message_local_id)
-			: Promise.resolve(null),
-		isFirstContact(env.INDEX_DB, {
-			fromAddr: row.from_addr,
-			messageLocalId: row.message_local_id,
-		}),
-	]);
-	return {
-		fromAddr: row.from_addr,
+	return buildCardContent(env, {
+		mailboxId: row.mailbox_id,
+		messageLocalId: row.message_local_id,
 		mailboxAddress,
+		fromAddr: row.from_addr,
 		subject: row.subject,
 		snippet: row.snippet,
 		hasAttachments: row.has_attachments === 1,
-		attachments: attachments?.map((attachment) => ({
-			filename: attachment.filename,
-			size: attachment.size,
-		})),
+	});
+}
+
+/**
+ * What a card says about one email, with sensitive mail already withheld.
+ *
+ * The one place a card's content is assembled -- the notifier and every
+ * re-rendering go through it -- so the sensitivity check (telegram/sensitive.ts)
+ * cannot be skipped by a surface that forgot to ask. One Durable Object round
+ * trip answers both questions it needs the DO for: the attachment names and the
+ * classification stored at ingest.
+ */
+export async function buildCardContent(
+	env: Env,
+	input: {
+		mailboxId: string;
+		messageLocalId: string;
+		mailboxAddress: string;
+		fromAddr: string;
+		subject: string | null;
+		snippet: string | null;
+		hasAttachments: boolean;
+	},
+): Promise<InboundNotification> {
+	const [message, firstContact] = await Promise.all([
+		inspectMailboxMessage(env, input.mailboxId, input.messageLocalId),
+		isFirstContact(env.INDEX_DB, {
+			fromAddr: input.fromAddr,
+			messageLocalId: input.messageLocalId,
+		}),
+	]);
+	const kind = telegramSensitivity(env, {
+		fromAddr: input.fromAddr,
+		subject: input.subject,
+		snippet: input.snippet,
+		message,
+	});
+	return {
+		fromAddr: input.fromAddr,
+		mailboxAddress: input.mailboxAddress,
+		subject: safeSubject(input.subject, kind),
+		snippet: kind ? null : input.snippet,
+		hasAttachments: input.hasAttachments,
+		attachments:
+			input.hasAttachments && !kind
+				? message?.attachments?.map((attachment) => ({
+						filename: attachment.filename,
+						size: attachment.size,
+					}))
+				: undefined,
 		firstContact,
+		sensitive: Boolean(kind),
 	};
 }
 
@@ -233,15 +302,23 @@ export type CardEditOutcome = "edited" | "unchanged" | "unknown_message";
  * signal to redeliver, and the one caller that cannot retry (a button press)
  * catches it itself.
  */
-async function restateCard(
+export async function restateCard(
 	env: Env,
 	config: TelegramConfig,
 	input: { link: TelegramLinkRow; status: TelegramCardStatus | null },
 ): Promise<CardEditOutcome> {
-	const content = await loadCardContent(env, {
-		mailboxId: input.link.mailbox_id,
-		messageLocalId: input.link.message_local_id,
-	});
+	const [content, superseded] = await Promise.all([
+		loadCardContent(env, {
+			mailboxId: input.link.mailbox_id,
+			messageLocalId: input.link.message_local_id,
+		}),
+		isCardSuperseded(env.INDEX_DB, {
+			chatId: input.link.chat_id,
+			mailboxId: input.link.mailbox_id,
+			threadId: input.link.thread_id,
+			messageLocalId: input.link.message_local_id,
+		}),
+	]);
 	if (!content) {
 		return "unknown_message";
 	}
@@ -249,13 +326,15 @@ async function restateCard(
 		await editMessageText(config, {
 			chatId: input.link.chat_id,
 			messageId: input.link.message_id,
-			text: renderInboundNotification({ ...content, status: input.status }),
+			text: renderInboundNotification({ ...content, status: input.status, superseded }),
 			replyMarkup: await cardKeyboardFor(env, {
 				mailboxId: input.link.mailbox_id,
 				threadId: input.link.thread_id,
 				fromAddr: content.fromAddr,
 				hasAttachments: content.hasAttachments,
 				status: input.status,
+				sensitive: content.sensitive ?? false,
+				superseded,
 			}),
 		});
 		return "edited";
@@ -424,10 +503,18 @@ export async function postMailCard(
 		replyToMessageId?: number | null;
 	},
 ): Promise<TelegramMessage> {
-	const content = await cardContentFor(env, input.row);
+	const [content, superseded] = await Promise.all([
+		cardContentFor(env, input.row),
+		isCardSuperseded(env.INDEX_DB, {
+			chatId: input.chatId,
+			mailboxId: input.row.mailbox_id,
+			threadId: input.row.thread_id,
+			messageLocalId: input.row.message_local_id,
+		}),
+	]);
 	const sent = await sendMessage(config, {
 		chatId: input.chatId,
-		text: renderInboundNotification(content),
+		text: renderInboundNotification({ ...content, superseded }),
 		messageThreadId: input.topicId,
 		replyToMessageId: input.replyToMessageId ?? null,
 		replyMarkup: await inboundNotificationKeyboard(env, {
@@ -435,6 +522,8 @@ export async function postMailCard(
 			threadId: input.row.thread_id,
 			fromAddr: input.row.from_addr,
 			hasAttachments: input.row.has_attachments === 1,
+			sensitive: content.sensitive ?? false,
+			superseded,
 		}),
 	});
 	await insertTelegramLink(env.INDEX_DB, {
@@ -585,6 +674,13 @@ export async function handleCardCallback(
 
 	if (verb === "x") {
 		const message = await fetchMailboxMessage(env, link.mailbox_id, link.message_local_id);
+		// Asked before anything is sent, and of the DO's own row: a card drawn before
+		// this check existed still carries the button, and pressing it must not be
+		// the way a one-time code reaches the chat.
+		if (await isSensitiveForLink(env, link, message)) {
+			await answer(config, query.id, SENSITIVE_REFUSAL);
+			return;
+		}
 		const body = message?.body_text?.trim();
 		if (!body) {
 			await answer(config, query.id, "Ese correo no tiene cuerpo de texto que mostrar.");
@@ -651,6 +747,11 @@ export async function handleCardCallback(
 	}
 
 	if (verb === "f") {
+		const message = await inspectMailboxMessage(env, link.mailbox_id, link.message_local_id);
+		if (await isSensitiveForLink(env, link, message)) {
+			await answer(config, query.id, SENSITIVE_REFUSAL);
+			return;
+		}
 		try {
 			const delivery = await deliverAttachments(env, config, link);
 			await answer(
@@ -672,25 +773,64 @@ export async function handleCardCallback(
 		return;
 	}
 
+	// Archivar and Leído act on the conversation, exactly like the web's thread
+	// actions: archiving the newest card used to archive one message and leave the
+	// rest of the thread sitting in the inbox.
 	const action = verb === "a" ? "archive" : "mark_read";
-	const applied = await applyMailboxMessageAction(env, {
+	const applied = await applyMailboxThreadAction(env, {
 		mailboxId: link.mailbox_id,
-		messageLocalId: link.message_local_id,
+		threadId: link.thread_id,
 		action,
 	});
 	if (!applied) {
 		await answer(config, query.id, "El buzón no aceptó la acción.");
 		return;
 	}
-	await answer(
+	const status: TelegramCardStatus = verb === "a" ? "archived" : "read";
+	const done = await restateAfterAction(
+		env,
 		config,
-		query.id,
-		await restateAfterAction(
-			env,
-			config,
-			verb === "a"
-				? { link, status: "archived", done: "Archivado" }
-				: { link, status: "read", done: "Marcado como leído" },
-		),
+		verb === "a"
+			? { link, status, done: "Conversación archivada" }
+			: { link, status, done: "Conversación marcada como leída" },
+	);
+	// Then every other card of the same conversation, best effort: the press is
+	// already answered by the card it came from, and a stale older card is a
+	// cosmetic failure, not a reason to make Telegram redeliver the update.
+	const others = (
+		await listCardsForThread(env.INDEX_DB, {
+			chatId,
+			mailboxId: link.mailbox_id,
+			threadId: link.thread_id,
+		})
+	).filter((card) => card.message_id !== link.message_id);
+	for (const card of others) {
+		try {
+			await restateCard(env, config, { link: card, status });
+		} catch (error) {
+			console.warn("telegram.thread_card_edit_failed", {
+				chatId: card.chat_id,
+				messageId: card.message_id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	await answer(config, query.id, done);
+}
+
+/** Sensitivity of the email behind a card, from the DO row when it could be read. */
+async function isSensitiveForLink(
+	env: Env,
+	link: TelegramLinkRow,
+	message: MailboxMessage | null,
+): Promise<boolean> {
+	const indexed = await getMailIndexRow(env.INDEX_DB, link.mailbox_id, link.message_local_id);
+	return (
+		telegramSensitivity(env, {
+			fromAddr: message?.from_addr ?? indexed?.from_addr ?? "",
+			subject: message?.subject ?? indexed?.subject ?? null,
+			snippet: indexed?.snippet ?? null,
+			message,
+		}) !== null
 	);
 }

@@ -128,8 +128,12 @@ function stubTelegram(): BotCall[] {
 
 type DoCall = { url: string; method: string; body: Record<string, unknown> | null };
 
-/** The mailbox DO, reduced to the two things a card button asks of it. */
-function buildEnv(bodyText: string | null): { env: Env; doCalls: DoCall[] } {
+/** The mailbox DO, reduced to the things a card button asks of it. */
+function buildEnv(
+	bodyText: string | null,
+	message: Record<string, unknown> = {},
+	envOverrides: Record<string, unknown> = {},
+): { env: Env; doCalls: DoCall[] } {
 	const doCalls: DoCall[] = [];
 	const stub = {
 		fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -142,6 +146,9 @@ function buildEnv(bodyText: string | null): { env: Env; doCalls: DoCall[] } {
 			if (url.endsWith("/actions")) {
 				return Response.json({ ok: true });
 			}
+			if (url.endsWith("/bulk-actions")) {
+				return Response.json({ action: "archive", changed: [] });
+			}
 			return Response.json({
 				message:
 					bodyText === null
@@ -153,6 +160,7 @@ function buildEnv(bodyText: string | null): { env: Env; doCalls: DoCall[] } {
 								date_header: null,
 								received_at: new Date().toISOString(),
 								body_text: bodyText,
+								...message,
 							},
 			});
 		},
@@ -163,6 +171,7 @@ function buildEnv(bodyText: string | null): { env: Env; doCalls: DoCall[] } {
 			TELEGRAM_BOT_TOKEN: "123:fake-token",
 			MAILBOX_DO: { getByName: () => stub },
 			MAILBOX_JURISDICTION: "none",
+			...envOverrides,
 		} as unknown as Env,
 		doCalls,
 	};
@@ -195,12 +204,13 @@ describe("card triage buttons", () => {
 
 		await handleCardCallback(cardEnv, config, press("v1:a"));
 
-		// The action is a real state change in the mailbox, not a cosmetic edit.
-		expect(doCalls).toEqual([
+		// The action is a real state change in the mailbox, not a cosmetic edit -- and
+		// it is the web's conversation action, not a one-message archive.
+		expect(doCalls.filter((call) => call.method === "POST")).toEqual([
 			{
-				url: `https://mailbox-do/messages/${MESSAGE_LOCAL_ID}/actions`,
+				url: "https://mailbox-do/bulk-actions",
 				method: "POST",
-				body: { action: "archive" },
+				body: { action: "archive", target: { threadIds: [THREAD_ID], scope: "live" } },
 			},
 		]);
 		const edit = calls.find((call) => call.method === "editMessageText");
@@ -211,7 +221,7 @@ describe("card triage buttons", () => {
 		expect(edit?.body.reply_markup).toBeUndefined();
 		// Without this Telegram leaves the button spinning until it times out.
 		const answer = calls.find((call) => call.method === "answerCallbackQuery");
-		expect(answer?.body.text).toBe("Archivado");
+		expect(answer?.body.text).toBe("Conversación archivada");
 	});
 
 	it("needs no token table: the pressed message is the address", async () => {
@@ -259,7 +269,9 @@ describe("card triage buttons", () => {
 		});
 		// Pressing a button is the explicit act the card's own argument asked for, so
 		// reading in Telegram finally counts as reading.
-		expect(doCalls.at(-1)?.body).toEqual({ action: "mark_read" });
+		expect(doCalls.filter((call) => call.method === "POST").at(-1)?.body).toEqual({
+			action: "mark_read",
+		});
 		expect(String(calls.find((call) => call.method === "editMessageText")?.body.text)).toContain(
 			"· leído",
 		);
@@ -409,5 +421,233 @@ describe("reconciliation from another surface", () => {
 
 		expect(outcome).toEqual({ status: "skipped", reason: "no_chat" });
 		expect(calls).toHaveLength(0);
+	});
+});
+
+const ORIGIN = "https://reccado.example";
+const OLDER_CARD_ID = 4241;
+const OLDER_MESSAGE_ID = "msg_cards_0";
+
+async function setOrigin(): Promise<void> {
+	await testEnv.INDEX_DB.prepare(
+		"INSERT OR REPLACE INTO runtime_config (key, value, updated_at) VALUES ('deployment.origin', ?, ?)",
+	)
+		.bind(ORIGIN, new Date().toISOString())
+		.run();
+}
+
+/** An earlier email of the same conversation, with its own card above the newest one. */
+async function seedOlderCard(): Promise<void> {
+	const earlier = new Date(Date.now() - 3_600_000).toISOString();
+	await testEnv.INDEX_DB.prepare(
+		`INSERT OR REPLACE INTO telegram_links
+     (chat_id, message_id, mailbox_id, thread_id, message_local_id, topic_id, created_at)
+     VALUES (?, ?, ?, ?, ?, NULL, ?)`,
+	)
+		.bind(CHAT_ID, OLDER_CARD_ID, MAILBOX_ID, THREAD_ID, OLDER_MESSAGE_ID, earlier)
+		.run();
+	await testEnv.INDEX_DB.prepare(
+		`INSERT OR REPLACE INTO message_index
+     (mailbox_id, message_local_id, thread_id, rfc_message_id, subject, from_addr, to_json, snippet,
+      received_at, has_attachments, labels_json, state, raw_r2_key, raw_sha256, updated_at)
+     VALUES (?, ?, ?, NULL, 'Factura pendiente', 'sender@example.com', ?, 'antes', ?, 0, '[]', 'inbox', 'raw/0', 'sha', ?)`,
+	)
+		.bind(
+			MAILBOX_ID,
+			OLDER_MESSAGE_ID,
+			THREAD_ID,
+			JSON.stringify(["hello@imsanti.dev"]),
+			earlier,
+			earlier,
+		)
+		.run();
+}
+
+type Keyboard = Array<Array<{ text: string; callback_data?: string; url?: string }>>;
+
+function keyboardOf(call: BotCall | undefined): Keyboard {
+	return ((call?.body.reply_markup as { inline_keyboard?: Keyboard } | undefined)
+		?.inline_keyboard ?? []) as Keyboard;
+}
+
+describe("sensitive mail never reaches the chat", () => {
+	beforeEach(seedCard);
+
+	const OTP_BODY = "Tu código de verificación es 482913. Caduca en 5 minutos.";
+
+	it("refuses 'Leer completo' for a message the DO classified as a one-time code", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv, doCalls } = buildEnv(OTP_BODY, {
+			sensitive_kind: "otp",
+			sensitive_classified: 1,
+		});
+
+		await handleCardCallback(cardEnv, config, press("v1:x"));
+
+		expect(calls.map((call) => call.method)).toEqual(["answerCallbackQuery"]);
+		expect(String(calls[0]?.body.text)).toContain("sensible");
+		expect(JSON.stringify(calls)).not.toContain("482913");
+		// Not marked read either: nothing was read.
+		expect(doCalls.filter((call) => call.method === "POST")).toHaveLength(0);
+	});
+
+	it("refuses when the DO never classified the row but its body is a code (fail closed)", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv } = buildEnv(OTP_BODY, { sensitive_classified: 0 });
+
+		await handleCardCallback(cardEnv, config, press("v1:x"));
+
+		expect(calls.map((call) => call.method)).toEqual(["answerCallbackQuery"]);
+		expect(JSON.stringify(calls)).not.toContain("482913");
+	});
+
+	it("refuses an HTML-only row it cannot judge", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv } = buildEnv("", {
+			body_text: null,
+			body_html_r2_key: "html/1",
+			sensitive_classified: 0,
+		});
+
+		await handleCardCallback(cardEnv, config, press("v1:x"));
+
+		expect(String(calls.at(-1)?.body.text)).toContain("sensible");
+	});
+
+	it("never publishes this instance's own sign-in mail, even when classification missed it", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv } = buildEnv(
+			"Sign-in code: 731942",
+			{ sensitive_kind: null, sensitive_classified: 1, from_addr: "noreply@send.example" },
+			{ MAIL_FROM_ADDRESS: "noreply@send.example" },
+		);
+
+		await handleCardCallback(cardEnv, config, press("v1:x"));
+
+		expect(calls.map((call) => call.method)).toEqual(["answerCallbackQuery"]);
+		expect(JSON.stringify(calls)).not.toContain("731942");
+	});
+
+	it("recognises the instance's sign-in template by its subject too", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv } = buildEnv("Sign-in code: 731942", {
+			subject: "Your Reccado sign-in code",
+			sensitive_kind: null,
+			sensitive_classified: 1,
+		});
+
+		await handleCardCallback(cardEnv, config, press("v1:x"));
+
+		expect(JSON.stringify(calls)).not.toContain("731942");
+	});
+
+	it("refuses the attachments of a sensitive email", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv } = buildEnv(OTP_BODY, {
+			sensitive_kind: "otp",
+			sensitive_classified: 1,
+			attachments: [
+				{ id: "a", filename: "code.pdf", content_type: "application/pdf", size: 10, r2_key: "k" },
+			],
+		});
+
+		await handleCardCallback(cardEnv, config, press("v1:f"));
+
+		expect(calls.map((call) => call.method)).toEqual(["answerCallbackQuery"]);
+		expect(String(calls[0]?.body.text)).toContain("sensible");
+	});
+
+	it("restates a sensitive card without its excerpt, with a masked subject and no body button", async () => {
+		await testEnv.INDEX_DB.prepare(
+			"UPDATE message_index SET subject = 'Your code is 482913', snippet = ? WHERE message_local_id = ?",
+		)
+			.bind(OTP_BODY, MESSAGE_LOCAL_ID)
+			.run();
+		await setOrigin();
+		const calls = stubTelegram();
+		const { env: cardEnv } = buildEnv(OTP_BODY, { sensitive_kind: "otp", sensitive_classified: 1 });
+
+		await refreshTelegramCard(cardEnv, {
+			mailboxId: MAILBOX_ID,
+			messageLocalId: MESSAGE_LOCAL_ID,
+			threadId: null,
+			status: "read",
+		});
+
+		const edit = calls.find((call) => call.method === "editMessageText");
+		const text = String(edit?.body.text);
+		expect(text).not.toContain("482913");
+		expect(text).toContain("Contenido sensible oculto");
+		expect(text).toContain("sender@example.com");
+		const data = keyboardOf(edit)
+			.flat()
+			.map((button) => button.callback_data ?? button.url);
+		expect(data).not.toContain("v1:x");
+		expect(data).toContain(`${ORIGIN}/inbox/${MAILBOX_ID}/${THREAD_ID}`);
+	});
+});
+
+describe("conversation actions from a card", () => {
+	beforeEach(async () => {
+		await seedCard();
+		await seedOlderCard();
+		await setOrigin();
+	});
+
+	it("archives the whole thread and closes every card of it, keeping 'Abrir'", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv } = buildEnv("cuerpo");
+
+		await handleCardCallback(cardEnv, config, press("v1:a"));
+
+		const edits = calls.filter((call) => call.method === "editMessageText");
+		expect(edits.map((edit) => edit.body.message_id).sort()).toEqual(
+			[OLDER_CARD_ID, CARD_MESSAGE_ID].sort(),
+		);
+		for (const edit of edits) {
+			expect(String(edit.body.text)).toContain("· archivado");
+			expect(keyboardOf(edit)).toEqual([
+				[{ text: "↗ Abrir", url: `${ORIGIN}/inbox/${MAILBOX_ID}/${THREAD_ID}` }],
+			]);
+		}
+	});
+
+	it("'Leído' marks the conversation read and drops itself from the card", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv, doCalls } = buildEnv("cuerpo");
+
+		await handleCardCallback(cardEnv, config, press("v1:r"));
+
+		expect(doCalls.find((call) => call.method === "POST")?.body).toEqual({
+			action: "mark_read",
+			target: { threadIds: [THREAD_ID], scope: "live" },
+		});
+		const newest = calls.find(
+			(call) => call.method === "editMessageText" && call.body.message_id === CARD_MESSAGE_ID,
+		);
+		expect(String(newest?.body.text)).toContain("· leído");
+		const data = keyboardOf(newest)
+			.flat()
+			.map((button) => button.callback_data ?? button.url);
+		expect(data).toContain("v1:a");
+		expect(data).not.toContain("v1:r");
+		expect(calls.find((call) => call.method === "answerCallbackQuery")?.body.text).toBe(
+			"Conversación marcada como leída",
+		);
+	});
+
+	it("keeps an older card of the thread superseded: only 'Abrir' survives", async () => {
+		const calls = stubTelegram();
+		const { env: cardEnv } = buildEnv("cuerpo");
+
+		await handleCardCallback(cardEnv, config, press("v1:r"));
+
+		const older = calls.find(
+			(call) => call.method === "editMessageText" && call.body.message_id === OLDER_CARD_ID,
+		);
+		expect(String(older?.body.text)).toContain("más reciente");
+		expect(keyboardOf(older)).toEqual([
+			[{ text: "↗ Abrir", url: `${ORIGIN}/inbox/${MAILBOX_ID}/${THREAD_ID}` }],
+		]);
 	});
 });

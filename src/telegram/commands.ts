@@ -16,6 +16,8 @@
  */
 
 import { listMailboxes } from "../db/d1";
+import { getRuntimeConfig, RUNTIME_CONFIG_KEYS } from "../db/runtime-config";
+import { buildApprovalUrl, getIntentCard } from "../lib/approvals";
 import { mailboxStub } from "../lib/mailbox-stub";
 import {
 	answerCallbackQuery,
@@ -31,6 +33,7 @@ import {
 	type TelegramInlineButton,
 	type TelegramMessage,
 } from "./api";
+import { formatExpiry } from "./approval-notices";
 import { postMailCard } from "./cards";
 import { renderResultFooter, telegramEscape } from "./format";
 import { listMailIndexRows, listNewestInboxRowsForThreads, type MailIndexRow } from "./index-rows";
@@ -42,6 +45,7 @@ import {
 	readQuietHours,
 	writeQuietHours,
 } from "./noise";
+import { safeSubject, sensitivityOfIndexedMail } from "./sensitive";
 
 /**
  * What the "/" menu offers.
@@ -53,14 +57,43 @@ import {
  * no menu, because it reads as the complete list.
  */
 export const TELEGRAM_COMMANDS: TelegramBotCommand[] = [
-	{ command: "inbox", description: "Últimos correos sin leer" },
+	{ command: "inbox", description: "Tarjetas de los últimos correos sin leer" },
+	{ command: "unread", description: "Conversaciones sin leer, en una lista" },
 	{ command: "buscar", description: "Busca en todo el archivo: /buscar factura" },
+	{ command: "approvals", description: "Aprobaciones pendientes (se aprueban en la web)" },
 	{ command: "silencio", description: "Horas de silencio: /silencio 23:00-08:00 +02:00" },
 	{ command: "silenciados", description: "Remitentes silenciados" },
 	{ command: "help", description: "Qué puede hacer este bot" },
 	{ command: "id", description: "Muestra chat_id y user_id" },
 	{ command: "start", description: "Vincula este chat con Reccado" },
 ];
+
+/**
+ * Answered by the webhook itself, before the operator allowlist (see
+ * handleIdentityCommand): the ids they print are what gets someone onto it.
+ */
+export const IDENTITY_COMMAND_NAMES = new Set(["start", "help", "id"]);
+
+/**
+ * The /help text: the menu above, in the order it is shown, plus the two gestures
+ * that are not commands. Generated from TELEGRAM_COMMANDS so the help can never
+ * describe a command the menu lacks or miss one it has.
+ */
+export function renderHelp(): string {
+	return [
+		"<b>Reccado</b> · lo que puedo hacer",
+		"",
+		...TELEGRAM_COMMANDS.map(
+			(command) => `/${command.command} — ${telegramEscape(command.description)}`,
+		),
+		"",
+		"Responde citando una tarjeta para contestar ese correo por email.",
+		"Los botones Archivar y Leído actúan sobre toda la conversación.",
+		"Los envíos y cambios que pide un agente se aprueban solo en la web.",
+		"",
+		"<i>Diagnóstico: /id muestra chat_id y user_id.</i>",
+	].join("\n");
+}
 
 function sameCommands(live: TelegramBotCommand[], wanted: TelegramBotCommand[]): boolean {
 	if (live.length !== wanted.length) return false;
@@ -185,25 +218,38 @@ type ThreadListRow = {
  * asked which conversations are open, and D1 which email to show for each.
  */
 async function collectUnreadInbox(env: Env, limit: number): Promise<MailIndexRow[]> {
+	return (await collectUnreadConversations(env, limit)).map((item) => item.row);
+}
+
+type UnreadConversation = { row: MailIndexRow; unread: number };
+
+/** The same, with how many messages of each conversation are unread. */
+async function collectUnreadConversations(env: Env, limit: number): Promise<UnreadConversation[]> {
 	const mailboxes = await listMailboxes(env.INDEX_DB);
-	const rows: MailIndexRow[] = [];
+	const items: UnreadConversation[] = [];
 	for (const mailbox of mailboxes) {
 		const stub = mailboxStub(env, mailbox.mailbox_id);
 		const response = await stub.fetch(`https://mailbox-do/threads?state=inbox&limit=${limit * 3}`);
 		if (!response.ok) continue;
 		const payload = (await response.json()) as { threads?: ThreadListRow[] };
-		const unread = (payload.threads ?? [])
+		const unread = new Map<string, number>();
+		for (const thread of payload.threads ?? []) {
 			// Unread as a conversation (any message), the way the web inbox shows it.
-			.filter((thread) =>
+			const count =
 				thread.unread_count !== undefined
-					? Number(thread.unread_count) > 0
-					: Number(thread.latest_is_read ?? 0) === 0,
-			)
-			.map((thread) => thread.id);
-		rows.push(...(await listNewestInboxRowsForThreads(env.INDEX_DB, mailbox.mailbox_id, unread)));
+					? Number(thread.unread_count)
+					: Number(thread.latest_is_read ?? 0) === 0
+						? 1
+						: 0;
+			if (count > 0) unread.set(thread.id, count);
+		}
+		const rows = await listNewestInboxRowsForThreads(env.INDEX_DB, mailbox.mailbox_id, [
+			...unread.keys(),
+		]);
+		items.push(...rows.map((row) => ({ row, unread: unread.get(row.thread_id) ?? 1 })));
 	}
-	rows.sort((a, b) => b.received_at.localeCompare(a.received_at));
-	return rows.slice(0, limit);
+	items.sort((a, b) => b.row.received_at.localeCompare(a.row.received_at));
+	return items.slice(0, limit);
 }
 
 /** Callback verb for "show me another page of these results". */
@@ -433,13 +479,139 @@ async function runMutedList(
 	);
 }
 
-export const RETRIEVAL_COMMANDS = new Set(["inbox", "buscar", "silencio", "silenciados"]);
+const UNREAD_LIMIT = 10;
+
+/**
+ * Unread conversations as one message: a line each, newest first.
+ *
+ * The compact sibling of /inbox, which posts a card per email. Each line prints
+ * sender and subject only -- never a snippet -- and a subject that belongs to
+ * sensitive mail is masked exactly as its card would be (telegram/sensitive.ts).
+ */
+async function runUnread(
+	env: Env,
+	config: TelegramConfig,
+	message: TelegramMessage,
+	chatId: string,
+): Promise<void> {
+	const [items, origin] = await Promise.all([
+		collectUnreadConversations(env, UNREAD_LIMIT),
+		getRuntimeConfig(env.INDEX_DB, RUNTIME_CONFIG_KEYS.deploymentOrigin),
+	]);
+	if (items.length === 0) {
+		await reply(config, message, chatId, "📭 Nada sin leer.");
+		return;
+	}
+	const lines: string[] = [];
+	for (const [index, item] of items.entries()) {
+		const kind = await sensitivityOfIndexedMail(env, item.row);
+		const subject = telegramEscape(safeSubject(item.row.subject, kind) ?? "(sin asunto)");
+		const link = origin
+			? ` · <a href="${telegramEscape(`${origin}/inbox/${item.row.mailbox_id}/${item.row.thread_id}`)}">abrir</a>`
+			: "";
+		const count = item.unread > 1 ? ` · ${item.unread} sin leer` : "";
+		lines.push(
+			`${index + 1}. <i>${telegramEscape(item.row.from_addr)}</i> — ${subject}${kind ? " 🔒" : ""}${count}${link}`,
+		);
+	}
+	await reply(
+		config,
+		message,
+		chatId,
+		[
+			`📬 <b>${items.length} sin leer</b>`,
+			"",
+			...lines,
+			"",
+			"<i>/inbox las trae como tarjetas.</i>",
+		].join("\n"),
+	);
+}
+
+const APPROVALS_LIMIT = 10;
+
+/**
+ * Pending approval requests, each with its link.
+ *
+ * Link-only, like the notices: a URL button per request and nothing that could
+ * approve or deny from here. Approval happens on /approve/:id with the owner web
+ * session, and Telegram's own send confirmations (origin 'telegram') are not
+ * listed -- they are buttons the operator already has.
+ */
+async function runApprovals(
+	env: Env,
+	config: TelegramConfig,
+	message: TelegramMessage,
+	chatId: string,
+): Promise<void> {
+	const now = new Date().toISOString();
+	const [pending, origin, hours] = await Promise.all([
+		env.INDEX_DB.prepare(
+			`SELECT token, expires_at FROM approvals
+       WHERE origin = 'mcp' AND decision IS NULL AND consumed_at IS NULL AND expires_at > ?
+       ORDER BY created_at ASC LIMIT ?`,
+		)
+			.bind(now, APPROVALS_LIMIT)
+			.all<{ token: string; expires_at: string }>(),
+		getRuntimeConfig(env.INDEX_DB, RUNTIME_CONFIG_KEYS.deploymentOrigin),
+		readQuietHours(env.INDEX_DB),
+	]);
+	const rows = pending.results ?? [];
+	if (rows.length === 0) {
+		await reply(config, message, chatId, "🔐 No hay aprobaciones pendientes.");
+		return;
+	}
+	const lines: string[] = [];
+	const buttons: TelegramInlineButton[][] = [];
+	for (const [index, row] of rows.entries()) {
+		const view = await getIntentCard(env, row.token);
+		const expires = formatExpiry(row.expires_at, hours.utcOffsetMinutes);
+		lines.push(
+			`${index + 1}. <b>${telegramEscape(view.title)}</b>${expires ? ` · caduca a las ${telegramEscape(expires)}` : ""}`,
+		);
+		const url = origin ? buildApprovalUrl(origin, row.token) : null;
+		if (url) buttons.push([{ text: `${index + 1} · Revisar en la web`, url }]);
+	}
+	await sendMessage(config, {
+		chatId,
+		text: [
+			`🔐 <b>${rows.length} ${rows.length === 1 ? "aprobación pendiente" : "aprobaciones pendientes"}</b>`,
+			"",
+			...lines,
+			"",
+			"🔑 Se aprueban solo en la página web, con tu sesión de propietario.",
+		].join("\n"),
+		replyToMessageId: message.message_id,
+		messageThreadId: message.message_thread_id ?? null,
+		replyMarkup: buttons.length > 0 ? inlineKeyboard(buttons) : undefined,
+	});
+}
+
+type CommandHandler = (
+	env: Env,
+	config: TelegramConfig,
+	message: TelegramMessage,
+	chatId: string,
+	argument: string,
+) => Promise<void>;
+
+/** Every operator command the webhook routes here, by name. */
+const COMMAND_HANDLERS: Record<string, CommandHandler> = {
+	inbox: (env, config, message, chatId) => runInbox(env, config, message, chatId),
+	unread: (env, config, message, chatId) => runUnread(env, config, message, chatId),
+	buscar: runSearch,
+	approvals: (env, config, message, chatId) => runApprovals(env, config, message, chatId),
+	silencio: runQuietHours,
+	silenciados: (env, config, message, chatId) => runMutedList(env, config, message, chatId),
+};
+
+export const RETRIEVAL_COMMANDS = new Set(Object.keys(COMMAND_HANDLERS));
 
 /**
  * Runs a command, having been told the sender is an operator in the bound chat.
  *
- * Returns false when the text is not one of ours, so the caller can carry on
- * treating it as the body of a reply.
+ * Returns false when the text is not one of ours; the caller answers that with
+ * "comando desconocido" rather than ever treating it as the body of a reply.
  */
 export async function handleTelegramCommand(
 	env: Env,
@@ -448,22 +620,15 @@ export async function handleTelegramCommand(
 	chatId: string,
 	command: ParsedCommand,
 ): Promise<boolean> {
-	switch (command.name) {
-		case "inbox":
-			await runInbox(env, config, message, chatId);
-			return true;
-		case "buscar":
-			await runSearch(env, config, message, chatId, command.argument);
-			return true;
-		case "silencio":
-			await runQuietHours(env, config, message, chatId, command.argument);
-			return true;
-		case "silenciados":
-			await runMutedList(env, config, message, chatId);
-			return true;
-		default:
-			return false;
-	}
+	const handler = COMMAND_HANDLERS[command.name];
+	if (!handler) return false;
+	await handler(env, config, message, chatId, command.argument);
+	return true;
+}
+
+/** The answer to a "/word" the bot does not know. */
+export function renderUnknownCommand(name: string): string {
+	return `Comando desconocido${name ? `: <code>/${telegramEscape(name)}</code>` : ""}. Escribe /help para ver la lista.`;
 }
 
 /**

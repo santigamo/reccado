@@ -1,5 +1,6 @@
 import { insertOpsEvent } from "../db/d1";
 import { TelegramApiError } from "../telegram/api";
+import { syncApprovalNotice } from "../telegram/approval-notices";
 import { refreshTelegramCard } from "../telegram/cards";
 import { deliverInboundNotification } from "../telegram/notify";
 import { type NotifyQueueMessage, notifyQueueMessageSchema } from "./types";
@@ -39,12 +40,14 @@ function errorMessage(error: unknown): string {
 
 /** What the ops trail calls this payload when it fails. */
 function subjectOf(body: NotifyQueueMessage): string {
+	if (body.eventType === "telegram.approval_notice.v1") return body.notice.approvalId;
 	return body.eventType === "mail.notify.v1"
 		? body.notification.messageLocalId
 		: (body.refresh.messageLocalId ?? body.refresh.threadId ?? body.refresh.mailboxId);
 }
 
-function mailboxOf(body: NotifyQueueMessage): string {
+function mailboxOf(body: NotifyQueueMessage): string | null {
+	if (body.eventType === "telegram.approval_notice.v1") return null;
 	return body.eventType === "mail.notify.v1" ? body.notification.mailboxId : body.refresh.mailboxId;
 }
 
@@ -59,6 +62,10 @@ function mailboxOf(body: NotifyQueueMessage): string {
 async function deliver(env: Env, body: NotifyQueueMessage): Promise<string | null> {
 	if (body.eventType === "mail.notify.v1") {
 		const outcome = await deliverInboundNotification(env, body.notification);
+		return outcome.status === "skipped" ? outcome.reason : null;
+	}
+	if (body.eventType === "telegram.approval_notice.v1") {
+		const outcome = await syncApprovalNotice(env, body.notice);
 		return outcome.status === "skipped" ? outcome.reason : null;
 	}
 	const outcome = await refreshTelegramCard(env, body.refresh);

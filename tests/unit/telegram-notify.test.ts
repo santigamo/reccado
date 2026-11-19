@@ -108,6 +108,11 @@ function stubTelegram(
 	return calls;
 }
 
+function keyboard(call: BotCall | undefined): Array<Array<Record<string, string>>> {
+	return (call?.body.reply_markup as { inline_keyboard: Array<Array<Record<string, string>>> })
+		?.inline_keyboard;
+}
+
 function telegramError(errorCode: number, description: string): Response {
 	return Response.json({ ok: false, error_code: errorCode, description });
 }
@@ -349,11 +354,6 @@ describe("what the card lets the operator do", () => {
 		await setRuntimeConfig("telegram.chat_is_forum", "0");
 	});
 
-	function keyboard(call: BotCall | undefined): Array<Array<Record<string, string>>> {
-		return (call?.body.reply_markup as { inline_keyboard: Array<Array<Record<string, string>>> })
-			?.inline_keyboard;
-	}
-
 	it("offers triage, the full body and the web thread", async () => {
 		await setRuntimeConfig("deployment.origin", "https://reccado.example");
 		const calls = stubTelegram();
@@ -365,15 +365,18 @@ describe("what the card lets the operator do", () => {
 
 		// The point of the whole change: most mail is dispatched, not answered, and a
 		// card with no buttons served only the fifth that needs a sentence back.
-		const buttons = keyboard(calls.find((call) => call.method === "sendMessage"))?.[0];
-		expect(buttons?.map((button) => button.callback_data ?? button.url)).toEqual([
+		const rows = keyboard(calls.find((call) => call.method === "sendMessage"));
+		// First row: the conversation's state (archive, read) and the web thread.
+		expect(rows?.[0]?.map((button) => button.callback_data ?? button.url)).toEqual([
 			"v1:a",
-			"v1:x",
+			"v1:r",
 			"https://reccado.example/inbox/mbx_hello/thread_42",
 		]);
+		// Second row: this email's content and its sender.
+		expect(rows?.[1]?.map((button) => button.callback_data)).toEqual(["v1:x", "v1:m"]);
 		// No trash button, deliberately: a delete one thumb-width from archive is a
 		// machine for mistakes, and the two mistakes do not cost the same.
-		expect(JSON.stringify(buttons)).not.toContain("v1:t");
+		expect(JSON.stringify(rows)).not.toContain("v1:t");
 	});
 
 	it("omits the open button rather than painting a broken URL", async () => {
@@ -387,7 +390,134 @@ describe("what the card lets the operator do", () => {
 		// Nobody has reached this deployment over its public hostname yet, so there is
 		// no URL to offer -- and a guessed one would be a dead link on every card.
 		const buttons = keyboard(calls.find((call) => call.method === "sendMessage"))?.[0];
-		expect(buttons?.map((button) => button.callback_data)).toEqual(["v1:a", "v1:x"]);
+		expect(buttons?.map((button) => button.callback_data)).toEqual(["v1:a", "v1:r"]);
+	});
+});
+
+describe("sensitive mail on a new card", () => {
+	beforeEach(async () => {
+		await setRuntimeConfig("telegram.chat_is_forum", "0");
+		await setRuntimeConfig("deployment.origin", "https://reccado.example");
+	});
+
+	function sentCard(calls: BotCall[]): BotCall | undefined {
+		return calls.find((call) => call.method === "sendMessage");
+	}
+
+	it("withholds the excerpt and masks the code in the subject", async () => {
+		const calls = stubTelegram();
+
+		await deliverInboundNotification(
+			buildEnv(),
+			notification({
+				subject: "Your verification code is 482913",
+				snippet: "Use 482913 to verify your account. It expires in 10 minutes.",
+			}),
+		);
+
+		const card = sentCard(calls);
+		const text = String(card?.body.text);
+		expect(text).not.toContain("482913");
+		expect(text).toContain("Contenido sensible oculto");
+		expect(text).toContain("sender@example.com");
+		const data = keyboard(card)
+			.flat()
+			.map((button) => button.callback_data ?? button.url);
+		expect(data).not.toContain("v1:x");
+		expect(data).toContain("https://reccado.example/inbox/mbx_hello/thread_1");
+	});
+
+	it("never prints this instance's own sign-in mail, whatever the classifier says", async () => {
+		const calls = stubTelegram();
+		const env = { ...buildEnv(), MAIL_FROM_ADDRESS: "noreply@send.example" } as unknown as Env;
+
+		// A snippet the classifier would not flag on its own (no keyword near the
+		// digits): the sender alone must be enough.
+		await deliverInboundNotification(
+			env,
+			notification({ fromAddr: "noreply@send.example", subject: "Hola", snippet: "731942" }),
+		);
+
+		expect(String(sentCard(calls)?.body.text)).not.toContain("731942");
+	});
+
+	it("leaves ordinary mail untouched", async () => {
+		const calls = stubTelegram();
+
+		await deliverInboundNotification(
+			buildEnv(),
+			notification({ subject: "Factura 2024-118", snippet: "Te adjunto la factura de octubre." }),
+		);
+
+		const text = String(sentCard(calls)?.body.text);
+		expect(text).toContain("Factura 2024-118");
+		expect(text).toContain("Te adjunto la factura de octubre.");
+	});
+});
+
+describe("thread-aware cards", () => {
+	beforeEach(async () => {
+		await setRuntimeConfig("telegram.chat_is_forum", "0");
+		await setRuntimeConfig("deployment.origin", "https://reccado.example");
+	});
+
+	async function index(messageLocalId: string, receivedAt: string): Promise<void> {
+		await testEnv.INDEX_DB.prepare(
+			`INSERT OR REPLACE INTO message_index
+       (mailbox_id, message_local_id, thread_id, rfc_message_id, subject, from_addr, to_json, snippet,
+        received_at, has_attachments, labels_json, state, raw_r2_key, raw_sha256, updated_at)
+       VALUES ('mbx_hello', ?, 'thread_conv', NULL, 'Presupuesto', 'sender@example.com',
+               '["hello@imsanti.dev"]', 'hola', ?, 0, '[]', 'inbox', 'raw/1', 'sha', ?)`,
+		)
+			.bind(messageLocalId, receivedAt, receivedAt)
+			.run();
+	}
+
+	it("replies to the previous card of the conversation and strips its buttons", async () => {
+		await index("msg_conv_1", "2026-11-01T10:00:00.000Z");
+		await index("msg_conv_2", "2026-11-01T11:00:00.000Z");
+		const calls = stubTelegram();
+		const env = buildEnv();
+
+		await deliverInboundNotification(
+			env,
+			notification({ threadId: "thread_conv", messageLocalId: "msg_conv_1" }),
+		);
+		const first = await testEnv.INDEX_DB.prepare(
+			"SELECT message_id FROM telegram_links WHERE message_local_id = 'msg_conv_1'",
+		).first<{ message_id: number }>();
+		calls.length = 0;
+
+		await deliverInboundNotification(
+			env,
+			notification({ threadId: "thread_conv", messageLocalId: "msg_conv_2" }),
+		);
+
+		const second = calls.find((call) => call.method === "sendMessage");
+		expect(second?.body.reply_parameters).toEqual({
+			message_id: first?.message_id,
+			allow_sending_without_reply: true,
+		});
+		const edit = calls.find((call) => call.method === "editMessageText");
+		expect(edit?.body.message_id).toBe(first?.message_id);
+		expect(String(edit?.body.text)).toContain("más reciente");
+		expect(keyboard(edit)).toEqual([
+			[{ text: "↗ Abrir", url: "https://reccado.example/inbox/mbx_hello/thread_conv" }],
+		]);
+	});
+
+	it("does not reply to a card of the same message when a notification is redelivered", async () => {
+		await index("msg_conv_3", "2026-11-01T12:00:00.000Z");
+		const calls = stubTelegram();
+		const input = notification({ threadId: "thread_conv", messageLocalId: "msg_conv_3" });
+
+		await deliverInboundNotification(buildEnv(), input);
+		await deliverInboundNotification(buildEnv(), input);
+
+		const sends = calls.filter((call) => call.method === "sendMessage");
+		expect(sends).toHaveLength(2);
+		expect(sends[1]?.body.reply_parameters).toBeUndefined();
+		expect(calls.some((call) => call.method === "editMessageText")).toBe(false);
 	});
 });
 

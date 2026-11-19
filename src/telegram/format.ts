@@ -1,6 +1,7 @@
 import { escapeHtml } from "../lib/email-headers";
 import type { TelegramEntity } from "./api";
 import { TELEGRAM_MAX_MESSAGE_CHARS } from "./api";
+import { SENSITIVE_PLACEHOLDER } from "./sensitive";
 
 // --- Telegram -> email -----------------------------------------------------
 
@@ -166,6 +167,9 @@ export const CARD_STATUS_LABELS = {
 
 export type TelegramCardStatus = keyof typeof CARD_STATUS_LABELS;
 
+/** Status line of a card whose conversation has a newer card further down. */
+export const SUPERSEDED_LABEL = "hay un correo más reciente en esta conversación ↓";
+
 /** What the card can say about one attachment: enough to decide whether to fetch it. */
 export type CardAttachment = {
 	filename: string | null;
@@ -193,6 +197,14 @@ export type InboundNotification = {
 	firstContact?: boolean;
 	/** Absent on the first render; set when the card is restated after an action. */
 	status?: TelegramCardStatus | null;
+	/**
+	 * One-time code, reset or magic link, or this instance's own sign-in mail (see
+	 * telegram/sensitive.ts). The excerpt and file names are withheld; the subject
+	 * arrives here already masked.
+	 */
+	sensitive?: boolean;
+	/** A newer message of this conversation has its own card below. */
+	superseded?: boolean;
 };
 
 const SUBJECT_LIMIT = 200;
@@ -231,7 +243,7 @@ export function formatByteSize(bytes: number): string {
  * from the card.
  */
 function renderAttachmentLine(input: InboundNotification): string {
-	if (!input.attachments?.length) {
+	if (!input.attachments?.length || input.sensitive) {
 		return input.hasAttachments ? "\n📎 con adjuntos" : "";
 	}
 	const shown = input.attachments
@@ -266,13 +278,21 @@ export function renderInboundNotification(input: InboundNotification): string {
 		input.firstContact ? "\n<i>primer correo de este remitente</i>" : ""
 	}`;
 	const attachments = renderAttachmentLine(input);
-	const status = input.status ? `\n· ${CARD_STATUS_LABELS[input.status]}` : "";
+	const status =
+		(input.status ? `\n· ${CARD_STATUS_LABELS[input.status]}` : "") +
+		(input.superseded ? `\n· ${SUPERSEDED_LABEL}` : "");
 	const footer = "\n\n<i>Responde a este mensaje para contestar por email.</i>";
 
 	const fixedLength =
 		header.length + addresses.length + attachments.length + status.length + footer.length + 4;
 	const budget = Math.max(0, Math.min(SNIPPET_LIMIT, TELEGRAM_MAX_MESSAGE_CHARS - fixedLength));
-	const snippet = input.snippet?.trim() ? `\n\n${escapeAndClip(input.snippet, budget)}` : "";
+	// A sensitive mail never prints its excerpt, whatever the snippet holds: the
+	// placeholder is the whole body of the card.
+	const snippet = input.sensitive
+		? `\n\n${SENSITIVE_PLACEHOLDER}`
+		: input.snippet?.trim()
+			? `\n\n${escapeAndClip(input.snippet, budget)}`
+			: "";
 
 	return withinLimit(
 		`${header}\n${addresses}${attachments}${status}${snippet}${footer}`,

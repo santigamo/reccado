@@ -376,7 +376,14 @@ describe("telegram webhook", () => {
 
 		const calls = stubTelegramApi();
 		await post(messageUpdate({ text: "/help" }));
-		expect(String(calls.find((call) => call.method === "sendMessage")?.body.text)).toContain(
+		// /help is the command list now; the ids moved to /id, named at its end.
+		const help = String(calls.find((call) => call.method === "sendMessage")?.body.text);
+		expect(help).toContain("/buscar");
+		expect(help).toContain("/id");
+		expect(help).not.toContain("chat_id: <code>");
+		const ids = stubTelegramApi();
+		await post(messageUpdate({ text: "/id" }));
+		expect(String(ids.find((call) => call.method === "sendMessage")?.body.text)).toContain(
 			"Envía /start",
 		);
 		const row = await testEnv.INDEX_DB.prepare("SELECT value FROM runtime_config WHERE key = ?")
@@ -470,7 +477,7 @@ describe("telegram webhook", () => {
 		expect(edit?.body.message_id).toBe(5151);
 		expect(String(edit?.body.text)).toContain("· archivado");
 		expect(calls.find((call) => call.method === "answerCallbackQuery")?.body.text).toBe(
-			"Archivado",
+			"Conversación archivada",
 		);
 	});
 

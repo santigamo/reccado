@@ -39,8 +39,10 @@ import {
 import {
 	handleSearchPageCallback,
 	handleTelegramCommand,
+	IDENTITY_COMMAND_NAMES,
 	parseCommand,
-	RETRIEVAL_COMMANDS,
+	renderHelp,
+	renderUnknownCommand,
 	SEARCH_PAGE_VERB,
 } from "./commands";
 import {
@@ -102,8 +104,6 @@ async function resolveLink(
 	}
 	return getTelegramLinkByMessage(env.INDEX_DB, chatId, message.reply_to_message.message_id);
 }
-
-const IDENTITY_COMMANDS = ["/start", "/help", "/id"] as const;
 
 /** `/start abc123` -> the argument; `/start` -> null. */
 function commandArgument(text: string): string | null {
@@ -377,7 +377,9 @@ async function handleEditedMessage(
 		return;
 	}
 	const text = message.text ?? message.caption;
-	if (!text?.trim()) {
+	// Editing a message into a "/command" is not a correction: a command never
+	// becomes the body of an email.
+	if (!text?.trim() || parseCommand(text)) {
 		return;
 	}
 	const row = await getDraftBySource(env.INDEX_DB, chatId, message.message_id);
@@ -412,13 +414,27 @@ async function handleMessage(
 	// so a first-time operator got silence with no way to tell whether the webhook,
 	// the secret, or the allowlist was at fault. Answering costs nothing an attacker
 	// could not already get from @userinfobot, and no action is taken for a stranger.
-	if (rawText && IDENTITY_COMMANDS.some((command) => rawText.startsWith(command))) {
-		const adopts = rawText.startsWith("/start");
+	const identity = parseCommand(rawText);
+	if (identity && IDENTITY_COMMAND_NAMES.has(identity.name)) {
+		// /help is a question about the bot, not about ids: an operator gets the
+		// command list (with /id named at its end for the diagnostic). A stranger
+		// still gets the ids and the pairing hint below -- the list of things he
+		// cannot do yet would only be a tease.
+		if (identity.name === "help" && allowed) {
+			await sendMessage(config, {
+				chatId,
+				text: renderHelp(),
+				replyToMessageId: message.message_id,
+				messageThreadId: message.message_thread_id ?? null,
+			});
+			return;
+		}
+		const adopts = identity.name === "start";
 		// The one path from stranger to operator. Attempted only for a stranger and
 		// only on /start: a code offered by someone who is already an operator would
 		// spend an invitation to grant an authority they hold, and /help must stay a
 		// question that changes nothing.
-		const code = adopts && !allowed ? commandArgument(rawText) : null;
+		const code = adopts && !allowed && rawText ? commandArgument(rawText) : null;
 		const pairing = code ? await claimTelegramPairing(env, { code, userId, chatId }) : null;
 		allowed = allowed || pairing?.claim === "linked";
 		await handleIdentityCommand(env, config, message, chatId, allowed, adopts, pairing);
@@ -450,9 +466,19 @@ async function handleMessage(
 
 	// Before anything that treats the text as prose: /buscar sends its argument to
 	// FTS, not to a stranger.
+	// Any "/word" is a command, known or not. An unknown one gets an answer and
+	// stops here: written as a reply to a card it used to fall through and become
+	// the body of an email draft to a stranger.
 	const command = parseCommand(text);
-	if (command && RETRIEVAL_COMMANDS.has(command.name)) {
-		await handleTelegramCommand(env, config, message, chatId, command);
+	if (command) {
+		if (!(await handleTelegramCommand(env, config, message, chatId, command))) {
+			await sendMessage(config, {
+				chatId,
+				text: renderUnknownCommand(command.name),
+				replyToMessageId: message.message_id,
+				messageThreadId: message.message_thread_id ?? null,
+			});
+		}
 		return;
 	}
 
