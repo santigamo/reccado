@@ -11,6 +11,16 @@ package.
 
 ### Added
 
+- **Agents can attach files to their drafts (2026-11-23).** New MCP tool
+  `manage_draft_attachments` (scope `mail:draft`): `add_file` (base64, the web's 17 MiB / 20-file
+  limits), `add_from_message` (a message's files by reference, gated like downloading them:
+  `mail:read:sensitive` for sensitive or unclassified mail) and `remove`. Only on a draft that is
+  still the agent's and not yet waiting for approval, re-checked in the mailbox DO with the write;
+  the web still has to take an agent draft over before adding files. The files ride in the frozen
+  payload and `payload_hash`, and the approval page now lists each file by name, type, size and
+  SHA-256 instead of hashes alone. The web upload and the tool share `storeDraftUpload`
+  (`src/lib/draft-attachment-upload.ts`).
+
 - **The owner can send an agent's draft directly (2026-11-18).** The agent prepared a draft and
   the web refused to send it (`approval_required`, "Approval expired") — a dead end. The rule is
   now: the agent can never send; an agent-initiated send needs the hash-bound approval; the owner
@@ -346,6 +356,16 @@ read/search/draft endpoint.
   change still hold the full body and should be purged by hand.
 
 ### Fixed
+
+- **MCP connections no longer expire every hour (2026-11-23).** Better Auth issues a refresh token
+  only for grants that carry `offline_access`, which Reccado did not offer and MCP clients never
+  ask for (the protected-resource metadata hides it): production had issued zero refresh tokens,
+  so every client needed a browser login when its 1-hour access JWT expired. The provider now
+  supports `offline_access`, every authorization request gets it server-side
+  (`withOfflineAccess`), the consent page names it ("Stay connected"), and migration `0031` adds it
+  to the stored scopes of already-registered clients (otherwise their next login would fail
+  `invalid_scope`). Refresh tokens last 30 days, rotate on use, and are deleted when the client is
+  revoked.
 
 - **Conversation actions leave the other folder's messages alone (2026-11-16).** Archiving, moving
   to Inbox or marking read/unread a conversation from Inbox, Archive or Sent also moved its trashed

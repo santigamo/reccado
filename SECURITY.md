@@ -265,6 +265,17 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
   match inside sensitive bodies; unclassified or parse-failed messages need
   `mail:read:sensitive` for raw access (fail closed). Agents can update or cancel only drafts
   that are still theirs (`origin='mcp'`): not the owner's, and not one the owner has taken over.
+- **Files on agent drafts.** `manage_draft_attachments` (scope `mail:draft`) uploads a file
+  (base64, same 17 MiB / 20-file limits as the web) or attaches files of a message in the mailbox
+  by reference, and removes them. The mailbox DO accepts it only as `requester: "mcp"` on a draft
+  that is still the agent's **and** still a plain `draft` (once it waits for approval its files are
+  frozen, like its text); the web still cannot add files to an agent's draft without taking it
+  over. Attaching a message's files needs the same read scope as downloading them
+  (`mail:read:sensitive` for sensitive, unclassified or parse-failed mail), so the tool cannot
+  launder content the agent could not read. The files are part of the frozen send snapshot, the
+  `payload_hash` and the owner's `content_fingerprint`, and the approval page lists each one by
+  name, type, size and SHA-256 (control characters stripped from names), so the owner sees exactly
+  which files would leave — the exfiltration path stays behind the same hash-bound approval.
 - **Host allow-list and framing.** `/mcp` accepts only localhost, the deployment's own origin and
   hosts listed in `MCP_ALLOWED_HOSTS`. Every HTML response carries `frame-ancestors 'none'`,
   `frame-src 'self'` and `X-Frame-Options: DENY`; `/approve/*` and `/inbox*` (whose URL can carry
@@ -293,6 +304,13 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
   runs `pnpm operator mcp revoke <client_id>`: access tokens, refresh tokens, consent and
   registration are deleted. Access JWTs already issued stay valid until they expire (≤ 3600 s), so
   revocation is not instant.
+- **Staying connected.** Every MCP authorization request is handled with `offline_access` added
+  server-side (MCP clients take their scope list from the protected-resource metadata, which does
+  not advertise it), and the consent page names it ("Stay connected"). The provider then issues a
+  refresh token (30 days, rotated on every use, PKCE required) next to the 1-hour access JWT, so a
+  connected agent renews without sending the owner through the browser login. It grants no tool.
+  Revoking the client deletes its refresh tokens; a refresh token that is not used for 30 days
+  expires and the next connection needs a new login.
 
 Accepted residual risk (honest list):
 

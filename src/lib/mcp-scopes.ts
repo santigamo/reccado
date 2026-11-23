@@ -18,6 +18,16 @@ export const MCP_SCOPES = [
 ] as const;
 export type McpScope = (typeof MCP_SCOPES)[number];
 
+/**
+ * The OAuth scope that makes the authorization server issue a refresh token
+ * (OIDC Core §11; Better Auth's provider mints one only when the grant carries
+ * it). It grants no tool: it only lets a connected client renew its 1-hour
+ * access token without sending the owner through the browser login again.
+ * Every MCP authorization request gets it (better-auth.ts), and revoking the
+ * client under "Connected agents" deletes its refresh tokens.
+ */
+export const OFFLINE_ACCESS_SCOPE = "offline_access";
+
 /** What a client gets when it asks for nothing in particular (and the consent page's pre-ticked set). */
 export const DEFAULT_MCP_SCOPES = ["mail:read", "mail:draft", "config:read"] as const;
 
@@ -39,6 +49,7 @@ export const TOOL_SCOPES: Readonly<Record<string, McpScope>> = {
 	search_messages: "mail:read",
 	save_draft: "mail:draft",
 	cancel_draft: "mail:draft",
+	manage_draft_attachments: "mail:draft",
 	update_messages: "mail:draft",
 	send: "mail:send",
 	get_health: "config:read",

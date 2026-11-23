@@ -136,6 +136,7 @@ const SCOPE_DESCRIPTIONS: Record<string, ReactNode> = {
 	"mail:draft": "Write and edit drafts, and tidy mail: mark read, archive, trash",
 	"mailboxes:write": "Create, rename and disable mailboxes",
 	"templates:write": "Create, edit and archive transactional templates",
+	offline_access: "Stay connected until you revoke it under Connected agents",
 	"suppressions:write": (
 		<>
 			Remove suppressed addresses <span className="text-approval">· needs your approval</span>
@@ -147,6 +148,7 @@ const SCOPE_GROUPS: ReadonlyArray<{ title: string; scopes: readonly string[] }> 
 	{ title: "Read", scopes: ["mail:read", "config:read", "mail:read:sensitive"] },
 	{ title: "Draft", scopes: ["mail:draft"] },
 	{ title: "Send", scopes: ["mail:send"] },
+	{ title: "Connection", scopes: ["offline_access"] },
 	{
 		title: "Manage",
 		scopes: [

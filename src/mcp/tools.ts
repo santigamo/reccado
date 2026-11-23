@@ -3,12 +3,13 @@ import { z } from "zod";
 import type { AuthContext } from "../api/auth";
 import { insertOpsEvent } from "../db/d1";
 import { AdminError } from "../lib/admin/errors";
+import { MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_COUNT } from "../lib/attachment-limits";
 import { TOOL_SCOPES } from "../lib/mcp-scopes";
 import * as adminReads from "./admin-reads";
 import { registerAdminTools } from "./admin-tools";
 import { mcpToolError, mcpToolResultJson } from "./errors";
 import type { IntentFlow } from "./intent-flow";
-import { McpMailboxFacade } from "./mailbox-facade";
+import { DRAFT_ATTACHMENT_ERRORS, McpMailboxFacade } from "./mailbox-facade";
 import { assertScope, type McpAuthContext, McpScopeError, scopeFilteredServer } from "./scopes";
 import { registerSendTool } from "./send-tool";
 
@@ -25,7 +26,42 @@ export const SAVE_DRAFT_DESCRIPTION = [
 	"To reply, call read_message first for the sender's address and put it in 'to'; never include the mailbox's own address. Pass idempotencyKey when creating so a retry does not create a second draft; pass draftId (no idempotencyKey needed) to replace the to/subject/body of a draft you created.",
 ].join(" ");
 
+export const DRAFT_ATTACHMENTS_DESCRIPTION = [
+	"Add files to, or remove them from, an email draft you created with save_draft. One change per call; the result lists the draft's files.",
+	"Files go out only with the draft, and only once the owner approves it through `send`: the approval page lists every file by name, type and size, and the approval is bound to exactly these files. Attaching or removing a file after asking to send is not possible (draft_not_editable): cancel_draft and save a new draft instead.",
+	"add_from_message attaches files of a message in this mailbox without downloading them (a forward); files of sensitive mail need the mail:read:sensitive scope, as reading them would. Limits: at most 20 files and 17 MiB in total per draft.",
+].join(" ");
+
+/** Base64 of the largest single file the draft limits allow (4 chars per 3 bytes, padded). */
+const MAX_ATTACHMENT_BASE64_CHARS = Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4;
+
+const draftAttachmentSchema = z.object({
+	attachment_id: z.string(),
+	filename: z.string(),
+	content_type: z.string(),
+	size: z.number(),
+	sha256: z.string(),
+	source: z.enum(["upload", "message"]),
+});
+
+/** Strict standard base64 (whitespace tolerated): anything else is a validation error, never a guess. */
+function decodeBase64(value: string): Uint8Array {
+	const clean = value.replace(/\s+/g, "");
+	if (!/^[A-Za-z0-9+/]*={0,2}$/.test(clean) || clean.length % 4 !== 0 || clean.length === 0)
+		throw new Error("validation_error");
+	let binary: string;
+	try {
+		binary = atob(clean);
+	} catch {
+		throw new Error("validation_error");
+	}
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+	return bytes;
+}
+
 const TOOL_LIMITS: Record<string, number> = {
+	manage_draft_attachments: 20,
 	list_mailboxes: 10,
 	list_threads: 30,
 	search_messages: 30,
@@ -55,7 +91,7 @@ function toolErrorText(error: unknown): string {
 		reason === "not_found" ||
 		reason === "validation_error" ||
 		reason === "draft_not_editable" ||
-		reason === "draft_not_agent_owned" ||
+		DRAFT_ATTACHMENT_ERRORS.has(reason) ||
 		reason.startsWith("insufficient_scope:")
 	) {
 		return reason;
@@ -613,6 +649,84 @@ export function registerTools(
 			runTool("cancel_draft", "mail:draft", params.mailboxId, () =>
 				facade.cancelDraft(params.mailboxId, params.draftId),
 			),
+	);
+
+	server.registerTool(
+		"manage_draft_attachments",
+		{
+			description: DRAFT_ATTACHMENTS_DESCRIPTION,
+			inputSchema: z.object({
+				mailboxId: z.string().min(1),
+				draftId: z.string().min(1).describe("A draft you created with save_draft"),
+				action: z
+					.enum(["add_file", "add_from_message", "remove"])
+					.describe(
+						"add_file: upload a new file (filename + contentBase64). add_from_message: attach files of a message in this mailbox (messageId, optional attachmentIds; omitted = all its files). remove: take one file off (attachmentId).",
+					),
+				filename: z.string().min(1).max(255).optional().describe("add_file: the file name"),
+				contentType: z
+					.string()
+					.max(255)
+					.optional()
+					.describe("add_file: MIME type, e.g. application/pdf"),
+				contentBase64: z
+					.string()
+					.min(1)
+					.max(MAX_ATTACHMENT_BASE64_CHARS)
+					.optional()
+					.describe(
+						`add_file: the file's bytes, standard base64 (at most ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MiB decoded)`,
+					),
+				messageId: z.string().min(1).optional().describe("add_from_message: the message"),
+				attachmentIds: z
+					.array(z.string().min(1))
+					.min(1)
+					.max(MAX_ATTACHMENT_COUNT)
+					.optional()
+					.describe("add_from_message: which of its files (from read_message); omitted = all"),
+				attachmentId: z
+					.string()
+					.min(1)
+					.optional()
+					.describe("remove: the draft file's attachment_id"),
+			}),
+			outputSchema: z.object({
+				draft_id: z.string(),
+				added: z.array(draftAttachmentSchema),
+				skipped: z.array(z.object({ id: z.string(), filename: z.string(), reason: z.string() })),
+				attachments: z.array(draftAttachmentSchema),
+			}),
+			annotations: {
+				readOnlyHint: false,
+				destructiveHint: false,
+				idempotentHint: false,
+				openWorldHint: false,
+			},
+		},
+		async (params) =>
+			runTool("manage_draft_attachments", "mail:draft", params.mailboxId, async () => {
+				if (params.action === "add_file") {
+					if (!params.filename || !params.contentBase64) throw new Error("validation_error");
+					const bytes = decodeBase64(params.contentBase64);
+					if (bytes.byteLength > MAX_ATTACHMENT_BYTES) throw new Error("attachment_too_large");
+					return facade.addDraftFile(params.mailboxId, params.draftId, {
+						filename: params.filename,
+						contentType: params.contentType,
+						bytes,
+					});
+				}
+				if (params.action === "add_from_message") {
+					if (!params.messageId) throw new Error("validation_error");
+					return facade.addDraftAttachmentsFromMessage(
+						params.mailboxId,
+						params.draftId,
+						params.messageId,
+						params.attachmentIds,
+					);
+				}
+				if (!params.attachmentId) throw new Error("validation_error");
+				return facade.removeDraftAttachment(params.mailboxId, params.draftId, params.attachmentId);
+			}),
 	);
 
 	server.registerTool(

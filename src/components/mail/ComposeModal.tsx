@@ -1011,9 +1011,18 @@ export function ComposeModal({
 					draftId={draftId}
 					disabled={busy}
 					onRemove={(key) => {
-						void files.remove(key, draftIdRef.current).then((ok) => {
+						// Removing a file the agent attached is an edit too: the agent's draft
+						// is saved as the owner's first (files change only on an owner draft).
+						void (async () => {
+							if (agentDraft && (await takeOver()) === null) return;
+							const ok = await files.remove(key, draftIdRef.current);
 							if (!ok) setStatus({ text: "Could not remove the file. Try again.", error: true });
-						});
+						})().catch((err: unknown) =>
+							setStatus({
+								text: err instanceof Error ? err.message : "Could not save the draft.",
+								error: true,
+							}),
+						);
 					}}
 				/>
 				{dragging ? (

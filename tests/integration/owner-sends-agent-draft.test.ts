@@ -10,9 +10,11 @@ import { insertMailbox } from "#/db/d1";
 import {
 	approveIntent,
 	getIntentStatus,
+	getIntentView,
 	getOrCreatePendingIntent,
 	signOwnerWebSendProof,
 } from "#/lib/approvals";
+import { storeDraftUpload } from "#/lib/draft-attachment-upload";
 import { confirmDraftSend } from "#/lib/outbound-send";
 import { McpMailboxFacade } from "../../src/mcp/mailbox-facade";
 import worker from "../../src/server";
@@ -503,5 +505,186 @@ describe("owner takeover of an agent draft", () => {
 		);
 		expect(upload.status).toBe(409);
 		expect(await upload.json()).toMatchObject({ error: "agent_draft_attachments" });
+	});
+});
+
+describe("agent attaches files to its own draft over MCP", () => {
+	const pdf = new TextEncoder().encode("%PDF-1.4 propuesta");
+
+	it("uploads a file that rides in the approved payload, is listed on the approval page and goes out", async () => {
+		const s = await setup("mcp-file");
+		const added = await s.facade.addDraftFile(s.mailboxId, s.draftId, {
+			filename: "propuesta.pdf",
+			contentType: "application/pdf",
+			bytes: pdf,
+		});
+		expect(added.added).toHaveLength(1);
+		expect(added.attachments).toEqual([
+			expect.objectContaining({
+				filename: "propuesta.pdf",
+				content_type: "application/pdf",
+				size: pdf.byteLength,
+				source: "upload",
+			}),
+		]);
+
+		const approval = await pendingApproval(s);
+		// The approval page lists the file by name, type and size, next to its hash.
+		const view = await getIntentView(shared, approval.id, { userId: s.owner.userId });
+		const files = view.fields.find((f) => f.label === "Adjuntos")?.value ?? "";
+		expect(files).toContain("propuesta.pdf · application/pdf");
+		expect(files).toContain(`sha256 ${added.added[0]!.sha256}`);
+
+		// Frozen once it waits for approval: no more files from the agent.
+		await expect(
+			s.facade.addDraftFile(s.mailboxId, s.draftId, { filename: "b.txt", bytes: pdf }),
+		).rejects.toThrow("draft_not_editable");
+		await expect(
+			s.facade.removeDraftAttachment(s.mailboxId, s.draftId, added.added[0]!.attachment_id),
+		).rejects.toThrow("draft_not_editable");
+
+		const approved = await approveIntent(shared, {
+			id: approval.id,
+			payloadHash: approval.payloadHash,
+			channel: "web",
+			approver: s.owner.userId,
+		});
+		expect(approved.status, JSON.stringify(approved)).toBe("sent");
+		expect(await messageCount(s)).toBe(1);
+		const sentFiles = await runInDurableObject(s.stub, async (_instance, state) =>
+			state.storage.sql
+				.exec<{ filename: string }>(
+					"SELECT a.filename FROM attachments a JOIN messages m ON m.id = a.message_id WHERE m.direction = 'outbound'",
+				)
+				.toArray(),
+		);
+		expect(sentFiles.map((f) => f.filename)).toEqual(["propuesta.pdf"]);
+	});
+
+	it("removes a file it added, and never touches a draft the owner took over", async () => {
+		const s = await setup("mcp-remove");
+		const added = await s.facade.addDraftFile(s.mailboxId, s.draftId, {
+			filename: "a.txt",
+			contentType: "text/plain",
+			bytes: pdf,
+		});
+		const removed = await s.facade.removeDraftAttachment(
+			s.mailboxId,
+			s.draftId,
+			added.added[0]!.attachment_id,
+		);
+		expect(removed.attachments).toEqual([]);
+
+		const saved = await api(s, `/drafts/${s.draftId}`, {
+			method: "PATCH",
+			body: { subject: "Propuesta" },
+		});
+		expect(await saved.json()).toMatchObject({ takenOver: true });
+		await expect(
+			s.facade.addDraftFile(s.mailboxId, s.draftId, { filename: "a.txt", bytes: pdf }),
+		).rejects.toThrow("draft_not_agent_owned");
+		// The DO refuses it too, atomically with the write, whatever the facade read.
+		const raced = await s.stub.fetch(
+			`https://mailbox-do/drafts/${s.draftId}/attachments/from-message`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ messageId: "x", requester: "mcp" }),
+			},
+		);
+		expect(raced.status).toBe(409);
+		expect(await raced.json()).toMatchObject({ error: "draft_not_agent_owned" });
+		// An upload the DO refuses leaves no object behind in R2.
+		const before = (await shared.MAIL_OBJECTS.list()).objects.length;
+		const refused = await storeDraftUpload(shared, s.stub, {
+			mailboxId: s.mailboxId,
+			draftId: s.draftId,
+			filename: "late.txt",
+			contentType: "text/plain",
+			bytes: pdf,
+			requester: "mcp",
+		});
+		expect(refused.status).toBe(409);
+		expect((await shared.MAIL_OBJECTS.list()).objects.length).toBe(before);
+	});
+
+	it("attaches a message's files only with the read scope that would download them", async () => {
+		// Source: the sent copy of an earlier draft that carried a file.
+		const source = await setup("mcp-forward-src");
+		await source.facade.addDraftFile(source.mailboxId, source.draftId, {
+			filename: "contrato.pdf",
+			contentType: "application/pdf",
+			bytes: pdf,
+		});
+		const shown = await loadDraft(source);
+		const sent = await webSend(source, "src-1", { fingerprint: shown.content_fingerprint });
+		expect(sent.body).toMatchObject({ sent: true });
+		const messageId = String(sent.body.messageId ?? sent.body.message_id ?? "");
+		const sourceMessage = await runInDurableObject(
+			source.stub,
+			async (_instance, state) =>
+				state.storage.sql
+					.exec<{ id: string }>("SELECT id FROM messages WHERE direction = 'outbound' LIMIT 1")
+					.toArray()[0],
+		);
+		const sourceId = messageId || sourceMessage!.id;
+
+		// A second agent draft in the same mailbox.
+		const { draft_id: draftId } = await source.facade.createDraft(source.mailboxId, {
+			to: ["stranger@example.net"],
+			subject: "Reenvío",
+			bodyText: "Te reenvío el contrato.",
+			idempotencyKey: crypto.randomUUID(),
+		});
+		// A sent copy is never classified: not shown harmless, so the plain read
+		// scope may not take its files (the same rule as downloading them).
+		await expect(
+			source.facade.addDraftAttachmentsFromMessage(source.mailboxId, draftId, sourceId),
+		).rejects.toThrow(/insufficient_scope/);
+		const sensitive = new McpMailboxFacade(shared, {
+			userId: source.owner.userId,
+			email: source.email,
+			scopes: new Set(["mail:read", "mail:read:sensitive", "mail:draft"]),
+		});
+		await expect(
+			sensitive.addDraftAttachmentsFromMessage(source.mailboxId, draftId, sourceId, ["nope"]),
+		).rejects.toThrow("not_found");
+		const forwarded = await sensitive.addDraftAttachmentsFromMessage(
+			source.mailboxId,
+			draftId,
+			sourceId,
+		);
+		expect(forwarded.added.map((a) => [a.filename, a.source])).toEqual([
+			["contrato.pdf", "message"],
+		]);
+		// Same file twice is not added twice.
+		const again = await sensitive.addDraftAttachmentsFromMessage(
+			source.mailboxId,
+			draftId,
+			sourceId,
+		);
+		expect(again.added).toEqual([]);
+		expect(again.attachments).toHaveLength(1);
+
+		// Once classified as ordinary mail (what ingest does for inbound messages),
+		// the plain read scope is enough.
+		await runInDurableObject(source.stub, async (_instance, state) => {
+			state.storage.sql.exec(
+				"UPDATE messages SET sensitive_classified = 1, sensitive_kind = NULL WHERE id = ?",
+				sourceId,
+			);
+		});
+		const { draft_id: third } = await source.facade.createDraft(source.mailboxId, {
+			to: ["stranger@example.net"],
+			subject: "Otra vez",
+			bodyText: "Adjunto.",
+			idempotencyKey: crypto.randomUUID(),
+		});
+		const plain = await source.facade.addDraftAttachmentsFromMessage(
+			source.mailboxId,
+			third,
+			sourceId,
+		);
+		expect(plain.added.map((a) => a.filename)).toEqual(["contrato.pdf"]);
 	});
 });

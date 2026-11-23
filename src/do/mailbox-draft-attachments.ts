@@ -154,6 +154,7 @@ export type AttachmentEditError = {
 	error:
 		| "draft_not_editable"
 		| "agent_draft_attachments"
+		| "draft_not_agent_owned"
 		| "send_in_progress"
 		| "too_many_attachments"
 		| "attachment_too_large"
@@ -164,14 +165,31 @@ export type AttachmentEditError = {
 };
 
 /**
- * May the owner change this draft's files right now? Only an open draft
- * (draft / pending_confirmation), not mid-send, and not a draft that is still the
- * agent's: its approval page shows the frozen text, not files, so an attachment
- * added from the web would ride along on an approval that never showed it. The
- * owner saves the draft first (the web PATCH takes it over, origin 'web'); from
- * then on it is an owner draft and takes files like any other.
+ * Who is changing the files: "mcp" is the agent, over MCP, on its own draft;
+ * absent is the owner from the web (or another internal caller).
  */
-function editable(sql: SqlStorage, draftId: string): AttachmentEditError | null {
+export type AttachmentRequester = "mcp" | undefined;
+
+/**
+ * May this caller change the draft's files right now?
+ *
+ * The agent: only on a draft that is still its own (origin 'mcp') and still a
+ * plain draft — once it waits for approval its content is frozen, exactly as
+ * save_draft answers draft_not_editable. Whatever it attaches is part of the
+ * payload the owner approves (the frozen snapshot and payload_hash cover the
+ * files, and the approval page lists each one by name, type and size).
+ *
+ * The owner: only an open draft (draft / pending_confirmation), not mid-send,
+ * and not a draft that is still the agent's — a file added from the web would
+ * ride along on an approval request the agent made for other content. The owner
+ * saves the draft first (the web PATCH takes it over, origin 'web'); from then
+ * on it is an owner draft and takes files like any other.
+ */
+function editable(
+	sql: SqlStorage,
+	draftId: string,
+	requester?: AttachmentRequester,
+): AttachmentEditError | null {
 	const draft = sql
 		.exec<{ status: string; origin: string }>(
 			"SELECT status, origin FROM outbound_drafts WHERE id = ?",
@@ -179,7 +197,11 @@ function editable(sql: SqlStorage, draftId: string): AttachmentEditError | null 
 		)
 		.toArray()[0];
 	if (!draft) throw new Error("draft not found");
-	if (draft.origin === "mcp") return { error: "agent_draft_attachments" };
+	if (requester === "mcp") {
+		if (draft.origin !== "mcp") return { error: "draft_not_agent_owned" };
+		if (draft.status !== "draft")
+			return { error: "draft_not_editable", currentStatus: draft.status };
+	} else if (draft.origin === "mcp") return { error: "agent_draft_attachments" };
 	if (draft.status !== "draft" && draft.status !== "pending_confirmation")
 		return { error: "draft_not_editable", currentStatus: draft.status };
 	if (
@@ -249,8 +271,9 @@ export function addUploadedAttachment(
 		sha256: string;
 		r2Key: string;
 	},
+	requester?: AttachmentRequester,
 ): { attachment: DraftAttachmentDto } | AttachmentEditError {
-	const blocked = editable(sql, draftId);
+	const blocked = editable(sql, draftId, requester);
 	if (blocked) return blocked;
 	const current = budget(sql, draftId);
 	const over = fits(current, input.size);
@@ -306,8 +329,9 @@ export function addMessageAttachments(
 	draftId: string,
 	messageId: string,
 	attachmentIds?: readonly string[],
+	requester?: AttachmentRequester,
 ): { added: DraftAttachmentDto[]; skipped: SkippedAttachment[] } | AttachmentEditError {
-	const blocked = editable(sql, draftId);
+	const blocked = editable(sql, draftId, requester);
 	if (blocked) return blocked;
 	const exists = sql.exec("SELECT 1 FROM messages WHERE id = ?", messageId).toArray().length;
 	if (!exists) return { error: "message_not_found" };
@@ -375,8 +399,9 @@ export function removeDraftAttachment(
 	sql: SqlStorage,
 	draftId: string,
 	attachmentId: string,
+	requester?: AttachmentRequester,
 ): { removed: string; deleteR2Key: string | null } | AttachmentEditError {
-	const blocked = editable(sql, draftId);
+	const blocked = editable(sql, draftId, requester);
 	if (blocked) return blocked;
 	const row = sql
 		.exec<Row>(

@@ -5,19 +5,14 @@ import { adminResponse } from "../lib/admin/errors";
 import * as ops from "../lib/admin/ops";
 import * as suppressions from "../lib/admin/suppressions";
 import * as templates from "../lib/admin/templates";
-import {
-	MAX_ATTACHMENT_BYTES,
-	normalizeAttachmentType,
-	sanitizeAttachmentName,
-} from "../lib/attachment-limits";
+import { MAX_ATTACHMENT_BYTES } from "../lib/attachment-limits";
 import { isPreviewableImage } from "../lib/attachment-preview";
-import { sha256Hex } from "../lib/crypto";
+import { storeDraftUpload } from "../lib/draft-attachment-upload";
 import { EMAIL_BASE_STYLE, injectIntoHead, prepareEmailHtml } from "../lib/email-html";
 import { AppError } from "../lib/errors";
 import { sanitizeOwnerHtml } from "../lib/html-sanitize";
 import { mailboxStub } from "../lib/mailbox-stub";
 import { confirmDraftSend } from "../lib/outbound-send";
-import { draftAttachmentR2Key, sanitizeFilename } from "../lib/r2-keys";
 import { htmlToPlainText } from "../lib/rich-text";
 import { enqueueTelegramCardRefreshForAction } from "../telegram/cards";
 import { assertMailboxAccess } from "./auth";
@@ -646,42 +641,13 @@ function registerDraftAttachmentRoutes(api: Hono<ApiBindings>): void {
 			return c.json({ error: "attachment_too_large", maxBytes: MAX_ATTACHMENT_BYTES }, 413);
 		}
 		if (bytes.byteLength === 0) return c.json({ error: "attachment_empty" }, 400);
-		const filename = c.req.query("filename") ?? "";
-		const contentType = normalizeAttachmentType(c.req.header("content-type"));
-		const id = crypto.randomUUID();
-		const r2Key = draftAttachmentR2Key({
+		return storeDraftUpload(c.env, stub, {
 			mailboxId,
 			draftId,
-			attachmentId: id,
-			safeFilename: sanitizeFilename(sanitizeAttachmentName(filename)),
+			filename: c.req.query("filename") ?? "",
+			contentType: c.req.header("content-type"),
+			bytes,
 		});
-		const sha256 = await sha256Hex(bytes);
-		await c.env.MAIL_OBJECTS.put(r2Key, bytes, {
-			httpMetadata: { contentType, contentDisposition: "attachment" },
-		});
-		let response: Response;
-		try {
-			response = await stub.fetch(
-				`https://mailbox-do/drafts/${encodeURIComponent(draftId)}/attachments`,
-				{
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify({
-						id,
-						filename,
-						contentType,
-						size: bytes.byteLength,
-						sha256,
-						r2Key,
-					}),
-				},
-			);
-		} catch (error) {
-			await c.env.MAIL_OBJECTS.delete(r2Key).catch(() => undefined);
-			throw error;
-		}
-		if (!response.ok) await c.env.MAIL_OBJECTS.delete(r2Key).catch(() => undefined);
-		return response;
 	});
 
 	api.post(`${path}/from-message`, async (c) => {

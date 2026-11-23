@@ -252,8 +252,9 @@ describe("CIMD opt-in", () => {
 		);
 		for (const requested of [null, "mail:read mail:draft keys:write"]) {
 			const { oauthQuery, verifier } = await runAuthorize(clientId, cookie, requested);
+			// The server adds offline_access (a refresh token) to whatever was asked.
 			expect(new URLSearchParams(oauthQuery).get("scope")).toBe(
-				requested ?? "mail:read mail:draft config:read",
+				`${requested ?? "mail:read mail:draft config:read"} offline_access`,
 			);
 			expect(new URLSearchParams(oauthQuery).get("redirect_uri")).toBe("https://client.example/cb");
 			const client = await run(
@@ -289,7 +290,9 @@ describe("CIMD opt-in", () => {
 			const body = (await token.json()) as { scope: string };
 			// A bare consent (no explicit tick) never grants a high-risk scope (keys:write).
 			expect(body.scope).toBe(
-				requested ? "mail:read mail:draft" : "mail:read mail:draft config:read",
+				requested
+					? "mail:read mail:draft offline_access"
+					: "mail:read mail:draft config:read offline_access",
 			);
 		}
 		const rows = await testEnv.INDEX_DB.prepare(
@@ -787,6 +790,7 @@ describe("the /mcp bearer-token perimeter", () => {
 				"read_thread",
 				"save_draft",
 				"cancel_draft",
+				"manage_draft_attachments",
 				"update_messages",
 				"get_health",
 				"list_ops",
@@ -800,7 +804,7 @@ describe("the /mcp bearer-token perimeter", () => {
 				destructiveHint: false,
 				idempotentHint: true,
 			});
-			for (const tool of tools.slice(8))
+			for (const tool of tools.slice(9))
 				expect(tool.annotations).toMatchObject({ readOnlyHint: true, openWorldHint: false });
 			for (const tool of tools) expect(tool.outputSchema).toBeTruthy();
 			const result = await call("tools/call", { name: "list_mailboxes", arguments: {} }, modern);
