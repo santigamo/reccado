@@ -30,7 +30,12 @@ import {
 } from "../lib/better-auth";
 import { resolveOwnerEmails } from "./auth";
 import { authMailHeader } from "../lib/auth-mail";
-import { DEFAULT_MCP_SCOPES, HIGH_RISK_MCP_SCOPES, MCP_SCOPES } from "../lib/mcp-scopes";
+import {
+	DEFAULT_MCP_SCOPES,
+	HIGH_RISK_MCP_SCOPES,
+	MCP_SCOPES,
+	OFFLINE_ACCESS_SCOPE,
+} from "../lib/mcp-scopes";
 import {
 	REGISTRATION_PATH_SUFFIX,
 	REGISTRATION_RATE_LIMIT,
@@ -355,9 +360,13 @@ export async function createAuth(
 			// audience-bound to the canonical /mcp resource; verification happens in
 			// mcp/handler.ts via @better-auth/mcp's requireMcpAuth. Tables: 0017.
 			mcp({
-				scopes: [...MCP_SCOPES],
-				clientRegistrationDefaultScopes: [...DEFAULT_MCP_SCOPES],
-				clientRegistrationAllowedScopes: [...MCP_SCOPES],
+				// offline_access is what makes the provider issue a refresh token; without
+				// it every connected agent had to log in again when its 1-hour access
+				// token expired. It grants no tool (tools are gated on MCP_SCOPES only),
+				// and the protected-resource metadata does not list it.
+				scopes: [...MCP_SCOPES, OFFLINE_ACCESS_SCOPE],
+				clientRegistrationDefaultScopes: [...DEFAULT_MCP_SCOPES, OFFLINE_ACCESS_SCOPE],
+				clientRegistrationAllowedScopes: [...MCP_SCOPES, OFFLINE_ACCESS_SCOPE],
 				resource: await resolveMcpResource(env, opts.request ?? new Request(baseURL)),
 				loginPage: "/login",
 				// The owner reviews client identity and requested permissions here.
@@ -503,6 +512,24 @@ function serializeSessionCookie(
 	return parts.join("; ");
 }
 
+/**
+ * The scope an MCP authorization request is handled with: the client's own
+ * request (or the defaults when it named none), plus offline_access.
+ *
+ * MCP clients take their scope list from the protected-resource metadata, which
+ * by design does not advertise offline_access (it is an authorization-server
+ * scope), so a stock client never asks for it, never gets a refresh token, and
+ * sends the owner back through the browser login every hour. Adding it here is
+ * the server deciding that a connection, once consented, lasts until the owner
+ * revokes it. It grants no tool; the consent page names it.
+ */
+export function withOfflineAccess(scope: string | null): string {
+	const requested = scope?.split(/\s+/).filter(Boolean) ?? [];
+	const scopes = requested.length > 0 ? requested : [...DEFAULT_MCP_SCOPES];
+	if (!scopes.includes(OFFLINE_ACCESS_SCOPE)) scopes.push(OFFLINE_ACCESS_SCOPE);
+	return scopes.join(" ");
+}
+
 const CONSENT_PATH = `${AUTH_BASE_PATH}/oauth2/consent`;
 /** Scopes that are only ever granted when the consent POST lists them explicitly. */
 const HIGH_RISK_CONSENT_SCOPES: ReadonlySet<string> = HIGH_RISK_MCP_SCOPES;
@@ -576,13 +603,12 @@ export async function handleAuthRequest(
 				{ status: 400 },
 			);
 		}
-		if (
-			url.pathname === `${AUTH_BASE_PATH}/oauth2/authorize` &&
-			request.method === "GET" &&
-			!url.searchParams.has("scope")
-		) {
-			url.searchParams.set("scope", DEFAULT_MCP_SCOPES.join(" "));
-			authRequest = new Request(url, request);
+		if (url.pathname === `${AUTH_BASE_PATH}/oauth2/authorize` && request.method === "GET") {
+			const withOffline = withOfflineAccess(url.searchParams.get("scope"));
+			if (withOffline !== url.searchParams.get("scope")) {
+				url.searchParams.set("scope", withOffline);
+				authRequest = new Request(url, request);
+			}
 		}
 		let registrationHosts: string[] = [];
 		if (

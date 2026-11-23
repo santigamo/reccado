@@ -123,6 +123,13 @@ export const SCOPE_COPY: Record<(typeof MCP_SCOPES)[number], ScopeCopy> = {
 /** Copy for a granted scope string, including ones this build no longer issues (e.g. legacy `admin`). */
 export function scopeCopy(scope: string): ScopeCopy {
 	if (scope in SCOPE_COPY) return SCOPE_COPY[scope as keyof typeof SCOPE_COPY];
+	if (scope === "offline_access") {
+		return {
+			label: "Stay connected",
+			detail: "Renews its access without a new login, until you revoke it here.",
+			gated: false,
+		};
+	}
 	if (scope === "admin") {
 		return {
 			label: "Legacy admin",

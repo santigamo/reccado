@@ -11,6 +11,8 @@ import migrationBetterAuthMcpFkFix from "../../migrations/d1/0018_better_auth_mc
 import migrationTwoFactor from "../../migrations/d1/0019_two_factor.sql?raw";
 import migrationAuthUpgrade from "../../migrations/d1/0021_better_auth_1_7_20.sql?raw";
 import migrationPasskey from "../../migrations/d1/0024_passkey.sql?raw";
+import migrationOfflineAccess from "../../migrations/d1/0031_oauth_client_offline_access.sql?raw";
+import { withOfflineAccess } from "../../src/api/better-auth";
 import { checkRegistrationBody, sweepStaleOAuthClients } from "../../src/lib/oauth-client-hygiene";
 import worker from "../../src/server";
 import { renderClientConnectedNotice } from "../../src/telegram/client-connected";
@@ -267,29 +269,103 @@ describe("PKCE flow after open registration", () => {
 			}),
 		);
 		expect(token.status).toBe(200);
-		const { access_token: accessToken } = (await token.json()) as { access_token: string };
+		const issued = (await token.json()) as {
+			access_token: string;
+			refresh_token?: string;
+			scope?: string;
+		};
+		// The client asked for "mail:read mail:draft" only; the server added
+		// offline_access, so the connection comes with a refresh token.
+		expect(issued.scope?.split(" ")).toContain("offline_access");
+		expect(issued.refresh_token).toBeTruthy();
 
-		const mcp = await run(
-			new Request(`${ORIGIN}/mcp`, {
-				method: "POST",
-				headers: {
-					"content-type": "application/json",
-					accept: "application/json, text/event-stream",
-					authorization: `Bearer ${accessToken}`,
-				},
-				body: JSON.stringify({
-					jsonrpc: "2.0",
-					id: 1,
-					method: "initialize",
-					params: {
-						protocolVersion: "2025-06-18",
-						capabilities: {},
-						clientInfo: { name: "std-test", version: "1" },
+		const initialize = (accessToken: string) =>
+			run(
+				new Request(`${ORIGIN}/mcp`, {
+					method: "POST",
+					headers: {
+						"content-type": "application/json",
+						accept: "application/json, text/event-stream",
+						authorization: `Bearer ${accessToken}`,
 					},
+					body: JSON.stringify({
+						jsonrpc: "2.0",
+						id: 1,
+						method: "initialize",
+						params: {
+							protocolVersion: "2025-06-18",
+							capabilities: {},
+							clientInfo: { name: "std-test", version: "1" },
+						},
+					}),
 				}),
-			}),
-		);
-		expect(mcp.status).toBe(200);
+			);
+		expect((await initialize(issued.access_token)).status).toBe(200);
+
+		// An hour later the client renews without the browser: the refresh grant
+		// answers a new access token that /mcp accepts, and a rotated refresh token.
+		const refresh = (refreshToken: string, extra: Record<string, string> = {}) =>
+			run(
+				new Request(`${ORIGIN}/api/auth/oauth2/token`, {
+					method: "POST",
+					headers: { "content-type": "application/x-www-form-urlencoded" },
+					body: new URLSearchParams({
+						grant_type: "refresh_token",
+						refresh_token: refreshToken,
+						client_id: clientId,
+						...extra,
+					}),
+				}),
+			);
+		const renewed = await refresh(issued.refresh_token!);
+		expect(renewed.status, await renewed.clone().text()).toBe(200);
+		const next = (await renewed.json()) as { access_token: string; refresh_token?: string };
+		expect(next.refresh_token).toBeTruthy();
+		expect(next.refresh_token).not.toBe(issued.refresh_token);
+		expect((await initialize(next.access_token)).status).toBe(200);
+		// The rotated token renews again, this time naming the resource as the MCP spec has clients do.
+		const again = await refresh(next.refresh_token!, { resource: `${ORIGIN}/mcp` });
+		expect(again.status, await again.clone().text()).toBe(200);
+		const third = (await again.json()) as { access_token: string };
+		expect((await initialize(third.access_token)).status).toBe(200);
+		// The consent page names it, and the tools a token unlocks are unchanged.
+		expect(withOfflineAccess(null).split(" ")).toEqual([
+			"mail:read",
+			"mail:draft",
+			"config:read",
+			"offline_access",
+		]);
+		expect(withOfflineAccess("mail:read offline_access")).toBe("mail:read offline_access");
+	});
+});
+
+describe("clients registered before offline_access", () => {
+	it("migration 0031 adds offline_access to stored client scopes once", async () => {
+		const legacy = JSON.stringify(["mail:read", "mail:draft", "config:read"]);
+		const now = Date.now();
+		const insert = (clientId: string, scopes: string | null) =>
+			testEnv.INDEX_DB.prepare(
+				`INSERT INTO "oauthClient" ("id", "clientId", "redirectUris", "scopes", "createdAt", "updatedAt") VALUES (?, ?, ?, ?, ?, ?)`,
+			)
+				.bind(crypto.randomUUID(), clientId, JSON.stringify([REDIRECT]), scopes, now, now)
+				.run();
+		await insert("legacy-client", legacy);
+		await insert("no-scopes-client", null);
+		await applyMigrations(testEnv.INDEX_DB, migrationOfflineAccess as string);
+		await applyMigrations(testEnv.INDEX_DB, migrationOfflineAccess as string);
+		const read = async (clientId: string) =>
+			(
+				await testEnv.INDEX_DB.prepare(`SELECT "scopes" FROM "oauthClient" WHERE "clientId" = ?`)
+					.bind(clientId)
+					.first<{ scopes: string | null }>()
+			)?.scopes ?? null;
+		expect(JSON.parse((await read("legacy-client"))!)).toEqual([
+			"mail:read",
+			"mail:draft",
+			"config:read",
+			"offline_access",
+		]);
+		expect(await read("no-scopes-client")).toBeNull();
 	});
 });
 
