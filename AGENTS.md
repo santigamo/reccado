@@ -151,8 +151,8 @@ actual repo state, fix this section rather than trusting it blindly.
   MCP endpoint (`/mcp`, Better Auth OAuth + owner registry; plan `docs/plans/mcp-v2.md`, final
   permission model in its "2026-11-14 final permission model" section) is no longer read/draft-only:
   `src/mcp/*` registers `list_mailboxes`, `list_threads`, `read_thread`, `read_message`,
-  `search_messages`, `save_draft`, `cancel_draft`, `update_messages`, `send`, `get_health`,
-  `list_ops`, `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`,
+  `search_messages`, `save_draft`, `cancel_draft`, `manage_draft_attachments`, `update_messages`,
+  `send`, `get_health`, `list_ops`, `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`,
   `manage_template`, `manage_api_key`, `remove_suppression`, `restore` and `reconcile_stale`
   (one operation per call, no batches). Scopes are `resource:action` with no `admin`:
   `mail:read`, `mail:read:sensitive`, `mail:draft`, `mail:send`, `config:read`, `mailboxes:write`,
@@ -170,12 +170,18 @@ actual repo state, fix this section rather than trusting it blindly.
   draft. All other writes apply directly and are undoable via `restore`. Delegation policies (`mcp_client_policies`, `pnpm operator mcp policy`, auto-apply,
   Telegram undo) were removed in `0030`. Connection is one URL + browser login: OAuth 2.1 + PRM,
   CIMD on (`MCP_CIMD_ENABLED`, `@better-auth/cimd`) as the preferred client registration, open
-  DCR kept as compatibility fallback; the owner revokes clients under `/settings/agent-access` "Connected
-  agents". Control-plane kinds live in `src/lib/control-plane-kinds/*`. Better
-  Auth/`@better-auth/mcp` is 1.7.20; migrations run through `0030` (`0021` Better Auth 1.7.20,
+  DCR kept as compatibility fallback; every authorization request carries `offline_access`
+  (added server-side), so clients get a refresh token and renew their 1-hour access JWT without a
+  new login; the owner revokes clients (and their refresh tokens) under `/settings/agent-access`
+  "Connected agents". Agents attach files only to their own plain drafts
+  (`manage_draft_attachments`, re-checked in the DO as `requester: "mcp"`); the files are part of
+  the frozen payload and the approval page lists each by name, type, size and hash. Control-plane
+  kinds live in `src/lib/control-plane-kinds/*`. Better
+  Auth/`@better-auth/mcp` is 1.7.20; migrations run through `0031` (`0021` Better Auth 1.7.20,
   `0022` approvals, `0024` passkey (unused), `0025`–`0028` audit/approval metadata, intent payload,
   pending uniqueness, `0029` `mcp_client_policies` + `approvals.approved_via`/`auto_refused`,
-  `0030` drops `mcp_client_policies`; `0023` does not exist). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
+  `0030` drops `mcp_client_policies`, `0031` adds `offline_access` to stored OAuth client scopes;
+  `0023` does not exist). Tier B proper (Workflows, EmailAgent drafting, RAG/Vectorize, AI
   Gateway) has not started — do not claim it. Cloudflare Email Sending lifecycle events are
   consumed by the `inbox-mcp-email-events` Queue and hard-bounce/complaint suppressions are
   enforced in the mailbox DO. The per-domain Email Sending event subscription is now created and

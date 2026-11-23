@@ -478,6 +478,12 @@ function stringField(value: unknown): string {
 	return typeof value === "string" ? value : "";
 }
 
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 function stringList(value: unknown): string[] {
 	return Array.isArray(value)
 		? value.filter((item): item is string => typeof item === "string")
@@ -514,18 +520,30 @@ export function fieldsFromSnapshot(snapshot: Record<string, unknown>): {
 	fields.push({ label: "Mensaje", value: text });
 	if (html) fields.push({ label: "HTML", value: html });
 	if (attachments.length) {
-		const hashes = attachments
-			.map((item) =>
-				item &&
-				typeof item === "object" &&
-				typeof (item as { sha256?: unknown }).sha256 === "string"
-					? (item as { sha256: string }).sha256
-					: "",
-			)
+		// One line per file: what the owner needs to judge it (name, type, size)
+		// and the hash the approval is bound to. An agent can attach files, so
+		// "2 attachments" would ask the owner to approve something they cannot see.
+		const lines = attachments
+			.map((item) => {
+				if (!item || typeof item !== "object") return "";
+				const file = item as Record<string, unknown>;
+				const sha256 = stringField(file.sha256);
+				if (!sha256) return "";
+				// Control characters (a newline would forge a second row) never reach the page.
+				const name = Array.from(stringField(file.filename), (ch) => {
+					const code = ch.charCodeAt(0);
+					return code < 0x20 || code === 0x7f ? " " : ch;
+				})
+					.join("")
+					.trim();
+				const type = stringField(file.contentType);
+				const size = typeof file.size === "number" ? formatBytes(file.size) : "";
+				return [name || "(unnamed)", type, size, `sha256 ${sha256}`].filter(Boolean).join(" · ");
+			})
 			.filter(Boolean);
 		fields.push({
 			label: "Adjuntos",
-			value: hashes.length ? hashes.join("\n") : String(attachments.length),
+			value: lines.length ? lines.join("\n") : String(attachments.length),
 		});
 	}
 	return { fields, warnings: [], from: from || null, recipients: [...to, ...cc, ...bcc] };

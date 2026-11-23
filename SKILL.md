@@ -257,7 +257,7 @@ If you use the manual path, you own the two sharp edges the scripted flow is des
 
 The MCP endpoint (`/mcp`) authenticates with Better Auth OAuth tokens plus the owner registry (see
 `SECURITY.md`, "MCP"). Tools: `list_mailboxes`, `list_threads`, `read_thread`, `read_message`,
-`search_messages`, `save_draft`, `cancel_draft`, `update_messages`, `send`, `get_health`, `list_ops`,
+`search_messages`, `save_draft`, `cancel_draft`, `manage_draft_attachments`, `update_messages`, `send`, `get_health`, `list_ops`,
 `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`, `manage_template`,
 `manage_api_key` (actions incl. `templates`, an in-place allowlist edit), `remove_suppression`, `restore`, `reconcile_stale` (`src/mcp/*`). Scopes:
 `mail:read`, `mail:draft`, `config:read` (default consent), `mail:send`, `mail:read:sensitive`,

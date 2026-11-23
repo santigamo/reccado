@@ -1,5 +1,7 @@
 import { getMailboxForOwner, listMailboxesByOwner } from "../db/d1";
+import type { DraftAttachmentDto } from "../do/mailbox-draft-attachments";
 import { isInstanceAuthSender } from "../lib/auth-mail";
+import { storeDraftUpload } from "../lib/draft-attachment-upload";
 import { sanitizeOwnerHtml } from "../lib/html-sanitize";
 import { mailboxStub } from "../lib/mailbox-stub";
 import { renderMarkdown } from "../lib/markdown";
@@ -69,6 +71,52 @@ const MESSAGE_ACTIONS = new Set<TelegramCardAction>([
 
 function isMessageAction(action: string): action is TelegramCardAction {
 	return MESSAGE_ACTIONS.has(action as TelegramCardAction);
+}
+
+/** A draft file as the agent sees it (no R2 key). */
+export type McpDraftAttachment = {
+	attachment_id: string;
+	filename: string;
+	content_type: string;
+	size: number;
+	sha256: string;
+	source: "upload" | "message";
+};
+
+export type McpDraftAttachmentsResult = {
+	draft_id: string;
+	added: McpDraftAttachment[];
+	skipped: Array<{ id: string; filename: string; reason: string }>;
+	attachments: McpDraftAttachment[];
+};
+
+function toMcpDraftAttachment(row: DraftAttachmentDto): McpDraftAttachment {
+	return {
+		attachment_id: row.id,
+		filename: row.filename,
+		content_type: row.content_type,
+		size: row.size,
+		sha256: row.sha256,
+		source: row.source,
+	};
+}
+
+/** Draft attachment refusals the agent can act on, by their DO error code. */
+export const DRAFT_ATTACHMENT_ERRORS: ReadonlySet<string> = new Set([
+	"draft_not_agent_owned",
+	"draft_not_editable",
+	"send_in_progress",
+	"too_many_attachments",
+	"attachment_too_large",
+	"attachments_too_large",
+]);
+
+async function draftAttachmentError(response: Response): Promise<Error> {
+	const body = (await response.json().catch(() => null)) as { error?: string } | null;
+	const code = body?.error ?? "";
+	if (DRAFT_ATTACHMENT_ERRORS.has(code)) return new Error(code);
+	if (response.status === 404) return new Error("not_found");
+	return new Error("internal_error");
 }
 
 async function draftMutationError(response: Response): Promise<Error> {
@@ -364,18 +412,24 @@ export class McpMailboxFacade {
 		};
 	}
 
-	async readResource(mailboxId: string, messageId: string, attachmentId?: string) {
-		assertScope(this.auth, "mail:read");
-		const msg = await this.messageRow(mailboxId, messageId);
-		// Fail closed: a row that was never classified, or whose body could not be
-		// parsed, cannot be shown to be harmless, and raw MIME/attachments carry the
-		// full content.
+	/**
+	 * Raw MIME and attachments carry the full content, so they need
+	 * mail:read:sensitive whenever the message is sensitive — or cannot be shown
+	 * not to be (never classified, or its body could not be parsed). Fail closed.
+	 */
+	private async assertFullContentReadable(msg: RawMessage): Promise<void> {
 		if (
 			msg.sensitive_classified !== 1 ||
 			msg.parse_status === "failed" ||
 			(await this.sensitivity(msg))
 		)
 			assertScope(this.auth, "mail:read:sensitive");
+	}
+
+	async readResource(mailboxId: string, messageId: string, attachmentId?: string) {
+		assertScope(this.auth, "mail:read");
+		const msg = await this.messageRow(mailboxId, messageId);
+		await this.assertFullContentReadable(msg);
 		const attachment = attachmentId
 			? msg.attachments?.find((a) => a.id === attachmentId)
 			: undefined;
@@ -506,6 +560,114 @@ export class McpMailboxFacade {
 		);
 		if (!response.ok) throw await draftMutationError(response);
 		return { draft_id: draftId, status: "cancelled" };
+	}
+
+	/**
+	 * Files on the agent's own draft. Each change is re-checked in the mailbox DO,
+	 * atomically with the write, as `requester: "mcp"`: the draft must still be the
+	 * agent's and still a plain draft (not waiting for approval). Everything
+	 * attached becomes part of the payload the owner approves — the frozen
+	 * snapshot and payload_hash cover the files, and the approval page lists them.
+	 */
+	async addDraftFile(
+		mailboxId: string,
+		draftId: string,
+		file: { filename: string; contentType?: string; bytes: Uint8Array },
+	): Promise<McpDraftAttachmentsResult> {
+		const stub = await this.resolveMailbox(mailboxId);
+		await this.assertAgentDraft(stub, draftId);
+		const response = await storeDraftUpload(this.env, stub, {
+			mailboxId,
+			draftId,
+			filename: file.filename,
+			contentType: file.contentType,
+			bytes: file.bytes,
+			requester: "mcp",
+		});
+		if (!response.ok) throw await draftAttachmentError(response);
+		const { attachment } = (await response.json()) as { attachment: DraftAttachmentDto };
+		return {
+			draft_id: draftId,
+			added: [toMcpDraftAttachment(attachment)],
+			skipped: [],
+			attachments: await this.draftAttachments(stub, draftId),
+		};
+	}
+
+	/**
+	 * Attaches files of a message in this mailbox (a forward, by reference to the
+	 * stored objects). The agent may attach only what it could download itself:
+	 * the same read gate as the attachment resources.
+	 */
+	async addDraftAttachmentsFromMessage(
+		mailboxId: string,
+		draftId: string,
+		messageId: string,
+		attachmentIds?: string[],
+	): Promise<McpDraftAttachmentsResult> {
+		assertScope(this.auth, "mail:read");
+		const stub = await this.resolveMailbox(mailboxId);
+		await this.assertAgentDraft(stub, draftId);
+		const msg = await this.messageRow(mailboxId, messageId);
+		await this.assertFullContentReadable(msg);
+		const known = new Set((msg.attachments ?? []).map((a) => a.id));
+		if (attachmentIds?.some((id) => !known.has(id))) throw new Error("not_found");
+		if (known.size === 0) throw new Error("not_found");
+		const response = await stub.fetch(
+			`https://mailbox-do/drafts/${encodeURIComponent(draftId)}/attachments/from-message`,
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ messageId, attachmentIds, requester: "mcp" }),
+			},
+		);
+		if (!response.ok) throw await draftAttachmentError(response);
+		const result = (await response.json()) as {
+			added: DraftAttachmentDto[];
+			skipped: Array<{ id: string; filename: string; reason: string }>;
+		};
+		return {
+			draft_id: draftId,
+			added: result.added.map(toMcpDraftAttachment),
+			skipped: result.skipped,
+			attachments: await this.draftAttachments(stub, draftId),
+		};
+	}
+
+	async removeDraftAttachment(
+		mailboxId: string,
+		draftId: string,
+		attachmentId: string,
+	): Promise<McpDraftAttachmentsResult> {
+		const stub = await this.resolveMailbox(mailboxId);
+		await this.assertAgentDraft(stub, draftId);
+		const response = await stub.fetch(
+			`https://mailbox-do/drafts/${encodeURIComponent(draftId)}/attachments/${encodeURIComponent(attachmentId)}`,
+			{
+				method: "DELETE",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ requester: "mcp" }),
+			},
+		);
+		if (!response.ok) throw await draftAttachmentError(response);
+		return {
+			draft_id: draftId,
+			added: [],
+			skipped: [],
+			attachments: await this.draftAttachments(stub, draftId),
+		};
+	}
+
+	private async draftAttachments(
+		stub: DurableObjectStub,
+		draftId: string,
+	): Promise<McpDraftAttachment[]> {
+		const response = await stub.fetch(
+			`https://mailbox-do/drafts/${encodeURIComponent(draftId)}/attachments`,
+		);
+		if (!response.ok) throw new Error("internal_error");
+		const { attachments } = (await response.json()) as { attachments: DraftAttachmentDto[] };
+		return attachments.map(toMcpDraftAttachment);
 	}
 
 	async updateMessages(mailboxId: string, messageIds: string[], action: string) {

@@ -3180,6 +3180,9 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			getDraft(sql, draftId);
 			return Response.json({ attachments: listDraftAttachments(sql, draftId) });
 		}
+		// requester "mcp": the agent, on its own draft (see editable() in
+		// mailbox-draft-attachments.ts). Absent: the owner from the web.
+		const requesterOf = (value: unknown) => (value === "mcp" ? ("mcp" as const) : undefined);
 		if (!tail && request.method === "POST") {
 			const body = (await request.json()) as {
 				id: string;
@@ -3188,15 +3191,26 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				size: number;
 				sha256: string;
 				r2Key: string;
+				requester?: unknown;
 			};
-			const result = addUploadedAttachment(sql, draftId, body);
+			const result = addUploadedAttachment(sql, draftId, body, requesterOf(body.requester));
 			return Response.json(result, {
 				status: "error" in result ? statusOf(result.error) : 201,
 			});
 		}
 		if (tail === "from-message" && request.method === "POST") {
-			const body = (await request.json()) as { messageId: string; attachmentIds?: string[] };
-			const result = addMessageAttachments(sql, draftId, body.messageId, body.attachmentIds);
+			const body = (await request.json()) as {
+				messageId: string;
+				attachmentIds?: string[];
+				requester?: unknown;
+			};
+			const result = addMessageAttachments(
+				sql,
+				draftId,
+				body.messageId,
+				body.attachmentIds,
+				requesterOf(body.requester),
+			);
 			return Response.json(result, {
 				status: "error" in result ? statusOf(result.error) : 200,
 			});
@@ -3207,7 +3221,10 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			return Response.json({ attachment: row });
 		}
 		if (tail && request.method === "DELETE") {
-			const result = removeDraftAttachment(sql, draftId, tail);
+			const body = request.headers.get("content-type")?.includes("application/json")
+				? ((await request.json()) as { requester?: unknown })
+				: {};
+			const result = removeDraftAttachment(sql, draftId, tail, requesterOf(body.requester));
 			if ("error" in result) {
 				return Response.json(result, { status: statusOf(result.error) });
 			}

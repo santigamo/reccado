@@ -21,6 +21,7 @@ const TOOL_NAMES = [
 	"read_thread",
 	"save_draft",
 	"cancel_draft",
+	"manage_draft_attachments",
 	"update_messages",
 	"get_health",
 	"list_ops",
@@ -58,6 +59,7 @@ const TOOL_SCOPES: Record<(typeof TOOL_NAMES)[number], string> = {
 	remove_suppression: "suppressions:write",
 	restore: "mailboxes:write",
 	reconcile_stale: "keys:write",
+	manage_draft_attachments: "mail:draft",
 	list_mailboxes: "mail:read",
 	list_threads: "mail:read",
 	search_messages: "mail:read",
@@ -247,6 +249,7 @@ describe("MCP P3 tools", () => {
 			"read_thread",
 			"save_draft",
 			"cancel_draft",
+			"manage_draft_attachments",
 			"update_messages",
 			"get_health",
 			"list_ops",
@@ -733,6 +736,78 @@ describe("MCP P3 tools", () => {
 		await expect(facade.updateMessages(id, [parent.messageId], "delete")).rejects.toThrow(
 			"validation_error",
 		);
+	});
+
+	it("manages files on the agent's own draft through manage_draft_attachments", async () => {
+		const drafter = actor("attach-drafter@local", ["mail:read", "mail:draft"]);
+		const id = await mailbox(drafter.email);
+		const created = await callTool(drafter, "save_draft", {
+			mailboxId: id,
+			to: ["person@example.com"],
+			subject: "With a file",
+			bodyText: "See attached.",
+			idempotencyKey: crypto.randomUUID(),
+		});
+		const draftId = (created.structuredContent as { draft: { draft_id: string } }).draft.draft_id;
+		const registered = serverFor(drafter)._registeredTools.manage_draft_attachments as unknown as {
+			description?: string;
+		};
+		expect(registered.description).toContain("approval page lists every file");
+
+		const added = await callTool(drafter, "manage_draft_attachments", {
+			mailboxId: id,
+			draftId,
+			action: "add_file",
+			filename: "notes.txt",
+			contentType: "text/plain",
+			contentBase64: btoa("hello world"),
+		});
+		expect(added.isError, textOf(added)).toBeFalsy();
+		const content = added.structuredContent as {
+			added: Array<{ attachment_id: string; size: number; filename: string }>;
+			attachments: unknown[];
+		};
+		expect(content.added[0]).toMatchObject({ filename: "notes.txt", size: 11 });
+		expect(content.attachments).toHaveLength(1);
+
+		// Not base64, or missing what the action needs: a validation error, nothing stored.
+		for (const bad of [
+			{ action: "add_file", filename: "x.txt", contentBase64: "not base64!" },
+			{ action: "add_file", contentBase64: btoa("x") },
+			{ action: "add_from_message" },
+			{ action: "remove" },
+		]) {
+			const result = await callTool(drafter, "manage_draft_attachments", {
+				mailboxId: id,
+				draftId,
+				...bad,
+			});
+			expect(result.isError, JSON.stringify(bad)).toBe(true);
+			expect(textOf(result), JSON.stringify(bad)).toContain("validation_error");
+		}
+		// Someone else's mailbox or a missing draft reads as not found.
+		expect(
+			textOf(
+				await callTool(drafter, "manage_draft_attachments", {
+					mailboxId: id,
+					draftId: "missing",
+					action: "remove",
+					attachmentId: "x",
+				}),
+			),
+		).toContain("not_found");
+
+		const removed = await callTool(drafter, "manage_draft_attachments", {
+			mailboxId: id,
+			draftId,
+			action: "remove",
+			attachmentId: content.added[0]!.attachment_id,
+		});
+		expect((removed.structuredContent as { attachments: unknown[] }).attachments).toEqual([]);
+		// Read-only callers do not even see the tool.
+		expect(
+			Object.keys(serverFor(actor("reader-only@local", ["mail:read"]))._registeredTools),
+		).not.toContain("manage_draft_attachments");
 	});
 
 	it("saves Markdown as a sanitised HTML part plus a matching text part, and needs exactly one body", async () => {
