@@ -29,17 +29,24 @@ async function draft() {
 }
 
 describe("frozen send intent", () => {
-	it("keeps MCP origin sticky and refuses unapproved sends", async () => {
+	it("never lets the agent claim an owner draft, keeps it the agent's otherwise, and refuses unapproved sends", async () => {
 		const { stub, id, arm } = await draft();
-		await stub.fetch(`https://mailbox-do/drafts/${id}`, {
+		// The agent cannot turn an owner's draft into its own.
+		const claimed = await stub.fetch(`https://mailbox-do/drafts/${id}`, {
 			method: "PATCH",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ origin: "mcp", bodyText: "Agent draft" }),
 		});
+		expect(claimed.status).toBe(409);
+		expect(await claimed.json()).toMatchObject({ error: "draft_not_agent_owned" });
+		await runInDurableObject(stub, async (_instance, state) => {
+			state.storage.sql.exec("UPDATE outbound_drafts SET origin = 'mcp' WHERE id = ?", id);
+		});
+		// An internal edit with no origin (the Telegram bridge) never changes the owner.
 		await stub.fetch(`https://mailbox-do/drafts/${id}`, {
 			method: "PATCH",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ origin: "web", bodyText: "Human edit" }),
+			body: JSON.stringify({ bodyText: "Bridge edit" }),
 		});
 		await arm();
 		const sent: unknown[] = [];
@@ -63,6 +70,25 @@ describe("frozen send intent", () => {
 		);
 		expect(result.error).toBe("approval_required");
 		expect(sent).toHaveLength(0);
+		// The owner saving it from the web takes it over, and voids the frozen intent.
+		const takeover = await stub.fetch(`https://mailbox-do/drafts/${id}`, {
+			method: "PATCH",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ origin: "web" }),
+		});
+		expect(await takeover.json()).toMatchObject({ takenOver: true });
+		const after = await runInDurableObject(stub, async (_instance, state) => ({
+			origin: state.storage.sql
+				.exec<{ origin: string }>("SELECT origin FROM outbound_drafts WHERE id = ?", id)
+				.toArray()[0]?.origin,
+			stale: state.storage.sql
+				.exec<{ value: string }>(
+					"SELECT value FROM mailbox_meta WHERE key = ?",
+					`intent_stale:${id}`,
+				)
+				.toArray()[0]?.value,
+		}));
+		expect(after).toEqual({ origin: "web", stale: "stale" });
 	});
 	it("hashes identical snapshots deterministically and keeps repeated requests stable", async () => {
 		const a = await draft();

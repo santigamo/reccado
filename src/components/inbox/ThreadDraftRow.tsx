@@ -42,12 +42,11 @@ export function ThreadDraftRow({
 						to {to.join(", ") || "(no recipients)"}
 					</span>
 					{byAgent ? <Pill tone="neutral">Written by the agent</Pill> : null}
-					{draft.status === "pending_confirmation" ? (
-						// An agent draft only reaches this row once its approval request is
-						// gone (the live one is drawn as the approval card instead).
-						<Pill tone={byAgent ? "neutral" : "approval"}>
-							{byAgent ? "Approval expired" : "Sending"}
-						</Pill>
+					{draft.status === "pending_confirmation" && !byAgent ? (
+						// An agent draft only reaches this row once no approval request is
+						// live for it (a live one is drawn as the approval card instead):
+						// it is then an ordinary draft the owner can open and send.
+						<Pill tone="approval">Sending</Pill>
 					) : null}
 					{files > 0 ? (
 						<Paperclip

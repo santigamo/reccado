@@ -11,6 +11,27 @@ package.
 
 ### Added
 
+- **The owner can send an agent's draft directly (2026-11-18).** The agent prepared a draft and
+  the web refused to send it (`approval_required`, "Approval expired") — a dead end. The rule is
+  now: the agent can never send; an agent-initiated send needs the hash-bound approval; the owner
+  may send an agent-written draft directly with the owner web session, bound to the content they
+  were shown; never from Telegram. *Direct send.* `GET /drafts/:id` serves a `content_fingerprint`
+  (SHA-256 over the draft's recipients, subject, text and HTML bodies, files and thread/parent);
+  the composer sends an untouched agent draft as it is with `draftFingerprint` on `confirm-send`.
+  Only that web route mints the new `owner-web-send.v1` HMAC proof (Origin present and equal,
+  session re-read with the cookie cache off); the mailbox DO compares the fingerprint with the
+  frozen send snapshot atomically and answers `draft_changed` (nothing sent) when the agent edited
+  it in between — the composer then reloads it with "The agent changed this draft after you opened
+  it". Without a fingerprint (or from Telegram) an agent draft is still refused. *Takeover.* Saving
+  an agent draft from the web (or adding a file to it) makes it the owner's (`origin` `web`): the
+  agent's `save_draft` / `cancel_draft` / `send` on it answer `draft_not_agent_owned`, checked in
+  the DO with the write; a replayed `save_draft` key no longer re-claims a draft. A takeover or a
+  direct send consumes any pending approval for the draft (it reads `stale`); a draft still sends
+  at most once whichever path gets there first. Ops events `send.owner_direct_agent_draft`,
+  `draft.owner_takeover`, `approval.superseded`; `send.confirmed` records the channel. The "Written
+  by the agent" pill stays; the "Approval expired" pill and the "can only be sent through your
+  approval link" copy are gone.
+
 - **Delete forever and Empty trash (2026-11-16).** The first permanent deletion in the mail client,
   and only from the Trash. *Web.* In Trash, "Delete forever" replaces Delete for the selected
   conversations, a row and the open conversation (`#` too), and an "Empty trash" bar/menu item acts

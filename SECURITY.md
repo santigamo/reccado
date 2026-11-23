@@ -222,11 +222,33 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
 - **Secrets never reach the agent.** `api_key_create` / rotate / `api_key_scopes` show the secret
   once, in the owner's approve response on the approval page; only the redacted result is stored in
   `result_json` and tool results strip `secret|token|plaintext`.
-- **Sticky draft origin.** A draft saved over MCP is permanently `origin='mcp'`; the web and
-  Telegram confirm paths refuse it (`approval_required`, fail closed). The mailbox DO sends it only
-  with an HMAC approval proof (`mcp-approval.v1`, 60 s, signed with `BETTER_AUTH_SECRET`) minted by
-  the approval. Human-authored sends (reply typed in Telegram, composed in the web UI) keep the
-  existing confirm flow: approval protects against the agent, not against the owner.
+- **Agent drafts: the agent never sends, the owner may.** The rule: the agent can never send; an
+  agent-initiated send needs the hash-bound approval; the owner may send an agent-written draft
+  directly with the owner web session, bound to the content they were shown; never from Telegram.
+  A draft saved over MCP has `origin='mcp'` while it is the agent's. The mailbox DO sends it only
+  with (a) an HMAC approval proof (`mcp-approval.v1`, 60 s, signed with `BETTER_AUTH_SECRET`)
+  minted by the approval, or (b) an HMAC owner-send proof (`owner-web-send.v1`, 60 s, same key,
+  different domain tag, bound to mailbox, draft, idempotency key and content fingerprint) minted
+  only by the web `confirm-send` route when the request carries `draftFingerprint`: that route
+  requires an Origin present and equal to its own (missing is a refusal) and re-reads the session
+  with the cookie cache off, the same bar as `POST /api/approvals/:id/approve`. The fingerprint is
+  the draft's `content_fingerprint` as served to the browser (a SHA-256 over every draft-held field
+  of the send snapshot: recipients, subject, text and HTML bodies, files, thread/parent). The DO
+  recomputes it from the frozen snapshot and, with no await between that and the send gate, checks
+  the draft still equals the snapshot; any difference answers `draft_changed` and sends nothing —
+  so an agent edit between the owner reading the draft and pressing Send cannot ride along. No
+  MCP code path can mint either proof. Telegram confirm and a web confirm without a fingerprint
+  still get `approval_required` (fail closed). Saving the draft from the web takes it over: `origin`
+  becomes `web`, and the agent's later `save_draft` / `cancel_draft` / `send` on it answer
+  `draft_not_agent_owned` (enforced in the DO with the write, not only in the facade); a retried
+  `save_draft` idempotency key can no longer claim a draft that is not the agent's. A takeover or a
+  direct owner send consumes any pending approval for that draft without a decision (it then reads
+  `stale` and can never be approved), and the DO's per-draft send gate keeps a draft sent at most
+  once whichever path reaches it first. Ops events: `draft.owner_takeover`,
+  `send.owner_direct_agent_draft` (distinct from an approval send, which records `mcp_approval` in
+  `outbound_sends`) and `approval.superseded`. Human-authored sends (reply typed in Telegram,
+  composed in the web UI) keep the existing confirm flow: approval protects against the agent, not
+  against the owner.
 - **Instance authentication mail is never visible to agents.** Sign-in and other
   authentication mail sent by this instance carries an `X-Reccado-Auth` HMAC marker; a message
   with a valid marker **or** from this instance's auth sender is classified `instance_auth` (at
@@ -242,7 +264,7 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
   keywords and token-bearing links are redacted; search without `mail:read:sensitive` does not
   match inside sensitive bodies; unclassified or parse-failed messages need
   `mail:read:sensitive` for raw access (fail closed). Agents can update or cancel only drafts
-  they created (`origin='mcp'`).
+  that are still theirs (`origin='mcp'`): not the owner's, and not one the owner has taken over.
 - **Host allow-list and framing.** `/mcp` accepts only localhost, the deployment's own origin and
   hosts listed in `MCP_ALLOWED_HOSTS`. Every HTML response carries `frame-ancestors 'none'`,
   `frame-src 'self'` and `X-Frame-Options: DENY`; `/approve/*` and `/inbox*` (whose URL can carry

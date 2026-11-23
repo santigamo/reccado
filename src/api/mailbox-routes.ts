@@ -1,5 +1,5 @@
 import type { Hono } from "hono";
-import { getMailbox } from "../db/d1";
+import { getMailbox, insertOpsEvent } from "../db/d1";
 import * as keys from "../lib/admin/api-keys";
 import { adminResponse } from "../lib/admin/errors";
 import * as ops from "../lib/admin/ops";
@@ -451,13 +451,35 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		const auth = c.get("auth")!;
 		const mailboxId = c.req.param("mailboxId");
 		assertMailboxAccess(auth, mailboxId, c.env);
+		const draftId = c.req.param("draftId");
 		const body = await withCleanHtml(updateDraftSchema.parse(await c.req.json()));
 		const stub = await requireMailboxStub(c.env, mailboxId);
-		return stub.fetch(`https://mailbox-do/drafts/${c.req.param("draftId")}`, {
+		// origin "web": the owner editing. Saving an agent's draft takes it over —
+		// it becomes the owner's, the agent can no longer change or cancel it, and
+		// any approval request frozen from the agent's version is superseded.
+		const response = await stub.fetch(`https://mailbox-do/drafts/${draftId}`, {
 			method: "PATCH",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
+			body: JSON.stringify({ ...body, origin: "web" }),
 		});
+		if (!response.ok) return response;
+		const result = (await response.json()) as Record<string, unknown>;
+		if (result.takenOver === true) {
+			const { supersedePendingSendApprovals } = await import("../lib/approvals");
+			await supersedePendingSendApprovals(c.env, {
+				mailboxId,
+				draftId,
+				reason: "owner_takeover",
+			}).catch(() => undefined);
+			await insertOpsEvent(c.env.INDEX_DB, {
+				id: crypto.randomUUID(),
+				event_type: "draft.owner_takeover",
+				severity: "info",
+				subject: mailboxId,
+				payload_json: JSON.stringify({ draftId, actor: auth.email }),
+			}).catch(() => undefined);
+		}
+		return c.json(result);
 	});
 
 	api.post("/api/mailboxes/:mailboxId/drafts/:draftId/request-send", async (c) => {
@@ -475,9 +497,10 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 				displayName: mailbox.display_name,
 				// The owner pressing Send again after an edit (body or files) re-freezes
 				// the draft as it is now; without this a stale intent could never be
-				// replaced from the web and every retry answered intent_stale. An agent
-				// draft is unaffected: its send still needs an approval bound to the
-				// new hash.
+				// replaced from the web and every retry answered intent_stale. Freezing
+				// an agent's draft sends nothing by itself: confirm-send then needs either
+				// an approval bound to the new hash or the owner's own send carrying the
+				// fingerprint of what they were shown.
 				replaceStale: true,
 			}),
 		});
@@ -489,10 +512,24 @@ export function registerMailboxRoutes(api: Hono<ApiBindings>): void {
 		assertMailboxAccess(auth, mailboxId, c.env);
 		const draftId = c.req.param("draftId");
 		const body = confirmSendSchema.parse(await c.req.json());
+		// The owner sending an agent's draft directly carries the fingerprint of the
+		// content the browser showed. That send is held to the approve endpoint's
+		// bar: the session was already re-read with the cookie cache off (hono.ts
+		// bypasses it for this path), and the Origin must be present and ours — a
+		// missing Origin is a refusal here, not a pass.
+		if (body.draftFingerprint) {
+			const origin = c.req.header("Origin");
+			if (!origin || origin !== new URL(c.req.url).origin) {
+				return c.json({ error: "origin_mismatch" }, 403);
+			}
+		}
 		const { status, body: result } = await confirmDraftSend(c.env, {
 			mailboxId,
 			draftId,
 			attemptKey: body.idempotencyKey,
+			...(body.draftFingerprint
+				? { ownerWebSend: { fingerprint: body.draftFingerprint, actor: auth.email } }
+				: {}),
 		});
 		return Response.json(result, { status });
 	});

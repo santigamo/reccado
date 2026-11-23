@@ -20,7 +20,7 @@ const MAX_MARKDOWN_CHARS = 100_000;
 
 /** Shown to agents in tools/list; also the place they learn that formatted mail exists. */
 export const SAVE_DRAFT_DESCRIPTION = [
-	"Create or update an email draft in a mailbox (a new message, or a reply when threadId + inReplyToMessageId are given). This tool never sends: to send, call the `send` tool with the draftId (needs the mail:send scope). That asks the mailbox owner to approve this exact message (headers, text and formatted body) on their approval page; nothing goes out until they do. Once a draft is waiting for approval it can no longer be edited here (draft_not_editable): cancel_draft it and save a new one instead.",
+	"Create or update an email draft in a mailbox (a new message, or a reply when threadId + inReplyToMessageId are given). This tool never sends: to send, call the `send` tool with the draftId (needs the mail:send scope). That asks the mailbox owner to approve this exact message (headers, text and formatted body) on their approval page; nothing goes out until they do. You can never send or approve yourself. The owner may also open the saved draft in their web inbox and send it themselves, exactly as they see it; if they edit and save it there it becomes theirs, and save_draft / cancel_draft on it then answer draft_not_agent_owned. Once a draft is waiting for approval it can no longer be edited here (draft_not_editable): cancel_draft it and save a new one instead.",
 	"Formatted mail is supported: pass the body as `bodyMarkdown` instead of `bodyText` (exactly one of the two). Supported Markdown: paragraphs (a single newline is a line break), **bold**, *italic*, `inline code`, ``` fenced code blocks ```, [links](https://example.com) and bare https:// URLs (http, https and mailto only; other targets stay plain text), - or 1. lists (indent two spaces to nest), # headings (shown as a bold line), > quotes and --- rules. Raw HTML is not supported and appears as literal text. The recipient gets an HTML part and a plain-text part rendered from the same Markdown (links read as 'text (url)').",
 	"To reply, call read_message first for the sender's address and put it in 'to'; never include the mailbox's own address. Pass idempotencyKey when creating so a retry does not create a second draft; pass draftId (no idempotencyKey needed) to replace the to/subject/body of a draft you created.",
 ].join(" ");
@@ -55,6 +55,7 @@ function toolErrorText(error: unknown): string {
 		reason === "not_found" ||
 		reason === "validation_error" ||
 		reason === "draft_not_editable" ||
+		reason === "draft_not_agent_owned" ||
 		reason.startsWith("insufficient_scope:")
 	) {
 		return reason;
