@@ -18,7 +18,25 @@ type Action = { kind: string; schema: z.ZodType<Record<string, unknown>> };
 const obj = <T extends z.ZodRawShape>(shape: T) =>
 	z.strictObject(shape) as unknown as z.ZodType<Record<string, unknown>>;
 const mailboxId = z.string().min(1);
-const body = <T extends z.ZodRawShape>(shape: T) => z.strictObject(shape);
+
+/**
+ * Some MCP clients send an object or array argument as its JSON text. Accept that text and parse
+ * it before validating; the published JSON Schema still shows the real object/array type.
+ */
+function parseJsonText(value: unknown): unknown {
+	if (typeof value !== "string") return value;
+	const text = value.trim();
+	if (!(text.startsWith("{") || text.startsWith("["))) return value;
+	try {
+		return JSON.parse(text);
+	} catch {
+		return value;
+	}
+}
+const body = <T extends z.ZodRawShape>(shape: T) =>
+	z.preprocess(parseJsonText, z.strictObject(shape));
+const list = <T extends z.ZodType>(item: T, min = 0) =>
+	z.preprocess(parseJsonText, z.array(item).min(min));
 
 // Field names mirror the src/lib/admin/* service inputs; the server-side kind `validate` stays the authority.
 const TOOLS: Record<string, { description: string; actions: Record<string, Action> }> = {
@@ -96,7 +114,7 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 					priority: z.number().int().min(0).optional(),
 					ruleAction: z.enum(["store", "forward", "reject"]).optional(),
 					mailboxId: z.string().min(1).nullable().optional(),
-					forwardTo: z.array(z.string()).optional(),
+					forwardTo: list(z.string()).optional(),
 					rejectReason: z.string().nullable().optional(),
 					enabled: z.boolean().optional(),
 				}),
@@ -142,8 +160,8 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 						environment: z.enum(["test", "live"]),
 						sender: z.string(),
 						senderName: z.string().nullable().optional(),
-						scopes: z.array(z.string()).min(1),
-						templateAllowlist: z.array(z.string()).optional(),
+						scopes: list(z.string(), 1),
+						templateAllowlist: list(z.string()).optional(),
 						recipientPolicy: z.string().optional(),
 						quotaMax: z.number().int().positive().optional(),
 						expiresAt: z.string().optional(),
@@ -157,8 +175,8 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 				schema: obj({
 					mailboxId,
 					keyId: z.string().min(1),
-					scopes: z.array(z.string()).min(1),
-					templateAllowlist: z.array(z.string()).optional(),
+					scopes: list(z.string(), 1),
+					templateAllowlist: list(z.string()).optional(),
 				}),
 			},
 			templates: {
@@ -166,9 +184,9 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 				schema: obj({
 					mailboxId,
 					keyId: z.string().min(1),
-					add: z.array(z.string()).optional(),
-					remove: z.array(z.string()).optional(),
-					set: z.array(z.string()).optional(),
+					add: list(z.string()).optional(),
+					remove: list(z.string()).optional(),
+					set: list(z.string()).optional(),
 				}),
 			},
 		},
@@ -404,6 +422,40 @@ function register(
 	);
 }
 
+/**
+ * Every action's fields, merged into one advertised shape so a client sees their names and types
+ * (an object stays an object instead of turning into text). Each is optional here and says which
+ * actions use it; the action's own strict schema in `resolveOp` still decides what is accepted.
+ */
+export function publishedFields(actions: Record<string, Action>): z.ZodRawShape {
+	const byField = new Map<string, Array<{ action: string; schema: z.ZodType }>>();
+	for (const [action, entry] of Object.entries(actions)) {
+		const shape = (entry.schema as unknown as z.ZodObject).shape;
+		for (const [field, schema] of Object.entries(shape)) {
+			const uses = byField.get(field) ?? [];
+			uses.push({ action, schema: schema as z.ZodType });
+			byField.set(field, uses);
+		}
+	}
+	const out: Record<string, z.ZodType> = {};
+	for (const [field, uses] of byField) {
+		const variants = new Map<string, z.ZodType>();
+		for (const { schema } of uses) {
+			const inner = schema instanceof z.ZodOptional ? (schema.unwrap() as z.ZodType) : schema;
+			variants.set(JSON.stringify(z.toJSONSchema(inner, { io: "input" })), inner);
+		}
+		const members = [...variants.values()];
+		const merged = members.length === 1 ? members[0]! : z.union(members as [z.ZodType, z.ZodType]);
+		const names = uses.map((use) => use.action);
+		const required = uses.filter(({ schema }) => !schema.safeParse(undefined).success);
+		const note = required.length
+			? ` Required by: ${required.map((use) => use.action).join(", ")}.`
+			: "";
+		out[field] = merged.optional().describe(`Used by: ${names.join(", ")}.${note}`);
+	}
+	return out;
+}
+
 export function registerAdminTools(
 	rawServer: McpServer,
 	env: Env,
@@ -420,7 +472,12 @@ export function registerAdminTools(
 				.enum(actions as [string, ...string[]])
 				.optional()
 				.describe(`One of: ${actions.join(", ")}`),
-			intentId: z.string().min(1).optional(),
+			intentId: z
+				.string()
+				.min(1)
+				.optional()
+				.describe("Only to check a pending approval: the intentId a previous call returned."),
+			...publishedFields(def.actions),
 		});
 		register(server, env, auth, origin, flow, tool, def.description, kinds, schema, (params) =>
 			resolveOp(tool, params),
