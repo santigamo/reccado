@@ -415,6 +415,66 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		expect((await approveNext(content.intentId)).reveal).toBeUndefined();
 	});
 
+	it("publishes each action's fields and accepts objects/arrays sent as JSON text", async () => {
+		await insertMailbox(db, {
+			mailbox_id: "mbx_mcp_jsontext",
+			primary_address: "jsontext@mcp-kinds.example",
+			display_name: null,
+			status: "active",
+			owner_email: email,
+		});
+		const { handler, registered } = await handlerFor("manage_template", auth, "legacy");
+		type Json = { type?: string; description?: string; properties: Record<string, Json> };
+		type Std = {
+			"~standard": {
+				jsonSchema: { input: (o: object) => Json };
+				validate: (v: unknown) => Promise<{ value?: object; issues?: unknown[] }>;
+			};
+		};
+		const schemaOf = (tool: string) =>
+			(registered[tool] as unknown as { inputSchema: Std }).inputSchema["~standard"];
+		const listed = schemaOf("manage_template").jsonSchema.input({ target: "draft-2020-12" });
+		expect(listed.properties.body).toMatchObject({
+			type: "object",
+			properties: { subject: { type: "string" } },
+		});
+		expect(listed.properties.templateId?.description).toContain("upsert");
+		const keyListed = schemaOf("manage_api_key").jsonSchema.input({ target: "draft-2020-12" });
+		expect(keyListed.properties.scopes?.type).toBe("array");
+
+		// A client that stringifies `body` passes the SDK's input validation and the action's own schema.
+		const validated = await schemaOf("manage_template").validate({
+			action: "upsert",
+			mailboxId: "mbx_mcp_jsontext",
+			templateId: "welcome",
+			body: JSON.stringify({ subject: "Hola", body_text: "Bienvenido" }),
+		});
+		expect(validated.issues).toBeUndefined();
+		const applied = (await handler(validated.value!, context())).structuredContent as {
+			status: string;
+		};
+		expect(applied.status).toBe("applied");
+
+		const created = await call("manage_api_key", {
+			action: "create",
+			mailboxId: "mbx_mcp_jsontext",
+			body: JSON.stringify({
+				environment: "test",
+				sender: "jsontext@mcp-kinds.example",
+				scopes: ["transactional:status"],
+			}),
+		});
+		expect(created.content.status).toBe("pending");
+		// Text that is not JSON is still a validation error, with no approval created.
+		const bad = await call("manage_template", {
+			action: "upsert",
+			mailboxId: "mbx_mcp_jsontext",
+			templateId: "welcome",
+			body: "{not json",
+		});
+		expect(bad.result.isError).toBe(true);
+	});
+
 	it("manage_api_key templates: applied in place immediately with no secret", async () => {
 		await insertMailbox(db, {
 			mailbox_id: "mbx_mcp_tpl",

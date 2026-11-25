@@ -489,9 +489,11 @@ function TerminalCard({
 				<p className="text-[14px] leading-[21px] text-text-muted">{copy.body}</p>
 			</div>
 			{fields.length > 0 && (
-				<details className="group border-t border-border-card">
+				<details className="group border-t border-border-card" open={status === "failed"}>
 					<summary className="flex h-11 cursor-pointer list-none items-center px-5 text-[13px] font-medium text-text-secondary outline-none hover:text-ink focus-visible:bg-row-selected [&::-webkit-details-marker]:hidden">
-						<span className="grow">What was requested</span>
+						<span className="grow">
+							{status === "failed" ? "What happened" : "What was requested"}
+						</span>
 						<span aria-hidden="true" className="transition-transform group-open:rotate-180">
 							▾
 						</span>

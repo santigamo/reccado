@@ -59,7 +59,7 @@ const STATUS_COPY: Record<string, StatusCopy> = {
 	failed: {
 		label: "Did not complete",
 		title: "The change did not complete",
-		body: "You approved it, but applying it failed. Check the result of each operation before asking again.",
+		body: "You approved it, but applying it failed. The reason and what to do are below, when available. Check them before asking again.",
 		tone: "danger",
 	},
 	denied: {
