@@ -87,7 +87,7 @@ Content-Type: application/json
 A body that fails the schema answers `403 invalid_request_body`. A body that is not JSON answers
 `400 {"error":"invalid_json"}`.
 
-**Idempotency** (`transactional-send-ops.ts:252-285`, `transactional-send.ts:334-410`)
+**Idempotency** (`transactional-send-ops.ts:252-286`, `transactional-send.ts:341-423`)
 
 - Idempotency is scoped to **(key id, Idempotency-Key)**. The payload hash covers `template`,
   `to`, `variables` and, when present, `replyTo`. The code shows no expiry on this record.

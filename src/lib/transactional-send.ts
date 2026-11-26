@@ -357,14 +357,14 @@ const PAYLOAD_HASH_V2 = "v2:";
 
 /**
  * Idempotency hash over key id, client idempotency key and the request body
- * (template, to, variables).
+ * (template, to, variables, and replyTo only when present).
  *
  * Variables are hashed as key-sorted `[name, value]` pairs, so the same variables
  * in a different key order are the same payload — JSON object order is not
  * something a client retrying a request can be expected to reproduce.
  *
- * Only the recipient is case-folded, the same canonical form the recipient
- * policy matches on. Everything else is hashed exactly: the legacy hash
+ * Only the addresses (`to`, and `replyTo` when set) are case-folded, the same
+ * canonical form the recipient policy matches on. Everything else is hashed exactly: the legacy hash
  * lower-cased the whole string, so a reused idempotency key carrying a
  * different magic-link token (`…/t/Token` vs `…/t/TOKEN`) replayed the first
  * result and the new email was silently never sent.

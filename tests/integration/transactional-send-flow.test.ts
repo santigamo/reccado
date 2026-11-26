@@ -487,22 +487,22 @@ describe("Transactional send flow", () => {
 			const mailboxId = "mbx_send_reply_to_bad";
 			const { plaintextKey } = await createKey(mailboxId, { templateAllowlist: ["t"] });
 			await createTemplate(mailboxId, "t", "Hello");
-			for (const replyTo of [
+			const bad = [
 				"Support <s@help.test>",
 				"s@help.test\r\nBcc: x@evil.test",
 				"a@b.com,c@d.com",
 				42,
-			]) {
-				const result = await sendTransactional(
-					mailboxId,
-					`Bearer ${plaintextKey}`,
-					`ik-rtb-${String(replyTo).length}`,
-					{
-						template: "t",
-						to: "a@b.com",
-						replyTo,
-					},
-				);
+				"",
+				"   ",
+				null,
+				`${"a".repeat(250)}@b.com`,
+			];
+			for (const [i, replyTo] of bad.entries()) {
+				const result = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, `ik-rtb-${i}`, {
+					template: "t",
+					to: "a@b.com",
+					replyTo,
+				});
 				expect(result.status).toBe(403);
 				expect(result.json.error).toBe("invalid_request_body");
 			}
