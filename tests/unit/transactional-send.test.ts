@@ -12,6 +12,7 @@ import {
 	transactionalResponseStatuses,
 	validateRecipientPolicy,
 } from "#/lib/transactional-send";
+import { sha256Hex } from "#/lib/crypto";
 
 describe("transactionalRequestSchema", () => {
 	it("accepts a valid request", () => {
@@ -450,6 +451,29 @@ describe("transactionalPayloadHash", () => {
 		expect(await payloadHashMatches(legacy, other)).toBe(false);
 		// A legacy hash is never mistaken for the current format or vice versa.
 		expect(await payloadHashMatches(`v2:${legacy}`, input)).toBe(false);
+	});
+
+	it("hashes a request without replyTo exactly as before the field existed", async () => {
+		const input = {
+			keyId: "k1",
+			clientIdempotencyKey: "ik1",
+			template: "t1",
+			to: "a@b.com",
+			variables: { a: "1" },
+		};
+		const expected =
+			"v2:" +
+			(await sha256Hex(
+				new TextEncoder().encode(JSON.stringify(["k1", "ik1", "t1", "a@b.com", [["a", "1"]]])),
+			));
+		expect(await transactionalPayloadHash(input)).toBe(expected);
+		expect(await transactionalPayloadHash({ ...input, replyTo: undefined })).toBe(expected);
+		const withReplyTo = await transactionalPayloadHash({ ...input, replyTo: "s@help.test" });
+		expect(withReplyTo).not.toBe(expected);
+		expect(await transactionalPayloadHash({ ...input, replyTo: "S@Help.test" })).toBe(withReplyTo);
+		// A legacy row predates Reply-To: a request carrying one never matches it.
+		const legacy = await legacyTransactionalPayloadHash(input);
+		expect(await payloadHashMatches(legacy, { ...input, replyTo: "s@help.test" })).toBe(false);
 	});
 
 	it("is case-insensitive for the recipient address", async () => {
