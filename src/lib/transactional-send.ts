@@ -12,6 +12,13 @@ export const MAX_TEMPLATE_SYNC_BATCH = 100;
 export const transactionalRequestSchema = z.object({
 	template: z.string().min(1).max(MAX_TEMPLATE_ID_LENGTH),
 	to: z.string().email(),
+	/**
+	 * Where a reply to this message should go: one bare address, no display name.
+	 * It lands in a header, so it is validated as an address (no whitespace, so no
+	 * CR/LF injection) and nothing else is accepted. It is part of the payload hash
+	 * only when present, so requests without it hash exactly as before.
+	 */
+	replyTo: z.string().trim().email().max(254).optional(),
 	variables: z
 		.record(z.string(), z.string().max(MAX_VARIABLE_VALUE_LENGTH))
 		.optional()
@@ -337,6 +344,7 @@ export type TransactionalPayloadHashInput = {
 	template: string;
 	to: string;
 	variables: Record<string, string>;
+	replyTo?: string;
 };
 
 /**
@@ -349,14 +357,14 @@ const PAYLOAD_HASH_V2 = "v2:";
 
 /**
  * Idempotency hash over key id, client idempotency key and the request body
- * (template, to, variables).
+ * (template, to, variables, and replyTo only when present).
  *
  * Variables are hashed as key-sorted `[name, value]` pairs, so the same variables
  * in a different key order are the same payload — JSON object order is not
  * something a client retrying a request can be expected to reproduce.
  *
- * Only the recipient is case-folded, the same canonical form the recipient
- * policy matches on. Everything else is hashed exactly: the legacy hash
+ * Only the addresses (`to`, and `replyTo` when set) are case-folded, the same
+ * canonical form the recipient policy matches on. Everything else is hashed exactly: the legacy hash
  * lower-cased the whole string, so a reused idempotency key carrying a
  * different magic-link token (`…/t/Token` vs `…/t/TOKEN`) replayed the first
  * result and the new email was silently never sent.
@@ -367,13 +375,17 @@ export async function transactionalPayloadHash(
 	const variables = Object.keys(input.variables)
 		.sort()
 		.map((name) => [name, input.variables[name]]);
-	const canonical = JSON.stringify([
+	const parts: unknown[] = [
 		input.keyId,
 		input.clientIdempotencyKey,
 		input.template,
 		input.to.trim().toLowerCase(),
 		variables,
-	]);
+	];
+	// Appended only when set: a request without Reply-To keeps the hash it always
+	// had, so idempotency keys used before the field existed still replay.
+	if (input.replyTo) parts.push(["replyTo", input.replyTo.trim().toLowerCase()]);
+	const canonical = JSON.stringify(parts);
 	return PAYLOAD_HASH_V2 + (await sha256Hex(new TextEncoder().encode(canonical)));
 }
 
@@ -405,6 +417,8 @@ export async function payloadHashMatches(
 	if (stored.startsWith(PAYLOAD_HASH_V2)) {
 		return stored === (await transactionalPayloadHash(input));
 	}
+	// Legacy rows predate Reply-To, so a request carrying one is a different payload.
+	if (input.replyTo) return false;
 	return stored === (await legacyTransactionalPayloadHash(input));
 }
 

@@ -75,21 +75,22 @@ Content-Type: application/json
   Derive the key from the business event (`<purpose>:<entity>:<version>`), never from a random
   value generated per attempt.
 
-**Body** (`src/lib/transactional-send.ts:4-23`)
+**Body** (`src/lib/transactional-send.ts:12-30`)
 
 | Field | Rule |
 | --- | --- |
 | `template` | string, 1–120 characters, must be on the key's allowlist and active in the mailbox |
 | `to` | one email address. There is no CC, BCC, list, attachment or custom header |
+| `replyTo` | optional. One bare email address (surrounding spaces are trimmed, at most 254 characters), sent as the message's `Reply-To` header so replies go there instead of to the key's sender. No display name (`Name <addr>`), no list. Omit it for no `Reply-To` header |
 | `variables` | optional object of **string → string**. At most 50 entries, each value at most 10 000 characters. Numbers and booleans are rejected, so stringify them first |
 
 A body that fails the schema answers `403 invalid_request_body`. A body that is not JSON answers
 `400 {"error":"invalid_json"}`.
 
-**Idempotency** (`transactional-send-ops.ts:252-285`, `transactional-send.ts:334-410`)
+**Idempotency** (`transactional-send-ops.ts:252-286`, `transactional-send.ts:341-423`)
 
 - Idempotency is scoped to **(key id, Idempotency-Key)**. The payload hash covers `template`,
-  `to` and `variables`. The code shows no expiry on this record.
+  `to`, `variables` and, when present, `replyTo`. The code shows no expiry on this record.
 - **Same key and same payload** replays the stored outcome with the original `requestId`, and
   Reccado does not contact the provider again. A replay answers with the original status (there
   is no separate `duplicate` status). A replay of a request that is still in flight answers
@@ -98,6 +99,9 @@ A body that fails the schema answers `403 invalid_request_body`. A body that is 
   `idempotency_key_already_used_with_different_payload` and the original `requestId`.
 - What counts as "the same payload":
   - Variable **key order doesn't matter**: `{b, a}` after `{a, b}` replays.
+  - `replyTo` is part of the payload only when you send it: a request without it hashes exactly
+    as it did before the field existed, so keys used earlier still replay. Adding, removing or
+    changing `replyTo` on a reused key is a `409`. Like `to`, it is compared case-insensitively.
   - The recipient address is compared case-insensitively. The template id and variable names
     and values are compared **exactly**, so a reused key with a token that differs only in
     case is a `409`, not a replay.

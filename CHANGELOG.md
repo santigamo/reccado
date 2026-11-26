@@ -11,6 +11,10 @@ package.
 
 ### Added
 
+- **Reply-To on transactional sends (2026-11-26).** `POST .../transactional/messages` accepts an
+  optional `replyTo` (one bare address) and sends it as the `Reply-To` header. It joins the
+  idempotency payload hash only when present, so requests without it hash as before. See
+  `docs/INTEGRATING.md` §3.
 - **Agents can attach files to their drafts (2026-11-23).** New MCP tool
   `manage_draft_attachments` (scope `mail:draft`): `add_file` (base64, the web's 17 MiB / 20-file
   limits), `add_from_message` (a message's files by reference, gated like downloading them:

@@ -429,6 +429,116 @@ describe("Transactional send flow", () => {
 		});
 	});
 
+	describe("Reply-To", () => {
+		async function sendCapturing(
+			mailboxId: string,
+			plaintextKey: string,
+			ik: string,
+			body: unknown,
+		) {
+			const stub = env.MAILBOX_DO.getByName(mailboxId);
+			return runInDurableObject(stub, async (_instance, state) => {
+				const calls: Array<Record<string, unknown>> = [];
+				const { handleTransactionalSend } = await import("#/do/transactional-send-ops");
+				const result = await handleTransactionalSend(
+					{
+						sql: state.storage.sql,
+						transactionSync: (fn: () => void) => state.storage.transactionSync(fn),
+						email: {
+							send: async (message: Record<string, unknown>) => {
+								calls.push(message);
+								return { messageId: `<m${calls.length}@test>` };
+							},
+						} as unknown as SendEmail,
+						fromAddress: "sender@test.com",
+					},
+					(env as unknown as { TRANSACTIONAL_API_KEY_PEPPER: string }).TRANSACTIONAL_API_KEY_PEPPER,
+					{ mailboxId, authHeader: `Bearer ${plaintextKey}`, idempotencyKeyHeader: ik, body },
+				);
+				return { result: result as unknown as Record<string, unknown>, calls };
+			});
+		}
+
+		it("passes replyTo to the provider, and sends none when it is omitted", async () => {
+			const mailboxId = "mbx_send_reply_to";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				quotaMax: 10,
+			});
+			await createTemplate(mailboxId, "t", "Hello");
+
+			const withIt = await sendCapturing(mailboxId, plaintextKey, "ik-rt-1", {
+				template: "t",
+				to: "a@b.com",
+				replyTo: " support@help.test ",
+			});
+			expect(withIt.result.status).toBe("sent");
+			expect(withIt.calls[0]?.replyTo).toBe("support@help.test");
+
+			const without = await sendCapturing(mailboxId, plaintextKey, "ik-rt-2", {
+				template: "t",
+				to: "a@b.com",
+			});
+			expect(without.result.status).toBe("sent");
+			expect(without.calls[0]?.replyTo).toBeUndefined();
+		});
+
+		it("rejects a replyTo that is not a single bare address", async () => {
+			const mailboxId = "mbx_send_reply_to_bad";
+			const { plaintextKey } = await createKey(mailboxId, { templateAllowlist: ["t"] });
+			await createTemplate(mailboxId, "t", "Hello");
+			const bad = [
+				"Support <s@help.test>",
+				"s@help.test\r\nBcc: x@evil.test",
+				"a@b.com,c@d.com",
+				42,
+				"",
+				"   ",
+				null,
+				`${"a".repeat(250)}@b.com`,
+			];
+			for (const [i, replyTo] of bad.entries()) {
+				const result = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, `ik-rtb-${i}`, {
+					template: "t",
+					to: "a@b.com",
+					replyTo,
+				});
+				expect(result.status).toBe(403);
+				expect(result.json.error).toBe("invalid_request_body");
+			}
+		});
+
+		it("treats replyTo as part of the payload for idempotency", async () => {
+			const mailboxId = "mbx_send_reply_to_idem";
+			const { plaintextKey } = await createKey(mailboxId, {
+				templateAllowlist: ["t"],
+				quotaMax: 10,
+			});
+			await createTemplate(mailboxId, "t", "Hello");
+			const body = { template: "t", to: "a@b.com", replyTo: "support@help.test" };
+
+			const first = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "ik-rti-1", body);
+			expect(first.status).toBe(200);
+			const replay = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "ik-rti-1", {
+				...body,
+				replyTo: "SUPPORT@help.test",
+			});
+			expect(replay.status).toBe(200);
+			expect(replay.json.requestId).toBe(first.json.requestId);
+
+			const changed = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "ik-rti-1", {
+				...body,
+				replyTo: "other@help.test",
+			});
+			expect(changed.status).toBe(409);
+			const dropped = await sendTransactional(mailboxId, `Bearer ${plaintextKey}`, "ik-rti-1", {
+				template: "t",
+				to: "a@b.com",
+			});
+			expect(dropped.status).toBe(409);
+		});
+	});
+
 	describe("D1 projection no secret body", () => {
 		it("upsertTransactionalRequestLog does not leak body secret or variables", async () => {
 			const mailboxId = "mbx_d1_proj_send";

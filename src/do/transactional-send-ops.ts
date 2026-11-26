@@ -188,7 +188,7 @@ export async function handleTransactionalSend(
 	if (!parsedBody.success) {
 		return { status: "rejected", requestId: "", keyId: activeKeyId, error: "invalid_request_body" };
 	}
-	const { template: templateId, to, variables } = parsedBody.data;
+	const { template: templateId, to, variables, replyTo } = parsedBody.data;
 
 	// 14. Check template allowlist
 	//     Null/empty = no template allowed (explicit allowlist required for creation).
@@ -257,6 +257,7 @@ export async function handleTransactionalSend(
 		template: templateId,
 		to,
 		variables,
+		replyTo,
 	};
 	const payloadHash = await transactionalPayloadHash(hashInput);
 
@@ -355,6 +356,7 @@ export async function handleTransactionalSend(
 			to,
 			from: fromAddress,
 			fromName: record.senderName,
+			replyTo: replyTo ?? null,
 			subject: interpolated.subject,
 			bodyText: interpolated.body_text,
 			bodyHtml: interpolated.body_html,
@@ -403,6 +405,8 @@ type DoSendParams = {
 	 * the address is also used unformatted elsewhere in this function.
 	 */
 	fromName: string | null;
+	/** Reply-To address from the request, or null for no Reply-To header. */
+	replyTo: string | null;
 	subject: string;
 	bodyText: string | null;
 	bodyHtml: string | null;
@@ -467,6 +471,7 @@ async function doTransactionalSend(
 			// safe to add without touching keys already in production.
 			from: params.fromName ? { name: params.fromName, email: params.from } : params.from,
 			to: [params.to],
+			replyTo: params.replyTo ?? undefined,
 			subject: params.subject,
 			text: params.bodyText ?? undefined,
 			html: params.bodyHtml ?? undefined,
