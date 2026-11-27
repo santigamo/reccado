@@ -361,6 +361,18 @@ read/search/draft endpoint.
 
 ### Fixed
 
+- **Editing an API key's template allowlist works on existing mailboxes (2026-11-27).**
+  `manage_api_key` `templates` (kind `api_key_templates`) failed in production with
+  `CHECK constraint failed: event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated')`:
+  `template_allowlist_updated` had been added to the v6 `api_key_events` rebuild after v6 shipped,
+  so every mailbox already past v6 kept the old CHECK. Tests only ran on fresh mailboxes, which
+  get the current schema. Mailbox schema v16 re-runs the rebuild (rows kept, one transaction,
+  skipped when the stored CHECK already admits every type), the allowed types live in one list
+  (`API_KEY_EVENT_TYPES`) shared by the fresh schema and the rebuild, and a test checks that every
+  type the key operations write is in it. The allowlist and sender-name edits now run in one
+  transaction with their audit row: before, a refused audit row left the change applied in the
+  mailbox while the call failed and D1 was not updated.
+
 - **MCP connections no longer expire every hour (2026-11-23).** Better Auth issues a refresh token
   only for grants that carry `offline_access`, which Reccado did not offer and MCP clients never
   ask for (the protected-resource metadata hides it): production had issued zero refresh tokens,

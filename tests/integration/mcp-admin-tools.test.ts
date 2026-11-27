@@ -1,3 +1,4 @@
+import { abortAllDurableObjects, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
 import { handleAuthRequest } from "#/api/better-auth";
@@ -24,12 +25,14 @@ import migrationIntentPayload from "../../migrations/d1/0027_intent_payload.sql?
 import migrationPendingUnique from "../../migrations/d1/0028_approval_pending_unique.sql?raw";
 import { McpServer, type ServerContext } from "@modelcontextprotocol/server";
 import { insertMailbox } from "#/db/d1";
+import { listApiKeyEvents } from "#/do/transactional-key-ops";
 import { mailboxStub } from "#/lib/mailbox-stub";
 import { getIntentView } from "#/lib/approvals";
 import { registerTools } from "../../src/mcp/tools";
 import { makeIntentCodec } from "../../src/mcp/intent-flow";
 import * as notification from "../../src/telegram/notify";
 import { vi } from "vitest";
+import { revertApiKeyEventsToV15, schemaVersion } from "../helpers/api-key-events-legacy";
 import { applyMigrations } from "../helpers/migrations";
 
 const db = env.INDEX_DB;
@@ -511,6 +514,71 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 		).json()) as { keys: Array<{ keyId: string; templateAllowlist: string[] }> };
 		expect(after.keys).toHaveLength(1);
 		expect(after.keys[0]).toMatchObject({ keyId, templateAllowlist: ["welcome", "invoice"] });
+	});
+
+	it("manage_api_key templates on a mailbox with the production (v15) event CHECK", async () => {
+		// Production failed here: mailboxes past v6 kept an api_key_events CHECK
+		// without 'template_allowlist_updated', so the audit insert rolled the edit back.
+		const MBX = "mbx_mcp_tpl_v15";
+		await insertMailbox(db, {
+			mailbox_id: MBX,
+			primary_address: "tplv15@mcp-kinds.example",
+			display_name: null,
+			status: "active",
+			owner_email: email,
+		});
+		const created = await call("manage_api_key", {
+			action: "create",
+			mailboxId: MBX,
+			body: {
+				environment: "test",
+				sender: "tplv15@mcp-kinds.example",
+				scopes: ["transactional:send", "transactional:templates:use"],
+				templateAllowlist: ["welcome"],
+			},
+		});
+		expect((await approveNext(created.content.intentId)).status).toBe("executed");
+		const listKeys = async () =>
+			(
+				(await (
+					await mailboxStub(env, MBX).fetch("https://mailbox-do/transactional/api-keys")
+				).json()) as { keys: Array<{ keyId: string; templateAllowlist: string[] }> }
+			).keys;
+		const keyId = (await listKeys())[0]!.keyId;
+		await runInDurableObject(mailboxStub(env, MBX), async (_i, state) =>
+			revertApiKeyEventsToV15(state.storage.sql),
+		);
+
+		// Before a restart the old CHECK is live: the production error, nothing changed.
+		const broken = await call("manage_api_key", {
+			action: "templates",
+			mailboxId: MBX,
+			keyId,
+			add: ["invoice"],
+		});
+		expect(broken.content.status).not.toBe("applied");
+		expect(JSON.stringify(broken.result)).toContain("CHECK constraint failed");
+		expect((await listKeys())[0]?.templateAllowlist).toEqual(["welcome"]);
+
+		// A restart runs v16, after which the same call applies in place with its audit row.
+		await abortAllDurableObjects();
+		const { content } = await call("manage_api_key", {
+			action: "templates",
+			mailboxId: MBX,
+			keyId,
+			add: ["invoice"],
+		});
+		expect(content.status).toBe("applied");
+		expect((await listKeys())[0]).toMatchObject({
+			keyId,
+			templateAllowlist: ["welcome", "invoice"],
+		});
+		const events = await runInDurableObject(mailboxStub(env, MBX), async (_i, state) => ({
+			version: schemaVersion(state.storage.sql),
+			types: listApiKeyEvents(state.storage.sql, keyId).map((event) => event.eventType),
+		}));
+		expect(events.version).toBe(16);
+		expect(events.types).toEqual(["created", "template_allowlist_updated"]);
 	});
 
 	it("restore tool: disable a domain, then restore it through the tools", async () => {

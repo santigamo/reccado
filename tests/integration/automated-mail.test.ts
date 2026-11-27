@@ -446,7 +446,7 @@ describe("schema v11 on a mailbox that predates it", () => {
 					.toArray()[0]?.v,
 			}),
 		);
-		expect(after).toEqual({ indexes: 2, version: 15 });
+		expect(after).toEqual({ indexes: 2, version: 16 });
 
 		const byId = new Map((await messageRows(name)).map((r) => [r.id, r]));
 		expect(byId.get(report.messageLocalId)).toMatchObject({
