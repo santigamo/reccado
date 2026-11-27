@@ -1,7 +1,13 @@
 import type { AuthContext } from "../../api/auth";
 import { insertOpsEvent } from "../../db/d1";
 
-export type SnapshotEntity = "mailbox" | "domain" | "alias" | "routing_rule" | "template";
+export type SnapshotEntity =
+	| "mailbox"
+	| "domain"
+	| "alias"
+	| "routing_rule"
+	| "template"
+	| "template_sync";
 
 /** Before-snapshot an owner can later reapply with the `restore` kind. */
 export async function writeBeforeSnapshot(

@@ -49,6 +49,14 @@ export function archiveTemplate(
 ) {
 	return perform(env, actor, input, "POST", `/${input.templateId}/archive`);
 }
+/** Undo of a template sync: previous content back, templates the sync created removed. */
+export function revertTemplateSync(
+	env: Env,
+	actor: AuthContext,
+	input: TemplateInput & { body: { restore: unknown[]; remove: string[] } },
+) {
+	return perform(env, actor, input, "POST", "/revert-sync");
+}
 export async function syncTemplates(env: Env, actor: AuthContext, input: TemplateInput) {
 	await requireMailboxOwner(env, actor, input.mailboxId);
 	const body = parseAdmin(syncTransactionalTemplatesSchema, await input.body);

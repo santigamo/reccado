@@ -2562,6 +2562,31 @@ export class MailboxDurableObject extends DurableObject<Env> {
 				return Response.json({ error: msg }, { status: 500 });
 			}
 		}
+		// Undo of a template sync (restore of a `template_sync` snapshot); see `revertTemplateSync`.
+		if (url.pathname === "/transactional/templates/revert-sync" && request.method === "POST") {
+			const mailboxId = this.ctx.id.name ?? "unknown";
+			const { revertTemplateSync, TemplateSyncError } = await import("./transactional-send-ops");
+			let body: { restore: import("./transactional-send-ops").TemplateInput[]; remove: string[] };
+			try {
+				body = (await request.json()) as typeof body;
+			} catch {
+				return Response.json({ error: "invalid_json" }, { status: 400 });
+			}
+			try {
+				const results = revertTemplateSync(
+					this.ctx.storage.sql,
+					(fn) => this.ctx.storage.transactionSync(fn),
+					mailboxId,
+					body ?? { restore: [], remove: [] },
+				);
+				return Response.json({ ok: true, results });
+			} catch (error) {
+				if (error instanceof TemplateSyncError)
+					return Response.json({ error: error.code }, { status: 400 });
+				const msg = error instanceof Error ? error.message : String(error);
+				return Response.json({ error: msg }, { status: 500 });
+			}
+		}
 		if (url.pathname === "/transactional/templates" && request.method === "GET") {
 			const mailboxId = this.ctx.id.name ?? "unknown";
 			const { listTemplates } = await import("./transactional-send-ops");

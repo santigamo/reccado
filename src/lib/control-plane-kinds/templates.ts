@@ -2,9 +2,17 @@ import { z } from "zod";
 import type { AuthContext } from "../../api/auth";
 import { requireMailboxOwner } from "../admin/access";
 import { AdminError } from "../admin/errors";
-import { listDomains } from "../../db/d1";
+import { getMailbox, insertOpsEvent, listDomains } from "../../db/d1";
 import type { IntentField, IntentWarning } from "../approvals";
-import { archiveTemplate, createTemplate, listTemplates, updateTemplate } from "../admin/templates";
+import {
+	archiveTemplate,
+	createTemplate,
+	listTemplates,
+	syncTemplates,
+	updateTemplate,
+} from "../admin/templates";
+import { templateContentHash } from "../template-hash";
+import { MAX_TEMPLATE_SYNC_BATCH } from "../transactional-send";
 import { registerControlPlaneKind, show, strict, type Operation } from "../control-plane-registry";
 import { lineDiff } from "./text-diff";
 import { writeBeforeSnapshot } from "./snapshot";
@@ -16,17 +24,18 @@ export type TemplateRow = {
 	body_html: string | null;
 };
 const templateId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+const subject = z
+	.string()
+	.min(1)
+	.max(300)
+	.refine((s) => !/[\r\n]/.test(s), "subject_contains_newline");
 const upsertSchema = z
 	.object({
 		mailboxId: z.string().min(1).max(100),
 		templateId,
 		body: z
 			.object({
-				subject: z
-					.string()
-					.min(1)
-					.max(300)
-					.refine((s) => !/[\r\n]/.test(s), "subject_contains_newline"),
+				subject,
 				body_text: z.string().max(100_000).nullable().optional(),
 				body_html: z.string().max(200_000).nullable().optional(),
 			})
@@ -213,5 +222,200 @@ registerControlPlaneKind("template_archive", {
 			...row,
 		});
 		return archiveTemplate(env, auth, { mailboxId: p.mailboxId, templateId: p.templateId });
+	},
+});
+
+// --- template_sync: a whole set of templates in one atomic call ---
+
+/** D1 keeps a row under ~2 MB; the before-snapshot of a sync must fit in one ops event. */
+export const MAX_SYNC_SNAPSHOT_BYTES = 1_800_000;
+
+const syncItem = z
+	.object({
+		id: templateId.refine((id) => !id.includes(".."), "invalid_template_id"),
+		subject,
+		// The mailbox DO's own per-template limits (`templateInputProblem`), checked here first.
+		body_text: z.string().max(100_000).nullable().optional(),
+		body_html: z.string().max(100_000).nullable().optional(),
+	})
+	.strict();
+const syncSchema = z
+	.object({
+		mailboxId: z.string().min(1).max(100),
+		templates: z.array(syncItem).min(1).max(MAX_TEMPLATE_SYNC_BATCH),
+		/** Where the MCP layer fetched `templates` from (recorded, never re-fetched here). */
+		source: z
+			.object({
+				url: z.string().min(1).max(2048),
+				sha256: z.string().regex(/^[0-9a-f]{64}$/),
+				bytes: z.number().int().min(0),
+			})
+			.strict()
+			.optional(),
+	})
+	.strict()
+	.superRefine((body, ctx) => {
+		const seen = new Set<string>();
+		body.templates.forEach((template, index) => {
+			if (seen.has(template.id))
+				ctx.addIssue({
+					code: "custom",
+					path: ["templates", index, "id"],
+					message: `duplicate_template_id: ${JSON.stringify(template.id)} appears more than once`,
+				});
+			seen.add(template.id);
+		});
+	});
+type SyncPayload = z.infer<typeof syncSchema>;
+type SyncItem = SyncPayload["templates"][number];
+
+const sameContent = (row: TemplateRow, item: SyncItem) =>
+	row.subject === item.subject &&
+	row.body_text === (item.body_text ?? null) &&
+	row.body_html === (item.body_html ?? null);
+
+/** What the sync would do to each listed id, judged against the active templates now. */
+async function planSync(env: Env, auth: AuthContext, payload: Operation) {
+	const p = payload as SyncPayload;
+	await requireMailboxOwner(env, auth, p.mailboxId);
+	if (!(await getMailbox(env.INDEX_DB, p.mailboxId)))
+		throw new AdminError("Mailbox not found", "mailbox_not_found", 404);
+	const result = await listTemplates(env, auth, { mailboxId: p.mailboxId });
+	const active = new Map(
+		((result.value as { templates?: TemplateRow[] } | undefined)?.templates ?? []).map((row) => [
+			row.id,
+			row,
+		]),
+	);
+	const changed: TemplateRow[] = [];
+	const unchanged: string[] = [];
+	// Not active now: created by the sync, or an archived id the sync reports and leaves alone.
+	const absent: string[] = [];
+	for (const item of p.templates) {
+		const row = active.get(item.id);
+		if (!row) absent.push(item.id);
+		else if (sameContent(row, item)) unchanged.push(item.id);
+		else
+			changed.push({
+				id: row.id,
+				subject: row.subject,
+				body_text: row.body_text,
+				body_html: row.body_html,
+			});
+	}
+	return { p, changed, unchanged, absent };
+}
+
+registerControlPlaneKind("template_sync", {
+	approval: "direct",
+	covers: ["mailboxId", "templates", "source"],
+	validate: (value) => strict(syncSchema, value),
+	render: async (env, auth, payload) => {
+		const { p, changed, unchanged, absent } = await planSync(env, auth, payload);
+		const fields: IntentField[] = [
+			{ label: "Buzón", value: p.mailboxId },
+			{
+				label: "Plantillas",
+				value: `${absent.length} nuevas, ${changed.length} actualizadas, ${unchanged.length} sin cambios`,
+			},
+		];
+		const verb = (id: string) =>
+			absent.includes(id) ? "crear" : unchanged.includes(id) ? "sin cambios" : "actualizar";
+		fields.push({
+			label: "Detalle",
+			value: p.templates.map((t) => `${t.id} — ${verb(t.id)} — ${t.subject}`).join("\n"),
+			format: "list",
+		});
+		if (p.source)
+			fields.push({
+				label: "Origen",
+				value: `${p.source.url} (sha256 ${p.source.sha256}, ${p.source.bytes} bytes)`,
+			});
+		return {
+			title: "Sincronizar plantillas",
+			fields,
+			warnings: changed.length
+				? [
+						{
+							code: "template_overwrite",
+							message: "Las claves que usan esta plantilla enviarán el nuevo contenido.",
+						},
+					]
+				: [],
+		};
+	},
+	execute: async (env, auth, payload) => {
+		const { p, changed, absent } = await planSync(env, auth, payload);
+		// One snapshot undoes the whole sync: the previous content of what it updates, and the ids
+		// it may create (restore removes those still active then; archived ids stay archived).
+		const snapshot = {
+			mailboxId: p.mailboxId,
+			restore: changed,
+			remove: absent,
+			...(p.source ? { source: p.source } : {}),
+		};
+		if (new TextEncoder().encode(JSON.stringify(snapshot)).length > MAX_SYNC_SNAPSHOT_BYTES)
+			throw new AdminError(
+				"The templates this sync overwrites are too large for one before-snapshot; split the sync",
+				"sync_too_large",
+				400,
+			);
+		// A sync that can only answer `unchanged` has nothing to undo.
+		const snapshotId =
+			changed.length || absent.length
+				? await writeBeforeSnapshot(
+						env,
+						auth,
+						"template_sync",
+						`${p.mailboxId}:template_sync`,
+						snapshot,
+					)
+				: null;
+		// The mailbox DO validates the whole batch and writes it in one transaction (all or nothing).
+		const synced = await syncTemplates(env, auth, {
+			mailboxId: p.mailboxId,
+			body: {
+				templates: p.templates.map((t) => ({
+					id: t.id,
+					subject: t.subject,
+					body_text: t.body_text ?? null,
+					body_html: t.body_html ?? null,
+				})),
+			},
+		});
+		const value = synced.value as {
+			results: Array<{ id: string; outcome: string; reason?: string }>;
+			summary: Record<string, number>;
+		};
+		const hashes = new Map(
+			await Promise.all(
+				p.templates.map(async (t) => [t.id, await templateContentHash(t)] as const),
+			),
+		);
+		const results = value.results.map((r) => ({
+			...r,
+			// Stored content now equals what was sent, except an archived id (left as it was).
+			...(r.outcome === "archived" ? {} : { sha256: hashes.get(r.id) }),
+		}));
+		await insertOpsEvent(env.INDEX_DB, {
+			id: crypto.randomUUID(),
+			event_type: "admin.template_sync",
+			severity: "info",
+			subject: p.mailboxId,
+			payload_json: JSON.stringify({
+				by: auth.email,
+				mailbox_id: p.mailboxId,
+				snapshot_id: snapshotId,
+				summary: value.summary,
+				results,
+				source: p.source ?? null,
+			}),
+		}).catch(() => undefined);
+		return {
+			mailboxId: p.mailboxId,
+			summary: value.summary,
+			results,
+			...(p.source ? { source: p.source } : {}),
+		};
 	},
 });

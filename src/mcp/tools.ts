@@ -793,12 +793,20 @@ export function registerTools(
 		"list_config",
 		{
 			description:
-				"Read domains, mailboxes, aliases, rules, templates and API key metadata without secrets.",
-			inputSchema: z.object({}),
+				'Read domains, mailboxes, aliases, rules, templates and API key metadata without secrets. templates:"summary" leaves template bodies out and gives each template\'s sha256 (the same hash manage_template sync reports) and body sizes instead: use it to verify templates without downloading them.',
+			inputSchema: z.object({
+				templates: z
+					.enum(["full", "summary"])
+					.default("full")
+					.describe('"full" (default) includes template bodies; "summary" gives sha256 + sizes.'),
+			}),
 			outputSchema: z.record(z.string(), z.unknown()),
 			annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
 		},
-		async () => runTool("list_config", "config:read", null, () => adminReads.config(env, auth)),
+		async (params) =>
+			runTool("list_config", "config:read", null, () =>
+				adminReads.config(env, auth, { templates: params.templates ?? "full" }),
+			),
 	);
 	registerSendTool(server, env, auth, origin, flow);
 	registerAdminTools(server, env, auth, origin, flow);

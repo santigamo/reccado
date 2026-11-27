@@ -154,7 +154,21 @@ actual repo state, fix this section rather than trusting it blindly.
   `search_messages`, `save_draft`, `cancel_draft`, `manage_draft_attachments`, `update_messages`,
   `send`, `get_health`, `list_ops`, `list_config`, `manage_mailbox`, `manage_domain`, `manage_routing`,
   `manage_template`, `manage_api_key`, `remove_suppression`, `restore` and `reconcile_stale`
-  (one operation per call, no batches). Scopes are `resource:action` with no `admin`:
+  (one operation per call, no batches — with one deliberate, owner-requested exception:
+  `manage_template` `sync`, kind `template_sync`, which writes a set of ≤ 100 templates of **one
+  mailbox** in one call. It is a direct kind like any template write; it is atomic (the mailbox DO
+  validates the whole batch and writes it in one `transactionSync`, so nothing or everything is
+  written); it only creates/updates listed ids and never archives (no `archiveMissing` over MCP);
+  it keeps **one** `admin.before_snapshot` (entity `template_sync`: previous content of what it
+  updates + ids it may create) so a single `restore` undoes the whole sync — reverting updates and
+  deleting the templates it created, or archiving them if a transactional request already used
+  them — and it writes an `admin.template_sync` ops event with per-id outcomes and hashes (no
+  bodies). Its templates come inline or from `source.url`: an https URL the Worker fetches itself
+  (`src/mcp/template-source.ts`: public hostnames only, no IP literals/local names/own host, no
+  credentials sent, redirects re-checked, 10 s, 2 MB, JSON only, optional `sha256` pin; the URL
+  without its query string and the document hash are recorded in the result, the snapshot and the
+  ops event). Do not extend batching to any other kind without an explicit owner decision.)
+  Scopes are `resource:action` with no `admin`:
   `mail:read`, `mail:read:sensitive`, `mail:draft`, `mail:send`, `config:read`, `mailboxes:write`,
   `templates:write`, `routing:write`, `domains:write`, `keys:write`, `suppressions:write`
   (`src/lib/mcp-scopes.ts`). `tools/list` shows only the tools whose scope was granted; a call

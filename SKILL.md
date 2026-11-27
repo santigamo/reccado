@@ -275,7 +275,14 @@ rule to a destination outside the owner's domains, `api_key_create|rotate|scopes
 `suppression_remove`, `domain_add|provision|disable`) create an approval intent: the agent gets a
 `/approve/:id` URL and the owner approves it there with the web session (API-key secrets are shown
 once on that page, never to the agent). Every other write applies directly with its scope, keeps a
-before-snapshot and is undoable with `restore`. One operation per call. An agent must never try to
+before-snapshot and is undoable with `restore`. One operation per call, except `manage_template`
+`sync`: up to 100 templates of one mailbox in one atomic call, given inline (`templates`) or as an
+https URL the server fetches (`source: {url, sha256?}`, a JSON `{"templates":[...]}` document, 2 MB
+max, no credentials sent), so an agent loading a template set does not re-emit every body. The
+result lists each id as `created` / `updated` / `unchanged` / `archived` (archived ids are left
+alone; unlisted templates are never touched) with its content `sha256`, and one `restore` of the
+returned snapshot undoes the whole sync. `list_config` with `templates: "summary"` returns the same
+per-template `sha256` and body sizes instead of the bodies, for cheap verification. An agent must never try to
 approve, replay or bypass that step, and the owner registry is not reachable over MCP.
 `save_draft` takes `bodyText` (plain) or `bodyMarkdown` (exactly one): the Markdown subset —
 paragraphs, bold/italic, inline and fenced code, http(s)/mailto links, lists, headings, quotes, rules —
