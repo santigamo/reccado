@@ -8,6 +8,7 @@ import * as keys from "../lib/admin/api-keys";
 import * as ops from "../lib/admin/ops";
 import * as suppressions from "../lib/admin/suppressions";
 import { listMailboxesByOwner } from "../db/d1";
+import { templateContentHash } from "../lib/template-hash";
 import type { McpAuthContext } from "./scopes";
 
 const SECRET_FIELDS = new Set([
@@ -39,7 +40,34 @@ export async function health(env: Env, auth: McpAuthContext, origin: string) {
 	return (await response.json()) as Record<string, unknown>;
 }
 
-export async function config(env: Env, auth: McpAuthContext) {
+type StoredTemplate = {
+	id: string;
+	subject: string;
+	body_text: string | null;
+	body_html: string | null;
+	[key: string]: unknown;
+};
+
+/** A template without its bodies: their sizes and the content hash (`templateContentHash`) instead. */
+async function templateSummary(row: StoredTemplate) {
+	const { body_text, body_html, ...rest } = row;
+	return {
+		...rest,
+		sha256: await templateContentHash(row),
+		body_text_chars: body_text?.length ?? 0,
+		body_html_chars: body_html?.length ?? 0,
+	};
+}
+
+/**
+ * `templates: "summary"` leaves template bodies out (sizes + sha256 instead), so an agent can
+ * verify a sync by hash without downloading every body.
+ */
+export async function config(
+	env: Env,
+	auth: McpAuthContext,
+	options: { templates?: "full" | "summary" } = {},
+) {
 	const [mailboxRows, domainRows, aliasRows, rules, owned] = await Promise.all([
 		mailboxes.listMailboxes(env, auth),
 		domains.listDomains(env, auth),
@@ -48,12 +76,18 @@ export async function config(env: Env, auth: McpAuthContext) {
 		listMailboxesByOwner(env.INDEX_DB, auth.email),
 	]);
 	const mailboxDetails = await Promise.all(
-		owned.map(async (mailbox) => ({
-			mailboxId: mailbox.mailbox_id,
-			templates: (await templates.listTemplates(env, auth, { mailboxId: mailbox.mailbox_id }))
-				.value,
-			keys: (await keys.listKeys(env, auth, { mailboxId: mailbox.mailbox_id })).value,
-		})),
+		owned.map(async (mailbox) => {
+			const listed = (await templates.listTemplates(env, auth, { mailboxId: mailbox.mailbox_id }))
+				.value as { templates?: StoredTemplate[] } | undefined;
+			return {
+				mailboxId: mailbox.mailbox_id,
+				templates:
+					options.templates === "summary"
+						? { templates: await Promise.all((listed?.templates ?? []).map(templateSummary)) }
+						: listed,
+				keys: (await keys.listKeys(env, auth, { mailboxId: mailbox.mailbox_id })).value,
+			};
+		}),
 	);
 	return stripConfigSecrets({
 		...mailboxRows,

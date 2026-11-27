@@ -788,7 +788,10 @@ only keeps a product's templates and API keys in shape): tick `templates:write` 
 (plus the pre-ticked `config:read` to list), leave `mail:read` off if it should not read inbound
 mail. It sees only `manage_template`, `manage_api_key`, `restore`, `reconcile_stale` and the
 `config:read` tools; template edits and `api_key_revoke`/`templates` apply directly (undo with
-`restore`), while key create/rotate/scopes return an approval link. A call outside the granted scopes
+`restore`), while key create/rotate/scopes return an approval link. To load a product's whole
+template file, use `manage_template` `sync` (one atomic call for up to 100 templates; pass
+`source: {url, sha256}` pointing at the JSON file, e.g. a secret gist's raw URL, instead of the
+bodies) and verify with `list_config` `templates: "summary"` (hashes, no bodies). A call outside the granted scopes
 returns `insufficient_scope` naming the scope.
 
 **Revoking an app.** The owner opens `/settings/agent-access` → *Connected agents* and presses *Revoke*

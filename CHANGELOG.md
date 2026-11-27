@@ -11,6 +11,21 @@ package.
 
 ### Added
 
+- **Template sync over MCP (2026-11-27).** Loading 31 templates took minutes: one
+  `manage_template` call per template, the model re-emitting every body, then a >200 KB
+  `list_config` to check. `manage_template` gains `sync` (kind `template_sync`, `templates:write`,
+  applied directly): up to 100 templates of one mailbox in one atomic call, through the same
+  mailbox-DO sync the HTTP `PUT .../transactional/templates` uses (all or nothing). Templates come
+  inline (`templates`) or from `source: {url, sha256?}`, an https JSON document the Worker fetches
+  itself (public hosts only, no credentials, redirects re-checked, 10 s, 2 MB, optional hash pin;
+  URL without query + document hash recorded). The result gives each id's outcome
+  (`created`/`updated`/`unchanged`/`archived`) and content `sha256`; it never archives. One
+  before-snapshot (entity `template_sync`) lets a single `restore` undo the sync: updates reverted,
+  created templates deleted (archived if a transactional request used them; new DO route
+  `POST /transactional/templates/revert-sync`). `list_config` takes `templates: "summary"` to
+  return per-template `sha256` and body sizes instead of bodies. This is the only batch exception
+  to "one operation per call" (AGENTS.md).
+
 - **Reply-To on transactional sends (2026-11-26).** `POST .../transactional/messages` accepts an
   optional `replyTo` (one bare address) and sends it as the `Reply-To` header. It joins the
   idempotency payload hash only when present, so requests without it hash as before. See
@@ -372,6 +387,11 @@ read/search/draft endpoint.
   type the key operations write is in it. The allowlist and sender-name edits now run in one
   transaction with their audit row: before, a refused audit row left the change applied in the
   mailbox while the call failed and D1 was not updated.
+- **MCP admin validation errors say what is wrong (2026-11-27).** A kind validation issue with no
+  field path (e.g. `rule_upsert` without `priority`) came back as a bare `validation_error`; the
+  admin tools now answer `validation_error: <path>: <message>` (e.g.
+  `validation_error: domainId, pattern, priority, action required`,
+  `validation_error: templates.3.subject: subject_contains_newline`).
 
 - **MCP connections no longer expire every hour (2026-11-23).** Better Auth issues a refresh token
   only for grants that carry `offline_access`, which Reccado did not offer and MCP clients never

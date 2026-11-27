@@ -16,7 +16,7 @@ import {
 import { assertAdminAccess, requireMailboxOwner } from "../admin/access";
 import { AdminError } from "../admin/errors";
 import { patchRule } from "../admin/routing";
-import { updateTemplate } from "../admin/templates";
+import { revertTemplateSync, updateTemplate } from "../admin/templates";
 import { registerControlPlaneKind, strict, type Operation } from "../control-plane-registry";
 import { activeTemplate } from "./templates";
 import { externalAddresses } from "./routing";
@@ -220,6 +220,47 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 						body: { subject: row.subject, body_text: row.body_text, body_html: row.body_html },
 					});
 					return { restored: "template", id: row.id };
+				},
+			};
+		}
+		case "template_sync": {
+			const row = snap as unknown as {
+				mailboxId: string;
+				restore: Array<{
+					id: string;
+					subject: string;
+					body_text: string | null;
+					body_html: string | null;
+				}>;
+				remove: string[];
+			};
+			if (!row.restore.length && !row.remove.length)
+				throw conflict("Nothing to restore", "restore_noop");
+			const list = (ids: string[]) => (ids.length ? ids.join("\n") : "(ninguna)");
+			return {
+				title: "Restaurar sincronización de plantillas",
+				fields: [
+					{ label: "Buzón", value: row.mailboxId },
+					{
+						label: "Contenido anterior (se reaplica)",
+						value: list(row.restore.map((t) => t.id)),
+					},
+					{
+						label:
+							"Creadas por la sincronización (se eliminan; si ya se usaron para enviar, se archivan)",
+						value: list(row.remove),
+					},
+				],
+				apply: async () => {
+					const result = await revertTemplateSync(env, auth, {
+						mailboxId: row.mailboxId,
+						body: { restore: row.restore, remove: row.remove },
+					});
+					return {
+						restored: "template_sync",
+						mailboxId: row.mailboxId,
+						results: (result.value as { results?: unknown[] } | undefined)?.results ?? [],
+					};
 				},
 			};
 		}

@@ -173,7 +173,7 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
   | `mail:send` | request a send (still needs approval) | no, explicit tick |
   | `config:read` | `get_health`, `list_ops`, `list_config` | yes |
   | `mailboxes:write` | create / update / disable mailboxes | no |
-  | `templates:write` | upsert / archive templates | no |
+  | `templates:write` | upsert / archive / sync templates | no |
   | `routing:write` | aliases and routing rules | no, explicit tick |
   | `domains:write` | add / provision / update / disable domains | no, explicit tick |
   | `keys:write` | API keys; `reconcile_stale` | no, explicit tick |
@@ -195,7 +195,18 @@ exfiltrate data. Everything else applies directly, with a before-snapshot so `re
   allow-list), `api_key_revoke`, mailbox kinds, internal aliases and rules, `domain_update`,
   `restore`, `reconcile_stale`, `update_messages`. Each keeps an `admin.before_snapshot` + ops
   event, returns `{status:"applied", result, snapshotIds}` to the agent, and is undoable with
-  `restore`. Deletes are soft (`disabled` / `revoked`). One operation per call; there are no batches.
+  `restore`. Deletes are soft (`disabled` / `revoked`). One operation per call; there are no batches,
+  with one exception: `manage_template` `sync` (kind `template_sync`) writes up to 100 templates of
+  one mailbox atomically (one DO transaction), never archives, and keeps one before-snapshot so a
+  single `restore` undoes it (updates reverted; templates it created deleted, or archived if a
+  transactional request already used them). Its templates may come from `source.url`, which the
+  Worker fetches itself: https on port 443 only, no userinfo, no IP-literal / single-label /
+  local / internal hostnames and not the deployment's own host, every redirect hop re-checked (at
+  most 3), no credentials or caller token forwarded, 10 s timeout, 2 MB cap, HTML refused, body
+  must be the sync JSON shape, failed bodies never echoed; an optional `sha256` pins the exact
+  bytes. The URL (query string dropped) and the document hash are recorded in the result, the
+  snapshot and an `admin.template_sync` ops event. It needs `templates:write` and shares the
+  admin tools' 10-calls-per-minute limit.
   **Owner-registry changes (`owner_identities`, bootstrap emails, pairing) are never exposed over
   MCP**; they stay CLI/web only.
 - **How approval works.** The intent stores a frozen payload and `payload_hash`; a send uses the

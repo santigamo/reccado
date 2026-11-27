@@ -843,6 +843,69 @@ export function syncTemplates(
 	return results;
 }
 
+export type TemplateRevertResult = {
+	id: string;
+	outcome: "reverted" | "deleted" | "archived" | "skipped";
+	/** `skipped`: the template is no longer active. `archived`: a transactional request names it. */
+	reason?: "not_active" | "used_by_requests";
+};
+
+/**
+ * Undo a template sync (the `restore` of a `template_sync` before-snapshot) in one
+ * `transactionSync`:
+ *  - `restore`: each listed template gets its previous content back, if it is still active;
+ *  - `remove`: templates the sync created. One that no transactional request names is
+ *    deleted, as if it had never existed, so its id can be created again; one that was already
+ *    used to send is archived instead, so the requests keep pointing at a (retired) row.
+ * Archived templates are left alone, as everywhere else.
+ */
+export function revertTemplateSync(
+	sql: DurableObjectState["storage"]["sql"],
+	transactionSync: (fn: () => void) => void,
+	mailboxId: string,
+	input: { restore: TemplateInput[]; remove: string[] },
+): TemplateRevertResult[] {
+	if (!Array.isArray(input.restore) || !Array.isArray(input.remove))
+		throw new TemplateSyncError("invalid_revert_shape", null, null);
+	const active = (id: string) =>
+		sql
+			.exec<{ status: string }>(
+				"SELECT status FROM templates WHERE id = ? AND mailbox_id = ?",
+				id,
+				mailboxId,
+			)
+			.toArray()[0]?.status === "active";
+	const results: TemplateRevertResult[] = [];
+	transactionSync(() => {
+		for (const template of input.restore) {
+			if (!active(template.id)) {
+				results.push({ id: template.id, outcome: "skipped", reason: "not_active" });
+				continue;
+			}
+			updateTemplate(sql, mailboxId, template.id, template);
+			results.push({ id: template.id, outcome: "reverted" });
+		}
+		for (const id of input.remove) {
+			if (!active(id)) {
+				results.push({ id, outcome: "skipped", reason: "not_active" });
+				continue;
+			}
+			const used =
+				sql
+					.exec("SELECT 1 AS x FROM transactional_requests WHERE template_id = ? LIMIT 1", id)
+					.toArray().length > 0;
+			if (used) {
+				archiveTemplate(sql, mailboxId, id);
+				results.push({ id, outcome: "archived", reason: "used_by_requests" });
+			} else {
+				sql.exec("DELETE FROM templates WHERE id = ? AND mailbox_id = ?", id, mailboxId);
+				results.push({ id, outcome: "deleted" });
+			}
+		}
+	});
+	return results;
+}
+
 // --- Transactional request CRUD ---
 
 function getTransactionalRequest(

@@ -28,6 +28,7 @@ import { insertMailbox } from "#/db/d1";
 import { listApiKeyEvents } from "#/do/transactional-key-ops";
 import { mailboxStub } from "#/lib/mailbox-stub";
 import { getIntentView } from "#/lib/approvals";
+import { templateContentHash } from "#/lib/template-hash";
 import { registerTools } from "../../src/mcp/tools";
 import { makeIntentCodec } from "../../src/mcp/intent-flow";
 import * as notification from "../../src/telegram/notify";
@@ -610,6 +611,7 @@ describe("mcp admin tools: control-plane kinds end to end", () => {
 			alias: "routing:write",
 			routing_rule: "routing:write",
 			template: "templates:write",
+			template_sync: "templates:write",
 		};
 		const all = ["mailboxes:write", "domains:write", "routing:write", "templates:write"];
 		for (const [entity, needed] of Object.entries(expected)) {
@@ -959,5 +961,375 @@ describe("mcp approval modes", () => {
 		const restored = await call("restore", { opsEventId: snapshotIds[0] });
 		expect(restored.content.status).toBe("applied");
 		expect(JSON.stringify(restored.result)).not.toMatch(/rck_/);
+	});
+});
+
+describe("manage_template sync", () => {
+	const email = "sync-mcp@example.com";
+	const MBX = "mbx_mcp_sync";
+	let auth: Record<string, unknown>;
+	beforeAll(async () => {
+		const owner = await registerOwner(email);
+		auth = {
+			userId: owner.userId,
+			email,
+			owners: [email],
+			scopes: new Set([...ADMIN, "config:read"]),
+		};
+		await insertMailbox(db, {
+			mailbox_id: MBX,
+			primary_address: "sync@mcp-sync.example",
+			display_name: null,
+			status: "active",
+			owner_email: email,
+		});
+	});
+	async function call(tool: string, args: object, as = auth) {
+		const { handler } = await handlerFor(tool, as, "legacy");
+		const result = await handler(args, context());
+		return {
+			result,
+			text: (result.content as Array<{ text: string }> | undefined)?.[0]?.text ?? "",
+			content: result.structuredContent as {
+				status: string;
+				error?: string;
+				snapshotIds?: string[];
+				result?: {
+					summary: Record<string, number>;
+					results: Array<{ id: string; outcome: string; reason?: string; sha256?: string }>;
+					source?: { url: string; sha256: string; bytes: number };
+				};
+			},
+		};
+	}
+	const active = async () => {
+		const { templates } = (await (
+			await mailboxStub(env, MBX).fetch("https://mailbox-do/transactional/templates")
+		).json()) as {
+			templates: Array<{
+				id: string;
+				subject: string;
+				body_text: string | null;
+				body_html: string | null;
+			}>;
+		};
+		return new Map(templates.map((t) => [t.id, t]));
+	};
+	const outcomes = (r?: { results: Array<{ id: string; outcome: string }> }) =>
+		Object.fromEntries((r?.results ?? []).map((x) => [x.id, x.outcome]));
+
+	it("applies many templates in one call, reports each outcome and hash, and restore undoes it", async () => {
+		const first = await call("manage_template", {
+			action: "sync",
+			mailboxId: MBX,
+			templates: [
+				{ id: "welcome", subject: "Hola", body_text: "uno" },
+				{ id: "reset", subject: "Reset", body_html: "<p>r</p>" },
+				{ id: "keep", subject: "Keep" },
+			],
+		});
+		expect(first.content.status, first.text).toBe("applied");
+		expect(first.content.result?.summary).toMatchObject({ created: 3, updated: 0, unchanged: 0 });
+		const hashOf = (id: string) => first.content.result!.results.find((r) => r.id === id)?.sha256;
+		expect(hashOf("welcome")).toBe(
+			await templateContentHash({ subject: "Hola", body_text: "uno" }),
+		);
+		expect(first.content.snapshotIds).toHaveLength(1);
+
+		// Second sync: one changed, one identical, one new; `keep` is not listed and is left alone.
+		const second = await call("manage_template", {
+			action: "sync",
+			mailboxId: MBX,
+			// Sent as JSON text, as some clients do.
+			templates: JSON.stringify([
+				{ id: "welcome", subject: "Hola 2", body_text: "dos" },
+				{ id: "reset", subject: "Reset", body_html: "<p>r</p>" },
+				{ id: "invoice", subject: "Factura" },
+			]),
+		});
+		expect(second.content.status, second.text).toBe("applied");
+		expect(outcomes(second.content.result)).toEqual({
+			welcome: "updated",
+			reset: "unchanged",
+			invoice: "created",
+		});
+		let now = await active();
+		expect(now.get("welcome")?.subject).toBe("Hola 2");
+		expect(now.has("keep")).toBe(true);
+
+		// Cheap verification: list_config summary gives the same hashes and no bodies.
+		const config = await call("list_config", { templates: "summary" });
+		const mine = (
+			config.result.structuredContent as {
+				mailboxDetails: Array<{
+					mailboxId: string;
+					templates: { templates: Array<Record<string, unknown>> };
+				}>;
+			}
+		).mailboxDetails.find((m) => m.mailboxId === MBX)!.templates.templates;
+		const welcome = mine.find((t) => t.id === "welcome")!;
+		expect(welcome.sha256).toBe(
+			second.content.result!.results.find((r) => r.id === "welcome")!.sha256,
+		);
+		expect(welcome).not.toHaveProperty("body_text");
+		expect(welcome.body_text_chars).toBe(3);
+
+		// One restore undoes the whole second sync: previous content back, the created one gone.
+		const restored = await call("restore", { opsEventId: second.content.snapshotIds![0] });
+		expect(restored.content.status, restored.text).toBe("applied");
+		now = await active();
+		expect(now.get("welcome")).toMatchObject({ subject: "Hola", body_text: "uno" });
+		expect(now.has("invoice")).toBe(false);
+		expect(now.has("reset") && now.has("keep")).toBe(true);
+		// A deleted (never used) template can be created again.
+		const again = await call("manage_template", {
+			action: "sync",
+			mailboxId: MBX,
+			templates: [{ id: "invoice", subject: "Factura" }],
+		});
+		expect(outcomes(again.content.result)).toEqual({ invoice: "created" });
+		// Nothing to change: nothing to undo, so no snapshot.
+		const same = await call("manage_template", {
+			action: "sync",
+			mailboxId: MBX,
+			templates: [{ id: "reset", subject: "Reset", body_html: "<p>r</p>" }],
+		});
+		expect(outcomes(same.content.result)).toEqual({ reset: "unchanged" });
+		expect(same.content.snapshotIds).toEqual([]);
+		// The sync is recorded without bodies.
+		const event = await db
+			.prepare(
+				"SELECT payload_json FROM ops_events WHERE event_type = 'admin.template_sync' AND subject = ? ORDER BY created_at DESC LIMIT 1",
+			)
+			.bind(MBX)
+			.first<{ payload_json: string }>();
+		expect(JSON.parse(event!.payload_json)).toMatchObject({ by: email, mailbox_id: MBX });
+	});
+
+	it("restore archives a created template that was already used to send", async () => {
+		const synced = await call("manage_template", {
+			action: "sync",
+			mailboxId: MBX,
+			templates: [{ id: "used", subject: "Used" }],
+		});
+		expect(outcomes(synced.content.result)).toEqual({ used: "created" });
+		await runInDurableObject(mailboxStub(env, MBX), async (_i, state) => {
+			const now = new Date().toISOString();
+			state.storage.sql.exec(
+				`INSERT INTO transactional_requests (request_id, key_id, client_idempotency_key, payload_hash, status, to_addr, template_id, sender, created_at, updated_at)
+				 VALUES ('req_used', 'key_x', 'idem_used', 'h', 'sent', 'a@b.example', 'used', 'sync@mcp-sync.example', ?, ?)`,
+				now,
+				now,
+			);
+		});
+		const restored = await call("restore", { opsEventId: synced.content.snapshotIds![0] });
+		expect(restored.content.status, restored.text).toBe("applied");
+		expect(JSON.stringify(restored.content.result)).toContain("used_by_requests");
+		expect((await active()).has("used")).toBe(false);
+		const status = await runInDurableObject(mailboxStub(env, MBX), async (_i, state) =>
+			state.storage.sql.exec("SELECT status FROM templates WHERE id = 'used'").toArray(),
+		);
+		expect(status).toEqual([{ status: "archived" }]);
+	});
+
+	it("is all or nothing and names the offending entry", async () => {
+		const other = "sync-mcp-2@example.com";
+		const owner = await registerOwner(other);
+		const as = { userId: owner.userId, email: other, owners: [other], scopes: new Set(ADMIN) };
+		await insertMailbox(db, {
+			mailbox_id: "mbx_mcp_sync2",
+			primary_address: "sync2@mcp-sync.example",
+			display_name: null,
+			status: "active",
+			owner_email: other,
+		});
+		const before = await approvals();
+		const bad: Array<[object, string]> = [
+			[
+				{
+					templates: [
+						{ id: "a", subject: "A" },
+						{ id: "b", subject: "bad\nsubject" },
+					],
+				},
+				"validation_error: templates.1.subject: subject_contains_newline",
+			],
+			[
+				{
+					templates: [
+						{ id: "a", subject: "A" },
+						{ id: "a", subject: "A again" },
+					],
+				},
+				'validation_error: templates.1.id: duplicate_template_id: "a" appears more than once',
+			],
+			[
+				{
+					templates: [{ id: "a", subject: "A" }],
+					source: { url: "https://files.example.net/t.json" },
+				},
+				"validation_error: give exactly one of templates or source",
+			],
+			[{}, "validation_error: give exactly one of templates or source"],
+			[{ source: { url: "http://files.example.net/t.json" } }, "refused: source_url_not_https"],
+			[{ source: { url: "https://example.com/t.json" } }, "refused: source_url_host_refused"],
+		];
+		for (const [args, message] of bad) {
+			const { result, text } = await call(
+				"manage_template",
+				{ action: "sync", mailboxId: "mbx_mcp_sync2", ...args },
+				as,
+			);
+			expect(result.isError, JSON.stringify(args)).toBe(true);
+			expect(text, JSON.stringify(args)).toContain(message);
+		}
+		const { templates } = (await (
+			await mailboxStub(env, "mbx_mcp_sync2").fetch("https://mailbox-do/transactional/templates")
+		).json()) as { templates: unknown[] };
+		expect(templates).toEqual([]);
+		expect(await approvals()).toBe(before);
+	});
+
+	it("loads the templates from an https URL the server fetches, pinned by sha256", async () => {
+		const other = "sync-mcp-3@example.com";
+		const owner = await registerOwner(other);
+		const as = { userId: owner.userId, email: other, owners: [other], scopes: new Set(ADMIN) };
+		await insertMailbox(db, {
+			mailbox_id: "mbx_mcp_sync3",
+			primary_address: "sync3@mcp-sync.example",
+			display_name: null,
+			status: "active",
+			owner_email: other,
+		});
+		const doc = JSON.stringify({
+			templates: Array.from({ length: 31 }, (_, i) => ({
+				id: `t${i}`,
+				subject: `Subject ${i}`,
+				body_html: `<p>${"x".repeat(5000)}</p>`,
+			})),
+		});
+		const digest = Array.from(
+			new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(doc))),
+			(b) => b.toString(16).padStart(2, "0"),
+		).join("");
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(
+				async () => new Response(doc, { headers: { "content-type": "text/plain" } }),
+			);
+		try {
+			const mismatch = await call(
+				"manage_template",
+				{
+					action: "sync",
+					mailboxId: "mbx_mcp_sync3",
+					source: { url: "https://files.example.net/t.json", sha256: "0".repeat(64) },
+				},
+				as,
+			);
+			expect(mismatch.text).toContain(`refused: source_hash_mismatch (got ${digest})`);
+
+			const synced = await call(
+				"manage_template",
+				{
+					action: "sync",
+					mailboxId: "mbx_mcp_sync3",
+					source: JSON.stringify({
+						url: "https://files.example.net/t.json?sig=abc",
+						sha256: digest,
+					}),
+				},
+				as,
+			);
+			expect(synced.content.status, synced.text).toBe("applied");
+			expect(synced.content.result?.summary).toMatchObject({ created: 31 });
+			expect(synced.content.result?.source).toEqual({
+				url: "https://files.example.net/t.json?…",
+				sha256: digest,
+				bytes: new TextEncoder().encode(doc).length,
+			});
+			const snapshot = await db
+				.prepare("SELECT payload_json FROM ops_events WHERE id = ?")
+				.bind(synced.content.snapshotIds![0])
+				.first<{ payload_json: string }>();
+			expect(JSON.parse(snapshot!.payload_json)).toMatchObject({
+				entity: "template_sync",
+				mailboxId: "mbx_mcp_sync3",
+				source: { sha256: digest },
+			});
+			const [, init] = fetchSpy.mock.calls.at(-1)!;
+			expect(new Headers(init?.headers).get("authorization")).toBeNull();
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
+	it("refuses a sync whose before-snapshot would not fit, changing nothing", async () => {
+		const other = "sync-mcp-4@example.com";
+		const owner = await registerOwner(other);
+		const as = { userId: owner.userId, email: other, owners: [other], scopes: new Set(ADMIN) };
+		await insertMailbox(db, {
+			mailbox_id: "mbx_mcp_sync4",
+			primary_address: "sync4@mcp-sync.example",
+			display_name: null,
+			status: "active",
+			owner_email: other,
+		});
+		const big = (subject: string) =>
+			Array.from({ length: 10 }, (_, i) => ({
+				id: `big${i}`,
+				subject,
+				body_text: "t".repeat(100_000),
+				body_html: "h".repeat(100_000),
+			}));
+		const first = await call(
+			"manage_template",
+			{ action: "sync", mailboxId: "mbx_mcp_sync4", templates: big("v1") },
+			as,
+		);
+		expect(first.content.status, first.text).toBe("applied");
+		const second = await call(
+			"manage_template",
+			{ action: "sync", mailboxId: "mbx_mcp_sync4", templates: big("v2") },
+			as,
+		);
+		expect(second.content).toMatchObject({ status: "failed", error: "sync_too_large" });
+		const { templates } = (await (
+			await mailboxStub(env, "mbx_mcp_sync4").fetch("https://mailbox-do/transactional/templates")
+		).json()) as { templates: Array<{ subject: string }> };
+		expect(new Set(templates.map((t) => t.subject))).toEqual(new Set(["v1"]));
+	});
+
+	it("publishes the sync fields and names a kind validation issue that has no path", async () => {
+		const { registered } = await handlerFor("manage_template", auth, "legacy");
+		type Json = { type?: string; description?: string; properties: Record<string, Json> };
+		const listed = (
+			registered.manage_template as unknown as {
+				inputSchema: { "~standard": { jsonSchema: { input: (o: object) => Json } } };
+			}
+		).inputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" });
+		expect(listed.properties.templates?.type).toBe("array");
+		expect(listed.properties.templates?.description).toContain("sync");
+		expect(listed.properties.source?.type).toBe("object");
+		expect(listed.properties.action?.description).toContain("sync");
+		expect(
+			(registered.manage_template as unknown as { description: string }).description,
+		).toContain("except `sync`");
+
+		await db
+			.prepare(
+				"INSERT INTO domains (id, domain, zone_id, status, created_at, updated_at) VALUES ('dom_sync_rule', 'mcp-sync.example', 'z', 'active', ?, ?)",
+			)
+			.bind(new Date().toISOString(), new Date().toISOString())
+			.run();
+		const rule = await call("manage_routing", {
+			action: "rule_upsert",
+			domainId: "dom_sync_rule",
+			pattern: "x@mcp-sync.example",
+			ruleAction: "store",
+			mailboxId: MBX,
+		});
+		expect(rule.result.isError).toBe(true);
+		expect(rule.text).toBe("validation_error: domainId, pattern, priority, action required");
 	});
 });

@@ -3,18 +3,25 @@ import { z } from "zod";
 import { getApproval, insertOpsEvent } from "../db/d1";
 import { requestControlPlaneChange } from "../lib/control-plane-intents";
 import { ControlPlaneRefusal } from "../lib/control-plane-registry";
+import { AdminValidationError } from "../lib/admin/errors";
 import { RESTORE_SCOPES, TOOL_SCOPES } from "../lib/mcp-scopes";
 import { notifyIntentCreated } from "../telegram/notify";
 import { mcpToolError, mcpToolResultJson } from "./errors";
 import { type IntentFlow, intentResponse, resolveIntentRetry } from "./intent-flow";
 import { assertScope, scopeFilteredServer } from "./scopes";
+import { fetchTemplateSource } from "./template-source";
 import type { McpSendAuth } from "./types";
 
 const RATE_LIMIT = 10;
 const rates = new Map<string, number>();
 const SECRET_KEY = /secret|token|plaintext/i;
 
-type Action = { kind: string; schema: z.ZodType<Record<string, unknown>> };
+type Action = {
+	kind: string;
+	schema: z.ZodType<Record<string, unknown>>;
+	/** Turns the parsed fields into the kind's payload (e.g. fetches a template sync's source). */
+	prepare?: (fields: Record<string, unknown>, origin: string) => Promise<Record<string, unknown>>;
+};
 const obj = <T extends z.ZodRawShape>(shape: T) =>
 	z.strictObject(shape) as unknown as z.ZodType<Record<string, unknown>>;
 const mailboxId = z.string().min(1);
@@ -39,7 +46,10 @@ const list = <T extends z.ZodType>(item: T, min = 0) =>
 	z.preprocess(parseJsonText, z.array(item).min(min));
 
 // Field names mirror the src/lib/admin/* service inputs; the server-side kind `validate` stays the authority.
-const TOOLS: Record<string, { description: string; actions: Record<string, Action> }> = {
+const TOOLS: Record<
+	string,
+	{ description: string; actions: Record<string, Action>; perCall?: string }
+> = {
 	manage_mailbox: {
 		description:
 			"Create, update or disable a mailbox. Applied immediately; every change keeps a before-snapshot you can undo with `restore`.",
@@ -127,8 +137,14 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 		},
 	},
 	manage_template: {
-		description:
-			"Upsert or archive a transactional template. Applied immediately; every change keeps a before-snapshot you can undo with `restore`.",
+		description: [
+			"Upsert, archive or sync transactional templates. Applied immediately; every change keeps a before-snapshot you can undo with `restore`.",
+			'sync loads many templates in one atomic call (all or nothing, at most 100): give `mailboxId` and either `templates` (items {id, subject, body_text?, body_html?}) or `source` {url, sha256?}, an https URL of a JSON document `{"templates":[...]}` (or a bare array of the same items) that the server fetches itself, so you do not have to repeat the bodies here (2 MB max; no credentials are sent; pass sha256 of the file to pin its exact bytes).',
+			"Listed ids are created when new, updated when different, reported unchanged when identical; an archived id is reported and left alone; templates not listed are never touched. The result reports each id's outcome and sha256, so no read-back is needed. One `restore` of the sync's snapshot undoes all of it (previous content back; templates it created are deleted, or archived if already used to send).",
+			'Template sha256 = SHA-256 hex of the UTF-8 compact JSON array [subject, body_text, body_html] (absent body = null, non-ASCII unescaped: JS JSON.stringify, Python json.dumps(..., separators=(",", ":"), ensure_ascii=False)); list_config with templates:"summary" shows the same hash per template.',
+		].join(" "),
+		perCall:
+			"One change per call, except `sync`, which applies one whole set of templates atomically.",
 		actions: {
 			upsert: {
 				kind: "template_upsert",
@@ -145,6 +161,48 @@ const TOOLS: Record<string, { description: string; actions: Record<string, Actio
 			archive: {
 				kind: "template_archive",
 				schema: obj({ mailboxId, templateId: z.string().min(1) }),
+			},
+			sync: {
+				kind: "template_sync",
+				schema: obj({
+					mailboxId,
+					templates: list(
+						body({
+							id: z.string().min(1),
+							subject: z.string().min(1),
+							body_text: z.string().nullable().optional(),
+							body_html: z.string().nullable().optional(),
+						}),
+						1,
+					)
+						.describe("Templates to sync (give this or `source`).")
+						.optional(),
+					source: body({
+						url: z.string().min(1),
+						sha256: z
+							.string()
+							.regex(/^[0-9a-fA-F]{64}$/)
+							.optional(),
+					})
+						.describe(
+							"https URL of a JSON document with the templates, fetched by the server (give this or `templates`); optional sha256 of its exact bytes.",
+						)
+						.optional(),
+				}),
+				prepare: async (fields, origin) => {
+					const { source, ...rest } = fields as {
+						source?: { url: string; sha256?: string };
+						templates?: unknown[];
+					};
+					if ((rest.templates === undefined) === (source === undefined))
+						throw new ToolFailure("validation_error: give exactly one of templates or source");
+					if (!source) return rest;
+					const fetched = await fetchTemplateSource(source.url, {
+						ownHost: new URL(origin).hostname.toLowerCase(),
+						expectedSha256: source.sha256,
+					});
+					return { ...rest, templates: fetched.templates, source: fetched.source };
+				},
 			},
 		},
 	},
@@ -224,7 +282,19 @@ function pruneRates(map: Map<string, number>): void {
 
 type Resolved = { kind: string; payload: unknown };
 
-function resolveOp(tool: string, params: Record<string, unknown>): Resolved {
+/** `validation_error: <path>: <message>` for the first issue (no path: just the message). */
+export function validationText(issue?: { path: PropertyKey[]; message: string }): string {
+	if (!issue) return "validation_error";
+	const path = issue.path.map(String).join(".");
+	const message = issue.message.replace(/\s+/g, " ").slice(0, 200);
+	return `validation_error: ${path ? `${path}: ` : ""}${message}`;
+}
+
+async function resolveOp(
+	tool: string,
+	params: Record<string, unknown>,
+	origin: string,
+): Promise<Resolved> {
 	const def = TOOLS[tool];
 	if (!def) throw new ToolFailure("tool_unavailable");
 	const { action, intentId: _intentId, ...rest } = params;
@@ -232,9 +302,8 @@ function resolveOp(tool: string, params: Record<string, unknown>): Resolved {
 	if (!entry) throw new ToolFailure("validation_error: unknown action");
 	const cleaned = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined));
 	const parsed = entry.schema.safeParse(cleaned);
-	if (!parsed.success)
-		throw new ToolFailure(`validation_error: ${parsed.error.issues[0]?.path.join(".") || "input"}`);
-	const out = { ...parsed.data };
+	if (!parsed.success) throw new ToolFailure(validationText(parsed.error.issues[0]));
+	const out = entry.prepare ? await entry.prepare(parsed.data, origin) : { ...parsed.data };
 	// Routing rules name their effect `ruleAction` here to avoid clashing with the tool's `action`.
 	if ("ruleAction" in out) {
 		out.action = out.ruleAction;
@@ -249,6 +318,7 @@ const SNAPSHOT_SCOPES: Record<string, string> = {
 	alias: "routing:write",
 	routing_rule: "routing:write",
 	template: "templates:write",
+	template_sync: "templates:write",
 };
 
 /** Write scope for the resource a before-snapshot recorded; null when the snapshot is unknown (the kind reports that itself). */
@@ -277,7 +347,7 @@ async function runIntent(
 	ctx: ServerContext | undefined,
 	tool: string,
 	params: Record<string, unknown>,
-	resolve: () => Resolved,
+	resolve: () => Promise<Resolved>,
 	kinds: string[],
 	audit: { intentId?: string },
 ) {
@@ -318,7 +388,7 @@ async function runIntent(
 			transform,
 		});
 	}
-	const { kind, payload } = resolve();
+	const { kind, payload } = await resolve();
 	let created: Awaited<ReturnType<typeof requestControlPlaneChange>>;
 	try {
 		created = await requestControlPlaneChange(env, auth, kind, payload, {
@@ -330,8 +400,16 @@ async function runIntent(
 	} catch (error) {
 		if (error instanceof Error && error.message === "invalid_intent_kind")
 			throw new ToolFailure("tool_unavailable");
+		// The kind's own validation: name the first issue (e.g. a rule missing its priority).
+		if (error instanceof AdminValidationError)
+			throw new ToolFailure(validationText(error.firstIssue));
 		const code = (error as { code?: unknown }).code;
-		if (code === "validation_error") throw new ToolFailure("validation_error");
+		if (code === "validation_error")
+			throw new ToolFailure(
+				error instanceof Error && error.message && error.message !== "Invalid payload"
+					? `validation_error: ${error.message}`
+					: "validation_error",
+			);
 		// A kind's reasoned refusal before any approval exists (e.g. an address Reccado does not file).
 		if (error instanceof ControlPlaneRefusal) throw new ToolFailure(`refused: ${error.code}`);
 		throw error;
@@ -368,12 +446,13 @@ function register(
 	description: string,
 	kinds: string[],
 	opSchema: z.ZodType,
-	resolve: (params: Record<string, unknown>) => Resolved,
+	resolve: (params: Record<string, unknown>) => Promise<Resolved>,
+	perCall = "One change per call.",
 ) {
 	server.registerTool(
 		tool,
 		{
-			description: `${description} One change per call. A direct change returns {status:"applied", result, snapshotIds} (undo with the restore tool). A change that needs owner approval returns a pending approval with a web URL (the owner approves only on that page; Telegram just notifies); re-call with intentId to check its status/result.`,
+			description: `${description} ${perCall} A direct change returns {status:"applied", result, snapshotIds} (undo with the restore tool). A change that needs owner approval returns a pending approval with a web URL (the owner approves only on that page; Telegram just notifies); re-call with intentId to check its status/result.`,
 			inputSchema: opSchema as z.ZodObject,
 			outputSchema: z.record(z.string(), z.unknown()),
 			annotations: ANNOTATIONS,
@@ -447,11 +526,14 @@ export function publishedFields(actions: Record<string, Action>): z.ZodRawShape 
 		const members = [...variants.values()];
 		const merged = members.length === 1 ? members[0]! : z.union(members as [z.ZodType, z.ZodType]);
 		const names = uses.map((use) => use.action);
+		const own = members.map((member) => member.description).find(Boolean);
 		const required = uses.filter(({ schema }) => !schema.safeParse(undefined).success);
 		const note = required.length
 			? ` Required by: ${required.map((use) => use.action).join(", ")}.`
 			: "";
-		out[field] = merged.optional().describe(`Used by: ${names.join(", ")}.${note}`);
+		out[field] = merged
+			.optional()
+			.describe(`${own ? `${own} ` : ""}Used by: ${names.join(", ")}.${note}`);
 	}
 	return out;
 }
@@ -479,8 +561,18 @@ export function registerAdminTools(
 				.describe("Only to check a pending approval: the intentId a previous call returned."),
 			...publishedFields(def.actions),
 		});
-		register(server, env, auth, origin, flow, tool, def.description, kinds, schema, (params) =>
-			resolveOp(tool, params),
+		register(
+			server,
+			env,
+			auth,
+			origin,
+			flow,
+			tool,
+			def.description,
+			kinds,
+			schema,
+			(params) => resolveOp(tool, params, origin),
+			def.perCall,
 		);
 	}
 	const single = (tool: string, description: string, kind: string, shape: z.ZodRawShape) =>
@@ -494,15 +586,12 @@ export function registerAdminTools(
 			description,
 			[kind],
 			z.object({ ...shape, intentId: z.string().min(1).optional() }),
-			(params) => {
+			async (params) => {
 				const { intentId: _i, ...rest } = params;
 				const parsed = z
 					.strictObject(shape)
 					.safeParse(Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== undefined)));
-				if (!parsed.success)
-					throw new ToolFailure(
-						`validation_error: ${parsed.error.issues[0]?.path.join(".") || "input"}`,
-					);
+				if (!parsed.success) throw new ToolFailure(validationText(parsed.error.issues[0]));
 				return { kind, payload: parsed.data };
 			},
 		);

@@ -15,7 +15,11 @@ export class AdminError extends AppError {
 }
 
 export class AdminValidationError extends AdminError {
-	constructor(readonly issues: ReturnType<ZodError["flatten"]>) {
+	constructor(
+		readonly issues: ReturnType<ZodError["flatten"]>,
+		/** The first issue with its full path (array indexes included), for callers that report one line. */
+		readonly firstIssue?: { path: PropertyKey[]; message: string },
+	) {
 		super("Validation failed", "validation_error", 400, false);
 	}
 }
@@ -66,7 +70,7 @@ export function parseAdmin<T extends z.ZodType>(schema: T, input: unknown): z.ou
 	try {
 		return schema.parse(input);
 	} catch (error) {
-		if (error instanceof ZodError) throw new AdminValidationError(error.flatten());
+		if (error instanceof ZodError) throw new AdminValidationError(error.flatten(), error.issues[0]);
 		throw error;
 	}
 }
