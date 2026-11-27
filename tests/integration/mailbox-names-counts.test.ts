@@ -359,7 +359,7 @@ describe("schema v10 on a mailbox that predates display names", () => {
 		}));
 		expect(after.columns).toEqual(expect.arrayContaining(["from_name", "recipient_names_json"]));
 		expect(after.index).toBe(1);
-		expect(after.version).toBe(15);
+		expect(after.version).toBe(16);
 
 		const { message } = await doGet<{ message: Row }>(name, `/messages/${result.messageLocalId}`);
 		expect(message.from_name).toBeNull();

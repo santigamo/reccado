@@ -72,6 +72,7 @@ import {
 	type WebSocketAttachment,
 } from "./mailbox-realtime";
 import { MAILBOX_SCHEMA_SQL } from "./mailbox-schema";
+import { API_KEY_EVENT_TYPES, API_KEY_EVENTS_TABLE_SQL } from "./mailbox-schema-content";
 import {
 	applyBulkAction,
 	type BulkAction,
@@ -84,7 +85,7 @@ type SqlStorage = DurableObjectState["storage"]["sql"];
 
 // Target schema_migrations version. Bump this (and the migration logic in the
 // constructor) when a future legacy-schema migration needs to run again.
-const MAILBOX_SCHEMA_VERSION = 15;
+const MAILBOX_SCHEMA_VERSION = 16;
 
 export type DraftOrigin = "web" | "telegram" | "mcp";
 
@@ -1786,6 +1787,14 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		if (currentVersion < 15) {
 			createPurgeThreadsTable(this.ctx.storage.sql);
 		}
+		// v16: re-run the api_key_events rebuild. 'template_allowlist_updated' was
+		// added to the v6 rebuild after v6 had shipped, so every mailbox already past
+		// v6 kept a CHECK without it and the in-place allowlist edit (`api_key_templates`)
+		// failed on its audit insert. The rebuild reads the
+		// stored DDL, so a mailbox that already admits every type is left untouched.
+		if (currentVersion < 16) {
+			this.migrateApiKeyEventTypes();
+		}
 		this.ctx.storage.sql.exec(
 			"INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
 			MAILBOX_SCHEMA_VERSION,
@@ -1839,7 +1848,8 @@ export class MailboxDurableObject extends DurableObject<Env> {
 	}
 
 	/**
-	 * Widens `api_key_events.event_type` to admit 'sender_name_updated' and 'template_allowlist_updated'.
+	 * Widens `api_key_events.event_type` to admit every type in `API_KEY_EVENT_TYPES`
+	 * (run at v6 for 'sender_name_updated', again at v16 for 'template_allowlist_updated').
 	 *
 	 * A CHECK constraint cannot be altered in SQLite, so a mailbox provisioned
 	 * before this event type existed would reject the audit row — and because the
@@ -1855,22 +1865,22 @@ export class MailboxDurableObject extends DurableObject<Env> {
 		const ddl = this.ctx.storage.sql
 			.exec("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_key_events'")
 			.toArray()[0] as { sql?: string } | undefined;
-		if (!ddl?.sql || ddl.sql.includes("template_allowlist_updated")) return;
+		if (!ddl?.sql) return;
+		const stored = ddl.sql;
+		if (API_KEY_EVENT_TYPES.every((type) => stored.includes(`'${type}'`))) return;
 
-		this.ctx.storage.sql.exec("ALTER TABLE api_key_events RENAME TO api_key_events_old");
-		this.ctx.storage.sql.exec(`CREATE TABLE api_key_events (
-  id TEXT PRIMARY KEY,
-  key_id TEXT NOT NULL,
-  event_type TEXT NOT NULL
-    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated', 'template_allowlist_updated')),
-  metadata_json TEXT,
-  created_at TEXT NOT NULL
-)`);
-		this.ctx.storage.sql.exec(
-			"INSERT INTO api_key_events SELECT id, key_id, event_type, metadata_json, created_at FROM api_key_events_old",
-		);
-		this.ctx.storage.sql.exec("DROP TABLE api_key_events_old");
-		this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id)");
+		// One transaction: a failure part-way leaves the old table exactly as it was
+		// instead of a renamed copy the next start would not recognise.
+		this.ctx.storage.transactionSync(() => {
+			const sql = this.ctx.storage.sql;
+			sql.exec("ALTER TABLE api_key_events RENAME TO api_key_events_old");
+			sql.exec(API_KEY_EVENTS_TABLE_SQL);
+			sql.exec(
+				"INSERT INTO api_key_events (id, key_id, event_type, metadata_json, created_at) SELECT id, key_id, event_type, metadata_json, created_at FROM api_key_events_old",
+			);
+			sql.exec("DROP TABLE api_key_events_old");
+			sql.exec("CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id)");
+		});
 	}
 
 	/**
@@ -2215,10 +2225,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			const body = (await request.json()) as { senderName?: unknown };
 			const { updateApiKeySenderName } = await import("./transactional-key-ops");
 			try {
-				const result = updateApiKeySenderName(
-					this.ctx.storage.sql,
-					keyId,
-					(body.senderName ?? null) as string | null,
+				// One transaction: a refused audit row must undo the rename with it.
+				const result = this.ctx.storage.transactionSync(() =>
+					updateApiKeySenderName(
+						this.ctx.storage.sql,
+						keyId,
+						(body.senderName ?? null) as string | null,
+					),
 				);
 				if (!result) {
 					return Response.json({ error: "key_not_found" }, { status: 404 });
@@ -2245,10 +2258,13 @@ export class MailboxDurableObject extends DurableObject<Env> {
 			}
 			const { updateApiKeyTemplateAllowlist } = await import("./transactional-key-ops");
 			try {
-				const result = updateApiKeyTemplateAllowlist(
-					this.ctx.storage.sql,
-					keyId,
-					body.templateAllowlist as string[],
+				// One transaction: a refused audit row must undo the allowlist change with it.
+				const result = this.ctx.storage.transactionSync(() =>
+					updateApiKeyTemplateAllowlist(
+						this.ctx.storage.sql,
+						keyId,
+						body.templateAllowlist as string[],
+					),
 				);
 				if (!result) return Response.json({ error: "key_not_found" }, { status: 404 });
 				return Response.json({ key: result });

@@ -1,3 +1,29 @@
+/**
+ * Every value the code writes to `api_key_events.event_type`, and so every value
+ * the table's CHECK must admit. Adding one here is not enough on its own: SQLite
+ * cannot ALTER a CHECK, so a mailbox created before the addition keeps the old
+ * constraint until a NEW schema version re-runs the table rebuild
+ * (`migrateApiKeyEventTypes` in mailbox-do.ts). Editing an older version's gate
+ * never reaches the mailboxes already past it.
+ */
+export const API_KEY_EVENT_TYPES = [
+	"created",
+	"revoked",
+	"rotated",
+	"sender_name_updated",
+	"template_allowlist_updated",
+] as const;
+
+/** The one definition of `api_key_events`, shared by fresh mailboxes and the rebuild. */
+export const API_KEY_EVENTS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS api_key_events (
+  id TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL,
+  event_type TEXT NOT NULL
+    CHECK (event_type IN (${API_KEY_EVENT_TYPES.map((type) => `'${type}'`).join(", ")})),
+  metadata_json TEXT,
+  created_at TEXT NOT NULL
+)`;
+
 export const MAILBOX_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY,
@@ -220,14 +246,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE INDEX IF NOT EXISTS idx_api_keys_mailbox ON api_keys(mailbox_id);
 CREATE INDEX IF NOT EXISTS idx_api_keys_status ON api_keys(status);
 
-CREATE TABLE IF NOT EXISTS api_key_events (
-  id TEXT PRIMARY KEY,
-  key_id TEXT NOT NULL,
-  event_type TEXT NOT NULL
-    CHECK (event_type IN ('created', 'revoked', 'rotated', 'sender_name_updated', 'template_allowlist_updated')),
-  metadata_json TEXT,
-  created_at TEXT NOT NULL
-);
+${API_KEY_EVENTS_TABLE_SQL};
 
 CREATE INDEX IF NOT EXISTS idx_ake_key ON api_key_events(key_id);
 

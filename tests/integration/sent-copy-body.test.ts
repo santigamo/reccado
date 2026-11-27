@@ -443,6 +443,6 @@ describe("sent copy body backfill (schema v7)", () => {
 		}));
 
 		expect(after.body).toBe("Cuerpo del envio antiguo");
-		expect(after.version).toBe(15);
+		expect(after.version).toBe(16);
 	});
 });
