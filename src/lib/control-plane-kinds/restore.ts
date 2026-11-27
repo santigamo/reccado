@@ -236,6 +236,9 @@ async function plan(env: Env, auth: AuthContext, payload: Operation): Promise<Pl
 			};
 			if (!row.restore.length && !row.remove.length)
 				throw conflict("Nothing to restore", "restore_noop");
+			// Check ownership (active mailbox) before execute consumes the snapshot: a
+			// disabled mailbox must refuse here, not after the snapshot is burned.
+			await requireMailboxOwner(env, auth, row.mailboxId);
 			const list = (ids: string[]) => (ids.length ? ids.join("\n") : "(ninguna)");
 			return {
 				title: "Restaurar sincronización de plantillas",

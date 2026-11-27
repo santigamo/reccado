@@ -61,6 +61,8 @@ describe("checkSourceUrl", () => {
 			["https://db.internal/t.json", "source_url_host_refused"],
 			[`https://${OWN}/api/whatever`, "source_url_host_refused"],
 			[`https://sub.${OWN}/x`, "source_url_host_refused"],
+			["https://localhost../t.json", "source_url_host_refused"],
+			[`https://${OWN}../x`, "source_url_host_refused"],
 		];
 		for (const [url, code] of cases)
 			expect(
@@ -129,6 +131,16 @@ describe("fetchTemplateSource", () => {
 		).rejects.toMatchObject({ code: "source_url_not_https" });
 		expect(spy).toHaveBeenCalledTimes(1);
 
+		for (const target of ["https://169.254.169.254/latest", `https://${OWN}/api/x`]) {
+			spy.mockReset();
+			spy.mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: target } }));
+			await expect(
+				fetchTemplateSource("https://files.example.net/t.json", { ownHost: OWN }),
+				target,
+			).rejects.toMatchObject({ code: "source_url_host_refused" });
+			expect(spy).toHaveBeenCalledTimes(1);
+		}
+
 		spy.mockReset();
 		spy.mockImplementation(
 			async () =>
@@ -141,6 +153,21 @@ describe("fetchTemplateSource", () => {
 			fetchTemplateSource("https://files.example.net/t.json", { ownHost: OWN }),
 		).rejects.toMatchObject({ code: "source_too_many_redirects" });
 		expect(spy).toHaveBeenCalledTimes(4);
+	});
+
+	it("never echoes the fetched document's own keys in a refusal", async () => {
+		const longKey = "k".repeat(5000);
+		vi.restoreAllMocks();
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			ok(JSON.stringify({ templates: [], [`secret\n${longKey}`]: 1 })),
+		);
+		const error = (await fetchTemplateSource("https://files.example.net/t.json", {
+			ownHost: OWN,
+		}).catch((e: unknown) => e)) as Error & { code: string };
+		expect(error.code).toBe("source_unsupported_field");
+		expect(error.message).not.toContain("secret");
+		expect(error.message).not.toContain("\n");
+		expect(error.message.length).toBeLessThan(200);
 	});
 
 	it("refuses failed, oversized, HTML, non-JSON, mismatched and unsupported documents", async () => {

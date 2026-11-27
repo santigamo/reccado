@@ -22,7 +22,9 @@ export class SourceRefusal extends Error {
 		readonly code: string,
 		readonly detail?: string,
 	) {
-		super(`refused: ${code}${detail ? ` (${detail})` : ""}`);
+		// The detail can come from a remote document: keep it one short line.
+		const safe = detail?.replace(/\s+/g, " ").slice(0, 120);
+		super(`refused: ${code}${safe ? ` (${safe})` : ""}`);
 		this.name = "SourceRefusal";
 	}
 }
@@ -45,9 +47,11 @@ export function checkSourceUrl(raw: string, ownHost: string | null): URL {
 	if (url.protocol !== "https:") throw new SourceRefusal("source_url_not_https");
 	if (url.username || url.password) throw new SourceRefusal("source_url_has_credentials");
 	if (url.port && url.port !== "443") throw new SourceRefusal("source_url_port_refused");
-	const host = url.hostname.toLowerCase().replace(/\.$/, "");
+	const host = url.hostname.toLowerCase().replace(/\.+$/, "");
 	const refused =
 		!host.includes(".") ||
+		host.includes("..") ||
+		host.startsWith(".") ||
 		host.startsWith("[") ||
 		host.includes(":") ||
 		/^[0-9.]+$/.test(host) ||
@@ -165,8 +169,12 @@ export async function fetchTemplateSource(
 	else if (doc && typeof doc === "object") {
 		const extra = Object.keys(doc).filter((key) => key !== "templates");
 		// `archiveMissing` belongs to the HTTP API; an MCP sync never archives.
+		// Never echo the remote document's own keys; name only the one we know.
 		if (extra.length)
-			throw new SourceRefusal("source_unsupported_field", extra.slice(0, 3).join(", "));
+			throw new SourceRefusal(
+				"source_unsupported_field",
+				extra.includes("archiveMissing") ? "archiveMissing" : 'only "templates" is allowed',
+			);
 		const list = (doc as { templates?: unknown }).templates;
 		if (Array.isArray(list)) templates = list;
 	}

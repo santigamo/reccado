@@ -1018,6 +1018,27 @@ describe("manage_template sync", () => {
 	const outcomes = (r?: { results: Array<{ id: string; outcome: string }> }) =>
 		Object.fromEntries((r?.results ?? []).map((x) => [x.id, x.outcome]));
 
+	it("restoring a sync on a disabled mailbox refuses without consuming the snapshot", async () => {
+		const synced = await call("manage_template", {
+			action: "sync",
+			mailboxId: MBX,
+			templates: [{ id: "disabled-case", subject: "Antes" }],
+		});
+		expect(synced.content.status, synced.text).toBe("applied");
+		const snapshotId = synced.content.snapshotIds![0];
+		await db.prepare("UPDATE mailboxes SET status = 'disabled' WHERE mailbox_id = ?").bind(MBX).run();
+		try {
+			const refused = await call("restore", { opsEventId: snapshotId });
+			expect(refused.content.status, refused.text).not.toBe("applied");
+		} finally {
+			await db.prepare("UPDATE mailboxes SET status = 'active' WHERE mailbox_id = ?").bind(MBX).run();
+		}
+		// The snapshot was not burned: once the mailbox is back, the same restore applies.
+		const restored = await call("restore", { opsEventId: snapshotId });
+		expect(restored.content.status, restored.text).toBe("applied");
+		expect((await active()).has("disabled-case")).toBe(false);
+	});
+
 	it("applies many templates in one call, reports each outcome and hash, and restore undoes it", async () => {
 		const first = await call("manage_template", {
 			action: "sync",
