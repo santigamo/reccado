@@ -1026,12 +1026,18 @@ describe("manage_template sync", () => {
 		});
 		expect(synced.content.status, synced.text).toBe("applied");
 		const snapshotId = synced.content.snapshotIds![0];
-		await db.prepare("UPDATE mailboxes SET status = 'disabled' WHERE mailbox_id = ?").bind(MBX).run();
+		await db
+			.prepare("UPDATE mailboxes SET status = 'disabled' WHERE mailbox_id = ?")
+			.bind(MBX)
+			.run();
 		try {
 			const refused = await call("restore", { opsEventId: snapshotId });
 			expect(refused.content.status, refused.text).not.toBe("applied");
 		} finally {
-			await db.prepare("UPDATE mailboxes SET status = 'active' WHERE mailbox_id = ?").bind(MBX).run();
+			await db
+				.prepare("UPDATE mailboxes SET status = 'active' WHERE mailbox_id = ?")
+				.bind(MBX)
+				.run();
 		}
 		// The snapshot was not burned: once the mailbox is back, the same restore applies.
 		const restored = await call("restore", { opsEventId: snapshotId });
